@@ -130,6 +130,25 @@ struct GitHubUpdateConfiguration: Sendable {
     }
 }
 
+struct AppUpdateProgress: Equatable, Sendable {
+    let title: String
+    let detail: String
+    let fraction: Double
+
+    init(title: String = "Updating AgentTrainer", detail: String, fraction: Double) {
+        self.title = title
+        self.detail = detail
+        self.fraction = min(max(fraction.isFinite ? fraction : 0, 0), 1)
+    }
+}
+
+struct PreparedAppUpdate: Sendable {
+    let stagedApplicationURL: URL
+    let workingDirectoryURL: URL
+    let targetApplicationURL: URL
+    let version: AppSemanticVersion
+}
+
 enum GitHubUpdateError: LocalizedError {
     case invalidEndpoint
     case invalidResponse
@@ -141,6 +160,12 @@ enum GitHubUpdateError: LocalizedError {
     case downloadTooLarge
     case checksumEntryMissing(String)
     case checksumMismatch
+    case invalidDiskImage
+    case invalidApplication(String)
+    case signatureMismatch
+    case applicationCannotBeReplaced(String)
+    case commandFailed(String, Int32, String)
+    case installerHelperFailed
 
     var errorDescription: String? {
         switch self {
@@ -154,8 +179,35 @@ enum GitHubUpdateError: LocalizedError {
         case .downloadTooLarge: "The update download is unexpectedly large."
         case .checksumEntryMissing(let name): "SHA256SUMS.txt does not contain \(name)."
         case .checksumMismatch: "The downloaded update failed SHA-256 verification."
+        case .invalidDiskImage: "The update disk image does not contain a valid AgentTrainer app."
+        case .invalidApplication(let reason): "The downloaded AgentTrainer app is invalid: \(reason)"
+        case .signatureMismatch: "The update was signed by a different identity and was not installed."
+        case .applicationCannotBeReplaced(let path): "AgentTrainer cannot update the app at \(path). Move it to a writable Applications folder and try again."
+        case .commandFailed(let command, let status, let details): "\(command) failed with status \(status). \(details)"
+        case .installerHelperFailed: "The update installer could not be started."
         }
     }
+}
+
+private final class UpdateDownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let progress: @Sendable (Double) -> Void
+
+    init(progress: @escaping @Sendable (Double) -> Void) {
+        self.progress = progress
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        guard totalBytesExpectedToWrite > 0 else { return }
+        progress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {}
 }
 
 struct GitHubReleaseUpdater: Sendable {
@@ -185,29 +237,84 @@ struct GitHubReleaseUpdater: Sendable {
         return version > configuration.currentVersion
     }
 
-    func downloadVerifiedInstaller(for release: GitHubRelease) async throws -> URL {
+    func prepareUpdate(
+        for release: GitHubRelease,
+        targetApplicationURL: URL,
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> PreparedAppUpdate {
         guard let installer = release.installerAsset else { throw GitHubUpdateError.missingInstaller }
         guard let checksum = release.checksumAsset else { throw GitHubUpdateError.missingChecksum }
+        guard let releaseVersion = release.version else { throw GitHubUpdateError.releaseHasNoVersion(release.tagName) }
         guard installer.size > 0, installer.size <= 1_500_000_000,
               checksum.size > 0, checksum.size <= 2_000_000 else { throw GitHubUpdateError.downloadTooLarge }
 
-        async let installerData = download(asset: installer, maximumBytes: 1_500_000_000)
-        async let checksumData = download(asset: checksum, maximumBytes: 2_000_000)
-        let (download, sums) = try await (installerData, checksumData)
+        let targetParent = targetApplicationURL.deletingLastPathComponent()
+        guard targetApplicationURL.pathExtension.lowercased() == "app",
+              FileManager.default.fileExists(atPath: targetApplicationURL.path),
+              FileManager.default.isWritableFile(atPath: targetParent.path) else {
+            throw GitHubUpdateError.applicationCannotBeReplaced(targetApplicationURL.path)
+        }
+        let values = try? targetApplicationURL.resourceValues(forKeys: [.volumeIsReadOnlyKey])
+        guard values?.volumeIsReadOnly != true else {
+            throw GitHubUpdateError.applicationCannotBeReplaced(targetApplicationURL.path)
+        }
+
+        let tag = Self.safePathComponent(release.tagName)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentTrainer Updates", isDirectory: true)
+            .appendingPathComponent(tag, isDirectory: true)
+        try? FileManager.default.removeItem(at: directory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        progress(0.02, "Downloading release checksum…")
+        let sums = try await downloadData(asset: checksum, maximumBytes: 2_000_000)
         guard let expected = Self.expectedChecksum(for: installer.name, in: sums) else {
             throw GitHubUpdateError.checksumEntryMissing(installer.name)
         }
-        let actual = SHA256.hash(data: download).map { String(format: "%02x", $0) }.joined()
+
+        let diskImage = directory.appendingPathComponent(installer.name)
+        progress(0.05, "Downloading \(installer.name)…")
+        try await downloadFile(asset: installer, destination: diskImage, maximumBytes: 1_500_000_000) { fraction in
+            progress(0.05 + fraction * 0.67, "Downloading update… \(Int((fraction * 100).rounded()))%")
+        }
+        progress(0.74, "Verifying SHA-256 checksum…")
+        let actual = try Self.sha256(of: diskImage)
         guard actual.caseInsensitiveCompare(expected) == .orderedSame else { throw GitHubUpdateError.checksumMismatch }
 
-        let tag = release.tagName.map { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" ? $0 : "-" }
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("AgentTrainer Updates", isDirectory: true)
-            .appendingPathComponent(String(tag), isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let destination = directory.appendingPathComponent(installer.name)
-        try download.write(to: destination, options: .atomic)
-        return destination
+        progress(0.79, "Opening verified disk image…")
+        let mountResult = try await Self.runProcess("/usr/bin/hdiutil", ["attach", "-nobrowse", "-readonly", "-plist", diskImage.path])
+        let mountPoint = try Self.mountPoint(fromHdiutilPlist: mountResult.stdout)
+        do {
+            let sourceApplication = mountPoint.appendingPathComponent("AgentTrainer.app", isDirectory: true)
+            guard FileManager.default.fileExists(atPath: sourceApplication.path) else { throw GitHubUpdateError.invalidDiskImage }
+            progress(0.84, "Validating app identity and signature…")
+            try await Self.validateApplication(
+                at: sourceApplication,
+                expectedVersion: releaseVersion,
+                replacing: targetApplicationURL
+            )
+
+            let stagedApplication = directory.appendingPathComponent("Staged AgentTrainer.app", isDirectory: true)
+            try? FileManager.default.removeItem(at: stagedApplication)
+            progress(0.89, "Staging the new application…")
+            _ = try await Self.runProcess("/usr/bin/ditto", ["--rsrc", "--extattr", sourceApplication.path, stagedApplication.path])
+            try await Self.validateApplication(
+                at: stagedApplication,
+                expectedVersion: releaseVersion,
+                replacing: targetApplicationURL
+            )
+            _ = try? await Self.runProcess("/usr/bin/hdiutil", ["detach", mountPoint.path])
+            progress(0.94, "Update verified and ready to install…")
+            return PreparedAppUpdate(
+                stagedApplicationURL: stagedApplication,
+                workingDirectoryURL: directory,
+                targetApplicationURL: targetApplicationURL,
+                version: releaseVersion
+            )
+        } catch {
+            _ = try? await Self.runProcess("/usr/bin/hdiutil", ["detach", mountPoint.path])
+            throw error
+        }
     }
 
     static func expectedChecksum(for filename: String, in data: Data) -> String? {
@@ -222,7 +329,15 @@ struct GitHubReleaseUpdater: Sendable {
         return nil
     }
 
-    private func download(asset: GitHubRelease.Asset, maximumBytes: Int) async throws -> Data {
+    static func mountPoint(fromHdiutilPlist data: Data) throws -> URL {
+        guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let entities = plist["system-entities"] as? [[String: Any]],
+              let path = entities.compactMap({ $0["mount-point"] as? String }).first,
+              !path.isEmpty else { throw GitHubUpdateError.invalidDiskImage }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    private func downloadData(asset: GitHubRelease.Asset, maximumBytes: Int) async throws -> Data {
         guard asset.browserDownloadURL.scheme == "https", asset.browserDownloadURL.host?.lowercased() == "github.com" else {
             throw GitHubUpdateError.unsafeDownloadURL
         }
@@ -233,16 +348,206 @@ struct GitHubReleaseUpdater: Sendable {
         return try await validatedData(for: request, permittedInitialHosts: ["github.com"], maximumBytes: maximumBytes)
     }
 
+    private func downloadFile(
+        asset: GitHubRelease.Asset,
+        destination: URL,
+        maximumBytes: Int,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        guard asset.browserDownloadURL.scheme == "https", asset.browserDownloadURL.host?.lowercased() == "github.com" else {
+            throw GitHubUpdateError.unsafeDownloadURL
+        }
+        var request = URLRequest(url: asset.browserDownloadURL)
+        request.timeoutInterval = 180
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        request.setValue("AgentTrainer/\(configuration.currentVersion)", forHTTPHeaderField: "User-Agent")
+        let delegate = UpdateDownloadProgressDelegate(progress: progress)
+        let (temporary, response) = try await session.download(for: request, delegate: delegate)
+        try Self.validate(response: response, dataSize: nil, maximumBytes: maximumBytes, permittedInitialHosts: ["github.com"], request: request)
+        let fileSize = try temporary.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard fileSize > 0, fileSize <= maximumBytes else { throw GitHubUpdateError.downloadTooLarge }
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.moveItem(at: temporary, to: destination)
+    }
+
     private func validatedData(for request: URLRequest, permittedInitialHosts: Set<String>, maximumBytes: Int) async throws -> Data {
         guard let host = request.url?.host?.lowercased(), permittedInitialHosts.contains(host) else { throw GitHubUpdateError.unsafeDownloadURL }
         let (data, response) = try await session.data(for: request)
+        try Self.validate(response: response, dataSize: data.count, maximumBytes: maximumBytes, permittedInitialHosts: permittedInitialHosts, request: request)
+        return data
+    }
+
+    private static func validate(
+        response: URLResponse,
+        dataSize: Int?,
+        maximumBytes: Int,
+        permittedInitialHosts: Set<String>,
+        request: URLRequest
+    ) throws {
+        guard let initialHost = request.url?.host?.lowercased(), permittedInitialHosts.contains(initialHost) else {
+            throw GitHubUpdateError.unsafeDownloadURL
+        }
         guard let http = response as? HTTPURLResponse else { throw GitHubUpdateError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else { throw GitHubUpdateError.requestFailed(http.statusCode) }
-        guard data.count <= maximumBytes else { throw GitHubUpdateError.downloadTooLarge }
+        if let dataSize, dataSize > maximumBytes { throw GitHubUpdateError.downloadTooLarge }
         guard let finalHost = http.url?.host?.lowercased(),
               finalHost == "github.com" || finalHost == "api.github.com" || finalHost.hasSuffix(".githubusercontent.com") else {
             throw GitHubUpdateError.unsafeDownloadURL
         }
-        return data
+    }
+
+    private static func safePathComponent(_ value: String) -> String {
+        String(value.map { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" ? $0 : "-" })
+    }
+
+    private static func sha256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let data = try handle.read(upToCount: 1_048_576), !data.isEmpty { hasher.update(data: data) }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func validateApplication(
+        at applicationURL: URL,
+        expectedVersion: AppSemanticVersion,
+        replacing currentApplicationURL: URL
+    ) async throws {
+        _ = try await runProcess("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", applicationURL.path])
+        guard let candidate = Bundle(url: applicationURL), let current = Bundle(url: currentApplicationURL) else {
+            throw GitHubUpdateError.invalidApplication("bundle metadata could not be read")
+        }
+        guard candidate.bundleIdentifier == current.bundleIdentifier else {
+            throw GitHubUpdateError.invalidApplication("bundle identifier does not match")
+        }
+        guard let versionString = candidate.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+              let candidateVersion = AppSemanticVersion(versionString), candidateVersion == expectedVersion else {
+            throw GitHubUpdateError.invalidApplication("version does not match the GitHub release")
+        }
+        let currentRequirement = try await designatedRequirement(for: currentApplicationURL)
+        let candidateRequirement = try await designatedRequirement(for: applicationURL)
+        guard currentRequirement == candidateRequirement else { throw GitHubUpdateError.signatureMismatch }
+    }
+
+    private static func designatedRequirement(for applicationURL: URL) async throws -> String {
+        let result = try await runProcess("/usr/bin/codesign", ["-d", "-r-", applicationURL.path])
+        let text = String(data: result.stderr + result.stdout, encoding: .utf8) ?? ""
+        guard let requirement = text.split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .first(where: { $0.contains("designated =>") })?
+            .split(separator: ">", maxSplits: 1)
+            .last?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !requirement.isEmpty else {
+            throw GitHubUpdateError.invalidApplication("designated signing requirement is missing")
+        }
+        return requirement
+    }
+
+    fileprivate static func runProcess(_ executable: String, _ arguments: [String]) async throws -> (stdout: Data, stderr: Data) {
+        try await Task.detached(priority: .utility) {
+            let process = Process()
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            process.standardOutput = stdout
+            process.standardError = stderr
+            try process.run()
+            process.waitUntilExit()
+            let output = stdout.fileHandleForReading.readDataToEndOfFile()
+            let error = stderr.fileHandleForReading.readDataToEndOfFile()
+            guard process.terminationStatus == 0 else {
+                let details = String(data: error, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                throw GitHubUpdateError.commandFailed(URL(fileURLWithPath: executable).lastPathComponent, process.terminationStatus, details)
+            }
+            return (output, error)
+        }.value
+    }
+}
+
+struct SelfUpdateInstaller: Sendable {
+    private let prepared: PreparedAppUpdate
+    private let incomingApplicationURL: URL
+    private let backupApplicationURL: URL
+    private let helperScriptURL: URL
+    private let readinessURL: URL
+
+    static func prepare(_ prepared: PreparedAppUpdate) async throws -> Self {
+        let parent = prepared.targetApplicationURL.deletingLastPathComponent()
+        guard FileManager.default.isWritableFile(atPath: parent.path) else {
+            throw GitHubUpdateError.applicationCannotBeReplaced(prepared.targetApplicationURL.path)
+        }
+        let token = UUID().uuidString
+        let incoming = parent.appendingPathComponent(".AgentTrainer Update \(token).app", isDirectory: true)
+        let backup = parent.appendingPathComponent(".AgentTrainer Backup \(token).app", isDirectory: true)
+        try? FileManager.default.removeItem(at: incoming)
+        _ = try await GitHubReleaseUpdater.runProcess("/usr/bin/ditto", ["--rsrc", "--extattr", prepared.stagedApplicationURL.path, incoming.path])
+        _ = try await GitHubReleaseUpdater.runProcess("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", incoming.path])
+
+        let script = prepared.workingDirectoryURL.appendingPathComponent("install-update.zsh")
+        let ready = prepared.workingDirectoryURL.appendingPathComponent("installer-ready")
+        try? FileManager.default.removeItem(at: ready)
+        let contents = """
+        #!/bin/zsh
+        set -u
+        pid="$1"
+        incoming="$2"
+        target="$3"
+        backup="$4"
+        ready="$5"
+        cleanup="$6"
+        log="$HOME/Library/Logs/AgentTrainer-update.log"
+        /bin/mkdir -p "$HOME/Library/Logs"
+        exec >>"$log" 2>&1
+        /usr/bin/touch "$ready"
+        while /bin/kill -0 "$pid" >/dev/null 2>&1; do /bin/sleep 0.1; done
+        /bin/rm -rf "$backup"
+        if ! /bin/mv "$target" "$backup"; then
+            /usr/bin/open "$target" >/dev/null 2>&1 || true
+            exit 1
+        fi
+        if /bin/mv "$incoming" "$target" && /usr/bin/codesign --verify --deep --strict "$target"; then
+            /usr/bin/open "$target"
+            /bin/sleep 2
+            /bin/rm -rf "$backup" "$cleanup"
+            exit 0
+        fi
+        /bin/rm -rf "$target"
+        /bin/mv "$backup" "$target"
+        /usr/bin/open "$target" >/dev/null 2>&1 || true
+        exit 1
+        """
+        try Data(contents.utf8).write(to: script, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        return Self(
+            prepared: prepared,
+            incomingApplicationURL: incoming,
+            backupApplicationURL: backup,
+            helperScriptURL: script,
+            readinessURL: ready
+        )
+    }
+
+    func launch() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = [
+            helperScriptURL.path,
+            String(ProcessInfo.processInfo.processIdentifier),
+            incomingApplicationURL.path,
+            prepared.targetApplicationURL.path,
+            backupApplicationURL.path,
+            readinessURL.path,
+            prepared.workingDirectoryURL.path
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: readinessURL.path) { return }
+            if !process.isRunning { throw GitHubUpdateError.installerHelperFailed }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw GitHubUpdateError.installerHelperFailed
     }
 }

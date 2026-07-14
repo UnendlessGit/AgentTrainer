@@ -29,6 +29,13 @@ struct RootView: View {
         }
         .background(WindowChromeConfigurator(configuration: appearance.configuration))
         .ignoresSafeArea(.container, edges: .top)
+        .overlay {
+            if let progress = model.appUpdateProgress {
+                AppUpdateProgressOverlay(progress: progress)
+                    .transition(.opacity)
+                    .zIndex(100)
+            }
+        }
         .task {
             model.hudModel.installPanel()
             await model.checkForUpdatesAtLaunch()
@@ -191,6 +198,41 @@ struct RootView: View {
 
     @ViewBuilder private var canvasBackground: some View {
         Rectangle().fill(ATColor.canvas)
+    }
+}
+
+private struct AppUpdateProgressOverlay: View {
+    let progress: AppUpdateProgress
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.58).ignoresSafeArea()
+            OLEDCard {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "arrow.down.app.fill")
+                            .font(.title2)
+                            .foregroundStyle(ATColor.green)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(progress.title).font(.headline)
+                            Text(progress.detail).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text("\(Int((progress.fraction * 100).rounded()))%")
+                            .font(.callout.bold().monospacedDigit())
+                            .foregroundStyle(ATColor.green)
+                    }
+                    ProgressView(value: progress.fraction, total: 1)
+                        .progressViewStyle(.linear)
+                        .tint(ATColor.green)
+                    Text("Keep AgentTrainer open. It will restart automatically when installation finishes.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 500)
+        }
+        .allowsHitTesting(true)
     }
 }
 

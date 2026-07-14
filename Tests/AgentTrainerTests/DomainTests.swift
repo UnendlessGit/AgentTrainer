@@ -28,6 +28,21 @@ final class DomainTests: XCTestCase {
         XCTAssertNil(GitHubReleaseUpdater.expectedChecksum(for: "AgentTrainer-1.4-Compact.dmg", in: sums))
         XCTAssertNil(GitHubReleaseUpdater.expectedChecksum(for: "AgentTrainer-1.4.dmg", in: Data("abc  AgentTrainer-1.4.dmg\n".utf8)))
     }
+
+    func testUpdateMountPointParsingAndProgressBounds() throws {
+        let plist: [String: Any] = [
+            "system-entities": [
+                ["dev-entry": "/dev/disk9"],
+                ["mount-point": "/Volumes/AgentTrainer 1.6"]
+            ]
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        XCTAssertEqual(try GitHubReleaseUpdater.mountPoint(fromHdiutilPlist: data).path, "/Volumes/AgentTrainer 1.6")
+        XCTAssertThrowsError(try GitHubReleaseUpdater.mountPoint(fromHdiutilPlist: Data()))
+        XCTAssertEqual(AppUpdateProgress(detail: "low", fraction: -1).fraction, 0)
+        XCTAssertEqual(AppUpdateProgress(detail: "high", fraction: 2).fraction, 1)
+        XCTAssertEqual(AppUpdateProgress(detail: "nan", fraction: .nan).fraction, 0)
+    }
     func testPackedObservationSizes() {
         var spec = PreprocessingSpec(width: 641, height: 361, colorMode: .color, bitDepth: 6, chroma: .yuv420)
         XCTAssertEqual(spec.sampleByteCount, 641 * 361 + 2 * 321 * 181)

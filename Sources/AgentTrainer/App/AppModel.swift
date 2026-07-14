@@ -38,6 +38,7 @@ final class AppModel: ObservableObject {
     @Published var trainingStatus = "Idle"
     @Published var runtimeStatus = "Idle"
     @Published var errorMessage: String?
+    @Published private(set) var appUpdateProgress: AppUpdateProgress?
     @Published var storageBytes: Int64 = 0
     @Published private(set) var storageUsage = WorkspaceStorageUsage(totalBytes: 0, trainingDataBytes: 0, modelBytes: 0)
     @Published private(set) var storageLocations = WorkspaceLocations(
@@ -187,26 +188,41 @@ final class AppModel: ObservableObject {
         let shortenedNotes = notes.count > 700 ? String(notes.prefix(700)) + "…" : notes
         alert.informativeText = "You have version \(configuration.currentVersion)." +
             (shortenedNotes.isEmpty ? "" : "\n\n\(shortenedNotes)") +
-            (hasVerifiedInstaller ? "\n\nThe signed disk image will be verified against the release checksum before it opens." : "\n\nThis release has no verified disk image, so its GitHub page will open instead.")
-        alert.addButton(withTitle: hasVerifiedInstaller ? "Download Update" : "View Release")
+            (hasVerifiedInstaller ? "\n\nAgentTrainer will download, verify, install, and restart automatically." : "\n\nThis release has no verified disk image, so its GitHub page will open instead.")
+        alert.addButton(withTitle: hasVerifiedInstaller ? "Update Now" : "View Release")
         alert.addButton(withTitle: "Not Now")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         do {
             if hasVerifiedInstaller {
                 activityStatus = "Downloading AgentTrainer \(version)…"
-                let installer = try await updater.downloadVerifiedInstaller(for: release)
-                guard NSWorkspace.shared.open(installer) else {
-                    throw AgentTrainerError.storage("The verified update was downloaded, but macOS could not open it.")
+                appUpdateProgress = AppUpdateProgress(detail: "Preparing secure download…", fraction: 0.01)
+                let publishProgress: @Sendable (Double, String) -> Void = { [weak self] fraction, detail in
+                    Task { @MainActor [weak self] in
+                        self?.appUpdateProgress = AppUpdateProgress(detail: detail, fraction: fraction)
+                    }
                 }
-                activityStatus = "Verified update opened — drag AgentTrainer to Applications"
-                AppLog.write(category: "Updates", "Verified update opened", details: installer.path)
+                let prepared = try await updater.prepareUpdate(
+                    for: release,
+                    targetApplicationURL: Bundle.main.bundleURL.standardizedFileURL,
+                    progress: publishProgress
+                )
+                appUpdateProgress = AppUpdateProgress(detail: "Preparing transactional replacement…", fraction: 0.96)
+                let installer = try await SelfUpdateInstaller.prepare(prepared)
+                appUpdateProgress = AppUpdateProgress(detail: "Restarting with AgentTrainer \(version)…", fraction: 0.99)
+                try await installer.launch()
+                appUpdateProgress = AppUpdateProgress(detail: "Update ready — restarting now…", fraction: 1)
+                activityStatus = "Installing AgentTrainer \(version) and restarting"
+                AppLog.write(category: "Updates", "Verified update ready to install", details: "\(configuration.currentVersion) → \(version)")
+                try? await Task.sleep(for: .milliseconds(350))
+                NSApplication.shared.terminate(nil)
             } else {
                 NSWorkspace.shared.open(release.htmlURL)
             }
         } catch {
-            activityStatus = "Update download failed"
-            AppLog.write(.error, category: "Updates", "Update download failed", details: error.localizedDescription)
+            appUpdateProgress = nil
+            activityStatus = "Update failed; the current app was left unchanged"
+            AppLog.write(.error, category: "Updates", "Automatic update failed", details: error.localizedDescription)
             present(error)
         }
     }
