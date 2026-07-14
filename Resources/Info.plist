@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
+    <key>CFBundleExecutable</key><string>AgentTrainer</string>
+    <key>CFBundleIdentifier</key><string>local.agenttrainer.mac</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>AgentTrainer</string>
+    <key>CFBundleDisplayName</key><string>AgentTrainer</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.3</string>
+    <key>CFBundleVersion</key><string>5</string>
+    <key>ATGitHubOwner</key><string>UnendlessGit</string>
+    <key>ATGitHubRepository</key><string>AgentTrainer</string>
+    <key>LSMinimumSystemVersion</key><string>15.0</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key><false/>
+    <key>NSScreenCaptureUsageDescription</key><string>AgentTrainer records selected screen content and supplies exact-resolution frames to local AI models.</string>
+    <key>NSInputMonitoringUsageDescription</key><string>AgentTrainer records keyboard and mouse input synchronized with your recordings.</string>
+    <key>NSHumanReadableCopyright</key><string>Local private software</string>
+</dict>
+</plist>
