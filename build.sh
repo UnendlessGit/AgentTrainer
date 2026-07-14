@@ -7,7 +7,6 @@ BUILD_ROOT="$ROOT/.build/xcode"
 APP="$ROOT/outputs/AgentTrainer.app"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT/Resources/Info.plist")"
 DMG="$ROOT/outputs/AgentTrainer-$VERSION.dmg"
-COMPACT_DMG="$ROOT/outputs/AgentTrainer-$VERSION-Compact.dmg"
 SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-}"
 SIGN_KEYCHAIN="${CODE_SIGN_KEYCHAIN:-}"
 
@@ -114,66 +113,42 @@ cd "$ROOT"
 /usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources build.sh test.sh README.md DEVELOPMENT_GUIDE.md IN_PLACE_UPDATE_GUIDE.md -x '*.DS_Store'
 
 DMG_STAGE="$BUILD_ROOT/DMG"
+DMG_APP="$DMG_STAGE/AgentTrainer.app"
 rm -rf "$DMG_STAGE" "$DMG"
 mkdir -p "$DMG_STAGE"
-cp -R "$APP" "$DMG_STAGE/AgentTrainer.app"
+cp -R "$APP" "$DMG_APP"
+
+# Ship one size-optimized disk image. The duplicate Resources metallib is not
+# needed because MLX loads the executable-adjacent copy. Stripping link/debug
+# symbols changes neither app behavior nor model quality; re-sign the staged
+# copy afterward so its designated requirement remains stable.
+rm -rf "$DMG_APP/Contents/_CodeSignature"
+rm -f "$DMG_APP/Contents/Resources/mlx.metallib"
+xcrun strip -x -S "$DMG_APP/Contents/MacOS/AgentTrainer"
+codesign --force --deep --options runtime --timestamp=none "${SIGN_KEYCHAIN_ARGUMENTS[@]}" --sign "$SIGN_IDENTITY" "$DMG_APP"
+codesign --verify --deep --strict --verbose=2 "$DMG_APP"
 ln -s /Applications "$DMG_STAGE/Applications"
 hdiutil create -quiet -volname "AgentTrainer $VERSION" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG"
 if [[ "$SIGN_IDENTITY" != "-" ]]; then
   codesign --force --timestamp=none "${SIGN_KEYCHAIN_ARGUMENTS[@]}" --sign "$SIGN_IDENTITY" "$DMG"
 fi
 hdiutil verify -quiet "$DMG"
-FULL_BYTES=$(stat -f %z "$DMG")
-
-# A second distribution is useful only when the full DMG reaches the requested
-# 10 MB ceiling. The compact app contains the same release code with link/debug
-# symbols stripped and the duplicate Resources metallib removed. MLX loads the
-# retained executable-adjacent metallib. Re-sign after stripping so compact and
-# full builds keep the same stable macOS permission identity.
-COMPACT_STAGE="$BUILD_ROOT/DMG-Compact"
-COMPACT_APP="$COMPACT_STAGE/AgentTrainer.app"
-COMPACT_BYTES=""
-if (( FULL_BYTES >= 10000000 )); then
-  rm -rf "$COMPACT_STAGE" "$COMPACT_DMG"
-  mkdir -p "$COMPACT_STAGE"
-  cp -R "$APP" "$COMPACT_APP"
-  rm -rf "$COMPACT_APP/Contents/_CodeSignature"
-  rm -f "$COMPACT_APP/Contents/Resources/mlx.metallib"
-  xcrun strip -x -S "$COMPACT_APP/Contents/MacOS/AgentTrainer"
-  codesign --force --deep --options runtime --timestamp=none "${SIGN_KEYCHAIN_ARGUMENTS[@]}" --sign "$SIGN_IDENTITY" "$COMPACT_APP"
-  codesign --verify --deep --strict --verbose=2 "$COMPACT_APP"
-  ln -s /Applications "$COMPACT_STAGE/Applications"
-  hdiutil create -quiet -volname "AgentTrainer $VERSION Compact" -srcfolder "$COMPACT_STAGE" -ov -format UDZO "$COMPACT_DMG"
-  if [[ "$SIGN_IDENTITY" != "-" ]]; then
-    codesign --force --timestamp=none "${SIGN_KEYCHAIN_ARGUMENTS[@]}" --sign "$SIGN_IDENTITY" "$COMPACT_DMG"
-  fi
-  hdiutil verify -quiet "$COMPACT_DMG"
-  COMPACT_BYTES=$(stat -f %z "$COMPACT_DMG")
-  if (( COMPACT_BYTES >= 10000000 )); then
-    echo "Compact DMG is $COMPACT_BYTES bytes; the required limit is below 10,000,000 bytes." >&2
-    exit 1
-  fi
-else
-  rm -rf "$COMPACT_STAGE"
-  rm -f "$COMPACT_DMG"
+DMG_BYTES=$(stat -f %z "$DMG")
+if (( DMG_BYTES >= 10000000 )); then
+  echo "DMG is $DMG_BYTES bytes; the required limit is below 10,000,000 bytes." >&2
+  exit 1
 fi
 
 # Keep the output directory unambiguous: a successful build supersedes older
 # versioned DMGs and historical zipped-DMG artifacts.
 for old in "$ROOT"/outputs/AgentTrainer-*.dmg(N) "$ROOT"/outputs/AgentTrainer-*.dmg.zip(N); do
-  if [[ "$old" != "$DMG" && "$old" != "$COMPACT_DMG" ]]; then rm -f "$old"; fi
+  if [[ "$old" != "$DMG" ]]; then rm -f "$old"; fi
 done
 
 CHECKSUM_INPUTS=("${DMG:t}" "AgentTrainer.app/Contents/MacOS/AgentTrainer" "AgentTrainer-Source.zip")
-if [[ -f "$COMPACT_DMG" ]]; then CHECKSUM_INPUTS+=("${COMPACT_DMG:t}"); fi
 (cd "$ROOT/outputs" && shasum -a 256 "${CHECKSUM_INPUTS[@]}" > SHA256SUMS.txt)
 
 echo "$APP"
-echo "$DMG ($FULL_BYTES bytes)"
-if [[ -f "$COMPACT_DMG" ]]; then
-  echo "$COMPACT_DMG ($COMPACT_BYTES bytes)"
-else
-  echo "Compact DMG skipped: the full DMG is already below 10,000,000 bytes."
-fi
+echo "$DMG ($DMG_BYTES bytes)"
 echo "Bundle update: $([[ "$APP_WAS_PRESENT" == "1" ]] && echo 'in place' || echo 'created')"
 echo "Signed with: $SIGN_IDENTITY"

@@ -138,7 +138,7 @@ cd "$ROOT"
 
 ### 3. Compile incrementally
 
-For a minimal Swift-only update, use the incremental command below and replace only the executable. The release `build.sh` is now also safe for a complete output release: it preserves an existing `outputs/AgentTrainer.app` bundle directory, refreshes its known executable/plist/icon/Metal contents, re-signs it, and rebuilds the full DMG. It emits a second compact DMG only when the full one is at least 10,000,000 bytes. It refuses to mutate a running copy. Use the manual path here when unchanged resources should retain their exact timestamps.
+For a minimal Swift-only update, use the incremental command below and replace only the executable. The release `build.sh` is now also safe for a complete output release: it preserves an existing `outputs/AgentTrainer.app` bundle directory, refreshes its known executable/plist/icon/Metal contents, re-signs it, and rebuilds exactly one size-optimized DMG below 10,000,000 bytes. It refuses to mutate a running copy. Use the manual path here when unchanged resources should retain their exact timestamps.
 
 Use the existing `.build/xcode` DerivedData directory:
 
