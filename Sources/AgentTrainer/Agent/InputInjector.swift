@@ -67,7 +67,7 @@ final class InputInjector: @unchecked Sendable {
         onState?(state)
     }
 
-    func execute(_ prediction: [Float], profile: AIProfile, allowedKeyCodes: Set<UInt16>, mouseMode: MouseControlMode, captureRect: CGRect, safety: AgentSafetyPolicy, gameCamera: GameCameraSettings = GameCameraSettings(), predictionIsFresh: Bool = true) {
+    func execute(_ prediction: [Float], profile: AIProfile, allowedKeyCodes: Set<UInt16>, mouseMode: MouseControlMode, captureRect: CGRect, safety: AgentSafetyPolicy, gameCamera: GameCameraSettings = GameCameraSettings(), predictionIsFresh: Bool = true, shiftUsesKeyboardChannel: Bool = false) {
         guard prediction.count >= ActionLayout.count,
               prediction.prefix(ActionLayout.count).allSatisfy(\.isFinite) else { return }
         lock.lock()
@@ -120,8 +120,11 @@ final class InputInjector: @unchecked Sendable {
         var desiredModifiers: UInt64 = 0
         let modifierMasks: [CGEventFlags] = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
         let modifierKeys: [UInt16] = [56, 59, 58, 55]
-        if outputPermissions.keyboard, channels.modifiers {
-            for i in 0..<4 where prediction[142 + i] >= 0.5 && restrictions.allowsModifier(i) && allowsDemonstratedModifier(i, keys: allowedKeyCodes) {
+        if outputPermissions.keyboard {
+            for i in 0..<4 where (i == 0 && shiftUsesKeyboardChannel ? channels.keyboard : channels.modifiers)
+                && prediction[142 + i] >= 0.5
+                && restrictions.allowsModifier(i)
+                && allowsDemonstratedModifier(i, keys: allowedKeyCodes) {
                 desiredModifiers |= modifierMasks[i].rawValue
             }
         }

@@ -199,7 +199,7 @@ private struct ProfileEditor: View {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack { Text("Control channels").font(.headline).foregroundStyle(ATColor.violet); InfoTip("Mouse demonstrations train absolute position and relative delta together. The execution mode is chosen only in Run.") }
                         HStack { Toggle("Mouse movement", isOn: Binding(get: { draft.channels.mouseMovement }, set: { draft.channels.mouseMovement = $0 })); Toggle("Buttons", isOn: $draft.channels.buttons) }
-                        HStack { Toggle("Scroll", isOn: $draft.channels.scroll); Toggle("Keyboard", isOn: $draft.channels.keyboard); Toggle("Modifiers", isOn: $draft.channels.modifiers) }
+                        HStack { Toggle("Scroll", isOn: $draft.channels.scroll); Toggle("Keyboard + Shift", isOn: $draft.channels.keyboard); Toggle("Command / Option / Control", isOn: $draft.channels.modifiers) }
                         Divider(); Text("Blocked outputs").font(.subheadline.bold()).foregroundStyle(ATColor.coral)
                         KeyRestrictionGrid(restrictions: Binding(get: { draft.effectiveRestrictions }, set: { draft.restrictions = $0 }), model: model)
                     }
@@ -1232,7 +1232,7 @@ struct RunView: View {
                                         HStack {
                                             Picker("Action head", selection: $model.cnnVisualizationSettings.actionFocus) {
                                                 ForEach(CNNActionFocus.allCases) { focus in
-                                                    Text(focus.rawValue + (actionFocusIsTrained(focus, by: profile) ? "" : " (not trained)")).tag(focus)
+                                                    Text(focus.displayName + (actionFocusIsTrained(focus, by: profile) ? "" : " (not trained)")).tag(focus)
                                                 }
                                             }
                                             CNNOverlayOpacityControl(value: $model.cnnVisualizationSettings.overlayOpacity)
@@ -1427,7 +1427,7 @@ struct SettingsView: View {
                 ThemeSettingsView()
                 OLEDCard { HStack { VStack(alignment: .leading, spacing: 4) { Text("Diagnostics and app logs").font(.headline).foregroundStyle(ATColor.cyan); Text("Open the dedicated tab for persistent errors, prints, crash reports, MLX memory, and a copyable support report.").foregroundStyle(.secondary) }; Spacer(); Button("Open Diagnostics") { model.selection = .diagnostics }.primaryButton() } }
                 StorageSettingsView(model: model)
-                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.2") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "13"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
+                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.3") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "14"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
             }.padding(28)
         }
     }

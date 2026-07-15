@@ -9,6 +9,9 @@ enum ActionLayout {
     static let buttons = 4..<12
     static let scroll = 12..<14
     static let keyboard = 14..<142
+    static let shift = 142..<143
+    static let keyboardAndShift = 14..<143
+    static let commandOptionControl = 143..<146
     static let modifiers = 142..<146
     static let count = 146
     static let binary = Array(buttons) + Array(keyboard) + Array(modifiers)
