@@ -8,7 +8,7 @@ enum WorkspaceDataKind: String, Sendable {
     fileprivate var managedNames: [String] {
         switch self {
         case .trainingData: ["Recordings", "Caches", "recording-folders.json"]
-        case .models: ["Profiles", "model-contract.json"]
+        case .models: ["Profiles", "model-contract.json", "model-artifact-audit-1.8.2.json"]
         }
     }
 }
@@ -188,56 +188,117 @@ actor WorkspaceStore {
         return WorkspaceRelocationResult(destination: destination, movedExistingData: true, sourceCleanupComplete: cleanupComplete)
     }
 
-    /// One-time compatibility boundary for learned action semantics. Profiles
-    /// and source recordings are preserved; only weights/checkpoints and derived
-    /// caches are discarded when the model contract changes.
+    /// One-time compatibility boundary for learned action semantics. Every
+    /// saved version is inspected independently: compatible brains stay in
+    /// place, while incompatible or unreadable artifacts are moved to a
+    /// recovery archive instead of being deleted. Profiles and recordings are
+    /// never removed by this migration.
     @discardableResult
     func removeObsoleteModelArtifacts(currentSchema: Int) throws -> Int {
         try prepare()
         let marker = modelsRoot.appendingPathComponent("model-contract.json")
-        if let data = try? Data(contentsOf: marker),
-           let stored = try? decoder.decode(Int.self, from: data), stored == currentSchema {
+        let auditMarker = modelsRoot.appendingPathComponent("model-artifact-audit-1.8.2.json")
+        let storedSchema = (try? Data(contentsOf: marker)).flatMap { try? decoder.decode(Int.self, from: $0) }
+        if storedSchema == currentSchema,
+           let data = try? Data(contentsOf: auditMarker),
+           (try? decoder.decode(Int.self, from: data)) == currentSchema {
             return 0
         }
 
-        var removed = 0
+        var archived = 0
         for var profile in listProfiles() {
-            // Protection prevents user deletion of a compatible brain, but it
-            // cannot make obsolete tensor shapes runnable. Preserve every
-            // profile and source recording while removing incompatible learned
-            // artifacts consistently, including protected profile names.
             let profileRoot = profileDirectory(profile.id)
-            for name in ["Versions", "Checkpoint"] {
-                let artifact = profileRoot.appendingPathComponent(name, isDirectory: true)
-                if FileManager.default.fileExists(atPath: artifact.path) {
-                    try FileManager.default.removeItem(at: artifact)
-                    removed += 1
+            let versionsRoot = profileRoot.appendingPathComponent("Versions", isDirectory: true)
+            let versionItems = (try? FileManager.default.contentsOfDirectory(
+                at: versionsRoot,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            var compatibleVersionIDs = Set<UUID>()
+
+            for item in versionItems {
+                let manifestURL = item.appendingPathComponent("manifest.json")
+                if let data = try? Data(contentsOf: manifestURL),
+                   let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
+                   manifest.schemaVersion == currentSchema,
+                   manifest.id.uuidString.caseInsensitiveCompare(item.lastPathComponent) == .orderedSame {
+                    compatibleVersionIDs.insert(manifest.id)
+                } else {
+                    try archiveModelArtifact(
+                        item,
+                        profileRoot: profileRoot,
+                        category: "Versions",
+                        storedSchema: storedSchema
+                    )
+                    archived += 1
                 }
             }
-            profile.activeVersionID = nil
-            profile.trainingProgress = nil
-            profile.training.architecture = migratedArchitecture(profile.training.architecture)
-            // Very long action histories made the old recurrent branch both
-            // slow and an easy persistence shortcut. Keep at most half a
-            // second at the common 60 Hz while the new motion channels carry
-            // the visual velocity signal directly.
-            profile.training.historyLength = min(32, max(0, profile.training.historyLength))
-            // Values such as 0.001–0.005 were stable only by accident under
-            // the old constant-rate optimizer and commonly destroyed earlier
-            // progress. The current schedule is tuned around this safe peak.
-            if !profile.training.learningRate.isFinite || profile.training.learningRate <= 0 {
-                profile.training.learningRate = 0.0003
-            } else {
-                profile.training.learningRate = min(0.0003, profile.training.learningRate)
+
+            let checkpoint = profileRoot.appendingPathComponent("Checkpoint", isDirectory: true)
+            var keepsCheckpoint = false
+            if FileManager.default.fileExists(atPath: checkpoint.path) {
+                let checkpointMarker = checkpoint.appendingPathComponent("model-schema.json")
+                let checkpointSchema = (try? Data(contentsOf: checkpointMarker)).flatMap { try? decoder.decode(Int.self, from: $0) }
+                keepsCheckpoint = checkpointSchema == currentSchema
+                    || (checkpointSchema == nil && (storedSchema == currentSchema || !compatibleVersionIDs.isEmpty))
+                if keepsCheckpoint {
+                    // Checkpoints created before 1.8.2 did not carry their own
+                    // schema marker. Once compatibility is established from a
+                    // current library or version manifest, make it explicit.
+                    if checkpointSchema == nil {
+                        try atomicWrite(try encoder.encode(currentSchema), to: checkpointMarker)
+                    }
+                } else {
+                    try archiveModelArtifact(
+                        checkpoint,
+                        profileRoot: profileRoot,
+                        category: "Checkpoints",
+                        storedSchema: checkpointSchema ?? storedSchema
+                    )
+                    archived += 1
+                }
             }
-            if profile.training.perceptionFPS > profile.training.actionFPS {
-                profile.training.perceptionFPS = profile.training.actionFPS
+
+            let activeIsCompatible = profile.activeVersionID.map(compatibleVersionIDs.contains) ?? false
+            if profile.activeVersionID != nil && !activeIsCompatible {
+                profile.activeVersionID = nil
+                profile.trainingProgress = nil
+            }
+
+            // A compatible saved brain or checkpoint proves that this profile
+            // already uses the current contract. Never rewrite its settings.
+            if compatibleVersionIDs.isEmpty && !keepsCheckpoint {
+                profile.training.architecture = migratedArchitecture(profile.training.architecture)
+                profile.training.historyLength = min(32, max(0, profile.training.historyLength))
+                if !profile.training.learningRate.isFinite || profile.training.learningRate <= 0 {
+                    profile.training.learningRate = 0.0003
+                } else {
+                    profile.training.learningRate = min(0.0003, profile.training.learningRate)
+                }
+                if profile.training.perceptionFPS > profile.training.actionFPS {
+                    profile.training.perceptionFPS = profile.training.actionFPS
+                }
             }
             try saveProfile(profile)
         }
         try clearCaches()
         try atomicWrite(try encoder.encode(currentSchema), to: marker)
-        return removed
+        try atomicWrite(try encoder.encode(currentSchema), to: auditMarker)
+        return archived
+    }
+
+    private func archiveModelArtifact(_ source: URL, profileRoot: URL, category: String, storedSchema: Int?) throws {
+        let schemaName = storedSchema.map(String.init) ?? "Unknown"
+        let categoryRoot = profileRoot
+            .appendingPathComponent("Archived Model Artifacts", isDirectory: true)
+            .appendingPathComponent("Model Contract \(schemaName)", isDirectory: true)
+            .appendingPathComponent(category, isDirectory: true)
+        try FileManager.default.createDirectory(at: categoryRoot, withIntermediateDirectories: true)
+        var destination = categoryRoot.appendingPathComponent(source.lastPathComponent, isDirectory: true)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            destination = categoryRoot.appendingPathComponent("\(source.lastPathComponent)-\(UUID().uuidString)", isDirectory: true)
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
     }
 
     private func migratedArchitecture(_ previous: ArchitectureSpec) -> ArchitectureSpec {
@@ -600,6 +661,7 @@ actor WorkspaceStore {
             try FileManager.default.copyItem(at: source.appendingPathComponent(version.weightsFile), to: temporary.appendingPathComponent("weights.safetensors"))
             try FileManager.default.copyItem(at: source.appendingPathComponent(optimizerFile), to: temporary.appendingPathComponent("optimizer.safetensors"))
             try FileManager.default.copyItem(at: source.appendingPathComponent(stateFile), to: temporary.appendingPathComponent("state.json"))
+            try encoder.encode(version.schemaVersion).write(to: temporary.appendingPathComponent("model-schema.json"), options: .atomic)
             if let randomStateFile = version.randomStateFile {
                 try FileManager.default.copyItem(at: source.appendingPathComponent(randomStateFile), to: temporary.appendingPathComponent("random.safetensors"))
             }

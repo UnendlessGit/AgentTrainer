@@ -489,7 +489,7 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Optional keeps versions created before this invariant decodable.
     var demonstratedKeyCodes: Set<UInt16>? = nil
     /// Optional so schema-1 manifests remain decodable long enough to be
-    /// removed by the compatibility migration.
+    /// identified and archived by the compatibility migration.
     var relativeMouseScale: Float? = nil
     /// Optional keeps existing runnable brains compatible. New training writes
     /// the dataset/target contract that produced the brain.

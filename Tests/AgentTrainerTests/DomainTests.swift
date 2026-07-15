@@ -585,14 +585,23 @@ final class DomainTests: XCTestCase {
         let recording = RecordingManifest(id: recordingID, name: "Keep me", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(.zero), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0)
         try await store.writeRecording(recording, to: recordingDirectory)
 
-        let removed = try await store.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
+        let archived = try await store.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
         let remainingRecordings = await store.listRecordings()
         let remainingProfiles = await store.listProfiles()
-        XCTAssertEqual(removed, 4)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: versions.path))
+        XCTAssertEqual(archived, 4)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: versions.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: versions.appendingPathComponent("old.bin").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: checkpoint.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: protectedVersions.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: protectedVersions.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: protectedVersions.appendingPathComponent("old.bin").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: protectedCheckpoint.path))
+        let archivedPaths = [profileDirectory, protectedRoot].flatMap { directory in
+            let archive = directory.appendingPathComponent("Archived Model Artifacts", isDirectory: true)
+            let enumerator = FileManager.default.enumerator(at: archive, includingPropertiesForKeys: nil)
+            return (enumerator?.allObjects as? [URL] ?? []).map(\.lastPathComponent)
+        }
+        XCTAssertEqual(archivedPaths.filter { $0 == "old.bin" }.count, 4)
+        XCTAssertEqual(archivedPaths.filter { $0 == "Checkpoint" }.count, 2)
         XCTAssertEqual(remainingRecordings.count, 1)
         XCTAssertEqual(Set(remainingProfiles.map(\.name)), ["Preserved profile", "Crystal V4"])
         XCTAssertTrue(remainingProfiles.allSatisfy { $0.activeVersionID == nil })
@@ -600,6 +609,71 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(migrated.training.architecture, .large)
         XCTAssertEqual(migrated.training.historyLength, 32)
         XCTAssertEqual(migrated.training.learningRate, 0.0003)
+        let secondPass = try await store.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
+        XCTAssertEqual(secondPass, 0)
+    }
+
+    func testModelContractAuditPreservesCompatibleBrainsInMixedCurrentLibrary() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("workspace-contract-audit-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+
+        var profile = AIProfile.fresh(name: "Current mixed library")
+        profile.training.historyLength = 73
+        profile.training.learningRate = 0.00025
+        let currentID = UUID()
+        profile.activeVersionID = currentID
+        profile.trainingProgress = TrainingProgressSummary(globalStep: 321, epoch: 4, updatedAt: Date(), savedBrainCount: 2)
+        try await store.saveProfile(profile)
+
+        let current = ModelVersionManifest(
+            id: currentID,
+            name: "Supported brain",
+            createdAt: Date(),
+            globalStep: 321,
+            trainingLoss: 0.2,
+            preprocessing: profile.preprocessing,
+            channels: profile.channels,
+            training: profile.training
+        )
+        try await store.saveVersionManifest(current, profileID: profile.id)
+        let currentDirectory = await store.versionDirectory(profileID: profile.id, versionID: currentID)
+        let currentWeights = Data([9, 8, 7, 6])
+        try currentWeights.write(to: currentDirectory.appendingPathComponent(current.weightsFile))
+
+        var legacy = current
+        legacy.schemaVersion = ModelContract.schemaVersion - 1
+        legacy.id = UUID()
+        legacy.name = "Legacy brain"
+        try await store.saveVersionManifest(legacy, profileID: profile.id)
+        let legacyDirectory = await store.versionDirectory(profileID: profile.id, versionID: legacy.id)
+        try Data([1, 2, 3]).write(to: legacyDirectory.appendingPathComponent(legacy.weightsFile))
+
+        let checkpoint = await store.checkpointDirectory(profileID: profile.id)
+        try FileManager.default.createDirectory(at: checkpoint, withIntermediateDirectories: true)
+        let checkpointWeights = Data([5, 4, 3, 2, 1])
+        let checkpointState = Data("current checkpoint".utf8)
+        try checkpointWeights.write(to: checkpoint.appendingPathComponent("weights.safetensors"))
+        try checkpointState.write(to: checkpoint.appendingPathComponent("state.json"))
+        try JSONEncoder().encode(ModelContract.schemaVersion).write(to: root.appendingPathComponent("model-contract.json"), options: .atomic)
+
+        let archived = try await store.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
+
+        XCTAssertEqual(archived, 1)
+        XCTAssertEqual(try Data(contentsOf: currentDirectory.appendingPathComponent(current.weightsFile)), currentWeights)
+        XCTAssertEqual(try Data(contentsOf: checkpoint.appendingPathComponent("weights.safetensors")), checkpointWeights)
+        XCTAssertEqual(try Data(contentsOf: checkpoint.appendingPathComponent("state.json")), checkpointState)
+        XCTAssertEqual(try JSONDecoder().decode(Int.self, from: Data(contentsOf: checkpoint.appendingPathComponent("model-schema.json"))), ModelContract.schemaVersion)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyDirectory.path))
+        let reloadedProfiles = await store.listProfiles()
+        let reloaded = try XCTUnwrap(reloadedProfiles.first { $0.id == profile.id })
+        XCTAssertEqual(reloaded.activeVersionID, currentID)
+        XCTAssertEqual(reloaded.trainingProgress?.globalStep, profile.trainingProgress?.globalStep)
+        XCTAssertEqual(reloaded.trainingProgress?.epoch, profile.trainingProgress?.epoch)
+        XCTAssertEqual(reloaded.trainingProgress?.savedBrainCount, profile.trainingProgress?.savedBrainCount)
+        XCTAssertEqual(reloaded.training.historyLength, 73)
+        XCTAssertEqual(reloaded.training.learningRate, 0.00025)
         let secondPass = try await store.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
         XCTAssertEqual(secondPass, 0)
     }
