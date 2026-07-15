@@ -1215,6 +1215,64 @@ final class DomainTests: XCTestCase {
         injector.disableAndReleaseAll()
     }
 
+    func testShiftFollowsKeyboardWhileCommandOptionControlFollowModifierChannel() {
+        var profile = AIProfile.fresh()
+        profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: false, keyboard: true, modifiers: false)
+        var prediction = [Float](repeating: 0, count: ActionLayout.count)
+        for index in ActionLayout.modifiers { prediction[index] = 1 }
+        let modifierKeyCodes: Set<UInt16> = [56, 59, 58, 55]
+
+        let keyboardCollector = EventCollector()
+        let keyboardInjector = InputInjector(eventSink: { keyboardCollector.append($0) })
+        keyboardInjector.enable()
+        keyboardInjector.execute(
+            prediction,
+            profile: profile,
+            allowedKeyCodes: modifierKeyCodes,
+            mouseMode: .absolute,
+            captureRect: CGRect(x: 0, y: 0, width: 100, height: 100),
+            safety: AgentSafetyPolicy(),
+            shiftUsesKeyboardChannel: true
+        )
+        let keyboardCodes = Set(keyboardCollector.events.map { UInt16($0.1) })
+        XCTAssertTrue(keyboardCodes.contains(56))
+        XCTAssertTrue(keyboardCodes.isDisjoint(with: [59, 58, 55]))
+        keyboardInjector.disableAndReleaseAll()
+
+        let legacyCollector = EventCollector()
+        let legacyInjector = InputInjector(eventSink: { legacyCollector.append($0) })
+        legacyInjector.enable()
+        legacyInjector.execute(
+            prediction,
+            profile: profile,
+            allowedKeyCodes: modifierKeyCodes,
+            mouseMode: .absolute,
+            captureRect: CGRect(x: 0, y: 0, width: 100, height: 100),
+            safety: AgentSafetyPolicy()
+        )
+        XCTAssertTrue(legacyCollector.events.isEmpty, "An older brain must keep its original all-modifiers toggle semantics")
+        legacyInjector.disableAndReleaseAll()
+
+        profile.channels.keyboard = false
+        profile.channels.modifiers = true
+        let modifierCollector = EventCollector()
+        let modifierInjector = InputInjector(eventSink: { modifierCollector.append($0) })
+        modifierInjector.enable()
+        modifierInjector.execute(
+            prediction,
+            profile: profile,
+            allowedKeyCodes: modifierKeyCodes,
+            mouseMode: .absolute,
+            captureRect: CGRect(x: 0, y: 0, width: 100, height: 100),
+            safety: AgentSafetyPolicy(),
+            shiftUsesKeyboardChannel: true
+        )
+        let modifierCodes = Set(modifierCollector.events.map { UInt16($0.1) })
+        XCTAssertFalse(modifierCodes.contains(56))
+        XCTAssertTrue(Set([59, 58, 55]).isSubset(of: modifierCodes))
+        modifierInjector.disableAndReleaseAll()
+    }
+
     func testInjectorCannotEmitAKeyMissingFromTraining() {
         let collector = EventCollector()
         let injector = InputInjector(eventSink: { collector.append($0) })
@@ -1755,6 +1813,40 @@ final class DomainTests: XCTestCase {
         MLX.eval(blockedLoss, learnedLoss)
         XCTAssertEqual(blockedLoss.item(Float.self), 0, accuracy: 0.000_001)
         XCTAssertGreaterThan(learnedLoss.item(Float.self), 0)
+    }
+
+    func testShiftLossBelongsToKeyboardAndNotModifierChannel() {
+        func loss(keyboard: Bool, modifiers: Bool, targetIndex: Int) -> Float {
+            var profile = AIProfile.fresh()
+            profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale, bitDepth: 8)
+            profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: false, keyboard: keyboard, modifiers: modifiers)
+            profile.training.historyLength = 1
+            profile.training.architecture = .small
+            profile.training.architecture.dropout = 0
+            profile.training.precision = .float32
+            let model = AgentPolicy(profile: profile)
+            let images = grayscaleTemporalTensor(batch: 1, width: 12, height: 8, value: 0.5)
+            let history = MLXArray([Float](repeating: 0, count: ActionLayout.count), [1, 1, ActionLayout.count])
+            var targetValues = [Float](repeating: 0, count: ActionLayout.count)
+            targetValues[targetIndex] = 1
+            var weightValues = [Float](repeating: 0, count: ActionLayout.count)
+            weightValues[targetIndex] = 4
+            let result = model.loss(
+                images: images,
+                history: history,
+                targets: MLXArray(targetValues, [1, ActionLayout.count]),
+                positiveWeights: MLXArray(weightValues, [ActionLayout.count])
+            )
+            MLX.eval(result)
+            return result.item(Float.self)
+        }
+
+        let shift = ActionLayout.shift.lowerBound
+        let control = ActionLayout.commandOptionControl.lowerBound
+        XCTAssertGreaterThan(loss(keyboard: true, modifiers: false, targetIndex: shift), 0)
+        XCTAssertEqual(loss(keyboard: true, modifiers: false, targetIndex: control), 0, accuracy: 0.000_001)
+        XCTAssertEqual(loss(keyboard: false, modifiers: true, targetIndex: shift), 0, accuracy: 0.000_001)
+        XCTAssertGreaterThan(loss(keyboard: false, modifiers: true, targetIndex: control), 0)
     }
 
     func testCompiledCNNDiagnosticsPreservePredictionsAndProduceBoundedMaps() {

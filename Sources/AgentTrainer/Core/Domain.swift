@@ -119,7 +119,9 @@ struct ActionChannels: Codable, Hashable, Sendable {
     var relativeMouse = false
     var buttons = true
     var scroll = true
+    /// Standard keyboard keys plus Shift in training-data schema 7 and later.
     var keyboard = true
+    /// Command, Option, and Control in training-data schema 7 and later.
     var modifiers = true
 
     static let all = ActionChannels(absoluteMouse: true, relativeMouse: true, buttons: true, scroll: true, keyboard: true, modifiers: true)
@@ -154,9 +156,10 @@ enum ModelContract {
 /// a data-only correction can invalidate caches/checkpoints without needlessly
 /// changing tensor shapes. Policy v4 itself is an intentional weight break.
 enum TrainingDataContract {
-    /// Version 6 preserves sub-tick key/button taps and supplies the preceding
-    /// perception frame used to construct the model's motion channels.
-    static let schemaVersion = 6
+    /// Version 7 preserves sub-tick key/button taps and preceding-perception
+    /// motion, and assigns Shift to the Keyboard channel while the Modifiers
+    /// channel owns only Control, Option, and Command.
+    static let schemaVersion = 7
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -297,6 +300,7 @@ enum CNNActionFocus: String, Codable, CaseIterable, Identifiable, Sendable {
     case keyboard = "Keyboard"
     case modifiers = "Modifiers"
     var id: String { rawValue }
+    var displayName: String { self == .modifiers ? "Command / Option / Control" : rawValue }
 }
 
 /// Presentation-only controls for live CNN inspection. Sanitizing at the

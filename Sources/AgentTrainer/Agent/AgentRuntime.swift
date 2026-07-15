@@ -37,6 +37,7 @@ final class AgentRuntime: @unchecked Sendable {
     private var outputPermissions = RuntimeOutputPermissions()
     private var outputPermissionsRevision = 0
     private var allowedKeyCodes: Set<UInt16> = []
+    private var shiftUsesKeyboardChannel = false
     private var latestFrame: CVPixelBuffer?
     private var processing = false
     private var predictionLatch = RuntimePredictionLatch()
@@ -138,6 +139,7 @@ final class AgentRuntime: @unchecked Sendable {
             self.saliencyGradientFunction = saliencyGradient
             self.profile = runtimeProfile
             self.allowedKeyCodes = allowedKeyCodes
+            self.shiftUsesKeyboardChannel = (version.trainingDataSchema ?? 0) >= 7
             self.safety = safety
             self.captureRect = captureRect
             self.mode = mode
@@ -234,7 +236,7 @@ final class AgentRuntime: @unchecked Sendable {
         await drain(queue: inferenceQueue)
         injector.disableAndReleaseAll()
         lock.withLock {
-            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false)
+            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
             latestFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history.removeAll(keepingCapacity: false); historyWriteIndex = 0; processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
@@ -399,12 +401,12 @@ final class AgentRuntime: @unchecked Sendable {
     }
 
     private static func actionSelector(focus: CNNActionFocus, mouseMode: MouseControlMode) -> MLXArray {
-        let indices: Range<Int> = switch focus {
-        case .movement: mouseMode == .relative ? ActionLayout.relativeMouse : ActionLayout.absoluteMouse
-        case .mouseButtons: ActionLayout.buttons
-        case .scroll: ActionLayout.scroll
-        case .keyboard: ActionLayout.keyboard
-        case .modifiers: ActionLayout.modifiers
+        let indices: [Int] = switch focus {
+        case .movement: Array(mouseMode == .relative ? ActionLayout.relativeMouse : ActionLayout.absoluteMouse)
+        case .mouseButtons: Array(ActionLayout.buttons)
+        case .scroll: Array(ActionLayout.scroll)
+        case .keyboard: Array(ActionLayout.keyboardAndShift)
+        case .modifiers: Array(ActionLayout.commandOptionControl)
         }
         var values = [Float](repeating: 0, count: ActionLayout.count)
         let weight = 1 / Float(max(1, indices.count))
@@ -429,7 +431,7 @@ final class AgentRuntime: @unchecked Sendable {
         lock.lock()
         guard !stopped, let latched = predictionLatch.consume(), let profile else { lock.unlock(); return }
         let prediction = latched.values
-        let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes
+        let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes, shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel
         let now = CACurrentMediaTime()
         let maximumPredictionAge = max(0.35, 3 / max(0.0001, profile.training.perceptionFPS))
         if now - latched.publishedAt > maximumPredictionAge {
@@ -472,7 +474,8 @@ final class AgentRuntime: @unchecked Sendable {
             captureRect: rect,
             safety: safety,
             gameCamera: gameCamera,
-            predictionIsFresh: latched.isFresh
+            predictionIsFresh: latched.isFresh,
+            shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
         )
         if let snapshot { onMetrics?(snapshot) }
     }
