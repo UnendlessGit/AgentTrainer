@@ -395,6 +395,48 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(foldersAfter.isEmpty)
     }
 
+    func testLegacyInvalidRecordingIsRecoveredBeforeStrictLibraryScanWithoutTouchingSources() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("recording-recovery-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let id = UUID()
+        let directory = try await store.createRecordingDirectory(id: id)
+        let videoURL = directory.appendingPathComponent("capture.mov")
+        let eventsURL = directory.appendingPathComponent("events.atrevents")
+        try await writeTestMovie(to: videoURL, width: 16, height: 16, frameCount: 6, fps: 30)
+        let writer = try InputEventWriter(url: eventsURL)
+        writer.append(InputSample(timestampNanos: 1_000_000_000, kind: .key, keyCode: 13, isDown: true))
+        _ = try writer.finish()
+        let videoBefore = try Data(contentsOf: videoURL)
+        let eventsBefore = try Data(contentsOf: eventsURL)
+
+        var manifest = RecordingManifest(
+            id: id, name: "Legacy", createdAt: Date(), hostStartNanos: 1_000_000_000,
+            duration: 0.1, capture: CaptureSpec(requestedFPS: 30),
+            globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
+            pixelWidth: 16, pixelHeight: 16, deliveredFPS: 30, eventCount: 1
+        )
+        manifest.trimEnd = 0.2 // Valid in the video but beyond the stale manifest duration.
+        try await store.writeRecording(manifest, to: directory)
+        let originalManifest = try Data(contentsOf: directory.appendingPathComponent("manifest.json"))
+        let hiddenBeforeRepair = await store.listRecordings()
+        XCTAssertTrue(hiddenBeforeRepair.isEmpty)
+
+        let repairedCount = try await store.repairInvalidRecordingManifests()
+        XCTAssertEqual(repairedCount, 1)
+        let recovered = await store.listRecordings()
+        XCTAssertEqual(recovered.count, 1)
+        XCTAssertTrue(recovered[0].manifest.isStructurallyValid)
+        XCTAssertGreaterThan(recovered[0].manifest.duration, 0.1)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(recovered[0].manifest.trimEnd), recovered[0].manifest.duration)
+        XCTAssertEqual(try Data(contentsOf: videoURL), videoBefore)
+        XCTAssertEqual(try Data(contentsOf: eventsURL), eventsBefore)
+        XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("manifest.pre-1.8.1-recovery.json")), originalManifest)
+        let secondRepairCount = try await store.repairInvalidRecordingManifests()
+        XCTAssertEqual(secondRepairCount, 0)
+    }
+
     func testLegacyRecordingsAreNormalizedIntoRealFolders() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("workspace-normalize-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }

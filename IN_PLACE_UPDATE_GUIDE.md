@@ -102,7 +102,7 @@ identifier "local.agenttrainer.mac" and certificate leaf = H"51e78a945e47715731a
 
 The executable CDHash changes on every build; that is expected. The designated requirement above must remain stable. Ad-hoc signing (`-`) makes identity depend on the changing binary hash and commonly causes macOS to request permissions again.
 
-AgentTrainer 1.8 uses native hotkey registration when Carbon is available and compiles an AppKit global/local-monitor fallback otherwise. This does not change the three TCC categories or the designated-requirement rules on current systems. The release baseline supports Sequoia 15, Tahoe 26, and macOS 27; compile with Xcode 27 as a separate release check when that toolchain is available.
+AgentTrainer 1.8.1 uses native hotkey registration when Carbon is available and compiles an AppKit global/local-monitor fallback otherwise. This does not change the three TCC categories or the designated-requirement rules on current systems. The release baseline supports Sequoia 15, Tahoe 26, and macOS 27; compile with Xcode 27 as a separate release check when that toolchain is available.
 
 Do not reset TCC, delete privacy database entries, change the bundle identifier, switch signers, or move/recreate the authorized app as a troubleshooting shortcut. Those actions can discard working grants. If the stable signing identity is unavailable, stop and report the blocker instead of silently ad-hoc signing.
 
