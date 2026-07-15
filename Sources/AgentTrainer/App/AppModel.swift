@@ -26,6 +26,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var versionsLoadedForProfileID: UUID?
     @Published private(set) var isLoadingVersions = false
     @Published var isRecording = false
+    @Published private(set) var isStartingRecording = false
     @Published var isTraining = false
     @Published var isRunning = false
     @Published var isReplaying = false
@@ -85,7 +86,7 @@ final class AppModel: ObservableObject {
     private let reenactor = InputReenactor()
     private let regionSelector = RegionSelector()
     private lazy var panicHotkey = GlobalHotkeyMonitor(identifier: 1, binding: hotkeys.panic) { [weak self] in Task { @MainActor in self?.panic() } }
-    private lazy var recordHotkey = GlobalHotkeyMonitor(identifier: 2, binding: hotkeys.record) { [weak self] in Task { @MainActor in guard let self else { return }; self.isRecording ? await self.stopRecording() : await self.startRecording() } }
+    private lazy var recordHotkey = GlobalHotkeyMonitor(identifier: 2, binding: hotkeys.record) { [weak self] in Task { @MainActor in guard let self else { return }; self.recordingIsActiveOrStarting ? await self.stopRecording() : await self.startRecording() } }
     private lazy var runHotkey = GlobalHotkeyMonitor(identifier: 3, binding: hotkeys.run) { [weak self] in Task { @MainActor in guard let self else { return }; self.isRunning ? await self.stopAgent() : await self.startAgent() } }
     private var agent: AgentRuntime?
     private var eventWriter: InputEventWriter?
@@ -96,6 +97,8 @@ final class AppModel: ObservableObject {
     private var activeRecordingSpec: CaptureSpec?
     private var activeRecordingRect: CGRect?
     private var activeRecordingFolderID: UUID?
+    private var activeRecordingExcludedKeyCodes: Set<UInt16> = []
+    private var recordingLaunchRevision: UInt64 = 0
     private var lastEventClock = RecordingClock()
     private var profileAutosaveTask: Task<Void, Never>?
     private var isRestoringWorkflowSettings = true
@@ -104,8 +107,9 @@ final class AppModel: ObservableObject {
     var selectedSource: CaptureSourceOption? { captureSources.first { $0.id == selectedSourceID && sourceMatchesKind($0) } }
     var selectedRecording: RecordingItem? { recordings.first { $0.id == selectedRecordingID } }
     var selectedProfile: AIProfile? { profiles.first { $0.id == selectedProfileID } }
+    var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording }
     var canChangeStorageLocations: Bool {
-        !isChangingStorageLocation && !isRecording && !isTraining && !isRunning && !isReplaying
+        !isChangingStorageLocation && !recordingIsActiveOrStarting && !isTraining && !isRunning && !isReplaying
     }
 
     init() {
@@ -279,16 +283,22 @@ final class AppModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !isRecording, !isRunning else { return }
+        guard !isRecording, !isStartingRecording, !isRunning else { return }
         guard let source = selectedSource else { present(AgentTrainerError.invalidConfiguration("Select a capture source.")); return }
         guard let destinationFolderID = recordingDestinationFolderID else { present(AgentTrainerError.invalidConfiguration("Create or select a recording folder.")); return }
+        isStartingRecording = true
+        recordingLaunchRevision &+= 1
+        let launchToken = recordingLaunchRevision
+        defer { isStartingRecording = false }
         do {
             let spec = captureSpec(source: source), captureRect = effectiveCaptureRect(source)
             let excludedKeys = recordingExcludedKeyCodes
+            let recordingShortcut = hotkeys.record
             let id = UUID()
             let directory = try await WorkspaceStore.shared.createRecordingDirectory(id: id)
+            guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             let writer = try InputEventWriter(url: directory.appendingPathComponent("events.atrevents"))
-            recordingID = id; recordingDirectory = directory; eventWriter = writer; activeRecordingSpec = spec; activeRecordingRect = captureRect; activeRecordingFolderID = destinationFolderID
+            recordingID = id; recordingDirectory = directory; eventWriter = writer; activeRecordingSpec = spec; activeRecordingRect = captureRect; activeRecordingFolderID = destinationFolderID; activeRecordingExcludedKeyCodes = excludedKeys
             let clock = RecordingClock()
             recordingClock = clock; recordingHostStart = 0
             let eventClock = RecordingClock(); lastEventClock = eventClock
@@ -300,33 +310,48 @@ final class AppModel: ObservableObject {
             }
             input.onState = { [weak self] state in Task { @MainActor in self?.hudModel.update(state: state, source: .human) } }
             try input.start()
+            guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             try await capture.start(spec: spec, recordingURL: directory.appendingPathComponent("capture.mov"), onFirstFrame: { [weak self, weak writer] nanos in
                 let pointer = CGEvent(source: nil)?.location ?? CGPoint(x: captureRect.midX, y: captureRect.midY)
+                // The global Record chord is commonly still being released on
+                // the first captured frame. Do not seed those shortcut
+                // modifiers as demonstrated controls; later real input events
+                // restore any modifier the user intentionally keeps held.
+                let initialModifiers = CGEventSource.flagsState(.combinedSessionState).rawValue & ~recordingShortcut.cgEventModifiers
                 var initialFilter = RecordingKeyFilter(excludedKeyCodes: excludedKeys)
                 let initialSample = initialFilter.process(InputSample(
                     timestampNanos: nanos,
                     kind: .mouseMove,
                     x: pointer.x,
                     y: pointer.y,
-                    modifiers: CGEventSource.flagsState(.combinedSessionState).rawValue
+                    modifiers: initialModifiers
                 ))
                 if let initialSample { writer?.append(initialSample); eventClock.update(nanos) }
                 clock.set(nanos)
                 Task { @MainActor [weak self] in self?.recordingHostStart = nanos }
             })
+            guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             hudModel.show(source: .human, vision: false)
             isRecording = true; activityStatus = "Recording — live keyboard is capture-excluded"
             AppLog.write(category: "Recording", "Recording started", details: "\(spec.kind.rawValue), \(Int(captureRect.width))×\(Int(captureRect.height)) at \(captureFPS.formatted()) FPS")
         } catch {
-            input.stop(); input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = try? eventWriter?.finish(); eventWriter = nil
+            _ = try? await capture.stop()
+            input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = try? eventWriter?.finish(); eventWriter = nil
             if let recordingDirectory { try? FileManager.default.removeItem(at: recordingDirectory) }
-            self.recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; present(error)
+            self.recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []
+            if error is CancellationError { activityStatus = "Recording start cancelled" }
+            else { present(error) }
         }
     }
 
     func stopRecording() async {
+        if isStartingRecording, !isRecording {
+            recordingLaunchRevision &+= 1
+            activityStatus = "Cancelling recording start…"
+            return
+        }
         guard isRecording, let directory = recordingDirectory, let id = recordingID, let captureSpec = activeRecordingSpec, let captureRect = activeRecordingRect, let destinationFolderID = activeRecordingFolderID else { return }
-        input.stop(); input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
+        input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
         let eventResult = Result { try eventWriter?.finish() ?? 0 }
         eventWriter = nil
         do {
@@ -339,13 +364,13 @@ final class AppModel: ObservableObject {
             var trimStart = min(duration, max(0, recordingTrimStart))
             var trimEnd = max(trimStart, duration - max(0, recordingTrimEnd))
             if trimEnd <= trimStart { trimStart = 0; trimEnd = duration }
-            let manifest = RecordingManifest(id: id, name: "Recording \(Date().formatted(date: .abbreviated, time: .shortened))", createdAt: Date(), hostStartNanos: hostStart, duration: duration, capture: captureSpec, globalRect: CodableRect(captureRect), pixelWidth: result.width, pixelHeight: result.height, deliveredFPS: result.deliveredFPS, eventCount: eventCount, trimStart: trimStart, trimEnd: trimEnd, folderID: destinationFolderID, thumbnailFile: "thumbnail.jpg", excludedKeyCodes: recordingExcludedKeyCodes)
+            let manifest = RecordingManifest(id: id, name: "Recording \(Date().formatted(date: .abbreviated, time: .shortened))", createdAt: Date(), hostStartNanos: hostStart, duration: duration, capture: captureSpec, globalRect: CodableRect(captureRect), pixelWidth: result.width, pixelHeight: result.height, deliveredFPS: result.deliveredFPS, eventCount: eventCount, trimStart: trimStart, trimEnd: trimEnd, folderID: destinationFolderID, thumbnailFile: "thumbnail.jpg", excludedKeyCodes: activeRecordingExcludedKeyCodes)
             try await WorkspaceStore.shared.writeRecording(manifest, to: directory)
             await createThumbnail(for: directory.appendingPathComponent("capture.mov"), at: max(0, min(duration * 0.25, 2)), destination: directory.appendingPathComponent("thumbnail.jpg"))
             activityStatus = "Recording saved"
             AppLog.write(category: "Recording", "Recording saved", details: "\(eventCount) input events, \(result.width)×\(result.height), \(duration.formatted(.number.precision(.fractionLength(2)))) seconds")
         } catch { try? FileManager.default.removeItem(at: directory); present(error) }
-        isRecording = false; recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; recordingClock = RecordingClock(); lastEventClock = RecordingClock(); await refreshLibrary()
+        isRecording = false; recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []; recordingClock = RecordingClock(); lastEventClock = RecordingClock(); await refreshLibrary()
     }
 
     func deleteRecording(_ item: RecordingItem) async {
@@ -457,7 +482,11 @@ final class AppModel: ObservableObject {
     func startTraining() {
         guard let profile = selectedProfile, !isTraining else { return }
         guard runningProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently running. Select a different AI to train in the background.")); return }
-        guard trainingRunSettings.maximumSteps >= 0, trainingRunSettings.autosaveSteps > 0 else { present(AgentTrainerError.invalidConfiguration("Maximum Steps must be zero or greater, and Autosave Steps must be positive.")); return }
+        guard trainingRunSettings.maximumSteps >= 0,
+              (1...100_000_000).contains(trainingRunSettings.autosaveSteps) else {
+            present(AgentTrainerError.invalidConfiguration("Maximum Steps must be zero or greater, and Autosave Steps must be from 1 through 100,000,000."))
+            return
+        }
         do { try validateProfile(profile) } catch { present(error); return }
         let folderIDs = Set(profile.effectiveFolderIDs)
         let selected = recordings.filter { profile.recordingIDs.contains($0.id) || $0.manifest.folderID.map(folderIDs.contains) == true }
@@ -482,13 +511,15 @@ final class AppModel: ObservableObject {
 
     func startAgent() async {
         guard let profile = selectedProfile, let versionID = profile.activeVersionID,
-              let source = selectedSource, !isRecording else { present(AgentTrainerError.model("Select a trained AI and a live capture source.")); return }
+              let source = selectedSource, !isRecording, !isRunning, agent == nil else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop any current AI first.")); return }
         guard trainingProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently training. Select another trained AI to run at the same time.")); return }
+        var attemptedRuntime: AgentRuntime?
         do {
             guard let version = await WorkspaceStore.shared.version(profileID: profile.id, versionID: versionID) else {
                 throw AgentTrainerError.model("The active runnable brain is missing. Load Saved Brains in AI Models and choose another version.")
             }
             let runtime = try AgentRuntime()
+            attemptedRuntime = runtime
             runtime.onState = { [weak self] state in Task { @MainActor in self?.hudModel.update(state: state, source: .agent) } }
             runtime.onMetrics = { [weak self] value in Task { @MainActor in self?.runtimeMetrics = value } }
             runtime.onPreview = { [weak self] frame in Task { @MainActor in self?.hudModel.updateVision(frame) } }
@@ -499,19 +530,32 @@ final class AppModel: ObservableObject {
                 AppLog.write(reason == nil ? .info : .warning, category: "Runtime", self.runtimeStatus)
             } }
             agent = runtime; isRunning = true; runningProfileID = profile.id; hudModel.show(source: .agent, vision: showVisionPreview, cnnVisualization: cnnVisualizationSettings)
-            runtimeStatus = "Agent starting at exactly \(profile.preprocessing.width) × \(profile.preprocessing.height)"; activityStatus = runtimeStatus
+            runtimeStatus = "Agent starting at exactly \(version.preprocessing.width) × \(version.preprocessing.height)"; activityStatus = runtimeStatus
             var runtimeSafety = safety
-            runtimeSafety.panicKeyCode = UInt16(hotkeys.panic.keyCode)
+            runtimeSafety.panicKeyCode = UInt16(clamping: hotkeys.panic.keyCode)
             runtimeSafety.panicModifiers = hotkeys.panic.cgEventModifiers
-            let previewRate = visionPreviewMatchesPerception ? profile.training.perceptionFPS : visionPreviewFPS
-            let resolvedMouseMode = await resolvedMouseMode(for: profile)
+            let previewRate = visionPreviewMatchesPerception ? version.training.perceptionFPS : visionPreviewFPS
+            let resolvedMouseMode: MouseControlMode
+            if runMouseMode != .automatic {
+                resolvedMouseMode = runMouseMode
+            } else if let recommended = version.recommendedMouseMode {
+                resolvedMouseMode = recommended
+            } else {
+                resolvedMouseMode = await self.resolvedMouseMode(for: profile)
+            }
             let allowedKeyCodes: Set<UInt16>
             if let persisted = version.demonstratedKeyCodes { allowedKeyCodes = persisted }
             else { allowedKeyCodes = await demonstratedKeyCodes(for: profile) }
             try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: captureSpec(source: source), captureRect: effectiveCaptureRect(source), mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, safety: runtimeSafety, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run])
             if isRunning, agent === runtime { runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue)"; activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus; AppLog.write(category: "Runtime", "Agent started", details: "\(profile.name), \(resolvedMouseMode.rawValue), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")") }
-        } catch is CancellationError { isRunning = false; runningProfileID = nil; hudModel.hide(); agent = nil; runtimeStatus = "Agent start cancelled"; activityStatus = runtimeStatus }
-        catch { isRunning = false; runningProfileID = nil; hudModel.hide(); agent = nil; runtimeStatus = error.localizedDescription; present(error) }
+        } catch is CancellationError {
+            guard attemptedRuntime == nil || agent === attemptedRuntime || agent == nil else { return }
+            isRunning = false; runningProfileID = nil; hudModel.hide(); if agent === attemptedRuntime { agent = nil }; runtimeStatus = "Agent start cancelled"; activityStatus = runtimeStatus
+        }
+        catch {
+            guard attemptedRuntime == nil || agent === attemptedRuntime || agent == nil else { return }
+            isRunning = false; runningProfileID = nil; hudModel.hide(); if agent === attemptedRuntime { agent = nil }; runtimeStatus = error.localizedDescription; present(error)
+        }
     }
 
     func stopAgent() async { let runtime = agent; agent = nil; await runtime?.stop(reason: "Agent stopped"); isRunning = false; runningProfileID = nil; runtimeMetrics = RuntimeMetrics(); hudModel.hide(); runtimeStatus = "Agent stopped; all hooks disabled and held inputs released"; activityStatus = isTraining ? trainingStatus : runtimeStatus; if runtime != nil { AppLog.write(category: "Runtime", "Agent stopped and input hooks released") } }
@@ -520,7 +564,7 @@ final class AppModel: ObservableObject {
         do { try reenactor.start(recording: recording); isReplaying = true; activityStatus = "Guarded reenactment running"; AppLog.write(category: "Replay", "Reenactment started", details: recording.manifest.name) } catch { present(error) }
     }
     func stopReenactment() { reenactor.stop(); if isReplaying { AppLog.write(category: "Replay", "Reenactment stopped") }; isReplaying = false; activityStatus = "Reenactment stopped" }
-    func panic() { AppLog.write(.warning, category: "Safety", "Panic stop requested"); Task { stopReenactment(); await stopAgent(); if isRecording { await stopRecording() }; if isTraining { stopTraining() } } }
+    func panic() { AppLog.write(.warning, category: "Safety", "Panic stop requested"); Task { stopReenactment(); await stopAgent(); if recordingIsActiveOrStarting { await stopRecording() }; if isTraining { stopTraining() } } }
     func clearCaches() async { do { try await WorkspaceStore.shared.clearCaches(); await refreshStorageState(); activityStatus = "Dataset caches cleared"; AppLog.write(category: "Storage", "Dataset caches cleared") } catch { present(error) } }
 
     func chooseStorageLocation(_ kind: WorkspaceDataKind) async {
@@ -625,7 +669,7 @@ final class AppModel: ObservableObject {
         hotkeys = value
         panicHotkey.update(value.panic); recordHotkey.update(value.record); runHotkey.update(value.run)
         let statuses = [panicHotkey.registrationStatus, recordHotkey.registrationStatus, runHotkey.registrationStatus]
-        if let failure = statuses.first(where: { $0 != noErr }) {
+        if let failure = statuses.first(where: { $0 != GlobalHotkeyMonitor.successStatus }) {
             hotkeys = previous
             panicHotkey.update(previous.panic); recordHotkey.update(previous.record); runHotkey.update(previous.run)
             present(AgentTrainerError.invalidConfiguration("macOS could not register that global shortcut (error \(failure)). The previous shortcuts were restored."))
@@ -752,15 +796,45 @@ final class AppModel: ObservableObject {
     private func validateProfile(_ profile: AIProfile) throws {
         _ = try profile.preprocessing.validated()
         let training = profile.training
-        guard training.epochs > 0, training.batchSize > 0, training.historyLength >= 0, training.learningRate > 0, training.weightDecay >= 0, training.perceptionFPS > 0, training.actionFPS > 0, training.validationSplit >= 0, training.validationSplit < 1 else {
-            throw AgentTrainerError.invalidConfiguration("Training values must be positive, history may be zero, and validation split must be from 0 up to (but not including) 1.")
+        guard training.learningRate.isFinite, training.weightDecay.isFinite,
+              training.perceptionFPS.isFinite, training.actionFPS.isFinite,
+              training.validationSplit.isFinite,
+              (1...1_000_000).contains(training.epochs),
+              (1...4_096).contains(training.batchSize),
+              (0...256).contains(training.historyLength),
+              training.learningRate >= 0.000_000_1, training.learningRate <= 0.003,
+              training.weightDecay >= 0, training.weightDecay <= 1,
+              training.perceptionFPS > 0, training.actionFPS > 0,
+              training.perceptionFPS <= training.actionFPS,
+              training.perceptionFPS <= 240, training.actionFPS <= 240,
+              training.validationSplit >= 0, training.validationSplit < 1 else {
+            throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, history 0–256, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
         }
         let architecture = training.architecture
-        guard architecture.convolutionChannels.allSatisfy({ $0 > 0 }), architecture.kernelSizes.allSatisfy({ $0 > 0 }), architecture.strides.allSatisfy({ $0 > 0 }), architecture.visualEmbedding > 0, architecture.recurrentWidth > 0, architecture.fusionWidths.allSatisfy({ $0 > 0 }), architecture.dropout >= 0, architecture.dropout < 1 else {
-            throw AgentTrainerError.invalidConfiguration("Network widths, kernels, and strides must be positive; dropout must be at least 0 and below 1.")
+        guard architecture.dropout.isFinite,
+              (1...8).contains(architecture.convolutionChannels.count),
+              architecture.convolutionChannels.allSatisfy({ (1...16_384).contains($0) }),
+              architecture.kernelSizes.count == architecture.convolutionChannels.count,
+              architecture.kernelSizes.allSatisfy({ (1...31).contains($0) }),
+              architecture.strides.count == architecture.convolutionChannels.count,
+              architecture.strides.allSatisfy({ (1...16).contains($0) }),
+              (1...16_384).contains(architecture.visualEmbedding),
+              (1...16_384).contains(architecture.recurrentWidth),
+              architecture.fusionWidths.count <= 16,
+              architecture.fusionWidths.allSatisfy({ (1...16_384).contains($0) }),
+              architecture.dropout >= 0, architecture.dropout <= 0.5 else {
+            throw AgentTrainerError.invalidConfiguration("Use 1–8 convolution stages with one kernel and stride per stage, positive bounded widths, and dropout from 0 through 0.5.")
         }
         let channels = profile.channels
         guard channels.mouseMovement || channels.buttons || channels.scroll || channels.keyboard || channels.modifiers else { throw AgentTrainerError.invalidConfiguration("Enable at least one control channel before training.") }
+        let physicalMemory = Int64(ProcessInfo.processInfo.physicalMemory)
+        let parameterCount = ModelSizing.parameterCount(profile)
+        let estimatedWorkingSet = ModelSizing.estimatedTrainingWorkingSet(profile)
+        guard parameterCount < Int64.max,
+              estimatedWorkingSet < Int64.max,
+              estimatedWorkingSet <= (physicalMemory / 3) * 2 else {
+            throw AgentTrainerError.invalidConfiguration("This vision, batch, and architecture combination cannot fit safely in this Mac's unified memory. Reduce batch size, model vision, or network widths.")
+        }
     }
 
     func isProfileBusy(_ id: UUID) -> Bool { trainingProfileID == id || runningProfileID == id }

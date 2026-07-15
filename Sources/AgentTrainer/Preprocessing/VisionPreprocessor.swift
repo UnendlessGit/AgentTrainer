@@ -25,20 +25,42 @@ final class VisionPreprocessor: @unchecked Sendable {
     }
 
     func process(_ pixelBuffer: CVPixelBuffer, spec: PreprocessingSpec) throws -> Data {
+        try withPackedBytes(pixelBuffer, spec: spec) { Data($0) }
+    }
+
+    /// Exposes the completed shared Metal buffer only for the duration of the
+    /// callback. Cache construction can copy it directly into its large output
+    /// buffer instead of allocating and copying an intermediate Data per frame.
+    func withPackedBytes<R>(_ pixelBuffer: CVPixelBuffer, spec: PreprocessingSpec, _ body: (UnsafeRawBufferPointer) throws -> R) throws -> R {
         let spec = try spec.validated()
         lock.lock()
         defer { lock.unlock() }
-        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
-            throw AgentTrainerError.model("The shared vision pipeline expects BGRA capture frames.")
-        }
         guard let textureCache else { throw AgentTrainerError.model("The Metal texture cache is unavailable.") }
-        var cvTexture: CVMetalTexture?
+
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
         let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
         let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
-        let status = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pixelBuffer, nil, .bgra8Unorm, sourceWidth, sourceHeight, 0, &cvTexture)
-        guard status == kCVReturnSuccess, let cvTexture, let texture = CVMetalTextureGetTexture(cvTexture) else {
-            throw AgentTrainerError.model("The capture frame could not be mapped into Metal.")
+        var cvLuma: CVMetalTexture?
+        var cvChroma: CVMetalTexture?
+        let sourceFormat: UInt32
+        switch pixelFormat {
+        case kCVPixelFormatType_32BGRA:
+            sourceFormat = 0
+            let status = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pixelBuffer, nil, .bgra8Unorm, sourceWidth, sourceHeight, 0, &cvLuma)
+            guard status == kCVReturnSuccess else { throw AgentTrainerError.model("The BGRA capture frame could not be mapped into Metal.") }
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            sourceFormat = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? 1 : 2
+            guard CVPixelBufferGetPlaneCount(pixelBuffer) == 2 else { throw AgentTrainerError.model("The decoded video frame has an invalid YUV plane layout.") }
+            let lumaStatus = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pixelBuffer, nil, .r8Unorm, CVPixelBufferGetWidthOfPlane(pixelBuffer, 0), CVPixelBufferGetHeightOfPlane(pixelBuffer, 0), 0, &cvLuma)
+            let chromaStatus = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pixelBuffer, nil, .rg8Unorm, CVPixelBufferGetWidthOfPlane(pixelBuffer, 1), CVPixelBufferGetHeightOfPlane(pixelBuffer, 1), 1, &cvChroma)
+            guard lumaStatus == kCVReturnSuccess, chromaStatus == kCVReturnSuccess else { throw AgentTrainerError.model("The decoded YUV video frame could not be mapped into Metal.") }
+        default:
+            throw AgentTrainerError.model("The shared vision pipeline received an unsupported pixel format.")
         }
+        guard let cvLuma, let lumaTexture = CVMetalTextureGetTexture(cvLuma) else { throw AgentTrainerError.model("The vision frame texture is unavailable.") }
+        let chromaTexture = cvChroma.flatMap(CVMetalTextureGetTexture)
+        if sourceFormat != 0, chromaTexture == nil { throw AgentTrainerError.model("The decoded video chroma texture is unavailable.") }
+
         if reusableOutput?.length ?? 0 < spec.sampleByteCount { reusableOutput = device.makeBuffer(length: spec.sampleByteCount, options: .storageModeShared) }
         guard let output = reusableOutput, let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else {
             throw AgentTrainerError.model("Metal could not allocate the preprocessing workload.")
@@ -49,10 +71,12 @@ final class VisionPreprocessor: @unchecked Sendable {
             outputWidth: UInt32(spec.width), outputHeight: UInt32(spec.height),
             bitDepth: UInt32(spec.bitDepth), mode: spec.colorMode == .grayscale ? 0 : 1,
             chroma: UInt32(spec.chroma == .yuv420 ? 0 : spec.chroma == .yuv422 ? 1 : 2),
-            resize: UInt32(spec.resizePolicy == .fit ? 0 : spec.resizePolicy == .fill ? 1 : 2)
+            resize: UInt32(spec.resizePolicy == .fit ? 0 : spec.resizePolicy == .fill ? 1 : 2),
+            sourceFormat: sourceFormat, sourceMatrix: Self.sourceMatrix(for: pixelBuffer)
         )
         encoder.setComputePipelineState(pipeline)
-        encoder.setTexture(texture, index: 0)
+        encoder.setTexture(lumaTexture, index: 0)
+        encoder.setTexture(chromaTexture, index: 1)
         encoder.setBuffer(output, offset: 0, index: 0)
         encoder.setBytes(&params, length: MemoryLayout<KernelParameters>.stride, index: 1)
         let threads = MTLSize(width: 16, height: 16, depth: 1)
@@ -61,7 +85,14 @@ final class VisionPreprocessor: @unchecked Sendable {
         command.commit()
         command.waitUntilCompleted()
         if let error = command.error { throw error }
-        return Data(bytes: output.contents(), count: spec.sampleByteCount)
+        return try body(UnsafeRawBufferPointer(start: output.contents(), count: spec.sampleByteCount))
+    }
+
+    private static func sourceMatrix(for pixelBuffer: CVPixelBuffer) -> UInt32 {
+        guard let matrix = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) else { return 0 }
+        if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4) { return 1 }
+        if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_2020) { return 2 }
+        return 0
     }
 
     static func unpackFloats(_ packed: Data, spec: PreprocessingSpec) -> [Float] {
@@ -113,9 +144,24 @@ final class VisionPreprocessor: @unchecked Sendable {
         return concatenated([y, cb, cr], axis: -1)
     }
 
+    /// Builds the temporal vision input used by Policy v4. Supplying both the
+    /// current frame and its signed difference from the preceding perception
+    /// gives the policy motion/velocity evidence without running the CNN once
+    /// per history frame. A missing predecessor deliberately produces a zero
+    /// difference at recording and runtime segment boundaries.
+    static func mlxTemporalTensor(current: Data, previous: Data?, batch: Int, spec: PreprocessingSpec) -> MLXArray {
+        let currentTensor = mlxTensor(current, batch: batch, spec: spec)
+        let previousTensor = previous.map { mlxTensor($0, batch: batch, spec: spec) } ?? currentTensor
+        return temporalTensor(current: currentTensor, previous: previousTensor)
+    }
+
+    static func temporalTensor(current: MLXArray, previous: MLXArray) -> MLXArray {
+        concatenated([current, current - previous], axis: -1)
+    }
+
     /// Renders the exact packed Y/Cb/Cr values consumed by the policy. This is only
     /// a presentation conversion; the preview never reprocesses or recaptures a frame.
-    static func previewImage(_ packed: Data, spec: PreprocessingSpec) -> NSImage? {
+    static func previewImage(_ packed: Data, spec: PreprocessingSpec, maximumWidth: Int = .max, maximumHeight: Int = .max) -> NSImage? {
         guard spec.width > 0, spec.height > 0, spec.sampleByteCount < Int.max else { return nil }
         let lumaCount = spec.width * spec.height
         let chromaWidth = spec.chroma == .yuv444 ? spec.width : (spec.width + 1) / 2
@@ -123,13 +169,22 @@ final class VisionPreprocessor: @unchecked Sendable {
         let chromaCount = chromaWidth * chromaHeight
         let requiredCount = spec.colorMode == .grayscale ? lumaCount : lumaCount + 2 * chromaCount
         guard packed.count >= requiredCount else { return nil }
-        var rgba = [UInt8](repeating: 255, count: spec.width * spec.height * 4)
+        let scale = min(1, min(Double(max(1, maximumWidth)) / Double(spec.width), Double(max(1, maximumHeight)) / Double(spec.height)))
+        let outputWidth = max(1, Int((Double(spec.width) * scale).rounded()))
+        let outputHeight = max(1, Int((Double(spec.height) * scale).rounded()))
+        let outputPixels = outputWidth.multipliedReportingOverflow(by: outputHeight)
+        let outputBytes = outputPixels.partialValue.multipliedReportingOverflow(by: 4)
+        guard !outputPixels.overflow, !outputBytes.overflow else { return nil }
+        var rgba = [UInt8](repeating: 255, count: outputBytes.partialValue)
         packed.withUnsafeBytes { raw in
             guard let bytes = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-            for y in 0..<spec.height {
-                for x in 0..<spec.width {
-                    let pixel = y * spec.width + x
-                    let luma = Float(bytes[pixel]) / 255
+            for outputY in 0..<outputHeight {
+                let y = min(spec.height - 1, outputY * spec.height / outputHeight)
+                for outputX in 0..<outputWidth {
+                    let x = min(spec.width - 1, outputX * spec.width / outputWidth)
+                    let sourcePixel = y * spec.width + x
+                    let outputPixel = outputY * outputWidth + outputX
+                    let luma = Float(bytes[sourcePixel]) / 255
                     let r: Float, g: Float, b: Float
                     if spec.colorMode == .grayscale {
                         r = luma; g = luma; b = luma
@@ -143,15 +198,15 @@ final class VisionPreprocessor: @unchecked Sendable {
                         g = luma - 0.1873 * cb - 0.4681 * cr
                         b = luma + 1.8556 * cb
                     }
-                    rgba[pixel * 4] = UInt8(clamping: Int((min(1, max(0, r)) * 255).rounded()))
-                    rgba[pixel * 4 + 1] = UInt8(clamping: Int((min(1, max(0, g)) * 255).rounded()))
-                    rgba[pixel * 4 + 2] = UInt8(clamping: Int((min(1, max(0, b)) * 255).rounded()))
+                    rgba[outputPixel * 4] = UInt8(clamping: Int((min(1, max(0, r)) * 255).rounded()))
+                    rgba[outputPixel * 4 + 1] = UInt8(clamping: Int((min(1, max(0, g)) * 255).rounded()))
+                    rgba[outputPixel * 4 + 2] = UInt8(clamping: Int((min(1, max(0, b)) * 255).rounded()))
                 }
             }
         }
-        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: spec.width, pixelsHigh: spec.height, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: spec.width * 4, bitsPerPixel: 32), let destination = bitmap.bitmapData else { return nil }
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: outputWidth, pixelsHigh: outputHeight, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: outputWidth * 4, bitsPerPixel: 32), let destination = bitmap.bitmapData else { return nil }
         rgba.withUnsafeBytes { source in if let base = source.baseAddress { memcpy(destination, base, rgba.count) } }
-        let image = NSImage(size: NSSize(width: spec.width, height: spec.height))
+        let image = NSImage(size: NSSize(width: outputWidth, height: outputHeight))
         image.addRepresentation(bitmap)
         return image
     }
@@ -165,14 +220,17 @@ final class VisionPreprocessor: @unchecked Sendable {
         var mode: UInt32
         var chroma: UInt32
         var resize: UInt32
+        var sourceFormat: UInt32
+        var sourceMatrix: UInt32
     }
 
     private static let kernelSource = #"""
     #include <metal_stdlib>
     using namespace metal;
-    struct Params { uint sw, sh, ow, oh, bits, mode, chroma, resize; };
+    struct Params { uint sw, sh, ow, oh, bits, mode, chroma, resize, sourceFormat, sourceMatrix; };
 
-    kernel void packVision(texture2d<float, access::sample> input [[texture(0)]],
+    kernel void packVision(texture2d<float, access::sample> lumaInput [[texture(0)]],
+                           texture2d<float, access::sample> chromaInput [[texture(1)]],
                            device uchar *output [[buffer(0)]],
                            constant Params &p [[buffer(1)]],
                            uint2 gid [[thread_position_in_grid]]) {
@@ -195,7 +253,26 @@ final class VisionPreprocessor: @unchecked Sendable {
                 uv.x = (uv.x - (1.0-used)*0.5) / used;
             }
         }
-        float3 rgb = outside ? float3(0.0) : input.sample(s, uv).rgb;
+        float3 rgb;
+        if (outside) {
+            rgb = float3(0.0);
+        } else if (p.sourceFormat == 0) {
+            rgb = lumaInput.sample(s, uv).rgb;
+        } else {
+            float yCode = lumaInput.sample(s, uv).r;
+            float2 chromaCode = chromaInput.sample(s, uv).rg;
+            float y = p.sourceFormat == 1 ? (yCode * 255.0 - 16.0) / 219.0 : yCode;
+            float cb = p.sourceFormat == 1 ? (chromaCode.x * 255.0 - 128.0) / 224.0 : (chromaCode.x * 255.0 - 128.0) / 255.0;
+            float cr = p.sourceFormat == 1 ? (chromaCode.y * 255.0 - 128.0) / 224.0 : (chromaCode.y * 255.0 - 128.0) / 255.0;
+            if (p.sourceMatrix == 1) {
+                rgb = float3(y + 1.4020 * cr, y - 0.344136 * cb - 0.714136 * cr, y + 1.7720 * cb);
+            } else if (p.sourceMatrix == 2) {
+                rgb = float3(y + 1.4746 * cr, y - 0.164553 * cb - 0.571353 * cr, y + 1.8814 * cb);
+            } else {
+                rgb = float3(y + 1.5748 * cr, y - 0.187324 * cb - 0.468124 * cr, y + 1.8556 * cb);
+            }
+            rgb = clamp(rgb, 0.0, 1.0);
+        }
         float Y = clamp(dot(rgb, float3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
         float Cb = clamp((rgb.b - Y) / 1.8556 + 0.5, 0.0, 1.0);
         float Cr = clamp((rgb.r - Y) / 1.5748 + 0.5, 0.0, 1.0);

@@ -88,7 +88,7 @@ private final class VisionPreviewRenderer: @unchecked Sendable {
             lock.lock()
             guard let next = newest else { processing = false; lock.unlock(); return }
             newest = nil; lock.unlock()
-            next.1(VisionPreprocessor.previewImage(next.0.packed, spec: next.0.spec), next.0.spec)
+            next.1(VisionPreprocessor.previewImage(next.0.packed, spec: next.0.spec, maximumWidth: 640, maximumHeight: 360), next.0.spec)
         }
     }
 }

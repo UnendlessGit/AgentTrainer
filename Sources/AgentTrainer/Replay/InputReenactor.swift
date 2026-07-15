@@ -15,6 +15,7 @@ final class InputReenactor: @unchecked Sendable {
 
     func start(recording: RecordingItem, speed: Double = 1) throws {
         guard AXIsProcessTrusted() else { throw AgentTrainerError.permission("Accessibility permission is required for guarded reenactment.") }
+        guard speed.isFinite, speed > 0 else { throw AgentTrainerError.invalidConfiguration("Reenactment speed must be finite and positive.") }
         let events = try InputEventReader.read(url: recording.directory.appendingPathComponent(recording.manifest.eventFile))
         guard !events.isEmpty else { throw AgentTrainerError.noData }
         stop()
@@ -22,16 +23,43 @@ final class InputReenactor: @unchecked Sendable {
         let base = recording.manifest.hostStartNanos
         let trimStart = recording.manifest.trimStart
         let trimEnd = recording.manifest.trimEnd ?? recording.manifest.duration
+        guard base > 0, trimStart.isFinite, trimEnd.isFinite,
+              trimStart >= 0, trimEnd >= trimStart,
+              trimStart * 1_000_000_000 < Double(UInt64.max - base) else {
+            throw AgentTrainerError.storage("This recording has an invalid reenactment timeline.")
+        }
         let selected = events.filter { event in guard event.timestampNanos >= base else { return false }; let t = Double(event.timestampNanos - base) / 1e9; return t >= trimStart && t <= trimEnd }
         let isGameCamera = InputEventReader.mouseDiagnostics(events: selected, globalRect: recording.manifest.globalRect.cgRect).isGameCamera
+        let startNanos = base + UInt64(trimStart * 1_000_000_000)
+        var initialKeys: Set<UInt16> = [], initialButtons: Set<UInt8> = []
+        var initialModifiers: UInt64 = 0
+        var initialPoint = CGPoint(x: recording.manifest.globalRect.cgRect.midX, y: recording.manifest.globalRect.cgRect.midY)
+        for event in events where event.timestampNanos >= base && event.timestampNanos < startNanos {
+            initialModifiers = event.modifiers
+            switch event.kind {
+            case .key:
+                if event.isDown { initialKeys.insert(event.keyCode) } else { initialKeys.remove(event.keyCode) }
+            case .mouseButton:
+                initialPoint = CGPoint(x: event.x, y: event.y)
+                if event.isDown { initialButtons.insert(event.button) } else { initialButtons.remove(event.button) }
+            case .mouseMove, .scroll: initialPoint = CGPoint(x: event.x, y: event.y)
+            case .flags: break
+            }
+        }
+        var timeline = [InputSample(timestampNanos: startNanos, kind: .mouseMove, x: initialPoint.x, y: initialPoint.y, modifiers: initialModifiers)]
+        if initialModifiers != 0 { timeline.append(InputSample(timestampNanos: startNanos, kind: .flags, modifiers: initialModifiers)) }
+        timeline += initialKeys.sorted().map { InputSample(timestampNanos: startNanos, kind: .key, keyCode: $0, modifiers: initialModifiers, isDown: true) }
+        timeline += initialButtons.sorted().map { InputSample(timestampNanos: startNanos, kind: .mouseButton, x: initialPoint.x, y: initialPoint.y, button: $0, modifiers: initialModifiers, isDown: true) }
+        timeline += selected
         lock.withLock { generation = token; gameCameraReplay = isGameCamera }
         let newTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             let clock = ContinuousClock(); let started = clock.now
-            for event in selected {
+            let replaySpeed = min(100, speed)
+            for event in timeline {
                 if Task.isCancelled { break }
                 guard event.timestampNanos >= base else { continue }
-                let relative = max(0, (Double(event.timestampNanos - base) / 1e9 - trimStart) / max(0.01, speed))
+                let relative = max(0, (Double(event.timestampNanos - base) / 1e9 - trimStart) / replaySpeed)
                 try? await clock.sleep(until: started.advanced(by: .seconds(relative)))
                 if Task.isCancelled { break }
                 self.post(event, controlRect: recording.manifest.globalRect.cgRect, gameCamera: isGameCamera, token: token)
@@ -57,8 +85,8 @@ final class InputReenactor: @unchecked Sendable {
         case .mouseMove:
             if gameCamera {
                 cursor = CGPoint(x: controlRect.midX, y: controlRect.midY)
-                let dx = Int64(sample.deltaX.rounded())
-                let dy = Int64(sample.deltaY.rounded())
+                let dx = boundedInt64(sample.deltaX)
+                let dy = boundedInt64(sample.deltaY)
                 guard dx != 0 || dy != 0 else { return }
                 _ = CGWarpMouseCursorPosition(cursor)
                 // Raw locked-camera movement stays mouseMoved even while a
@@ -72,8 +100,8 @@ final class InputReenactor: @unchecked Sendable {
                 cursor = CGPoint(x: sample.x, y: sample.y).clampedForReplay(to: controlRect)
                 let movement = movementEvent()
                 guard let event = CGEvent(mouseEventSource: hidEventSource, mouseType: movement.type, mouseCursorPosition: cursor, mouseButton: movement.button) else { return }
-                event.setIntegerValueField(.mouseEventDeltaX, value: Int64(sample.deltaX.rounded()))
-                event.setIntegerValueField(.mouseEventDeltaY, value: Int64(sample.deltaY.rounded()))
+                event.setIntegerValueField(.mouseEventDeltaX, value: boundedInt64(sample.deltaX))
+                event.setIntegerValueField(.mouseEventDeltaY, value: boundedInt64(sample.deltaY))
                 taggedPost(event)
             }
         case .mouseButton:
@@ -83,12 +111,32 @@ final class InputReenactor: @unchecked Sendable {
             event.setIntegerValueField(.mouseEventButtonNumber, value: Int64(sample.button)); taggedPost(event)
             if sample.isDown { heldButtons.insert(sample.button) } else { heldButtons.remove(sample.button) }
         case .scroll:
-            if let event = CGEvent(scrollWheelEvent2Source: hidEventSource, units: .pixel, wheelCount: 2, wheel1: Int32(sample.scrollY), wheel2: Int32(sample.scrollX), wheel3: 0) { taggedPost(event) }
+            if let event = CGEvent(scrollWheelEvent2Source: hidEventSource, units: .pixel, wheelCount: 2, wheel1: boundedInt32(sample.scrollY), wheel2: boundedInt32(sample.scrollX), wheel3: 0) { taggedPost(event) }
         case .key:
             if let event = CGEvent(keyboardEventSource: hidEventSource, virtualKey: sample.keyCode, keyDown: sample.isDown) { event.flags = CGEventFlags(rawValue: sample.modifiers); taggedPost(event) }
             if sample.isDown { heldKeys.insert(sample.keyCode) } else { heldKeys.remove(sample.keyCode) }
         case .flags:
-            break
+            let mappings: [(mask: CGEventFlags, keys: [UInt16])] = [
+                (.maskShift, [56, 60]), (.maskControl, [59, 62]),
+                (.maskAlternate, [58, 61]), (.maskCommand, [55, 54])
+            ]
+            for mapping in mappings {
+                let held = heldKeys.intersection(mapping.keys)
+                let desired = sample.modifiers & mapping.mask.rawValue != 0
+                if desired, held.isEmpty {
+                    let code = mapping.keys.contains(sample.keyCode) ? sample.keyCode : mapping.keys[0]
+                    if let event = CGEvent(keyboardEventSource: hidEventSource, virtualKey: code, keyDown: true) {
+                        event.flags = CGEventFlags(rawValue: sample.modifiers); taggedPost(event); heldKeys.insert(code)
+                    }
+                } else if !desired, !held.isEmpty {
+                    for code in held {
+                        if let event = CGEvent(keyboardEventSource: hidEventSource, virtualKey: code, keyDown: false) {
+                            event.flags = CGEventFlags(rawValue: sample.modifiers); taggedPost(event)
+                        }
+                        heldKeys.remove(code)
+                    }
+                }
+            }
         }
     }
 
@@ -116,6 +164,16 @@ final class InputReenactor: @unchecked Sendable {
     }
 
     private func taggedPost(_ event: CGEvent) { event.setIntegerValueField(.eventSourceUserData, value: agentTrainerSyntheticTag); event.post(tap: .cghidEventTap) }
+
+    private func boundedInt64(_ value: Double) -> Int64 {
+        guard value.isFinite else { return 0 }
+        return Int64(min(Double(GameCameraContract.maximumPostedDelta), max(-Double(GameCameraContract.maximumPostedDelta), value)).rounded())
+    }
+
+    private func boundedInt32(_ value: Double) -> Int32 {
+        guard value.isFinite else { return 0 }
+        return Int32(min(10_000, max(-10_000, value)).rounded())
+    }
 
     private func movementEvent() -> (type: CGEventType, button: CGMouseButton) {
         if heldButtons.contains(0) { return (.leftMouseDragged, .left) }

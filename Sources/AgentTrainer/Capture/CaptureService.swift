@@ -49,13 +49,22 @@ final class CaptureService: NSObject, @unchecked Sendable {
             CGRequestScreenCaptureAccess()
             throw AgentTrainerError.permission("Screen Recording permission is required. Enable AgentTrainer in System Settings → Privacy & Security → Screen & System Audio Recording.")
         }
-        guard spec.requestedFPS > 0 else { throw AgentTrainerError.invalidConfiguration("Capture FPS must be positive.") }
+        guard spec.requestedFPS.isFinite, spec.requestedFPS > 0, spec.requestedFPS <= 240 else {
+            throw AgentTrainerError.invalidConfiguration("Capture FPS must be finite, positive, and no higher than 240.")
+        }
 
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         let selection = try makeFilterAndGeometry(spec: spec, content: content)
+        let outputWidth = exactOutputSize?.width ?? selection.pixelSize.width
+        let outputHeight = exactOutputSize?.height ?? selection.pixelSize.height
+        guard outputWidth.isFinite, outputHeight.isFinite,
+              outputWidth > 0, outputHeight > 0,
+              outputWidth <= 16_384, outputHeight <= 16_384 else {
+            throw AgentTrainerError.invalidConfiguration("Capture dimensions must be finite, positive, and no larger than 16,384 pixels per side.")
+        }
         let config = SCStreamConfiguration()
-        config.width = max(1, Int(exactOutputSize?.width ?? selection.pixelSize.width))
-        config.height = max(1, Int(exactOutputSize?.height ?? selection.pixelSize.height))
+        config.width = max(1, Int(outputWidth))
+        config.height = max(1, Int(outputHeight))
         config.minimumFrameInterval = CMTime(seconds: 1 / spec.requestedFPS, preferredTimescale: 1_000_000_000)
         config.queueDepth = max(1, queueDepth)
         config.showsCursor = spec.showsCursor
@@ -121,6 +130,7 @@ final class CaptureService: NSObject, @unchecked Sendable {
             let scaleX = CGFloat(display.width) / max(1, display.frame.width)
             let scaleY = CGFloat(display.height) / max(1, display.frame.height)
             if spec.kind == .screenRegion, let global = spec.region?.cgRect {
+                guard global.hasFiniteComponents else { throw AgentTrainerError.capture("The selected screen region is invalid.") }
                 let intersection = global.intersection(display.frame)
                 guard !intersection.isNull, intersection.width > 0, intersection.height > 0 else { throw AgentTrainerError.capture("The selected region does not intersect the selected display.") }
                 let local = CGRect(x: intersection.minX - display.frame.minX, y: intersection.minY - display.frame.minY, width: intersection.width, height: intersection.height)
@@ -132,6 +142,7 @@ final class CaptureService: NSObject, @unchecked Sendable {
             let filter = SCContentFilter(desktopIndependentWindow: window)
             let scale = screenScale(for: window.frame)
             if spec.kind == .windowRegion, let region = spec.region?.cgRect {
+                guard region.hasFiniteComponents else { throw AgentTrainerError.capture("The selected window region is invalid.") }
                 let bounded = region.intersection(CGRect(origin: .zero, size: window.frame.size))
                 guard bounded.width > 0, bounded.height > 0 else { throw AgentTrainerError.capture("The selected window region is empty.") }
                 return (filter, CGSize(width: bounded.width * scale, height: bounded.height * scale), bounded)
@@ -142,6 +153,12 @@ final class CaptureService: NSObject, @unchecked Sendable {
 
     private func screenScale(for frame: CGRect) -> CGFloat {
         NSScreen.screens.first { $0.frame.intersects(frame) }?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+    }
+}
+
+private extension CGRect {
+    var hasFiniteComponents: Bool {
+        origin.x.isFinite && origin.y.isFinite && width.isFinite && height.isFinite
     }
 }
 

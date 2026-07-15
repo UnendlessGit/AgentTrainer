@@ -12,6 +12,7 @@ final class InputEventWriter: @unchecked Sendable {
     init(url: URL) throws {
         FileManager.default.createFile(atPath: url.path, contents: nil)
         handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: 0)
         try handle.write(contentsOf: Data("ATREVT01".utf8))
         var version = UInt32(1).littleEndian
         try withUnsafeBytes(of: &version) { try handle.write(contentsOf: Data($0)) }
@@ -72,6 +73,29 @@ final class InputEventWriter: @unchecked Sendable {
 enum InputEventReader {
     static let recordSize = 72
 
+    /// Memory-mapped random-access view used by dataset construction. Large,
+    /// mouse-heavy recordings no longer expand every fixed-width record into a
+    /// heap-allocated Swift value before the first training sample is written.
+    struct MappedEvents: RandomAccessCollection {
+        typealias Index = Int
+        typealias Element = InputSample
+
+        fileprivate let data: Data
+        let startIndex = 0
+        let endIndex: Int
+
+        fileprivate init(data: Data) throws {
+            try InputEventReader.validate(data)
+            self.data = data
+            endIndex = (data.count - 12) / InputEventReader.recordSize
+        }
+
+        subscript(position: Int) -> InputSample {
+            precondition(indices.contains(position))
+            return InputEventReader.decodeRecord(in: data, index: position)
+        }
+    }
+
     struct MouseDiagnostics: Sendable, Equatable {
         var moveEventCount = 0
         var nonzeroDeltaCount = 0
@@ -98,11 +122,15 @@ enum InputEventReader {
     }
 
     static func read(url: URL) throws -> [InputSample] {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        let mapped = try mapped(url: url)
         var result: [InputSample] = []
-        result.reserveCapacity(max(0, (data.count - 12) / recordSize))
-        try forEach(in: data) { result.append($0) }
+        result.reserveCapacity(mapped.count)
+        result.append(contentsOf: mapped)
         return result
+    }
+
+    static func mapped(url: URL) throws -> MappedEvents {
+        try MappedEvents(data: Data(contentsOf: url, options: .mappedIfSafe))
     }
 
     static func summarize(url: URL, previewLimit: Int = 80, globalRect: CGRect? = nil) throws -> Summary {
@@ -181,26 +209,55 @@ enum InputEventReader {
         return Set(mappings.compactMap { flags & $0.0.rawValue != 0 ? $0.1 : nil })
     }
 
-    private static func forEach(in data: Data, _ body: (InputSample) -> Void) throws {
+    private static func validate(_ data: Data) throws {
         guard data.count >= 12, String(data: data.prefix(8), encoding: .utf8) == "ATREVT01" else { throw AgentTrainerError.storage("Invalid AgentTrainer input event file.") }
         var headerCursor = 8
         let version: UInt32 = data.readInteger(at: &headerCursor)
         guard version == 1, (data.count - 12).isMultiple(of: recordSize) else {
             throw AgentTrainerError.storage("This AgentTrainer input event file is unsupported or incomplete.")
         }
-        var cursor = 12
-        while cursor + recordSize <= data.count {
+        let count = (data.count - 12) / recordSize
+        var previousTimestamp: UInt64?
+        for index in 0..<count {
+            let recordStart = 12 + index * recordSize
+            let rawKind = data[recordStart + 8]
+            guard InputEventKind(rawValue: rawKind) != nil else {
+                throw AgentTrainerError.storage("This AgentTrainer input event file contains an unknown event kind.")
+            }
+            var cursor = recordStart
             let timestamp: UInt64 = data.readInteger(at: &cursor)
-            let kindRaw = data[cursor]; cursor += 1
-            let isDown = data[cursor] != 0; cursor += 1
-            let button = data[cursor]; cursor += 2
-            let keyCode: UInt16 = data.readInteger(at: &cursor); cursor += 2
-            let modifiers: UInt64 = data.readInteger(at: &cursor)
-            let x = data.readDouble(at: &cursor), y = data.readDouble(at: &cursor)
-            let dx = data.readDouble(at: &cursor), dy = data.readDouble(at: &cursor)
-            let sx = data.readDouble(at: &cursor), sy = data.readDouble(at: &cursor)
-            guard let kind = InputEventKind(rawValue: kindRaw) else { continue }
-            body(InputSample(timestampNanos: timestamp, kind: kind, x: x, y: y, deltaX: dx, deltaY: dy, button: button, scrollX: sx, scrollY: sy, keyCode: keyCode, modifiers: modifiers, isDown: isDown))
+            if let previousTimestamp, timestamp < previousTimestamp {
+                throw AgentTrainerError.storage("This AgentTrainer input event file is not ordered by capture time.")
+            }
+            previousTimestamp = timestamp
+            let event = decodeRecord(in: data, index: index)
+            guard [event.x, event.y, event.deltaX, event.deltaY, event.scrollX, event.scrollY].allSatisfy(\.isFinite) else {
+                throw AgentTrainerError.storage("This AgentTrainer input event file contains a non-finite control value.")
+            }
+        }
+    }
+
+    private static func decodeRecord(in data: Data, index: Int) -> InputSample {
+        var cursor = 12 + index * recordSize
+        let timestamp: UInt64 = data.readInteger(at: &cursor)
+        let kindRaw = data[cursor]; cursor += 1
+        let isDown = data[cursor] != 0; cursor += 1
+        let button = data[cursor]; cursor += 2
+        let keyCode: UInt16 = data.readInteger(at: &cursor); cursor += 2
+        let modifiers: UInt64 = data.readInteger(at: &cursor)
+        let x = data.readDouble(at: &cursor), y = data.readDouble(at: &cursor)
+        let dx = data.readDouble(at: &cursor), dy = data.readDouble(at: &cursor)
+        let sx = data.readDouble(at: &cursor), sy = data.readDouble(at: &cursor)
+        // Validation above guarantees the closed version-1 event kind set.
+        let kind = InputEventKind(rawValue: kindRaw)!
+        return InputSample(timestampNanos: timestamp, kind: kind, x: x, y: y, deltaX: dx, deltaY: dy, button: button, scrollX: sx, scrollY: sy, keyCode: keyCode, modifiers: modifiers, isDown: isDown)
+    }
+
+    private static func forEach(in data: Data, _ body: (InputSample) -> Void) throws {
+        try validate(data)
+        let count = (data.count - 12) / recordSize
+        for index in 0..<count {
+            body(decodeRecord(in: data, index: index))
         }
     }
 }

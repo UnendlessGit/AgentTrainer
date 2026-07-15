@@ -75,10 +75,14 @@ actor WorkspaceStore {
     }()
 
     init(root: URL? = nil) {
-        let resolvedRoot = (root ?? Self.defaultRoot).standardizedFileURL
+        let environmentRoot = root == nil
+            ? ProcessInfo.processInfo.environment["AGENTTRAINER_WORKSPACE_ROOT"]
+                .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            : nil
+        let resolvedRoot = (root ?? environmentRoot ?? Self.defaultRoot).standardizedFileURL
         self.root = resolvedRoot
-        persistsLocations = root == nil
-        if root == nil {
+        persistsLocations = root == nil && environmentRoot == nil
+        if persistsLocations {
             trainingDataRoot = UserDefaults.standard.string(forKey: Self.trainingDataRootKey)
                 .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL } ?? resolvedRoot
             modelsRoot = UserDefaults.standard.string(forKey: Self.modelsRootKey)
@@ -197,9 +201,10 @@ actor WorkspaceStore {
 
         var removed = 0
         for var profile in listProfiles() {
-            // User-designated preservation boundary. Contract migrations may
-            // clean derived artifacts for other profiles, but never Crystal V4.
-            if profile.isDeletionProtected { continue }
+            // Protection prevents user deletion of a compatible brain, but it
+            // cannot make obsolete tensor shapes runnable. Preserve every
+            // profile and source recording while removing incompatible learned
+            // artifacts consistently, including protected profile names.
             let profileRoot = profileDirectory(profile.id)
             for name in ["Versions", "Checkpoint"] {
                 let artifact = profileRoot.appendingPathComponent(name, isDirectory: true)
@@ -208,15 +213,44 @@ actor WorkspaceStore {
                     removed += 1
                 }
             }
-            if profile.activeVersionID != nil {
-                profile.activeVersionID = nil
-                profile.trainingProgress = nil
-                try saveProfile(profile)
+            profile.activeVersionID = nil
+            profile.trainingProgress = nil
+            profile.training.architecture = migratedArchitecture(profile.training.architecture)
+            // Very long action histories made the old recurrent branch both
+            // slow and an easy persistence shortcut. Keep at most half a
+            // second at the common 60 Hz while the new motion channels carry
+            // the visual velocity signal directly.
+            profile.training.historyLength = min(32, max(0, profile.training.historyLength))
+            // Values such as 0.001–0.005 were stable only by accident under
+            // the old constant-rate optimizer and commonly destroyed earlier
+            // progress. The current schedule is tuned around this safe peak.
+            if !profile.training.learningRate.isFinite || profile.training.learningRate <= 0 {
+                profile.training.learningRate = 0.0003
+            } else {
+                profile.training.learningRate = min(0.0003, profile.training.learningRate)
             }
+            if profile.training.perceptionFPS > profile.training.actionFPS {
+                profile.training.perceptionFPS = profile.training.actionFPS
+            }
+            try saveProfile(profile)
         }
         try clearCaches()
         try atomicWrite(try encoder.encode(currentSchema), to: marker)
         return removed
+    }
+
+    private func migratedArchitecture(_ previous: ArchitectureSpec) -> ArchitectureSpec {
+        let widestConvolution = previous.convolutionChannels.max() ?? 0
+        var architecture: ArchitectureSpec
+        if previous.visualEmbedding <= 128, previous.recurrentWidth <= 128, widestConvolution <= 64 {
+            architecture = .small
+        } else if previous.visualEmbedding >= 384 || previous.recurrentWidth >= 320 || widestConvolution >= 192 {
+            architecture = .large
+        } else {
+            architecture = .balanced
+        }
+        architecture.recurrentKind = previous.recurrentKind
+        return architecture
     }
 
     func createRecordingDirectory(id: UUID) throws -> URL {
@@ -234,7 +268,9 @@ actor WorkspaceStore {
         guard let urls = try? FileManager.default.contentsOfDirectory(at: recordingsRoot, includingPropertiesForKeys: nil) else { return [] }
         return urls.compactMap { directory in
             let manifestURL = directory.appendingPathComponent("manifest.json")
-            guard let data = try? Data(contentsOf: manifestURL), let manifest = try? decoder.decode(RecordingManifest.self, from: data) else { return nil }
+            guard let data = try? Data(contentsOf: manifestURL),
+                  let manifest = try? decoder.decode(RecordingManifest.self, from: data),
+                  manifest.isStructurallyValid else { return nil }
             return RecordingItem(manifest: manifest, directory: directory)
         }.sorted { $0.manifest.createdAt > $1.manifest.createdAt }
     }
@@ -490,9 +526,15 @@ actor WorkspaceStore {
     }
 
     func restoreVersionAsCheckpoint(profileID: UUID, version: ModelVersionManifest) throws -> Bool {
-        guard let optimizerFile = version.optimizerFile, let stateFile = version.trainingStateFile else { return false }
-        let source = versionDirectory(profileID: profileID, versionID: version.id)
         let destination = checkpointDirectory(profileID: profileID)
+        guard let optimizerFile = version.optimizerFile, let stateFile = version.trainingStateFile else {
+            // Explicitly activating a weights-only/best brain means future
+            // training should fine-tune that brain with a fresh optimizer, not
+            // silently resume an unrelated newer checkpoint left on disk.
+            if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
+            return false
+        }
+        let source = versionDirectory(profileID: profileID, versionID: version.id)
         let temporary = destination.deletingLastPathComponent().appendingPathComponent(".Checkpoint.restore.\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         do {

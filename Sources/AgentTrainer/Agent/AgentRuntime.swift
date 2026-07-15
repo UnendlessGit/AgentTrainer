@@ -55,6 +55,9 @@ final class AgentRuntime: @unchecked Sendable {
     private var lastVisualizationTime = 0.0
     private var lastMetricsReportTime = 0.0
     private var lastFocusCheckTime = 0.0
+    private var previousPackedVision: Data?
+    private var launchRevision: UInt64 = 0
+    private var starting = false
 
     init() throws {
         preprocessor = try VisionPreprocessor()
@@ -71,8 +74,28 @@ final class AgentRuntime: @unchecked Sendable {
               version.relativeMouseScale == GameCameraContract.deltaScale else {
             throw AgentTrainerError.model("This brain predates the current visual and Game Camera contracts. Retrain it from the original recordings.")
         }
+        let launchToken: UInt64? = lock.withLock {
+            guard stopped, !starting else { return nil }
+            starting = true
+            launchRevision &+= 1
+            return launchRevision
+        }
+        guard let launchToken else { throw AgentTrainerError.model("This AI is already starting or running.") }
+        defer {
+            lock.withLock {
+                if launchRevision == launchToken { starting = false }
+            }
+        }
+
+        // A runnable brain is immutable. Timing, history length, enabled heads,
+        // precision, and architecture must come from the saved version rather
+        // than mutable editor fields that may have changed after training.
+        var runtimeProfile = profile
+        runtimeProfile.preprocessing = version.preprocessing
+        runtimeProfile.channels = version.channels
+        runtimeProfile.training = version.training
         let startRevisions = lock.withLock { (outputPermissionsRevision, visualizationSettingsRevision) }
-        let model = AgentPolicy(profile: profile)
+        let model = AgentPolicy(profile: runtimeProfile)
         let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
         model.train(false)
@@ -105,16 +128,15 @@ final class AgentRuntime: @unchecked Sendable {
             let logits = model.logits(visualFeatures: inputs[0], history: inputs[1])
             return (logits * inputs[2].asType(model.dtype)).sum()
         }, argumentNumbers: [0])
-        guard version.preprocessing == profile.preprocessing else { throw AgentTrainerError.model("The selected version is incompatible with this profile's vision settings.") }
-
-        lock.withLock {
+        let accepted = lock.withLock { () -> Bool in
+            guard launchRevision == launchToken, starting, stopped else { return false }
             self.model = model
             self.predictionFunction = predictionFunction
             self.activationVisualizationFunctions = activationVisualizationFunctions
             self.channelVisualizationFunction = channelVisualizationFunction
             self.saliencyVisualizationFunction = saliencyVisualizationFunction
             self.saliencyGradientFunction = saliencyGradient
-            self.profile = profile
+            self.profile = runtimeProfile
             self.allowedKeyCodes = allowedKeyCodes
             self.safety = safety
             self.captureRect = captureRect
@@ -123,20 +145,24 @@ final class AgentRuntime: @unchecked Sendable {
             self.gameCamera = gameCamera
             if outputPermissionsRevision == startRevisions.0 { self.outputPermissions = outputPermissions }
             if visualizationSettingsRevision == startRevisions.1 {
-                self.visualizationSettings = visualizationSettings.sanitized(layerCount: profile.training.architecture.convolutionChannels.count)
+                self.visualizationSettings = visualizationSettings.sanitized(layerCount: runtimeProfile.training.architecture.convolutionChannels.count)
             } else {
-                self.visualizationSettings = self.visualizationSettings.sanitized(layerCount: profile.training.architecture.convolutionChannels.count)
+                self.visualizationSettings = self.visualizationSettings.sanitized(layerCount: runtimeProfile.training.architecture.convolutionChannels.count)
             }
             self.previewFPS = max(0, previewFPS)
             self.lastPreviewTime = 0
             self.lastVisualizationTime = 0
-            latestFrame = nil; predictionLatch.reset(); history = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: max(1, profile.training.historyLength))
+            latestFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: max(1, runtimeProfile.training.historyLength))
             historyWriteIndex = 0; metrics = RuntimeMetrics(); startedAt = CACurrentMediaTime(); nextPerceptionTime = 0; lastMetricsReportTime = 0; lastFocusCheckTime = 0; stopped = false
             // Keep session enablement ordered with live permission changes. A
             // toggle made while model weights are loading must not be replaced
             // by the older settings captured when `start` was first called.
             injector.enable(outputPermissions: self.outputPermissions)
+            stopped = false
+            starting = false
+            return true
         }
+        guard accepted else { throw CancellationError() }
         do {
             safetyMonitor.ignoredHotkeys = ignoredHotkeys
             safetyMonitor.onSample = { [weak self] sample in
@@ -150,14 +176,15 @@ final class AgentRuntime: @unchecked Sendable {
             guard lock.withLock({ !stopped }) else { throw CancellationError() }
             lock.withLock { self.targetPID = targetPID }
             var liveCaptureSpec = captureSpec
-            liveCaptureSpec.requestedFPS = profile.training.perceptionFPS
+            liveCaptureSpec.requestedFPS = runtimeProfile.training.perceptionFPS
+            liveCaptureSpec.showsCursor = version.trainingShowsCursor ?? captureSpec.showsCursor
             try await capture.start(spec: liveCaptureSpec, queueDepth: mode == .newest ? 3 : 8, onFrame: { [weak self] buffer, pts in
                 self?.receive(buffer, timestamp: pts)
             }, onUnexpectedStop: { [weak self] error in
                 Task { await self?.stop(reason: "Capture stopped: \(error.localizedDescription)") }
             })
             guard lock.withLock({ !stopped }) else { _ = try? await capture.stop(); throw CancellationError() }
-            startActionTimer(fps: profile.training.actionFPS)
+            startActionTimer(fps: runtimeProfile.training.actionFPS)
         } catch {
             await stop(reason: nil)
             throw error
@@ -188,10 +215,12 @@ final class AgentRuntime: @unchecked Sendable {
 
     func stop(reason: String? = nil) async {
         let stopState = lock.withLock { () -> (Bool, DispatchSourceTimer?) in
+            launchRevision &+= 1
+            starting = false
             guard !stopped else { return (false, nil) }
             stopped = true
             let timer = actionTimer; actionTimer = nil
-            latestFrame = nil; predictionLatch.reset(); targetPID = nil
+            latestFrame = nil; previousPackedVision = nil; predictionLatch.reset(); targetPID = nil
             return (true, timer)
         }
         guard stopState.0 else { return }
@@ -206,7 +235,7 @@ final class AgentRuntime: @unchecked Sendable {
         injector.disableAndReleaseAll()
         lock.withLock {
             predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false)
-            latestFrame = nil; predictionLatch.reset(); history.removeAll(keepingCapacity: false); historyWriteIndex = 0; processing = false
+            latestFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history.removeAll(keepingCapacity: false); historyWriteIndex = 0; processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
         onStop?(reason)
@@ -266,7 +295,12 @@ final class AgentRuntime: @unchecked Sendable {
         let began = CACurrentMediaTime()
         do {
             let packed = try preprocessor.process(buffer, spec: profile.preprocessing)
-            let image = VisionPreprocessor.mlxTensor(packed, batch: 1, spec: profile.preprocessing)
+            let previousPacked = lock.withLock { () -> Data? in
+                let previous = previousPackedVision
+                previousPackedVision = packed
+                return previous
+            }
+            let image = VisionPreprocessor.mlxTemporalTensor(current: packed, previous: previousPacked, batch: 1, spec: profile.preprocessing)
             let historyArray = MLXArray(history, [1, max(1, profile.training.historyLength), ActionLayout.count])
             let result: [MLXArray] = Device.withDefaultDevice(.gpu) {
                 guard visualizationDue else { return [predictionFunction(image, historyArray)] }
@@ -297,6 +331,9 @@ final class AgentRuntime: @unchecked Sendable {
                 MLX.eval(output)
             }
             let values = output.asArray(Float.self)
+            guard values.count >= ActionLayout.count, values.prefix(ActionLayout.count).allSatisfy(\.isFinite) else {
+                throw AgentTrainerError.model("The brain produced an invalid prediction, so all outputs were stopped safely.")
+            }
             if let visualization {
                 let frame = CNNVisualizationFrame(
                     packed: packed,
@@ -394,6 +431,12 @@ final class AgentRuntime: @unchecked Sendable {
         let prediction = latched.values
         let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes
         let now = CACurrentMediaTime()
+        let maximumPredictionAge = max(0.35, 3 / max(0.0001, profile.training.perceptionFPS))
+        if now - latched.publishedAt > maximumPredictionAge {
+            lock.unlock()
+            Task { await stop(reason: "Stopped because live inference stopped producing fresh predictions") }
+            return
+        }
         // Frontmost-app lookup crosses into AppKit/WindowServer. Ten checks per
         // second preserves a near-immediate safety stop without doing that work
         // at a 60–240 Hz action rate.
@@ -468,14 +511,17 @@ struct RuntimePredictionLatch: Sendable {
     struct Snapshot: Sendable {
         var values: [Float]
         var isFresh: Bool
+        var publishedAt: Double
     }
 
     private var latest: [Float]?
     private var revision: UInt64 = 0
     private var consumedRevision: UInt64 = 0
+    private var publishedAt = 0.0
 
-    mutating func publish(_ values: [Float]) {
+    mutating func publish(_ values: [Float], at time: Double = CACurrentMediaTime()) {
         latest = values
+        publishedAt = time
         revision &+= 1
     }
 
@@ -483,13 +529,14 @@ struct RuntimePredictionLatch: Sendable {
         guard let latest else { return nil }
         let isFresh = revision != consumedRevision
         if isFresh { consumedRevision = revision }
-        return Snapshot(values: latest, isFresh: isFresh)
+        return Snapshot(values: latest, isFresh: isFresh, publishedAt: publishedAt)
     }
 
     mutating func reset() {
         latest = nil
         revision = 0
         consumedRevision = 0
+        publishedAt = 0
     }
 }
 
