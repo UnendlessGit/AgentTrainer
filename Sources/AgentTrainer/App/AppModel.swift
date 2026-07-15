@@ -149,8 +149,8 @@ final class AppModel: ObservableObject {
             if repairedRecordings > 0 {
                 AppLog.write(.warning, category: "Migration", "Recovered legacy recording manifests", details: "\(repairedRecordings) recording manifests repaired; video and input files were unchanged")
             }
-            let removed = try await WorkspaceStore.shared.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
-            if removed > 0 { AppLog.write(.warning, category: "Migration", "Removed incompatible model artifacts", details: "\(removed) model/checkpoint directories; recordings and profiles were preserved") }
+            let archived = try await WorkspaceStore.shared.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
+            if archived > 0 { AppLog.write(.warning, category: "Migration", "Archived incompatible model artifacts", details: "\(archived) model/checkpoint items moved to recovery archives; compatible brains, recordings, and profiles were preserved") }
             let obsoleteCaches = try await WorkspaceStore.shared.removeObsoleteCaches(currentSchema: TrainingDataContract.schemaVersion)
             if obsoleteCaches > 0 { AppLog.write(category: "Migration", "Removed obsolete dataset caches", details: "\(obsoleteCaches) cache directories; recordings and runnable brains were preserved") }
             let prunedAutosaves = try await WorkspaceStore.shared.pruneAllAutosaves(keeping: 10)

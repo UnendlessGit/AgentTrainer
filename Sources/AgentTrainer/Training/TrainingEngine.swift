@@ -494,6 +494,7 @@ final class TrainingEngine: @unchecked Sendable {
             }
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(state).write(to: temporary.appendingPathComponent("state.json"), options: .atomic)
+            try encoder.encode(ModelContract.schemaVersion).write(to: temporary.appendingPathComponent("model-schema.json"), options: .atomic)
             if FileManager.default.fileExists(atPath: destination.path) {
                 let backupName = ".Checkpoint.backup.\(UUID().uuidString)"
                 let backup = destination.deletingLastPathComponent().appendingPathComponent(backupName)
