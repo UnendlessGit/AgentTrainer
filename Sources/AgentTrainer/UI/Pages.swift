@@ -207,12 +207,12 @@ private struct ProfileEditor: View {
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack { Text("Training configuration").font(.headline).foregroundStyle(ATColor.green); InfoTip("Maximum Steps and Autosave Steps are universal run controls in the Training tab, so they do not change a model's learning identity. Architecture and exact vision changes require a fresh brain, and the app asks before clearing training.") }
-                        HStack { IntField("Epochs per block", value: $draft.training.epochs, help: "How many complete dataset passes to add. If a block is paused, Train finishes it first; after a completed block, Train adds another block of this size."); IntField("Batch", value: $draft.training.batchSize, help: "Samples evaluated together. Larger batches use more unified memory."); IntField("History", value: $draft.training.historyLength, help: "Number of earlier actions supplied to the recurrent encoder.") }
-                        HStack { DoubleField("Learning rate", value: $draft.training.learningRate, help: "AdamW update size."); DoubleField("Weight decay", value: $draft.training.weightDecay, help: "Regularization applied by AdamW."); DoubleField("Validation", value: $draft.training.validationSplit, help: "Fraction of recordings held out for validation.") }
-                        HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives a newly processed screen frame."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the AI may update mouse, keyboard, button, and scroll output."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
+                        HStack { IntField("Epochs per block", value: $draft.training.epochs, help: "How many complete dataset passes to add. If a block is paused, Train finishes it first; after a completed block, Train adds another block of this size."); IntField("Batch", value: $draft.training.batchSize, help: "Samples evaluated together. Larger batches use more unified memory."); IntField("History", value: $draft.training.historyLength, help: "Earlier actions supplied to the recurrent encoder. Keep this short: motion comes directly from consecutive screen frames, and training masks history on half the samples so the policy cannot succeed by copying it.") }
+                        HStack { DoubleField("Learning rate", value: $draft.training.learningRate, help: "Peak AdamW update size. Training warms up for 500 steps, then decays automatically so long runs refine instead of erasing earlier progress."); DoubleField("Weight decay", value: $draft.training.weightDecay, help: "Regularization applied by AdamW."); DoubleField("Validation", value: $draft.training.validationSplit, help: "Fraction of whole recordings held out. Rare controls are kept in training, held-out samples are class-aware, and the best validation brain is activated when training completes.") }
+                        HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives a new screen frame and signed motion difference. It cannot exceed Action FPS."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the AI may update mouse, keyboard, button, and scroll output."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
                         HStack { Text("Architecture preset").foregroundStyle(.secondary); Button("Small") { draft.training.architecture = .small }.primaryButton(); Button("Balanced") { draft.training.architecture = .balanced }.primaryButton(); Button("Large") { draft.training.architecture = .large }.primaryButton() }
                         HStack { IntField("Visual width", value: $draft.training.architecture.visualEmbedding, help: "How much visual information is kept after the convolution layers."); IntField("Recurrent width", value: $draft.training.architecture.recurrentWidth, help: "How much capacity is used to remember the recent action history."); Picker("History encoder", selection: $draft.training.architecture.recurrentKind) { ForEach(RecurrentKind.allCases) { Text($0.rawValue).tag($0) } } }
-                        HStack { InfoTip("Convolution channels control visual capacity. Recurrent width controls action-history capacity. Larger values require more compute and unified memory."); Spacer() }
+                        HStack { InfoTip("The four-stage spatial encoder sees the current frame, signed frame-to-frame motion, and screen coordinates. It preserves layout instead of averaging the screen into one vector. Convolution channels control visual capacity; recurrent width controls short action history."); Spacer() }
                         HStack { IntArrayField("Conv channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
                         HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
                     }
@@ -235,7 +235,7 @@ private struct ProfileEditor: View {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
                             Text("Saved brains and autosaves").font(.headline).foregroundStyle(ATColor.violet)
-                            InfoTip("This list is loaded only when you ask for it, which keeps the AI Models page fast even after long training runs. The newest brain appears first.")
+                            InfoTip("This list is loaded only when you ask for it, which keeps the page fast after long runs. Completed training activates the lowest held-out validation-loss brain; the separate latest checkpoint remains available for exact continuation.")
                             Spacer()
                             if model.versionsLoadedForProfileID == draft.id {
                                 Button("Hide List") { model.unloadVersions() }.primaryButton(color: ATColor.violet)
@@ -252,7 +252,7 @@ private struct ProfileEditor: View {
                         } else {
                             ForEach(model.versions) { version in
                                 HStack {
-                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • loss \(version.trainingLoss.formatted(.number.precision(.fractionLength(4)))) • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
+                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
                                     Spacer(); Button(version.optimizerFile == nil ? "Run this" : "Revert & Resume") { Task { await model.activateVersion(version); draft.activeVersionID = version.id } }.primaryButton(color: ATColor.violet)
                                     if !draft.isDeletionProtected { Button("Delete") { Task { await model.deleteVersion(version) } }.primaryButton(color: ATColor.coral) }
                                 }.padding(.vertical, 4)
@@ -403,6 +403,12 @@ private struct NeuralNetworkInputOverview: View {
                     value: "\(input.expandedVisionValues.formatted()) values",
                     detail: "\(profile.preprocessing.width) × \(profile.preprocessing.height) × \(profile.preprocessing.channelCount) after chroma expansion",
                     color: ATColor.cyan
+                )
+                NeuralInputBreakdown(
+                    title: "Signed visual motion",
+                    value: "\(input.temporalDifferenceValues.formatted()) values",
+                    detail: "Current frame minus the immediately preceding perception frame",
+                    color: ATColor.amber
                 )
                 NeuralInputBreakdown(
                     title: "Generated coordinates",
@@ -863,7 +869,7 @@ struct TrainingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                SectionTitle("Training", "A bounded, compiled MLX pipeline uses Apple GPU and unified memory. Another trained AI can run simultaneously.")
+                SectionTitle("Training", "Compiled MLX training uses temporal vision, class-balanced controls, anti-shortcut history masking, and best-held-out brain selection. Another trained AI can run simultaneously.")
                 HStack {
                     if model.isTraining, let profile = displayedProfile {
                         Text(profile.name).font(.title2.bold())
@@ -942,6 +948,7 @@ struct TrainingView: View {
                                 .font(.caption).foregroundStyle(ATColor.amber)
                         }
                         if let profile = displayedProfile { Text("\(profile.preprocessing.width) × \(profile.preprocessing.height) • \(profile.preprocessing.bitDepth)-bit \(profile.preprocessing.chroma.rawValue) • \(profile.training.precision.rawValue) • perception \(profile.training.perceptionFPS.formatted()) FPS • action \(profile.training.actionFPS.formatted()) FPS").font(.caption).foregroundStyle(.secondary) }
+                        Text("Exact continuation always uses the latest optimizer checkpoint. When a validation split exists, completed training runs the lowest-loss held-out brain so late regression is never silently activated.").font(.caption2).foregroundStyle(.secondary)
                         Text("MLX reports allocator-backed unified memory: active arrays, reusable cache, and process-lifetime peak. It is not separate VRAM on Apple silicon.").font(.caption2).foregroundStyle(.tertiary)
                     }
                 }
@@ -1324,8 +1331,8 @@ struct DiagnosticsView: View {
                 }
                 PermissionStrip(model: model)
                 HStack(spacing: 12) { MetricCard(title: "MLX active", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .memory), symbol: "memorychip", color: ATColor.green); MetricCard(title: "MLX peak", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .memory), symbol: "chart.bar.fill", color: ATColor.amber); MetricCard(title: "MLX cache", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.cacheMemory), countStyle: .memory), symbol: "shippingbox", color: ATColor.violet) }
-                OLEDCard { VStack(alignment: .leading, spacing: 10) { LabeledContent("Chip", value: hardwareName()); LabeledContent("MLX device", value: Device.defaultDevice().deviceType == .gpu ? "Apple GPU" : "CPU"); LabeledContent("Physical unified memory", value: ByteCountFormatter.string(fromByteCount: Int64(ProcessInfo.processInfo.physicalMemory), countStyle: .memory)); LabeledContent("Local workspace", value: ByteCountFormatter.string(fromByteCount: model.storageBytes, countStyle: .file)); LabeledContent("Bundle identifier", value: Bundle.main.bundleIdentifier ?? "local.agenttrainer.mac"); LabeledContent("Networking", value: "Not present") } }
-                OLEDCard { HStack { VStack(alignment: .leading) { HStack { Text("Packed dataset caches").font(.headline); InfoTip("Caches are reusable, preprocessed copies of recordings used to start training faster. Clearing them never deletes recordings, AI profiles, checkpoints, or Crystal V4.") }; Text("Delete reusable decoded observations without deleting recordings or models.").foregroundStyle(.secondary) }; Spacer(); Button("Clear Caches") { Task { await model.clearCaches() } }.primaryButton(color: ATColor.amber) } }
+                OLEDCard { VStack(alignment: .leading, spacing: 10) { LabeledContent("Chip", value: hardwareName()); LabeledContent("MLX device", value: Device.defaultDevice().deviceType == .gpu ? "Apple GPU" : "CPU"); LabeledContent("Physical unified memory", value: ByteCountFormatter.string(fromByteCount: Int64(ProcessInfo.processInfo.physicalMemory), countStyle: .memory)); LabeledContent("Local workspace", value: ByteCountFormatter.string(fromByteCount: model.storageBytes, countStyle: .file)); LabeledContent("Bundle identifier", value: Bundle.main.bundleIdentifier ?? "local.agenttrainer.mac"); LabeledContent("Networking", value: "GitHub Releases update check only") } }
+                OLEDCard { HStack { VStack(alignment: .leading) { HStack { Text("Packed dataset caches").font(.headline); InfoTip("Caches store each perception frame once, map faster action ticks to compact frame indices, and preserve the exact previous frame for motion input. Clearing them never deletes recordings, profiles, or checkpoints.") }; Text("Delete reusable decoded observations without deleting recordings or models.").foregroundStyle(.secondary) }; Spacer(); Button("Clear Caches") { Task { await model.clearCaches() } }.primaryButton(color: ATColor.amber) } }
                 let crashReports = AppLogStore.crashReports()
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 10) {
@@ -1420,7 +1427,7 @@ struct SettingsView: View {
                 ThemeSettingsView()
                 OLEDCard { HStack { VStack(alignment: .leading, spacing: 4) { Text("Diagnostics and app logs").font(.headline).foregroundStyle(ATColor.cyan); Text("Open the dedicated tab for persistent errors, prints, crash reports, MLX memory, and a copyable support report.").foregroundStyle(.secondary) }; Spacer(); Button("Open Diagnostics") { model.selection = .diagnostics }.primaryButton() } }
                 StorageSettingsView(model: model)
-                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "5"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
+                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "11"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
             }.padding(28)
         }
     }
@@ -1625,7 +1632,7 @@ private struct ThemeSettingsView: View {
                 .padding(11)
                 .raisedGlassSurface(cornerRadius: 11, tint: appearance.motionEnabled ? ATColor.cyan : nil)
 
-                Label("The top bar and sidebar use solid, theme-matched surfaces on both macOS Sequoia and Tahoe, avoiding unsupported glass and inactive-window gray states.", systemImage: "macwindow")
+                Label("The top bar and sidebar use solid, theme-matched surfaces on macOS Sequoia, Tahoe, and macOS 27, avoiding version-specific glass and inactive-window gray states.", systemImage: "macwindow")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -1727,7 +1734,7 @@ private struct HotkeySettingsEditor: View {
         if value.carbonModifiers & UInt32(1 << 11) != 0 { result += "⌥" }
         if value.carbonModifiers & UInt32(1 << 9) != 0 { result += "⇧" }
         if value.carbonModifiers & UInt32(1 << 8) != 0 { result += "⌘" }
-        return result + KeyNames.name(for: UInt16(value.keyCode))
+        return result + KeyNames.name(for: UInt16(clamping: value.keyCode))
     }
 }
 

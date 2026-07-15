@@ -68,13 +68,14 @@ final class InputInjector: @unchecked Sendable {
     }
 
     func execute(_ prediction: [Float], profile: AIProfile, allowedKeyCodes: Set<UInt16>, mouseMode: MouseControlMode, captureRect: CGRect, safety: AgentSafetyPolicy, gameCamera: GameCameraSettings = GameCameraSettings(), predictionIsFresh: Bool = true) {
-        guard prediction.count >= ActionLayout.count else { return }
+        guard prediction.count >= ActionLayout.count,
+              prediction.prefix(ActionLayout.count).allSatisfy(\.isFinite) else { return }
         lock.lock()
-        defer { lock.unlock() }
-        guard enabled else { return }
+        guard enabled else { lock.unlock(); return }
         let channels = profile.channels
         let restrictions = profile.effectiveRestrictions
-        let allowed = safety.allowFullMac ? fullMacRect : (safety.controlRegion?.cgRect ?? captureRect)
+        let requested = safety.allowFullMac ? fullMacRect : (safety.controlRegion?.cgRect ?? captureRect)
+        let allowed = requested.isNull || requested.isEmpty || !requested.hasFiniteComponents ? captureRect : requested
         var mouseDelta = CGSize.zero
         var scrollDelta = CGSize.zero
 
@@ -92,7 +93,9 @@ final class InputInjector: @unchecked Sendable {
                 usedGameCamera = true
             }
         } else if predictionIsFresh, outputPermissions.cursorMovement, channels.mouseMovement {
-            cursor = CGPoint(x: captureRect.minX + CGFloat(prediction[0]) * captureRect.width, y: captureRect.minY + CGFloat(prediction[1]) * captureRect.height).clamped(to: allowed)
+            let normalizedX = min(1, max(0, prediction[0]))
+            let normalizedY = min(1, max(0, prediction[1]))
+            cursor = CGPoint(x: captureRect.minX + CGFloat(normalizedX) * captureRect.width, y: captureRect.minY + CGFloat(normalizedY) * captureRect.height).clamped(to: allowed)
             postMove(to: cursor)
         }
 
@@ -104,8 +107,8 @@ final class InputInjector: @unchecked Sendable {
         }
 
         if predictionIsFresh, channels.scroll {
-            let sx = CGFloat(prediction[12]) * 20
-            let sy = CGFloat(prediction[13]) * 20
+            let sx = CGFloat(min(1, max(-1, prediction[12]))) * 20
+            let sy = CGFloat(min(1, max(-1, prediction[13]))) * 20
             let postedX = Int32(sx.rounded())
             let postedY = Int32(sy.rounded())
             if postedX != 0 || postedY != 0 {
@@ -135,9 +138,10 @@ final class InputInjector: @unchecked Sendable {
         let state = InputState(keys: heldKeys, buttons: heldButtons, modifiers: modifiers, mouseDelta: mouseDelta, scrollDelta: scrollDelta)
         let now = CACurrentMediaTime()
         let controlsChanged = state.keys != lastReportedState.keys || state.buttons != lastReportedState.buttons || state.modifiers != lastReportedState.modifiers
-        if controlsChanged || now - lastStateReportTime >= 1.0 / 30.0 {
-            lastStateReportTime = now; lastReportedState = state; onState?(state)
-        }
+        let shouldReport = controlsChanged || now - lastStateReportTime >= 1.0 / 30.0
+        if shouldReport { lastStateReportTime = now; lastReportedState = state }
+        lock.unlock()
+        if shouldReport { onState?(state) }
     }
 
     func disableAndReleaseAll() {
@@ -240,5 +244,11 @@ final class InputInjector: @unchecked Sendable {
 private extension CGPoint {
     func clamped(to rect: CGRect) -> CGPoint {
         CGPoint(x: min(rect.maxX, max(rect.minX, x)), y: min(rect.maxY, max(rect.minY, y)))
+    }
+}
+
+private extension CGRect {
+    var hasFiniteComponents: Bool {
+        origin.x.isFinite && origin.y.isFinite && width.isFinite && height.isFinite
     }
 }

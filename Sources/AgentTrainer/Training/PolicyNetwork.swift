@@ -1,17 +1,25 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXRandom
 
 final class AgentPolicy: Module, @unchecked Sendable {
     let profile: AIProfile
     let dtype: DType
-    let coordinateGrid: MLXArray
+    // Leading underscore deliberately keeps this deterministic tensor out of
+    // MLX Module reflection. It is an input buffer, not a learned parameter;
+    // putting it in AdamW would waste two Float32 moment arrays and allow
+    // optimization to distort the meaning of X/Y coordinates.
+    private let _coordinateGrid: MLXArray
 
     @ModuleInfo var convolutions: [Conv2d]
+    @ModuleInfo var convolutionNormalizations: [GroupNorm]
     @ModuleInfo var visualProjection: Linear
+    @ModuleInfo var visualNormalization: LayerNorm
     @ModuleInfo var gru: GRU?
     @ModuleInfo var lstm: LSTM?
     @ModuleInfo var fusion: [Linear]
+    @ModuleInfo var fusionNormalizations: [LayerNorm]
     @ModuleInfo var absoluteMouseHead: Linear
     @ModuleInfo var relativeMouseHead: Linear
     @ModuleInfo var buttonHead: Linear
@@ -32,18 +40,25 @@ final class AgentPolicy: Module, @unchecked Sendable {
         let height = max(1, profile.preprocessing.height)
         let x = broadcast(MLXArray.linspace(Float(-1), Float(1), count: width).reshaped([1, 1, width, 1]), to: [1, height, width, 1])
         let y = broadcast(MLXArray.linspace(Float(-1), Float(1), count: height).reshaped([1, height, 1, 1]), to: [1, height, width, 1])
-        coordinateGrid = concatenated([x, y], axis: -1).asType(dtype)
-        var inputChannels = profile.preprocessing.channelCount + 2
+        _coordinateGrid = concatenated([x, y], axis: -1).asType(dtype)
+        // Current planes, signed temporal differences, and explicit X/Y.
+        var inputChannels = profile.preprocessing.channelCount * 2 + 2
         var convs: [Conv2d] = []
+        var convolutionNormalizations: [GroupNorm] = []
         for i in architecture.convolutionChannels.indices {
             let output = architecture.convolutionChannels[i]
             let kernel = architecture.kernelSizes.indices.contains(i) ? max(1, architecture.kernelSizes[i]) : 3
             let stride = architecture.strides.indices.contains(i) ? max(1, architecture.strides[i]) : 2
-            convs.append(Conv2d(inputChannels: inputChannels, outputChannels: output, kernelSize: .init(kernel), stride: .init(stride), padding: .init(kernel / 2)))
+            convs.append(Conv2d(inputChannels: inputChannels, outputChannels: output, kernelSize: .init(kernel), stride: .init(stride), padding: .init(kernel / 2), bias: false))
+            convolutionNormalizations.append(GroupNorm(groupCount: Self.normalizationGroups(for: output), dimensions: output))
             inputChannels = output
         }
         convolutions = convs
-        visualProjection = Linear(max(1, inputChannels), architecture.visualEmbedding)
+        self.convolutionNormalizations = convolutionNormalizations
+        let visualSize = CNNGeometry.outputSize(width: width, height: height, architecture: architecture)
+        let flattenedVisualSize = max(1, visualSize.width * visualSize.height * inputChannels)
+        visualProjection = Linear(flattenedVisualSize, architecture.visualEmbedding)
+        visualNormalization = LayerNorm(dimensions: architecture.visualEmbedding)
         if architecture.recurrentKind == .gru {
             gru = GRU(inputSize: ActionLayout.count, hiddenSize: architecture.recurrentWidth)
             lstm = nil
@@ -52,12 +67,15 @@ final class AgentPolicy: Module, @unchecked Sendable {
             lstm = LSTM(inputSize: ActionLayout.count, hiddenSize: architecture.recurrentWidth)
         }
         var fusionLayers: [Linear] = []
+        var fusionNormalizations: [LayerNorm] = []
         var fusionInput = architecture.visualEmbedding + architecture.recurrentWidth
         for width in architecture.fusionWidths {
             fusionLayers.append(Linear(fusionInput, max(1, width)))
+            fusionNormalizations.append(LayerNorm(dimensions: max(1, width)))
             fusionInput = max(1, width)
         }
         fusion = fusionLayers
+        self.fusionNormalizations = fusionNormalizations
         absoluteMouseHead = Linear(fusionInput, 2)
         relativeMouseHead = Linear(fusionInput, 2)
         buttonHead = Linear(fusionInput, 8)
@@ -69,17 +87,25 @@ final class AgentPolicy: Module, @unchecked Sendable {
         if dtype != .float32 { update(parameters: mapParameters { $0.asType(self.dtype) }) }
     }
 
-    /// Returns every post-ReLU spatial stage without changing the normal policy
+    private static func normalizationGroups(for channels: Int) -> Int {
+        [8, 4, 2].first(where: { channels.isMultiple(of: $0) }) ?? 1
+    }
+
+    /// Returns every normalized post-SiLU spatial stage without changing the normal policy
     /// graph or its saved parameters. Runtime diagnostics consume these tensors
     /// only when explicitly enabled.
     func visualActivations(images: MLXArray) -> [MLXArray] {
         var vision = images.asType(dtype)
-        let coordinates = broadcast(coordinateGrid, to: [images.dim(0), profile.preprocessing.height, profile.preprocessing.width, 2])
+        let coordinates = broadcast(_coordinateGrid, to: [images.dim(0), profile.preprocessing.height, profile.preprocessing.width, 2])
         vision = concatenated([vision, coordinates], axis: -1)
         var activations: [MLXArray] = []
         activations.reserveCapacity(max(1, convolutions.count))
-        for convolution in convolutions {
-            vision = relu(convolution(vision))
+        for (index, convolution) in convolutions.enumerated() {
+            vision = convolution(vision)
+            if convolutionNormalizations.indices.contains(index) {
+                vision = convolutionNormalizations[index](vision)
+            }
+            vision = silu(vision)
             activations.append(vision)
         }
         // A convolution-free custom architecture is still a valid tensor graph.
@@ -89,10 +115,23 @@ final class AgentPolicy: Module, @unchecked Sendable {
     }
 
     func logits(visualFeatures: MLXArray, history: MLXArray) -> MLXArray {
-        var vision = visualFeatures.mean(axes: [1, 2])
-        vision = relu(visualProjection(vision))
+        let batch = visualFeatures.dim(0)
+        var vision = visualFeatures.reshaped([batch, -1])
+        vision = silu(visualNormalization(visualProjection(vision)))
 
-        let history = history.asType(dtype)
+        var history = history.asType(dtype)
+        // Ground-truth action history is an exceptionally tempting shortcut:
+        // a model can copy the previous held key and achieve a tiny loss while
+        // ignoring the screen. Drop the complete history branch for half of
+        // every training batch independently of ordinary feature dropout, so a
+        // user cannot reopen that shortcut by setting Dropout to zero.
+        // Inference still gets normal history, but vision must be independently
+        // predictive.
+        if training, profile.training.historyLength > 0 {
+            let keepProbability: Float = 0.5
+            let mask = MLXRandom.bernoulli(keepProbability, [batch, 1, 1]).asType(dtype)
+            history = history * mask / keepProbability
+        }
         let recurrent: MLXArray
         if let gru {
             recurrent = gru(history)[.ellipsis, -1, 0...]
@@ -102,7 +141,13 @@ final class AgentPolicy: Module, @unchecked Sendable {
             recurrent = MLXArray.zeros([visualFeatures.dim(0), profile.training.architecture.recurrentWidth], dtype: dtype)
         }
         var fused = concatenated([vision, recurrent], axis: -1)
-        for layer in fusion { fused = dropout(relu(layer(fused))) }
+        for (index, layer) in fusion.enumerated() {
+            fused = layer(fused)
+            if fusionNormalizations.indices.contains(index) {
+                fused = fusionNormalizations[index](fused)
+            }
+            fused = dropout(silu(fused))
+        }
         return concatenated([
             absoluteMouseHead(fused), relativeMouseHead(fused), buttonHead(fused),
             scrollHead(fused), keyboardHead(fused), modifierHead(fused)
@@ -149,22 +194,51 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return sampled[.ellipsis, indices]
     }
 
-    func loss(images: MLXArray, history: MLXArray, targets: MLXArray) -> MLXArray {
+    func loss(images: MLXArray, history: MLXArray, targets: MLXArray, positiveWeights: MLXArray? = nil) -> MLXArray {
         let logits = callAsFunction(images: images, history: history)
         let targets = targets.asType(dtype)
+        let previous = history.asType(dtype)[.ellipsis, -1, 0...]
+        let positiveWeights = positiveWeights?.asType(dtype)
         var losses: [MLXArray] = []
         let channels = profile.channels
         if channels.mouseMovement {
-            let absolute = mseLoss(predictions: sigmoid(logits[.ellipsis, ActionLayout.absoluteMouse]), targets: targets[.ellipsis, ActionLayout.absoluteMouse])
-            let relative = mseLoss(predictions: tanh(logits[.ellipsis, ActionLayout.relativeMouse]), targets: targets[.ellipsis, ActionLayout.relativeMouse])
+            let absolute = smoothL1Loss(predictions: sigmoid(logits[.ellipsis, ActionLayout.absoluteMouse]), targets: targets[.ellipsis, ActionLayout.absoluteMouse], beta: 0.05)
+            let relative = activeContinuousLoss(predictions: tanh(logits[.ellipsis, ActionLayout.relativeMouse]), targets: targets[.ellipsis, ActionLayout.relativeMouse])
             losses.append((absolute + relative) / 2)
         }
-        if channels.buttons { losses.append(binaryCrossEntropy(logits: logits[.ellipsis, ActionLayout.buttons], targets: targets[.ellipsis, ActionLayout.buttons])) }
-        if channels.scroll { losses.append(mseLoss(predictions: tanh(logits[.ellipsis, ActionLayout.scroll]), targets: targets[.ellipsis, ActionLayout.scroll])) }
-        if channels.keyboard { losses.append(binaryCrossEntropy(logits: logits[.ellipsis, ActionLayout.keyboard], targets: targets[.ellipsis, ActionLayout.keyboard])) }
-        if channels.modifiers { losses.append(binaryCrossEntropy(logits: logits[.ellipsis, ActionLayout.modifiers], targets: targets[.ellipsis, ActionLayout.modifiers])) }
+        if channels.buttons { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.buttons)) }
+        if channels.scroll { losses.append(activeContinuousLoss(predictions: tanh(logits[.ellipsis, ActionLayout.scroll]), targets: targets[.ellipsis, ActionLayout.scroll])) }
+        if channels.keyboard { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.keyboard)) }
+        if channels.modifiers { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.modifiers)) }
         guard let first = losses.first else { return MLXArray(0, dtype: dtype) }
         return losses.dropFirst().reduce(first, +) / Float(losses.count)
+    }
+
+    private func binaryControlLoss(logits: MLXArray, targets: MLXArray, previous: MLXArray, positiveWeights: MLXArray?, range: Range<Int>) -> MLXArray {
+        let selectedLogits = logits[.ellipsis, range]
+        let selectedTargets = targets[.ellipsis, range]
+        let selectedPrevious = previous[.ellipsis, range]
+        let raw = binaryCrossEntropy(logits: selectedLogits, targets: selectedTargets, reduction: .none)
+        let classWeights: MLXArray
+        if let positiveWeights {
+            let positives = positiveWeights[range]
+            let learnedOutput = (positives .> 0).asType(dtype)
+            classWeights = (1 + selectedTargets * (positives - 1)) * learnedOutput
+        } else {
+            classWeights = MLXArray.ones(like: selectedTargets)
+        }
+        // Press/release boundaries matter far more than another frame in the
+        // middle of a long hold. Upweighting transitions prevents a policy from
+        // learning only action persistence.
+        let transitionWeights = 1 + 3 * abs(selectedTargets - selectedPrevious)
+        let weights = classWeights * transitionWeights
+        return (raw * weights).sum() / (weights.sum() + 1e-6)
+    }
+
+    private func activeContinuousLoss(predictions: MLXArray, targets: MLXArray) -> MLXArray {
+        let raw = smoothL1Loss(predictions: predictions, targets: targets, beta: 0.05, reduction: .none)
+        let weights = which(abs(targets) .> 0.0001, MLXArray(8, dtype: dtype), MLXArray(1, dtype: dtype))
+        return (raw * weights).sum() / (weights.sum() + 1e-6)
     }
 
     func saveWeights(to url: URL) throws {
@@ -210,6 +284,14 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     func update(model: Module, gradients: ModuleParameters, targetType: DType) {
         initialize(model: model)
         stepArray = stepArray + 1
+        // Linear warmup prevents unstable first updates; inverse-square-root
+        // decay lets very long runs refine instead of oscillating forever at a
+        // constant learning rate. The schedule depends only on the persisted
+        // optimizer step, so exact resume remains exact.
+        let warmupSteps: Float = 500
+        let warmupScale = minimum(stepArray / warmupSteps, MLXArray(1, dtype: .float32))
+        let decayScale = sqrt(warmupSteps / stepArray)
+        let scheduledLearningRate = learningRate * minimum(warmupScale, decayScale)
         let gradientMap = Dictionary(uniqueKeysWithValues: gradients.flattened())
         var updated: [(String, MLXArray)] = []
         for (name, parameter) in model.parameters().flattened() {
@@ -223,7 +305,7 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
             let correction1 = 1 - pow(beta1, stepArray)
             let correction2 = 1 - pow(beta2, stepArray)
             let update = (m / correction1) / (sqrt(v / correction2) + epsilon)
-            updated.append((name, (p * (1 - learningRate * weightDecay) - learningRate * update).asType(targetType)))
+            updated.append((name, (p * (1 - scheduledLearningRate * weightDecay) - scheduledLearningRate * update).asType(targetType)))
         }
         model.update(parameters: ModuleParameters.unflattened(updated))
     }

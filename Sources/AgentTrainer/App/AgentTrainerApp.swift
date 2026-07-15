@@ -17,7 +17,7 @@ struct AgentTrainerApp: App {
             CommandMenu("AgentTrainer") {
                 Button("Panic Stop") { model.panic() }
                 Divider()
-                Button(model.isRecording ? "Stop Recording" : "Start Recording") { Task { model.isRecording ? await model.stopRecording() : await model.startRecording() } }
+                Button(model.recordingIsActiveOrStarting ? "Stop Recording" : "Start Recording") { Task { model.recordingIsActiveOrStarting ? await model.stopRecording() : await model.startRecording() } }
                 Button(model.isRunning ? "Stop Agent" : "Run Agent") { Task { model.isRunning ? await model.stopAgent() : await model.startAgent() } }
             }
         }
@@ -51,7 +51,7 @@ private struct AgentTrainerMenuBarView: View {
             status("Training", model.isTraining ? model.profiles.first(where: { $0.id == model.trainingProfileID })?.name ?? "Active" : "Idle", model.isTraining ? ATColor.cyan : .secondary)
             status("Agent", model.isRunning ? model.profiles.first(where: { $0.id == model.runningProfileID })?.name ?? "Running" : "Idle", model.isRunning ? ATColor.violet : .secondary)
             Divider()
-            Button(model.isRecording ? "Stop & Save Recording" : "Start Recording") { Task { model.isRecording ? await model.stopRecording() : await model.startRecording() } }
+            Button(model.recordingIsActiveOrStarting ? (model.isRecording ? "Stop & Save Recording" : "Cancel Recording Start") : "Start Recording") { Task { model.recordingIsActiveOrStarting ? await model.stopRecording() : await model.startRecording() } }
                 .disabled(model.isRunning)
             Button(model.isRunning ? "Stop Agent & Release Inputs" : "Start Selected Agent") { Task { model.isRunning ? await model.stopAgent() : await model.startAgent() } }
                 .disabled(!model.isRunning && model.selectedProfile?.activeVersionID == nil)
@@ -72,12 +72,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model, model.isTraining || model.isRecording || model.isRunning || model.isReplaying else { return .terminateNow }
+        guard let model, model.isTraining || model.recordingIsActiveOrStarting || model.isRunning || model.isReplaying else { return .terminateNow }
         if model.isTraining { model.pauseTraining() }
         Task { @MainActor in
             if model.isRunning { await model.stopAgent() }
             if model.isReplaying { model.stopReenactment() }
-            if model.isRecording { await model.stopRecording() }
+            if model.recordingIsActiveOrStarting { await model.stopRecording() }
+            while model.recordingIsActiveOrStarting { try? await Task.sleep(for: .milliseconds(50)) }
             while model.isTraining { try? await Task.sleep(for: .milliseconds(100)) }
             sender.reply(toApplicationShouldTerminate: true)
         }

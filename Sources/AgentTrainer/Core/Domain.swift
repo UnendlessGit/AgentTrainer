@@ -101,6 +101,10 @@ struct PreprocessingSpec: Codable, Hashable, Sendable {
 
     func validated() throws -> Self {
         guard width > 0, height > 0 else { throw AgentTrainerError.invalidConfiguration("Vision dimensions must be positive.") }
+        let pixels = width.multipliedReportingOverflow(by: height)
+        guard width <= 8_192, height <= 8_192, !pixels.overflow, pixels.partialValue <= 33_554_432 else {
+            throw AgentTrainerError.invalidConfiguration("Model vision may be at most 8,192 pixels per side and 33.5 million pixels total.")
+        }
         guard (1...8).contains(bitDepth) else { throw AgentTrainerError.invalidConfiguration("Color detail must be 1 through 8 bits.") }
         guard sampleByteCount < Int.max else { throw AgentTrainerError.invalidConfiguration("The selected vision dimensions exceed this Mac's addressable memory.") }
         return self
@@ -137,18 +141,22 @@ enum MouseControlMode: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 enum ModelContract {
-    /// Version 2 corrected game-camera delta scaling; version 3 adds explicit
-    /// X/Y coordinates to the visual encoder before global spatial pooling.
-    static let schemaVersion = 3
-    static let weightFormat = "AgentTrainer.Policy.v3"
+    /// Version 4 replaces the shallow globally-pooled encoder with a temporal,
+    /// coordinate-aware spatial encoder. The new weights intentionally cannot
+    /// be attached to older profiles because their tensor shapes and meaning
+    /// are different.
+    static let schemaVersion = 4
+    static let weightFormat = "AgentTrainer.Policy.v4"
 }
 
 /// Version of the causal pairing between a captured frame and the controls the
-/// model should perform next. This is deliberately separate from the weight
-/// format: old runnable brains remain usable, while exact-resume checkpoints
-/// built from an older target alignment are not mixed with newly built data.
+/// model should perform next. This remains separate from the weight format so
+/// a data-only correction can invalidate caches/checkpoints without needlessly
+/// changing tensor shapes. Policy v4 itself is an intentional weight break.
 enum TrainingDataContract {
-    static let schemaVersion = 5
+    /// Version 6 preserves sub-tick key/button taps and supplies the preceding
+    /// perception frame used to construct the model's motion channels.
+    static let schemaVersion = 6
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -164,7 +172,9 @@ enum GameCameraContract {
     }
 
     static func runtimeDelta(forPrediction prediction: Float, sensitivity: Double) -> CGFloat {
-        let value = CGFloat(prediction) * CGFloat(deltaScale) * max(0.01, sensitivity)
+        guard prediction.isFinite else { return 0 }
+        let safeSensitivity = sensitivity.isFinite ? min(100, max(0.01, sensitivity)) : 1
+        let value = CGFloat(prediction) * CGFloat(deltaScale) * safeSensitivity
         return min(maximumPostedDelta, max(-maximumPostedDelta, value))
     }
 }
@@ -192,18 +202,22 @@ enum RecurrentKind: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 struct ArchitectureSpec: Codable, Hashable, Sendable {
-    var convolutionChannels: [Int] = [32, 64, 96]
-    var kernelSizes: [Int] = [5, 3, 3]
-    var strides: [Int] = [2, 2, 2]
+    /// The stride-four stem cuts the dominant high-resolution convolution cost,
+    /// while the extra stage expands the receptive field before spatial
+    /// features are flattened. This is both faster and substantially more
+    /// expressive than three stride-two layers followed by a global mean.
+    var convolutionChannels: [Int] = [32, 64, 96, 128]
+    var kernelSizes: [Int] = [7, 3, 3, 3]
+    var strides: [Int] = [4, 2, 2, 2]
     var visualEmbedding = 256
     var recurrentKind: RecurrentKind = .gru
     var recurrentWidth = 192
     var fusionWidths: [Int] = [384, 256]
     var dropout: Double = 0.1
 
-    static let small = ArchitectureSpec(convolutionChannels: [16, 32, 48], visualEmbedding: 128, recurrentWidth: 96, fusionWidths: [192, 128])
+    static let small = ArchitectureSpec(convolutionChannels: [24, 48, 72, 96], visualEmbedding: 192, recurrentWidth: 128, fusionWidths: [256, 192])
     static let balanced = ArchitectureSpec()
-    static let large = ArchitectureSpec(convolutionChannels: [64, 128, 192], visualEmbedding: 512, recurrentWidth: 384, fusionWidths: [768, 512], dropout: 0.15)
+    static let large = ArchitectureSpec(convolutionChannels: [48, 96, 160, 224], visualEmbedding: 384, recurrentWidth: 256, fusionWidths: [512, 384], dropout: 0.12)
 }
 
 struct CNNLayerGeometry: Hashable, Sendable {
@@ -231,6 +245,26 @@ enum CNNGeometry {
             effectiveStride *= stride
         }
         return CNNLayerGeometry(kernelSize: currentKernel, effectiveStride: effectiveStride, receptiveField: receptiveField)
+    }
+
+    /// Exact NHWC spatial geometry produced by the configured same-ish padded
+    /// convolutions. Keeping this in the domain layer ensures model sizing and
+    /// the actual projection layer can never silently disagree.
+    static func outputSize(width: Int, height: Int, architecture: ArchitectureSpec) -> (width: Int, height: Int) {
+        var width = max(1, width)
+        var height = max(1, height)
+        for index in architecture.convolutionChannels.indices {
+            let kernel = architecture.kernelSizes.indices.contains(index) ? max(1, architecture.kernelSizes[index]) : 3
+            let stride = architecture.strides.indices.contains(index) ? max(1, architecture.strides[index]) : 2
+            let padding = kernel / 2
+            width = convolutionOutput(width, kernel: kernel, stride: stride, padding: padding)
+            height = convolutionOutput(height, kernel: kernel, stride: stride, padding: padding)
+        }
+        return (width, height)
+    }
+
+    private static func convolutionOutput(_ input: Int, kernel: Int, stride: Int, padding: Int) -> Int {
+        max(1, (max(0, input + 2 * padding - kernel) / max(1, stride)) + 1)
     }
 }
 
@@ -389,6 +423,23 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
     var folderID: UUID?
     var thumbnailFile: String?
     var excludedKeyCodes: Set<UInt16>?
+
+    var isStructurallyValid: Bool {
+        let rect = globalRect.cgRect
+        let end = trimEnd ?? duration
+        let safeFileNames = [videoFile, eventFile] + (thumbnailFile.map { [$0] } ?? [])
+        return (1...2).contains(schemaVersion)
+            && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && duration.isFinite && duration >= 0
+            && capture.requestedFPS.isFinite && capture.requestedFPS > 0 && capture.requestedFPS <= 1_000
+            && rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite
+            && pixelWidth > 0 && pixelHeight > 0 && pixelWidth <= 32_768 && pixelHeight <= 32_768
+            && deliveredFPS.isFinite && deliveredFPS >= 0 && deliveredFPS <= 1_000
+            && eventCount >= 0
+            && trimStart.isFinite && trimStart >= 0 && trimStart <= duration
+            && end.isFinite && end >= trimStart && end <= duration
+            && safeFileNames.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0") }
+    }
 }
 
 struct RecordingItem: Identifiable, Hashable, Sendable {
@@ -449,6 +500,15 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Demonstration-time consumed by optimizer batches. A model can process
     /// many hours of examples in a much shorter amount of wall time.
     var experienceDurationSeconds: Double? = nil
+    /// Cursor visibility is part of the visual distribution even though it
+    /// does not change tensor shape. Runtime reproduces the majority setting
+    /// from the immutable training dataset instead of inheriting a Record-tab
+    /// toggle that may have changed later.
+    var trainingShowsCursor: Bool? = nil
+    /// Auto mouse mode is derived from the exact recordings used to train this
+    /// immutable brain. Editing a profile's recording selection later cannot
+    /// silently switch a game-camera policy into absolute cursor control.
+    var recommendedMouseMode: MouseControlMode? = nil
 }
 
 struct TrainingProgressSummary: Codable, Hashable, Sendable {
@@ -657,20 +717,45 @@ enum ModelSizing {
     static func parameterCount(_ profile: AIProfile) -> Int64 {
         let architecture = profile.training.architecture
         var total: Int64 = 0
-        var input = profile.preprocessing.channelCount + 2
+        // Current color planes + temporal differences + explicit X/Y.
+        var input = profile.preprocessing.channelCount * 2 + 2
         for i in architecture.convolutionChannels.indices {
             let output = max(1, architecture.convolutionChannels[i])
             let kernel = architecture.kernelSizes.indices.contains(i) ? max(1, architecture.kernelSizes[i]) : 3
-            total = add(total, multiply(Int64(output), add(multiply(multiply(Int64(input), Int64(kernel)), Int64(kernel)), 1))); input = output
+            total = add(total, multiply(Int64(output), multiply(multiply(Int64(input), Int64(kernel)), Int64(kernel))))
+            // Affine GroupNorm scale and bias.
+            total = add(total, multiply(2, Int64(output)))
+            input = output
         }
-        total = add(total, multiply(add(Int64(input), 1), Int64(max(1, architecture.visualEmbedding))))
+        let output = CNNGeometry.outputSize(width: profile.preprocessing.width, height: profile.preprocessing.height, architecture: architecture)
+        let spatialFeatures = multiply(multiply(Int64(output.width), Int64(output.height)), Int64(max(1, input)))
+        total = add(total, multiply(add(spatialFeatures, 1), Int64(max(1, architecture.visualEmbedding))))
+        total = add(total, multiply(2, Int64(max(1, architecture.visualEmbedding))))
         let recurrent = max(1, architecture.recurrentWidth)
         let gates = architecture.recurrentKind == .gru ? 3 : 4
         total = add(total, multiply(multiply(Int64(gates), Int64(recurrent)), add(add(Int64(ActionLayout.count), Int64(recurrent)), 1)))
+        // MLX's GRU has the usual three-gate bias plus a separate hidden-state
+        // candidate bias (`bhn`) of one value per hidden unit. LSTM uses only
+        // its four-gate bias, which is already included above.
+        if architecture.recurrentKind == .gru { total = add(total, Int64(recurrent)) }
         var fusionInput = max(1, architecture.visualEmbedding) + recurrent
-        for width in architecture.fusionWidths { total = add(total, multiply(add(Int64(fusionInput), 1), Int64(max(1, width)))); fusionInput = max(1, width) }
+        for width in architecture.fusionWidths {
+            total = add(total, multiply(add(Int64(fusionInput), 1), Int64(max(1, width))))
+            total = add(total, multiply(2, Int64(max(1, width))))
+            fusionInput = max(1, width)
+        }
         total = add(total, multiply(add(Int64(fusionInput), 1), Int64(ActionLayout.count)))
         return total
+    }
+
+    /// Conservative peak budget for compiled forward/backward training. AdamW
+    /// keeps two Float32 moments in addition to parameters and gradients, while
+    /// activations and compiler temporaries multiply the nominal batch input.
+    /// This is a safety bound, not a reported MLX memory measurement.
+    static func estimatedTrainingWorkingSet(_ profile: AIProfile) -> Int64 {
+        let parameters = multiply(parameterCount(profile), 24)
+        let batch = multiply(NeuralInputSizing.summary(for: profile).nominalBytesPerTrainingBatch, 8)
+        return add(512 * 1_024 * 1_024, add(parameters, batch))
     }
 
     private static func multiply(_ lhs: Int64, _ rhs: Int64) -> Int64 { let result = lhs.multipliedReportingOverflow(by: rhs); return result.overflow ? Int64.max : result.partialValue }
@@ -686,6 +771,7 @@ struct NeuralInputSummary: Hashable, Sendable {
     var chromaValuesPerPlane: Int64
     var packedVisionValues: Int64
     var expandedVisionValues: Int64
+    var temporalDifferenceValues: Int64
     var coordinateValues: Int64
     var firstConvolutionValues: Int64
     var historySteps: Int64
@@ -760,7 +846,8 @@ enum NeuralInputSizing {
         let denseChannels: Int64 = spec.colorMode == .grayscale ? 1 : 3
         let expandedVision = multiply(pixels, denseChannels)
         let coordinates = multiply(pixels, 2)
-        let firstConvolution = add(expandedVision, coordinates)
+        let temporalDifference = expandedVision
+        let firstConvolution = add(add(expandedVision, temporalDifference), coordinates)
 
         // Dataset and runtime tensors deliberately retain one zero row when
         // history is disabled so recurrent input always has a valid shape.
@@ -787,6 +874,7 @@ enum NeuralInputSizing {
             chromaValuesPerPlane: chromaPerPlane,
             packedVisionValues: packedVision,
             expandedVisionValues: expandedVision,
+            temporalDifferenceValues: temporalDifference,
             coordinateValues: coordinates,
             firstConvolutionValues: firstConvolution,
             historySteps: historySteps,

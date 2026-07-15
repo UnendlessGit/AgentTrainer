@@ -32,7 +32,6 @@ let package = Package(
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("Accelerate"),
-                .linkedFramework("Carbon"),
                 .linkedFramework("IOKit")
             ]
         ),

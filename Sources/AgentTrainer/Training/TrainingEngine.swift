@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import MLX
 import MLXNN
+import MLXOptimizers
 import QuartzCore
 
 struct TrainingCompletion: Sendable {
@@ -77,9 +78,11 @@ final class TrainingEngine: @unchecked Sendable {
 
     private func train(profile: AIProfile, recordings: [RecordingItem], runSettings: TrainingRunSettings, randomState: MLXRandom.RandomState, metrics: @escaping MetricsHandler) async throws -> TrainingCompletion {
         let physical = Int(ProcessInfo.processInfo.physicalMemory)
-        // Leave a small OS reserve while allowing MLX to use nearly all unified
-        // memory available to the Apple GPU. Batch size remains user-controlled.
-        Memory.memoryLimit = max(1 << 30, Int(Double(physical) * 0.94))
+        // Unified memory is also needed by macOS, ScreenCaptureKit, video decode,
+        // and the UI. Keeping at least 15% (and normally 2 GiB) outside MLX
+        // avoids swap-driven slowdowns during long unattended runs.
+        let reserved = max(2 << 30, Int(Double(physical) * 0.15))
+        Memory.memoryLimit = max(1 << 30, physical - reserved)
         // Fixed-shape compiled batches reuse a small set of buffers. A bounded
         // cache prevents allocator growth during multi-hour sessions without
         // changing model math or precision.
@@ -95,27 +98,59 @@ final class TrainingEngine: @unchecked Sendable {
         guard dataset.count > 0 else { throw AgentTrainerError.noData }
         let split = splitIndices(dataset: dataset, fraction: profile.training.validationSplit, seed: profile.training.seed)
         guard !split.train.isEmpty else { throw AgentTrainerError.noData }
+        let positiveClassWeightValues = dataset.positiveClassWeights(
+            at: split.train,
+            restrictions: profile.effectiveRestrictions
+        )
+        let positiveClassWeights = MLXArray(positiveClassWeightValues, [ActionLayout.count])
+        let validationEvaluationIndices = dataset.representativeValidationIndices(
+            from: split.validation,
+            limit: max(1, profile.training.batchSize * 16)
+        )
 
         let model = AgentPolicy(profile: profile)
         model.train(true)
         let optimizer = ResumableAdamW(learningRate: Float(profile.training.learningRate), weightDecay: Float(profile.training.weightDecay))
         optimizer.initialize(model: model)
         let signature = try profileSignature(profile, recordings: recordings)
-        let demonstratedKeys = try recordings.reduce(into: Set<UInt16>()) { result, recording in
+        let inputSummaries = try recordings.map { recording in
             let url = recording.directory.appendingPathComponent(recording.manifest.eventFile)
-            result.formUnion(try InputEventReader.demonstratedKeyCodes(url: url))
+            return (recording, try InputEventReader.summarize(url: url, previewLimit: 0, globalRect: recording.manifest.globalRect.cgRect))
         }
+        let demonstratedKeys = dataset.demonstratedKeyCodes(at: split.train)
+        let mouseDurations = inputSummaries.reduce(into: (camera: 0.0, cursor: 0.0)) { result, value in
+            guard value.1.mouse.moveEventCount > 0 else { return }
+            let recording = value.0.manifest
+            let duration = max(0, min(recording.duration, recording.trimEnd ?? recording.duration) - max(0, recording.trimStart))
+            if value.1.mouse.isGameCamera { result.camera += duration } else { result.cursor += duration }
+        }
+        let recommendedMouseMode: MouseControlMode = mouseDurations.camera > mouseDurations.cursor ? .relative : .absolute
         var state = CheckpointState(profileSignature: signature, epoch: 0, batchOffset: 0, globalStep: 0, elapsed: 0, lossHistory: [], validationHistory: [], demonstratedKeyCodes: demonstratedKeys, experienceSeconds: 0)
-        let restoreStatus = try await restoreCheckpointIfPresent(profile: profile, expectedSignature: signature, model: model, optimizer: optimizer, randomState: randomState, state: &state)
+        let restore = try await restoreCheckpointIfPresent(profile: profile, expectedSignature: signature, model: model, optimizer: optimizer, randomState: randomState, state: &state)
         // The raw event stream is authoritative, including taps shorter than one
         // action interval. Refresh after restoring an older checkpoint.
         state.demonstratedKeyCodes = demonstratedKeys
+        state.recommendedMouseMode = recommendedMouseMode
+        let cursorDurations = recordings.reduce(into: (shown: 0.0, total: 0.0)) { result, recording in
+            let start = max(0, min(recording.manifest.duration, recording.manifest.trimStart))
+            let end = max(start, min(recording.manifest.duration, recording.manifest.trimEnd ?? recording.manifest.duration))
+            let duration = end - start
+            result.total += duration
+            if recording.manifest.capture.showsCursor { result.shown += duration }
+        }
+        state.trainingShowsCursor = cursorDurations.total > 0
+            ? cursorDurations.shown >= cursorDurations.total / 2
+            : recordings.filter { $0.manifest.capture.showsCursor }.count * 2 >= recordings.count
 
         let trainingStep = compile(inputs: [model, optimizer, randomState], outputs: [model, optimizer, randomState]) { images, history, targets in
+            // Capture the Sendable Swift values and materialize the constant while
+            // MLX traces the graph. MLXArray itself is intentionally non-Sendable.
+            let classWeights = MLXArray(positiveClassWeightValues, [ActionLayout.count])
             let result = valueAndGrad(model: model) { model, arrays in
-                [model.loss(images: arrays[0], history: arrays[1], targets: arrays[2])]
+                [model.loss(images: arrays[0], history: arrays[1], targets: arrays[2], positiveWeights: classWeights)]
             }(model, [images, history, targets])
-            optimizer.update(model: model, gradients: result.1, targetType: model.dtype)
+            let clipped = clipGradNorm(gradients: result.1, maxNorm: 1).0
+            optimizer.update(model: model, gradients: clipped, targetType: model.dtype)
             return result.0[0]
         }
         let started = ContinuousClock.now
@@ -155,11 +190,20 @@ final class TrainingEngine: @unchecked Sendable {
         let totalSteps = min(epochStepTarget, runStepTarget)
         var latestSnapshot: TrainingCompletion?
         let autosaveInterval = max(1, runSettings.autosaveSteps)
-        var nextAutosaveStep = state.globalStep + autosaveInterval
+        var nextAutosaveStep = saturatingAdd(state.globalStep, autosaveInterval)
         var autosavesPublished = 0
 
+        // Activating a weights-only best brain intentionally discards an
+        // unrelated newer optimizer checkpoint. Preserve that selected brain
+        // as the validation baseline before fine-tuning, while initializing a
+        // fresh exact-resume checkpoint from it. A first worse epoch can no
+        // longer replace the brain the user explicitly chose.
+        if restore.captureValidationBaseline {
+            try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer, randomState: randomState, state: state, captureBest: true)
+        }
+
         let initialMemory = Memory.snapshot()
-        metrics(TrainingMetrics(epoch: min(targetEpoch, state.epoch + (state.batchOffset > 0 ? 1 : 0)), totalEpochs: targetEpoch, batch: state.batchOffset / batchSize, totalBatches: stepsPerEpoch, globalStep: state.globalStep, totalSteps: totalSteps, nextAutosaveStep: nextAutosaveStep, autosavesPublished: autosavesPublished, trainingLoss: state.lossHistory.last ?? 0, validationLoss: state.validationHistory.last, samplesPerSecond: 0, elapsed: state.elapsed, experienceElapsed: state.experienceSeconds ?? 0, lossHistory: Array(state.lossHistory.suffix(4_096)), validationHistory: Array(state.validationHistory.suffix(1_024)), mlxActiveMemory: initialMemory.activeMemory, mlxCacheMemory: initialMemory.cacheMemory, mlxPeakMemory: initialMemory.peakMemory), "\(restoreStatus) • continuing to epoch \(targetEpoch)")
+        metrics(TrainingMetrics(epoch: min(targetEpoch, state.epoch + (state.batchOffset > 0 ? 1 : 0)), totalEpochs: targetEpoch, batch: state.batchOffset / batchSize, totalBatches: stepsPerEpoch, globalStep: state.globalStep, totalSteps: totalSteps, nextAutosaveStep: nextAutosaveStep, autosavesPublished: autosavesPublished, trainingLoss: state.lossHistory.last ?? 0, validationLoss: state.validationHistory.last, samplesPerSecond: 0, elapsed: state.elapsed, experienceElapsed: state.experienceSeconds ?? 0, lossHistory: Array(state.lossHistory.suffix(4_096)), validationHistory: Array(state.validationHistory.suffix(1_024)), mlxActiveMemory: initialMemory.activeMemory, mlxCacheMemory: initialMemory.cacheMemory, mlxPeakMemory: initialMemory.peakMemory), "\(restore.status) • continuing to epoch \(targetEpoch)")
 
         var lastMetricsPublish = CACurrentMediaTime() - 1
         var lastRateTime = CACurrentMediaTime()
@@ -195,7 +239,13 @@ final class TrainingEngine: @unchecked Sendable {
                     return (Double(lossArray.item(Float.self)), next)
                 }
                 let loss = result.loss
+                guard loss.isFinite else {
+                    throw AgentTrainerError.model("Training became numerically unstable before this step could be saved. Lower the learning rate or reset this brain's learning state.")
+                }
                 prefetchedBatch = result.next
+                guard state.globalStep < Int.max else {
+                    throw AgentTrainerError.model("The restored optimizer step counter is invalid and cannot be advanced safely.")
+                }
                 state.globalStep += 1
                 samplesSinceRate += batch.count
                 state.experienceSeconds = (state.experienceSeconds ?? 0) + Double(batch.count) / max(0.0001, dataset.manifest.actionFPS)
@@ -228,7 +278,7 @@ final class TrainingEngine: @unchecked Sendable {
                     latestSnapshot = try await publishRunnableSnapshot(profile: profile, state: state, completed: false)
                     autosavesPublished += 1
                     if shouldCheckpoint {
-                        repeat { nextAutosaveStep += autosaveInterval } while nextAutosaveStep <= state.globalStep
+                        nextAutosaveStep = saturatingAdd(state.globalStep, autosaveInterval)
                     }
                     if shouldPause {
                         lock.withLock { pauseRequested = false }
@@ -240,21 +290,33 @@ final class TrainingEngine: @unchecked Sendable {
             }
             state.batchOffset = 0
             state.epoch = epoch + 1
+            var capturedBest = false
             if !split.validation.isEmpty {
-                let validationLoss = evaluate(model: model, dataset: dataset, indices: split.validation, profile: profile)
+                let validationLoss = evaluate(model: model, dataset: dataset, indices: validationEvaluationIndices, profile: profile, positiveClassWeights: positiveClassWeights)
+                guard validationLoss.isFinite else {
+                    throw AgentTrainerError.model("Validation became numerically unstable, so the current epoch was not published. Lower the learning rate or reset this brain's learning state.")
+                }
                 state.validationHistory.append(validationLoss)
                 if state.validationHistory.count > 2_048 { state.validationHistory.removeFirst(1_024) }
+                if validationLoss < (state.bestValidationLoss ?? .infinity) {
+                    state.bestValidationLoss = validationLoss
+                    state.bestGlobalStep = state.globalStep
+                    state.bestEpoch = state.epoch
+                    state.bestTrainingLoss = state.lossHistory.last
+                    state.bestElapsed = baseElapsed + started.duration(to: .now).seconds
+                    state.bestExperienceSeconds = state.experienceSeconds
+                    capturedBest = true
+                }
             }
             state.elapsed = baseElapsed + started.duration(to: .now).seconds
-            try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer, randomState: randomState, state: state)
+            try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer, randomState: randomState, state: state, captureBest: capturedBest)
         }
 
         state.elapsed = baseElapsed + started.duration(to: .now).seconds
-        let finalLoss = state.lossHistory.last ?? 0
         if latestSnapshot?.version.globalStep != state.globalStep {
             try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer, randomState: randomState, state: state)
         }
-        let final = try await publishRunnableSnapshot(profile: profile, state: state, completed: true, lossOverride: finalLoss)
+        let final = try await publishRunnableSnapshot(profile: profile, state: state, completed: true, preferBest: !split.validation.isEmpty)
         return final
     }
 
@@ -277,6 +339,7 @@ final class TrainingEngine: @unchecked Sendable {
         return PreparedBatch(
             count: b,
             packedObservations: dataset.packedObservations(at: indices),
+            precedingPackedObservations: dataset.precedingPackedObservations(at: indices),
             history: historyData,
             targets: targetData
         )
@@ -284,7 +347,7 @@ final class TrainingEngine: @unchecked Sendable {
 
     private func materializeBatch(_ batch: PreparedBatch, profile: AIProfile) -> [MLXArray] {
         return [
-            VisionPreprocessor.mlxTensor(batch.packedObservations, batch: batch.count, spec: profile.preprocessing),
+            VisionPreprocessor.mlxTemporalTensor(current: batch.packedObservations, previous: batch.precedingPackedObservations, batch: batch.count, spec: profile.preprocessing),
             MLXArray(batch.history, [batch.count, max(1, profile.training.historyLength), ActionLayout.count], type: Float.self),
             MLXArray(batch.targets, [batch.count, ActionLayout.count], type: Float.self)
         ]
@@ -294,31 +357,81 @@ final class TrainingEngine: @unchecked Sendable {
         materializeBatch(prepareBatch(dataset: dataset, indices: indices, profile: profile), profile: profile)
     }
 
-    private func evaluate(model: AgentPolicy, dataset: CachedDataset, indices: [Int], profile: AIProfile) -> Double {
-        let limited = Array(indices.prefix(max(1, min(indices.count, profile.training.batchSize * 4))))
-        let arrays = makeBatch(dataset: dataset, indices: limited, profile: profile)
+    private func evaluate(model: AgentPolicy, dataset: CachedDataset, indices: [Int], profile: AIProfile, positiveClassWeights: MLXArray) -> Double {
         model.train(false)
         defer { model.train(true) }
-        let loss = model.loss(images: arrays[0], history: arrays[1], targets: arrays[2])
-        MLX.eval(loss)
-        return Double(loss.item(Float.self))
+        var weightedLoss = 0.0
+        var evaluated = 0
+        let batchSize = max(1, profile.training.batchSize)
+        for start in Swift.stride(from: 0, to: indices.count, by: batchSize) {
+            let end = min(indices.count, start + batchSize)
+            let batch = Array(indices[start..<end])
+            let arrays = makeBatch(dataset: dataset, indices: batch, profile: profile)
+            let loss = model.loss(images: arrays[0], history: arrays[1], targets: arrays[2], positiveWeights: positiveClassWeights)
+            MLX.eval(loss)
+            weightedLoss += Double(loss.item(Float.self)) * Double(batch.count)
+            evaluated += batch.count
+        }
+        return weightedLoss / Double(max(1, evaluated))
     }
 
-    private func splitIndices(dataset: CachedDataset, fraction: Double, seed: UInt64) -> (train: [Int], validation: [Int]) {
+    func splitIndices(dataset: CachedDataset, fraction: Double, seed: UInt64) -> (train: [Int], validation: [Int]) {
         let fraction = min(0.9, max(0, fraction))
         if dataset.manifest.segments.count > 1 {
-            let shuffledSegments = shuffled(Array(dataset.manifest.segments.indices), seed: seed)
-            let validationCount = max(fraction > 0 ? 1 : 0, Int(Double(shuffledSegments.count) * fraction))
-            let validationSegments = Set(shuffledSegments.suffix(validationCount))
+            let segments = dataset.manifest.segments
+            let shuffledSegments = shuffled(Array(segments.indices), seed: seed)
+            let validationCount = min(
+                max(0, segments.count - 1),
+                max(fraction > 0 ? 1 : 0, Int(Double(segments.count) * fraction))
+            )
+            let segmentCounts = segments.map { segment in
+                dataset.binaryPositiveCounts(in: segment.start..<(segment.start + segment.count))
+            }
+            var remainingCounts = segmentCounts.reduce([Int](repeating: 0, count: ActionLayout.count)) { partial, counts in
+                zip(partial, counts).map(+)
+            }
+            var validationSegments: Set<Int> = []
+            for segmentIndex in shuffledSegments.reversed() where validationSegments.count < validationCount {
+                let counts = segmentCounts[segmentIndex]
+                let wouldRemoveOnlyExample = ActionLayout.binary.contains { output in
+                    counts[output] > 0 && remainingCounts[output] - counts[output] <= 0
+                }
+                guard !wouldRemoveOnlyExample else { continue }
+                validationSegments.insert(segmentIndex)
+                for output in ActionLayout.binary { remainingCounts[output] -= counts[output] }
+            }
             var train: [Int] = [], validation: [Int] = []
-            for (i, segment) in dataset.manifest.segments.enumerated() {
+            for (i, segment) in segments.enumerated() {
                 let values = Array(segment.start..<(segment.start + segment.count))
                 if validationSegments.contains(i) { validation += values } else { train += values }
             }
             return (train, validation)
         }
         let validationCount = Int(Double(dataset.count) * fraction)
-        return (Array(0..<max(0, dataset.count - validationCount)), Array(max(0, dataset.count - validationCount)..<dataset.count))
+        let splitPoint = max(0, dataset.count - validationCount)
+        var train = Array(0..<splitPoint)
+        var validation = Array(splitPoint..<dataset.count)
+        guard !train.isEmpty, !validation.isEmpty else { return (train, validation) }
+        let totalCounts = dataset.binaryPositiveCounts(in: 0..<dataset.count)
+        let trainCounts = dataset.binaryPositiveCounts(at: train)
+        var missing = Set(ActionLayout.binary.filter { totalCounts[$0] > 0 && trainCounts[$0] == 0 })
+        if !missing.isEmpty {
+            var moved: Set<Int> = []
+            for index in validation where !missing.isEmpty {
+                let action = dataset.action(at: index)
+                let covered = missing.filter { action[$0] >= 0.5 }
+                if !covered.isEmpty {
+                    moved.insert(index)
+                    missing.subtract(covered)
+                }
+            }
+            if !moved.isEmpty {
+                train.append(contentsOf: moved)
+                train.sort()
+                validation.removeAll(where: moved.contains)
+            }
+        }
+        return (train, validation)
     }
 
     private func shuffled(_ input: [Int], seed: UInt64) -> [Int] {
@@ -329,6 +442,11 @@ final class TrainingEngine: @unchecked Sendable {
             result.swapAt(i, Int(rng.next() % UInt64(i + 1)))
         }
         return result
+    }
+
+    private func saturatingAdd(_ value: Int, _ increment: Int) -> Int {
+        let result = value.addingReportingOverflow(max(0, increment))
+        return result.overflow ? Int.max : result.partialValue
     }
 
     private func profileSignature(_ profile: AIProfile, recordings: [RecordingItem]) throws -> String {
@@ -356,50 +474,82 @@ final class TrainingEngine: @unchecked Sendable {
         return SHA256.hash(data: try encoder.encode(identity)).map { String(format: "%02x", $0) }.joined()
     }
 
-    private func saveCheckpoint(profile: AIProfile, model: AgentPolicy, optimizer: ResumableAdamW, randomState: MLXRandom.RandomState, state: CheckpointState) async throws {
+    private func saveCheckpoint(profile: AIProfile, model: AgentPolicy, optimizer: ResumableAdamW, randomState: MLXRandom.RandomState, state: CheckpointState, captureBest: Bool = false) async throws {
         let destination = await WorkspaceStore.shared.checkpointDirectory(profileID: profile.id)
         let temporary = destination.deletingLastPathComponent().appendingPathComponent(".Checkpoint.\(UUID().uuidString).tmp")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
-        try model.saveWeights(to: temporary.appendingPathComponent("weights.safetensors"))
-        try optimizer.save(to: temporary.appendingPathComponent("optimizer.safetensors"))
-        try TrainingRandomState.save(randomState, to: temporary.appendingPathComponent("random.safetensors"))
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(state).write(to: temporary.appendingPathComponent("state.json"), options: .atomic)
-        if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-        try FileManager.default.moveItem(at: temporary, to: destination)
+        do {
+            let currentWeights = temporary.appendingPathComponent("weights.safetensors")
+            try model.saveWeights(to: currentWeights)
+            try optimizer.save(to: temporary.appendingPathComponent("optimizer.safetensors"))
+            try TrainingRandomState.save(randomState, to: temporary.appendingPathComponent("random.safetensors"))
+            let bestWeights = temporary.appendingPathComponent("best.weights.safetensors")
+            if captureBest {
+                try FileManager.default.copyItem(at: currentWeights, to: bestWeights)
+            } else {
+                let existingBest = destination.appendingPathComponent("best.weights.safetensors")
+                if FileManager.default.fileExists(atPath: existingBest.path) {
+                    try FileManager.default.copyItem(at: existingBest, to: bestWeights)
+                }
+            }
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(state).write(to: temporary.appendingPathComponent("state.json"), options: .atomic)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                let backupName = ".Checkpoint.backup.\(UUID().uuidString)"
+                let backup = destination.deletingLastPathComponent().appendingPathComponent(backupName)
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary, backupItemName: backupName, options: .usingNewMetadataOnly)
+                try? FileManager.default.removeItem(at: backup)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
     }
 
-    private func publishRunnableSnapshot(profile: AIProfile, state: CheckpointState, completed: Bool, lossOverride: Double? = nil) async throws -> TrainingCompletion {
+    private func publishRunnableSnapshot(profile: AIProfile, state: CheckpointState, completed: Bool, preferBest: Bool = false) async throws -> TrainingCompletion {
         let checkpoint = await WorkspaceStore.shared.checkpointDirectory(profileID: profile.id)
-        let displayedEpoch = state.batchOffset > 0 ? state.epoch + 1 : state.epoch
+        let bestWeights = checkpoint.appendingPathComponent("best.weights.safetensors")
+        let usesBest = completed && preferBest && state.bestGlobalStep != nil && FileManager.default.fileExists(atPath: bestWeights.path)
+        let currentEpoch = state.batchOffset > 0 ? state.epoch + 1 : state.epoch
+        let displayedEpoch = usesBest ? state.bestEpoch ?? currentEpoch : currentEpoch
+        let displayedStep = usesBest ? state.bestGlobalStep ?? state.globalStep : state.globalStep
+        let displayedLoss = usesBest ? state.bestTrainingLoss ?? state.lossHistory.last ?? 0 : state.lossHistory.last ?? 0
+        let displayedValidationLoss = usesBest ? state.bestValidationLoss : state.validationHistory.last
         let version = ModelVersionManifest(
             id: UUID(),
-            name: completed ? "Brain • Epoch \(displayedEpoch) • Step \(state.globalStep)" : "Autosave • Epoch \(displayedEpoch) • Step \(state.globalStep)",
+            name: usesBest ? "Best Brain • Epoch \(displayedEpoch) • Step \(displayedStep)" : completed ? "Brain • Epoch \(displayedEpoch) • Step \(displayedStep)" : "Autosave • Epoch \(displayedEpoch) • Step \(displayedStep)",
             createdAt: Date(),
-            globalStep: state.globalStep,
-            trainingLoss: lossOverride ?? state.lossHistory.last ?? 0,
-            validationLoss: state.validationHistory.last,
+            globalStep: displayedStep,
+            trainingLoss: displayedLoss,
+            validationLoss: displayedValidationLoss,
             preprocessing: profile.preprocessing,
             channels: profile.channels,
             training: profile.training,
-            optimizerFile: "optimizer.safetensors",
-            trainingStateFile: "state.json",
-            randomStateFile: "random.safetensors",
+            optimizerFile: usesBest ? nil : "optimizer.safetensors",
+            trainingStateFile: usesBest ? nil : "state.json",
+            randomStateFile: usesBest ? nil : "random.safetensors",
             epoch: displayedEpoch,
             isAutosave: !completed,
             demonstratedKeyCodes: state.demonstratedKeyCodes ?? [],
             relativeMouseScale: GameCameraContract.deltaScale,
             trainingDataSchema: TrainingDataContract.schemaVersion,
-            trainingDurationSeconds: state.elapsed,
-            experienceDurationSeconds: state.experienceSeconds ?? 0
+            trainingDurationSeconds: usesBest ? state.bestElapsed : state.elapsed,
+            experienceDurationSeconds: usesBest ? state.bestExperienceSeconds : state.experienceSeconds ?? 0,
+            trainingShowsCursor: state.trainingShowsCursor,
+            recommendedMouseMode: state.recommendedMouseMode
         )
         let destination = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         do {
-            try FileManager.default.copyItem(at: checkpoint.appendingPathComponent("weights.safetensors"), to: destination.appendingPathComponent(version.weightsFile))
-            try FileManager.default.copyItem(at: checkpoint.appendingPathComponent("optimizer.safetensors"), to: destination.appendingPathComponent("optimizer.safetensors"))
-            try FileManager.default.copyItem(at: checkpoint.appendingPathComponent("state.json"), to: destination.appendingPathComponent("state.json"))
-            try FileManager.default.copyItem(at: checkpoint.appendingPathComponent("random.safetensors"), to: destination.appendingPathComponent("random.safetensors"))
+            let sourceWeights = usesBest ? bestWeights : checkpoint.appendingPathComponent("weights.safetensors")
+            try FileManager.default.copyItem(at: sourceWeights, to: destination.appendingPathComponent(version.weightsFile))
+            if !usesBest {
+                try FileManager.default.copyItem(at: checkpoint.appendingPathComponent("optimizer.safetensors"), to: destination.appendingPathComponent("optimizer.safetensors"))
+                try FileManager.default.copyItem(at: checkpoint.appendingPathComponent("state.json"), to: destination.appendingPathComponent("state.json"))
+                try FileManager.default.copyItem(at: checkpoint.appendingPathComponent("random.safetensors"), to: destination.appendingPathComponent("random.safetensors"))
+            }
             try await WorkspaceStore.shared.saveVersionManifest(version, profileID: profile.id)
         } catch {
             try? FileManager.default.removeItem(at: destination)
@@ -427,7 +577,7 @@ final class TrainingEngine: @unchecked Sendable {
         return TrainingCompletion(profile: updated, version: version, completed: completed)
     }
 
-    private func restoreCheckpointIfPresent(profile: AIProfile, expectedSignature: String, model: AgentPolicy, optimizer: ResumableAdamW, randomState: MLXRandom.RandomState, state: inout CheckpointState) async throws -> String {
+    private func restoreCheckpointIfPresent(profile: AIProfile, expectedSignature: String, model: AgentPolicy, optimizer: ResumableAdamW, randomState: MLXRandom.RandomState, state: inout CheckpointState) async throws -> CheckpointRestore {
         let directory = await WorkspaceStore.shared.checkpointDirectory(profileID: profile.id)
         let stateURL = directory.appendingPathComponent("state.json")
         if FileManager.default.fileExists(atPath: stateURL.path) {
@@ -438,7 +588,7 @@ final class TrainingEngine: @unchecked Sendable {
                 let randomStateURL = directory.appendingPathComponent("random.safetensors")
                 if FileManager.default.fileExists(atPath: randomStateURL.path) { try TrainingRandomState.load(randomState, from: randomStateURL) }
                 state = restored
-                return "Restored exact checkpoint; compiling resumed MLX graph"
+                return CheckpointRestore(status: "Restored exact checkpoint; compiling resumed MLX graph", captureValidationBaseline: false)
             }
         }
 
@@ -460,16 +610,31 @@ final class TrainingEngine: @unchecked Sendable {
             state.experienceSeconds = version.experienceDurationSeconds ?? profile.trainingProgress?.experienceDurationSeconds
             state.lossHistory = [version.trainingLoss]
             state.validationHistory = version.validationLoss.map { [$0] } ?? []
-            return "Loaded the active brain for the corrected training-data contract; optimizer restarted safely"
+            if let validationLoss = version.validationLoss, validationLoss.isFinite {
+                state.bestValidationLoss = validationLoss
+                state.bestGlobalStep = state.globalStep
+                state.bestEpoch = state.epoch
+                state.bestTrainingLoss = version.trainingLoss
+                state.bestElapsed = state.elapsed
+                state.bestExperienceSeconds = state.experienceSeconds
+                return CheckpointRestore(status: "Loaded the selected best brain; optimizer restarted safely", captureValidationBaseline: true)
+            }
+            return CheckpointRestore(status: "Loaded the active brain for fine-tuning; optimizer restarted safely", captureValidationBaseline: false)
         }
-        return "Compiling fused MLX training graph on Apple GPU"
+        return CheckpointRestore(status: "Compiling fused MLX training graph on Apple GPU", captureValidationBaseline: false)
     }
 
+}
+
+private struct CheckpointRestore {
+    var status: String
+    var captureValidationBaseline: Bool
 }
 
 private struct PreparedBatch {
     let count: Int
     let packedObservations: Data
+    let precedingPackedObservations: Data
     let history: Data
     let targets: Data
 }
@@ -489,6 +654,19 @@ private struct CheckpointState: Codable {
     /// Optional keeps checkpoints from builds before experience counters
     /// decodable. Restore backfills a stable step/batch estimate once.
     var experienceSeconds: Double? = nil
+    /// The lowest held-out loss and its exact runnable weights are tracked
+    /// independently from the latest optimizer checkpoint. Long training runs
+    /// can therefore resume from the latest step without publishing a brain
+    /// that has regressed after its best epoch.
+    var bestValidationLoss: Double? = nil
+    var bestGlobalStep: Int? = nil
+    var bestEpoch: Int? = nil
+    var bestTrainingLoss: Double? = nil
+    var bestElapsed: Double? = nil
+    var bestExperienceSeconds: Double? = nil
+    /// Cursor visibility is frozen from the duration-weighted recording mix.
+    var trainingShowsCursor: Bool? = nil
+    var recommendedMouseMode: MouseControlMode? = nil
 }
 
 private struct SplitMix64 {
