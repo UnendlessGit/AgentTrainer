@@ -98,8 +98,10 @@ final class CaptureService: NSObject, @unchecked Sendable {
         let dimensions = activeDimensions
         activeDimensions = .zero
         if let writer {
-            let result = try await writer.finish()
+            // Clear the retained writer before awaiting finalization so a
+            // failed encoder cannot leave this CaptureService half-stopped.
             self.writer = nil
+            let result = try await writer.finish()
             if let stopError { throw stopError }
             return CaptureResult(duration: result.duration, deliveredFPS: result.deliveredFPS, frameCount: result.frames, width: Int(dimensions.width), height: Int(dimensions.height), firstFrameHostNanos: firstFrameHostNanos)
         }

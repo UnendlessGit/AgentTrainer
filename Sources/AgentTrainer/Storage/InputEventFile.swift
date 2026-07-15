@@ -7,6 +7,7 @@ final class InputEventWriter: @unchecked Sendable {
     private var buffer = Data()
     private(set) var count = 0
     private var closed = false
+    private var failure: Error?
 
     init(url: URL) throws {
         FileManager.default.createFile(atPath: url.path, contents: nil)
@@ -20,7 +21,7 @@ final class InputEventWriter: @unchecked Sendable {
     func append(_ event: InputSample) {
         lock.lock()
         defer { lock.unlock() }
-        guard !closed else { return }
+        guard !closed, failure == nil else { return }
         buffer.appendInteger(event.timestampNanos)
         buffer.append(event.kind.rawValue)
         buffer.append(event.isDown ? 1 : 0)
@@ -39,20 +40,31 @@ final class InputEventWriter: @unchecked Sendable {
         if buffer.count >= 256 * 1024 { flushLocked() }
     }
 
-    func finish() -> Int {
+    func finish() throws -> Int {
         lock.lock()
         defer { lock.unlock() }
-        guard !closed else { return count }
+        if closed {
+            if let failure { throw failure }
+            return count
+        }
         flushLocked()
-        try? handle.synchronize()
-        try? handle.close()
+        if failure == nil {
+            do { try handle.synchronize() }
+            catch { failure = error }
+        }
+        do { try handle.close() }
+        catch { if failure == nil { failure = error } }
         closed = true
+        if let failure {
+            throw AgentTrainerError.storage("The recorded input file could not be saved: \(failure.localizedDescription)")
+        }
         return count
     }
 
     private func flushLocked() {
-        guard !buffer.isEmpty else { return }
-        try? handle.write(contentsOf: buffer)
+        guard !buffer.isEmpty, failure == nil else { return }
+        do { try handle.write(contentsOf: buffer) }
+        catch { failure = error }
         buffer.removeAll(keepingCapacity: true)
     }
 }
@@ -171,6 +183,11 @@ enum InputEventReader {
 
     private static func forEach(in data: Data, _ body: (InputSample) -> Void) throws {
         guard data.count >= 12, String(data: data.prefix(8), encoding: .utf8) == "ATREVT01" else { throw AgentTrainerError.storage("Invalid AgentTrainer input event file.") }
+        var headerCursor = 8
+        let version: UInt32 = data.readInteger(at: &headerCursor)
+        guard version == 1, (data.count - 12).isMultiple(of: recordSize) else {
+            throw AgentTrainerError.storage("This AgentTrainer input event file is unsupported or incomplete.")
+        }
         var cursor = 12
         while cursor + recordSize <= data.count {
             let timestamp: UInt64 = data.readInteger(at: &cursor)

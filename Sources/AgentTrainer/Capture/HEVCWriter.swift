@@ -67,6 +67,9 @@ final class HEVCWriter: @unchecked Sendable {
 
     func finish() async throws -> (duration: Double, deliveredFPS: Double, frames: Int) {
         guard started else {
+            if writer.status == .failed {
+                throw writer.error ?? AgentTrainerError.capture("HEVC encoding failed before the first frame was written.")
+            }
             writer.cancelWriting()
             return (0, 0, 0)
         }

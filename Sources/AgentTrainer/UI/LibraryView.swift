@@ -162,7 +162,7 @@ struct LibraryView: View {
     @ViewBuilder private var inspector: some View {
         if let item = model.selectedRecording {
             OLEDCard(padding: 13) {
-                ScrollView {
+                List {
                     VStack(alignment: .leading, spacing: 12) {
                         VideoPlayer(player: player)
                             .aspectRatio(CGFloat(item.manifest.pixelWidth) / CGFloat(max(1, item.manifest.pixelHeight)), contentMode: .fit)
@@ -220,7 +220,16 @@ struct LibraryView: View {
                             Spacer(); Button("Delete", role: .destructive) { deleteRecording = item }.primaryButton(color: ATColor.coral)
                         }
                     }
+                    .listRowInsets(EdgeInsets())
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
                 }
+                // `ScrollView` currently enters a safe-area/frame feedback
+                // loop with this AVKit-backed inspector on macOS 27. A plain
+                // List uses AppKit's stable table scrolling path while keeping
+                // the inspector scrollable on Sequoia and Tahoe as well.
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }.frame(width: 380).frame(maxHeight: .infinity)
         } else {
             OLEDCard { ContentUnavailableView("Select a recording", systemImage: "play.rectangle") }.frame(width: 380).frame(maxHeight: .infinity)

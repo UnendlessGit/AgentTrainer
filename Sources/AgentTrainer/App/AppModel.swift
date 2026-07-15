@@ -318,7 +318,7 @@ final class AppModel: ObservableObject {
             isRecording = true; activityStatus = "Recording — live keyboard is capture-excluded"
             AppLog.write(category: "Recording", "Recording started", details: "\(spec.kind.rawValue), \(Int(captureRect.width))×\(Int(captureRect.height)) at \(captureFPS.formatted()) FPS")
         } catch {
-            input.stop(); input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = eventWriter?.finish(); eventWriter = nil
+            input.stop(); input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = try? eventWriter?.finish(); eventWriter = nil
             if let recordingDirectory { try? FileManager.default.removeItem(at: recordingDirectory) }
             self.recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; present(error)
         }
@@ -326,9 +326,12 @@ final class AppModel: ObservableObject {
 
     func stopRecording() async {
         guard isRecording, let directory = recordingDirectory, let id = recordingID, let captureSpec = activeRecordingSpec, let captureRect = activeRecordingRect, let destinationFolderID = activeRecordingFolderID else { return }
-        input.stop(); input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); let eventCount = eventWriter?.finish() ?? 0; eventWriter = nil
+        input.stop(); input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
+        let eventResult = Result { try eventWriter?.finish() ?? 0 }
+        eventWriter = nil
         do {
             let result = try await capture.stop()
+            let eventCount = try eventResult.get()
             let hostStart = recordingClock.value ?? (result.firstFrameHostNanos > 0 ? result.firstFrameHostNanos : recordingHostStart)
             guard hostStart > 0 else { throw AgentTrainerError.capture("No complete screen frame was received; the recording was not saved.") }
             let inputDuration = lastEventClock.value.flatMap { $0 >= hostStart ? Double($0 - hostStart) / 1e9 : nil } ?? 0

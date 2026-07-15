@@ -40,16 +40,48 @@ final class CachedDataset: @unchecked Sendable {
 
     init(directory: URL) throws {
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
-        manifest = try decoder.decode(DatasetCacheManifest.self, from: Data(contentsOf: directory.appendingPathComponent("manifest.json")))
-        guard manifest.schemaVersion == TrainingDataContract.schemaVersion else {
+        let decoded = try decoder.decode(DatasetCacheManifest.self, from: Data(contentsOf: directory.appendingPathComponent("manifest.json")))
+        guard decoded.schemaVersion == TrainingDataContract.schemaVersion else {
             throw AgentTrainerError.storage("This dataset cache uses an obsolete input contract and must be rebuilt.")
         }
-        observations = try Data(contentsOf: directory.appendingPathComponent("observations.bin"), options: .mappedIfSafe)
-        actions = try Data(contentsOf: directory.appendingPathComponent("actions.bin"), options: .mappedIfSafe)
-        guard observations.count == manifest.sampleCount * manifest.observationBytesPerSample,
-              actions.count == manifest.sampleCount * manifest.actionValuesPerSample * MemoryLayout<Float>.size else {
+        _ = try decoded.preprocessing.validated()
+        guard decoded.sampleCount >= 0,
+              decoded.historyLength >= 0,
+              decoded.actionFPS.isFinite, decoded.actionFPS > 0,
+              decoded.perceptionFPS.isFinite, decoded.perceptionFPS > 0,
+              decoded.observationBytesPerSample == decoded.preprocessing.sampleByteCount,
+              decoded.observationBytesPerSample > 0,
+              decoded.actionValuesPerSample == ActionLayout.count else {
+            throw AgentTrainerError.storage("The dataset cache manifest is invalid.")
+        }
+
+        let observationSize = decoded.sampleCount.multipliedReportingOverflow(by: decoded.observationBytesPerSample)
+        let actionValueCount = decoded.sampleCount.multipliedReportingOverflow(by: decoded.actionValuesPerSample)
+        let actionSize = actionValueCount.partialValue.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+        guard !observationSize.overflow, !actionValueCount.overflow, !actionSize.overflow else {
+            throw AgentTrainerError.storage("The dataset cache manifest exceeds this Mac's addressable memory.")
+        }
+        var segmentEnd = 0
+        for segment in decoded.segments {
+            let end = segmentEnd.addingReportingOverflow(segment.count)
+            guard segment.start == segmentEnd, segment.count >= 0, !end.overflow else {
+                throw AgentTrainerError.storage("The dataset cache segment index is invalid.")
+            }
+            segmentEnd = end.partialValue
+        }
+        guard segmentEnd == decoded.sampleCount else {
+            throw AgentTrainerError.storage("The dataset cache segment index is incomplete.")
+        }
+
+        let loadedObservations = try Data(contentsOf: directory.appendingPathComponent("observations.bin"), options: .mappedIfSafe)
+        let loadedActions = try Data(contentsOf: directory.appendingPathComponent("actions.bin"), options: .mappedIfSafe)
+        guard loadedObservations.count == observationSize.partialValue,
+              loadedActions.count == actionSize.partialValue else {
             throw AgentTrainerError.storage("The dataset cache is incomplete or corrupt.")
         }
+        manifest = decoded
+        observations = loadedObservations
+        actions = loadedActions
     }
 
     var count: Int { manifest.sampleCount }

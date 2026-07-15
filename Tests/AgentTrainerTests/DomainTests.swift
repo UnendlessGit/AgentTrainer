@@ -204,8 +204,25 @@ final class DomainTests: XCTestCase {
         let writer = try InputEventWriter(url: url)
         let expected = InputSample(timestampNanos: 123_456, kind: .key, x: 10, y: 20, deltaX: 3, deltaY: -4, button: 2, scrollX: 1.5, scrollY: -2.5, keyCode: 12, modifiers: 0x1C0000, isDown: true)
         writer.append(expected)
-        XCTAssertEqual(writer.finish(), 1)
+        XCTAssertEqual(try writer.finish(), 1)
         XCTAssertEqual(try InputEventReader.read(url: url), [expected])
+    }
+
+    func testInputEventReaderRejectsUnsupportedAndTruncatedFiles() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("invalid-events-\(UUID().uuidString).atrevents")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var version = UInt32(2).littleEndian
+        var data = Data("ATREVT01".utf8)
+        withUnsafeBytes(of: &version) { data.append(contentsOf: $0) }
+        try data.write(to: url)
+        XCTAssertThrowsError(try InputEventReader.read(url: url))
+
+        version = UInt32(1).littleEndian
+        data = Data("ATREVT01".utf8)
+        withUnsafeBytes(of: &version) { data.append(contentsOf: $0) }
+        data.append(0)
+        try data.write(to: url)
+        XCTAssertThrowsError(try InputEventReader.read(url: url))
     }
 
     func testMetalPreprocessingSizeAndQuantization() throws {
@@ -652,7 +669,7 @@ final class DomainTests: XCTestCase {
         for index in 0..<120 {
             writer.append(InputSample(timestampNanos: UInt64(index), kind: index % 3 == 0 ? .key : .mouseMove, keyCode: UInt16(index % 20), isDown: true))
         }
-        _ = writer.finish()
+        _ = try writer.finish()
         let summary = try InputEventReader.summarize(url: url, previewLimit: 12)
         XCTAssertEqual(summary.preview.count, 12)
         XCTAssertEqual(summary.keyEventCount, 40)
@@ -666,7 +683,7 @@ final class DomainTests: XCTestCase {
         let writer = try InputEventWriter(url: url)
         writer.append(InputSample(timestampNanos: 1, kind: .flags, keyCode: 56, modifiers: CGEventFlags.maskShift.rawValue, isDown: true))
         writer.append(InputSample(timestampNanos: 2, kind: .flags, keyCode: 56, modifiers: 0, isDown: false))
-        _ = writer.finish()
+        _ = try writer.finish()
         XCTAssertEqual(try InputEventReader.summarize(url: url).usedKeyCodes, [56])
     }
 
@@ -810,7 +827,7 @@ final class DomainTests: XCTestCase {
         for index in 0..<40 {
             writer.append(InputSample(timestampNanos: UInt64(index), kind: .mouseMove, x: 500, y: 300, deltaX: index.isMultiple(of: 2) ? 2 : 0, deltaY: index.isMultiple(of: 3) ? -1 : 0))
         }
-        _ = writer.finish()
+        _ = try writer.finish()
         let summary = try InputEventReader.summarize(url: url, globalRect: CGRect(x: 0, y: 0, width: 1_000, height: 700))
         XCTAssertTrue(summary.mouse.isGameCamera)
         XCTAssertTrue(summary.mouse.positionsAreValid)
@@ -1138,6 +1155,19 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(targets[0], 3); XCTAssertEqual(targets[ActionLayout.count], 1)
         let history = MLXArray(dataset.historyBatch(at: [2]), [1, 2, ActionLayout.count], type: Float.self).asArray(Float.self)
         XCTAssertEqual(history[0], 1); XCTAssertEqual(history[ActionLayout.count], 2)
+    }
+
+    func testCorruptDatasetCacheSizesThrowInsteadOfOverflowing() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("overflow-cache-\(UUID().uuidString).atrcache", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale, bitDepth: 8)
+        let manifest = DatasetCacheManifest(key: "invalid", createdAt: Date(), preprocessing: spec, actionFPS: 60, perceptionFPS: 30, historyLength: 1, sampleCount: Int.max, observationBytesPerSample: 1, actionValuesPerSample: ActionLayout.count, segments: [CacheSegment(recordingID: UUID(), start: 0, count: Int.max)])
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
+        try Data().write(to: directory.appendingPathComponent("observations.bin"))
+        try Data().write(to: directory.appendingPathComponent("actions.bin"))
+        XCTAssertThrowsError(try CachedDataset(directory: directory))
     }
 
     func testBlockingEitherModifierSideBlocksModifierChannel() {
