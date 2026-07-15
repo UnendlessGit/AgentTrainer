@@ -1427,7 +1427,7 @@ struct SettingsView: View {
                 ThemeSettingsView()
                 OLEDCard { HStack { VStack(alignment: .leading, spacing: 4) { Text("Diagnostics and app logs").font(.headline).foregroundStyle(ATColor.cyan); Text("Open the dedicated tab for persistent errors, prints, crash reports, MLX memory, and a copyable support report.").foregroundStyle(.secondary) }; Spacer(); Button("Open Diagnostics") { model.selection = .diagnostics }.primaryButton() } }
                 StorageSettingsView(model: model)
-                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "11"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
+                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.1") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "12"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
             }.padding(28)
         }
     }

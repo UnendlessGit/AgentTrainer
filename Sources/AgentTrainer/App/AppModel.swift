@@ -145,6 +145,10 @@ final class AppModel: ObservableObject {
         storageLocations = await WorkspaceStore.shared.locations()
         do {
             try await WorkspaceStore.shared.prepare()
+            let repairedRecordings = try await WorkspaceStore.shared.repairInvalidRecordingManifests()
+            if repairedRecordings > 0 {
+                AppLog.write(.warning, category: "Migration", "Recovered legacy recording manifests", details: "\(repairedRecordings) recording manifests repaired; video and input files were unchanged")
+            }
             let removed = try await WorkspaceStore.shared.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
             if removed > 0 { AppLog.write(.warning, category: "Migration", "Removed incompatible model artifacts", details: "\(removed) model/checkpoint directories; recordings and profiles were preserved") }
             let obsoleteCaches = try await WorkspaceStore.shared.removeObsoleteCaches(currentSchema: TrainingDataContract.schemaVersion)
@@ -632,6 +636,7 @@ final class AppModel: ObservableObject {
             if kind == .trainingData {
                 recordingDestinationFolderID = nil
                 selectedRecordingID = nil
+                _ = try await WorkspaceStore.shared.repairInvalidRecordingManifests()
                 _ = try await WorkspaceStore.shared.removeObsoleteCaches(currentSchema: TrainingDataContract.schemaVersion)
                 _ = try await WorkspaceStore.shared.normalizeRecordingFolders()
             } else {

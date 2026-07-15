@@ -1,3 +1,4 @@
+@preconcurrency import AVFoundation
 import Foundation
 
 enum WorkspaceDataKind: String, Sendable {
@@ -262,6 +263,64 @@ actor WorkspaceStore {
 
     func writeRecording(_ manifest: RecordingManifest, to directory: URL) throws {
         try atomicWrite(try encoder.encode(manifest), to: directory.appendingPathComponent("manifest.json"))
+    }
+
+    /// Repairs legacy manifests before the strict library scan runs. Policy
+    /// v4 added defensive validation, but filtering first made an older
+    /// recording with a stale duration/trim disappear from the UI before the
+    /// existing clock repair could discover it. This pass enumerates recording
+    /// directories directly and changes only invalid, decodable manifests.
+    /// Video and input files are never moved, rewritten, or removed.
+    @discardableResult
+    func repairInvalidRecordingManifests() async throws -> Int {
+        try prepare()
+        guard let directories = try? FileManager.default.contentsOfDirectory(at: recordingsRoot, includingPropertiesForKeys: [.isDirectoryKey]) else { return 0 }
+        var repaired = 0
+        for directory in directories where directory.pathExtension == "atrrecord" {
+            let manifestURL = directory.appendingPathComponent("manifest.json")
+            guard let originalData = try? Data(contentsOf: manifestURL),
+                  var manifest = try? decoder.decode(RecordingManifest.self, from: originalData),
+                  !manifest.isStructurallyValid,
+                  (1...2).contains(manifest.schemaVersion),
+                  Self.isSafeLeafName(manifest.videoFile), Self.isSafeLeafName(manifest.eventFile),
+                  manifest.thumbnailFile.map(Self.isSafeLeafName) ?? true else { continue }
+
+            let videoURL = directory.appendingPathComponent(manifest.videoFile)
+            let eventURL = directory.appendingPathComponent(manifest.eventFile)
+            guard FileManager.default.fileExists(atPath: videoURL.path),
+                  FileManager.default.fileExists(atPath: eventURL.path) else { continue }
+            let asset = AVURLAsset(url: videoURL)
+            guard let time = try? await asset.load(.duration) else { continue }
+            let videoDuration = CMTimeGetSeconds(time)
+            guard videoDuration.isFinite, videoDuration > 0 else { continue }
+
+            if manifest.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { manifest.name = "Recovered Recording" }
+            manifest.duration = videoDuration
+            if !manifest.capture.requestedFPS.isFinite || manifest.capture.requestedFPS <= 0 || manifest.capture.requestedFPS > 1_000 {
+                manifest.capture.requestedFPS = manifest.deliveredFPS.isFinite && manifest.deliveredFPS > 0 && manifest.deliveredFPS <= 1_000 ? manifest.deliveredFPS : 60
+            }
+            if !manifest.deliveredFPS.isFinite || manifest.deliveredFPS < 0 || manifest.deliveredFPS > 1_000 {
+                manifest.deliveredFPS = manifest.capture.requestedFPS
+            }
+            let rect = manifest.globalRect
+            if !rect.x.isFinite || !rect.y.isFinite || !rect.width.isFinite || !rect.height.isFinite {
+                manifest.globalRect = CodableRect(CGRect(x: 0, y: 0, width: max(1, manifest.pixelWidth), height: max(1, manifest.pixelHeight)))
+            }
+            manifest.pixelWidth = min(32_768, max(1, manifest.pixelWidth))
+            manifest.pixelHeight = min(32_768, max(1, manifest.pixelHeight))
+            manifest.eventCount = max(0, manifest.eventCount)
+            manifest.trimStart = manifest.trimStart.isFinite ? min(videoDuration, max(0, manifest.trimStart)) : 0
+            if let trimEnd = manifest.trimEnd {
+                manifest.trimEnd = trimEnd.isFinite ? min(videoDuration, max(manifest.trimStart, trimEnd)) : videoDuration
+            }
+            guard manifest.isStructurallyValid else { continue }
+
+            let backup = directory.appendingPathComponent("manifest.pre-1.8.1-recovery.json")
+            if !FileManager.default.fileExists(atPath: backup.path) { try originalData.write(to: backup, options: .atomic) }
+            try atomicWrite(try encoder.encode(manifest), to: manifestURL)
+            repaired += 1
+        }
+        return repaired
     }
 
     func listRecordings() -> [RecordingItem] {
@@ -683,6 +742,9 @@ actor WorkspaceStore {
         if FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory), !isDirectory.boolValue {
             throw AgentTrainerError.storage("Choose a folder, not a file, for \(kind.rawValue.lowercased()).")
         }
+        guard !destination.pathComponents.contains(where: { $0.lowercased().hasSuffix(".app") }) else {
+            throw AgentTrainerError.storage("Store \(kind.rawValue.lowercased()) outside application bundles so an app update can never replace it.")
+        }
         let current = location(for: kind)
         if destination != current, pathsOverlap(destination, current) {
             throw AgentTrainerError.storage("The new \(kind.rawValue.lowercased()) folder cannot be inside the current folder, or contain it.")
@@ -691,6 +753,10 @@ actor WorkspaceStore {
         if destination != other, pathsOverlap(destination, other) {
             throw AgentTrainerError.storage("Training data and AI model locations may be the same folder, but one cannot be nested inside the other.")
         }
+    }
+
+    private static func isSafeLeafName(_ value: String) -> Bool {
+        !value.isEmpty && value != "." && value != ".." && !value.contains("/") && !value.contains("\0")
     }
 
     private func ensureLocationIsAvailable(_ location: URL, name: String) throws {

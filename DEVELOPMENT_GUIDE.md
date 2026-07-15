@@ -98,6 +98,8 @@ For launch/UI smoke tests only, set `AGENTTRAINER_WORKSPACE_ROOT` to an absolute
 
 `events.atrevents` begins with `ATREVT01`, a UInt32 version, then 72-byte little-endian records. Readers reject unknown kinds, truncated records, non-finite values, and decreasing timestamps before use. Keep old manifests decodable by using optional fields or explicit custom decoding when a required field is introduced. The cache key includes the complete recording manifests, preprocessing, rates, and history length; trims and recording exclusions therefore invalidate derived caches automatically.
 
+Strict recording validation must run only after `repairInvalidRecordingManifests`. The recovery pass enumerates `.atrrecord` directories directly so malformed-but-decodable legacy duration/trim metadata cannot hide a recording before repair. It derives the real video duration, clamps safe metadata, retains `manifest.pre-1.8.1-recovery.json`, and must never alter or remove the video or event stream. Training/model storage destinations inside an `.app` bundle are rejected because bundle replacement during an update would replace that directory.
+
 ## Recording pipeline
 
 1. `AppModel.startRecording` freezes the selected `CaptureSpec`, global capture rectangle, trim settings, destination folder, and recording key blacklist.
