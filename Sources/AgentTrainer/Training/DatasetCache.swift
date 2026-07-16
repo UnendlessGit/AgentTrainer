@@ -14,7 +14,63 @@ enum ActionLayout {
     static let commandOptionControl = 143..<146
     static let modifiers = 142..<146
     static let count = 146
-    static let binary = Array(buttons) + Array(keyboard) + Array(modifiers)
+    /// Command, Option, and Control are also reported by macOS as ordinary
+    /// key codes. Those duplicate keyboard outputs must never be learned or
+    /// executed; their dedicated modifier outputs are the single source of
+    /// truth. Shift intentionally remains part of Keyboard.
+    static let commandOptionControlKeyCodes: [UInt16] = [54, 55, 58, 59, 61, 62]
+    static let commandOptionControlKeyCodeSet = Set(commandOptionControlKeyCodes)
+    static let commandOptionControlKeyboardIndices = commandOptionControlKeyCodes.map { keyboard.lowerBound + Int($0) }
+    static let commandOptionControlKeyboardIndexSet = Set(commandOptionControlKeyboardIndices)
+    static let keyboardAndShiftIndices = Array(keyboardAndShift).filter { !commandOptionControlKeyboardIndexSet.contains($0) }
+    static let binary = Array(buttons) + keyboardAndShiftIndices + Array(commandOptionControl)
+
+    /// Removes controls that do not belong to the selected training channels
+    /// from targets and recurrent action history. This prevents a disabled
+    /// channel from becoming a hidden shortcut through the history branch.
+    static func sanitizeTrainingRows(
+        _ values: UnsafeMutableBufferPointer<Float>,
+        rowCount: Int,
+        channels: ActionChannels,
+        restrictions: ActionRestrictions
+    ) {
+        guard rowCount > 0, values.count >= rowCount * count else { return }
+        for row in 0..<rowCount {
+            let base = row * count
+            if !channels.mouseMovement {
+                for index in absoluteMouse { values[base + index] = 0 }
+                for index in relativeMouse { values[base + index] = 0 }
+            }
+            if !channels.buttons {
+                for index in buttons { values[base + index] = 0 }
+            } else {
+                for button in restrictions.blockedMouseButtons where button < 8 {
+                    values[base + buttons.lowerBound + Int(button)] = 0
+                }
+            }
+            if !channels.scroll {
+                for index in scroll { values[base + index] = 0 }
+            }
+            if !channels.keyboard {
+                for index in keyboardAndShift { values[base + index] = 0 }
+            } else {
+                for key in restrictions.blockedKeyCodes where key < 128 {
+                    values[base + keyboard.lowerBound + Int(key)] = 0
+                }
+                if !restrictions.allowsModifier(0) { values[base + shift.lowerBound] = 0 }
+            }
+            // Close the duplicate-keyboard loophole even when both channels
+            // are enabled. Only the dedicated modifier outputs may own these.
+            for index in commandOptionControlKeyboardIndices { values[base + index] = 0 }
+            if !channels.modifiers {
+                for index in commandOptionControl { values[base + index] = 0 }
+            } else {
+                for modifier in 1..<4 where !restrictions.allowsModifier(modifier) {
+                    values[base + modifiers.lowerBound + modifier] = 0
+                }
+            }
+        }
+    }
 }
 
 struct CacheSegment: Codable, Hashable, Sendable {

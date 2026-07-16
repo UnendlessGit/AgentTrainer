@@ -208,7 +208,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         }
         if channels.buttons { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.buttons)) }
         if channels.scroll { losses.append(activeContinuousLoss(predictions: tanh(logits[.ellipsis, ActionLayout.scroll]), targets: targets[.ellipsis, ActionLayout.scroll])) }
-        if channels.keyboard { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.keyboardAndShift)) }
+        if channels.keyboard { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, indices: ActionLayout.keyboardAndShiftIndices)) }
         if channels.modifiers { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.commandOptionControl)) }
         guard let first = losses.first else { return MLXArray(0, dtype: dtype) }
         return losses.dropFirst().reduce(first, +) / Float(losses.count)
@@ -230,6 +230,25 @@ final class AgentPolicy: Module, @unchecked Sendable {
         // Press/release boundaries matter far more than another frame in the
         // middle of a long hold. Upweighting transitions prevents a policy from
         // learning only action persistence.
+        let transitionWeights = 1 + 3 * abs(selectedTargets - selectedPrevious)
+        let weights = classWeights * transitionWeights
+        return (raw * weights).sum() / (weights.sum() + 1e-6)
+    }
+
+    private func binaryControlLoss(logits: MLXArray, targets: MLXArray, previous: MLXArray, positiveWeights: MLXArray?, indices: [Int]) -> MLXArray {
+        let selection = MLXArray(indices)
+        let selectedLogits = logits[.ellipsis, selection]
+        let selectedTargets = targets[.ellipsis, selection]
+        let selectedPrevious = previous[.ellipsis, selection]
+        let raw = binaryCrossEntropy(logits: selectedLogits, targets: selectedTargets, reduction: .none)
+        let classWeights: MLXArray
+        if let positiveWeights {
+            let positives = positiveWeights[selection]
+            let learnedOutput = (positives .> 0).asType(dtype)
+            classWeights = (1 + selectedTargets * (positives - 1)) * learnedOutput
+        } else {
+            classWeights = MLXArray.ones(like: selectedTargets)
+        }
         let transitionWeights = 1 + 3 * abs(selectedTargets - selectedPrevious)
         let weights = classWeights * transitionWeights
         return (raw * weights).sum() / (weights.sum() + 1e-6)

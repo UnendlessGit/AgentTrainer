@@ -300,7 +300,7 @@ enum CNNActionFocus: String, Codable, CaseIterable, Identifiable, Sendable {
     case keyboard = "Keyboard"
     case modifiers = "Modifiers"
     var id: String { rawValue }
-    var displayName: String { self == .modifiers ? "Command / Option / Control" : rawValue }
+    var displayName: String { rawValue }
 }
 
 /// Presentation-only controls for live CNN inspection. Sanitizing at the

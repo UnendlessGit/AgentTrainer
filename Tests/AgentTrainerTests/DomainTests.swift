@@ -1220,6 +1220,9 @@ final class DomainTests: XCTestCase {
         profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: false, keyboard: true, modifiers: false)
         var prediction = [Float](repeating: 0, count: ActionLayout.count)
         for index in ActionLayout.modifiers { prediction[index] = 1 }
+        for code in ActionLayout.commandOptionControlKeyCodes {
+            prediction[ActionLayout.keyboard.lowerBound + Int(code)] = 1
+        }
         let modifierKeyCodes: Set<UInt16> = [56, 59, 58, 55]
 
         let keyboardCollector = EventCollector()
@@ -1250,7 +1253,7 @@ final class DomainTests: XCTestCase {
             captureRect: CGRect(x: 0, y: 0, width: 100, height: 100),
             safety: AgentSafetyPolicy()
         )
-        XCTAssertTrue(legacyCollector.events.isEmpty, "An older brain must keep its original all-modifiers toggle semantics")
+        XCTAssertTrue(legacyCollector.events.isEmpty, "An older brain must not bypass disabled Modifiers through ordinary key outputs")
         legacyInjector.disableAndReleaseAll()
 
         profile.channels.keyboard = false
@@ -1271,6 +1274,34 @@ final class DomainTests: XCTestCase {
         XCTAssertFalse(modifierCodes.contains(56))
         XCTAssertTrue(Set([59, 58, 55]).isSubset(of: modifierCodes))
         modifierInjector.disableAndReleaseAll()
+    }
+
+    func testTrainingSanitizerRemovesDisabledAndDuplicateModifierPaths() {
+        var values = [Float](repeating: 1, count: ActionLayout.count * 2)
+        let channels = ActionChannels(absoluteMouse: true, relativeMouse: true, buttons: true, scroll: true, keyboard: true, modifiers: false)
+        values.withUnsafeMutableBufferPointer {
+            ActionLayout.sanitizeTrainingRows($0, rowCount: 2, channels: channels, restrictions: ActionRestrictions())
+        }
+
+        for row in 0..<2 {
+            let base = row * ActionLayout.count
+            XCTAssertEqual(values[base + ActionLayout.keyboard.lowerBound + 13], 1)
+            XCTAssertEqual(values[base + ActionLayout.keyboard.lowerBound + 56], 1)
+            XCTAssertEqual(values[base + ActionLayout.shift.lowerBound], 1)
+            for index in ActionLayout.commandOptionControlKeyboardIndices { XCTAssertEqual(values[base + index], 0) }
+            for index in ActionLayout.commandOptionControl { XCTAssertEqual(values[base + index], 0) }
+        }
+    }
+
+    func testCurrentModifierToggleCanDisableButNeverEnableAnOldBrainHead() {
+        let savedEnabled = ActionChannels(absoluteMouse: true, relativeMouse: true, buttons: true, scroll: true, keyboard: true, modifiers: true)
+        var currentDisabled = savedEnabled
+        currentDisabled.modifiers = false
+        XCTAssertFalse(RuntimeActionSemantics.effectiveChannels(saved: savedEnabled, current: currentDisabled).modifiers)
+
+        var savedDisabled = savedEnabled
+        savedDisabled.modifiers = false
+        XCTAssertFalse(RuntimeActionSemantics.effectiveChannels(saved: savedDisabled, current: savedEnabled).modifiers)
     }
 
     func testInjectorCannotEmitAKeyMissingFromTraining() {
@@ -1843,8 +1874,11 @@ final class DomainTests: XCTestCase {
 
         let shift = ActionLayout.shift.lowerBound
         let control = ActionLayout.commandOptionControl.lowerBound
+        let duplicatedControlKey = ActionLayout.keyboard.lowerBound + 59
         XCTAssertGreaterThan(loss(keyboard: true, modifiers: false, targetIndex: shift), 0)
         XCTAssertEqual(loss(keyboard: true, modifiers: false, targetIndex: control), 0, accuracy: 0.000_001)
+        XCTAssertEqual(loss(keyboard: true, modifiers: false, targetIndex: duplicatedControlKey), 0, accuracy: 0.000_001)
+        XCTAssertEqual(loss(keyboard: true, modifiers: true, targetIndex: duplicatedControlKey), 0, accuracy: 0.000_001)
         XCTAssertEqual(loss(keyboard: false, modifiers: true, targetIndex: shift), 0, accuracy: 0.000_001)
         XCTAssertGreaterThan(loss(keyboard: false, modifiers: true, targetIndex: control), 0)
     }
