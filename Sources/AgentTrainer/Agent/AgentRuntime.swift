@@ -9,6 +9,13 @@ import MLXNN
 final class AgentRuntime: @unchecked Sendable {
     private typealias VisualizationFunction = @Sendable ([MLXArray]) -> [MLXArray]
 
+    private enum StopAction {
+        case perform(DispatchSourceTimer?)
+        case waitForTeardown
+        case waitForStartup
+        case finished
+    }
+
     var onState: (@Sendable (InputState) -> Void)?
     var onMetrics: (@Sendable (RuntimeMetrics) -> Void)?
     var onStop: (@Sendable (String?) -> Void)?
@@ -39,6 +46,7 @@ final class AgentRuntime: @unchecked Sendable {
     private var allowedKeyCodes: Set<UInt16> = []
     private var shiftUsesKeyboardChannel = false
     private var latestFrame: CVPixelBuffer?
+    private var lastUsableCaptureFrame: CVPixelBuffer?
     private var processing = false
     private var predictionLatch = RuntimePredictionLatch()
     private var history: [[Float]] = []
@@ -59,8 +67,12 @@ final class AgentRuntime: @unchecked Sendable {
     private var previousPackedVision: Data?
     private var launchRevision: UInt64 = 0
     private var starting = false
+    private var teardownInProgress = false
+    private var startupWaiters: [CheckedContinuation<Void, Never>] = []
+    private var teardownWaiters: [CheckedContinuation<Void, Never>] = []
 
     init() throws {
+        MLXMemoryLifecycle.configure()
         preprocessor = try VisionPreprocessor()
         injector.onState = { [weak self] state in self?.onState?(state) }
     }
@@ -76,16 +88,20 @@ final class AgentRuntime: @unchecked Sendable {
             throw AgentTrainerError.model("This brain predates the current visual and Game Camera contracts. Retrain it from the original recordings.")
         }
         let launchToken: UInt64? = lock.withLock {
-            guard stopped, !starting else { return nil }
+            guard stopped, !starting, !teardownInProgress else { return nil }
             starting = true
             launchRevision &+= 1
             return launchRevision
         }
         guard let launchToken else { throw AgentTrainerError.model("This AI is already starting or running.") }
         defer {
-            lock.withLock {
-                if launchRevision == launchToken { starting = false }
+            let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+                starting = false
+                let waiters = startupWaiters
+                startupWaiters.removeAll(keepingCapacity: false)
+                return waiters
             }
+            waiters.forEach { $0.resume() }
         }
 
         // A runnable brain is immutable. Timing, history length, enabled heads,
@@ -154,7 +170,7 @@ final class AgentRuntime: @unchecked Sendable {
             self.previewFPS = max(0, previewFPS)
             self.lastPreviewTime = 0
             self.lastVisualizationTime = 0
-            latestFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: max(1, runtimeProfile.training.historyLength))
+            latestFrame = nil; lastUsableCaptureFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: max(1, runtimeProfile.training.historyLength))
             historyWriteIndex = 0; metrics = RuntimeMetrics(); startedAt = CACurrentMediaTime(); nextPerceptionTime = 0; lastMetricsReportTime = 0; lastFocusCheckTime = 0; stopped = false
             // Keep session enablement ordered with live permission changes. A
             // toggle made while model weights are loading must not be replaced
@@ -166,6 +182,7 @@ final class AgentRuntime: @unchecked Sendable {
         }
         guard accepted else { throw CancellationError() }
         do {
+            guard lock.withLock({ !stopped }) else { throw CancellationError() }
             safetyMonitor.ignoredHotkeys = ignoredHotkeys
             safetyMonitor.onSample = { [weak self] sample in
                 guard let self else { return }
@@ -182,13 +199,24 @@ final class AgentRuntime: @unchecked Sendable {
             liveCaptureSpec.showsCursor = version.trainingShowsCursor ?? captureSpec.showsCursor
             try await capture.start(spec: liveCaptureSpec, queueDepth: mode == .newest ? 3 : 8, onFrame: { [weak self] buffer, pts in
                 self?.receive(buffer, timestamp: pts)
+            }, onIdle: { [weak self] pts in
+                self?.receiveIdle(timestamp: pts)
             }, onUnexpectedStop: { [weak self] error in
                 Task { await self?.stop(reason: "Capture stopped: \(error.localizedDescription)") }
             })
             guard lock.withLock({ !stopped }) else { _ = try? await capture.stop(); throw CancellationError() }
             startActionTimer(fps: runtimeProfile.training.actionFPS)
+            guard lock.withLock({ !stopped }) else { throw CancellationError() }
         } catch {
             await stop(reason: nil)
+            // A concurrent stop can finish between a cancellation check and a
+            // subsequently-started monitor/stream. Clean those late resources
+            // again after joining teardown so a cancelled launch can never
+            // leave an input tap or capture stream behind.
+            safetyMonitor.stop()
+            safetyMonitor.onSample = nil
+            _ = try? await capture.stop()
+            injector.disableAndReleaseAll()
             throw error
         }
     }
@@ -216,39 +244,77 @@ final class AgentRuntime: @unchecked Sendable {
     }
 
     func stop(reason: String? = nil) async {
-        let stopState = lock.withLock { () -> (Bool, DispatchSourceTimer?) in
+        let action = lock.withLock { () -> StopAction in
             launchRevision &+= 1
-            starting = false
-            guard !stopped else { return (false, nil) }
+            if teardownInProgress { return .waitForTeardown }
+            guard !stopped else { return starting ? .waitForStartup : .finished }
             stopped = true
+            teardownInProgress = true
             let timer = actionTimer; actionTimer = nil
-            latestFrame = nil; previousPackedVision = nil; predictionLatch.reset(); targetPID = nil
-            return (true, timer)
+            latestFrame = nil; lastUsableCaptureFrame = nil; previousPackedVision = nil; predictionLatch.reset(); targetPID = nil
+            return .perform(timer)
         }
-        guard stopState.0 else { return }
-        let timer = stopState.1
+        let timer: DispatchSourceTimer?
+        switch action {
+        case .finished:
+            return
+        case .waitForStartup:
+            await waitForStartupCompletion()
+            return
+        case .waitForTeardown:
+            await waitForTeardownCompletion()
+            return
+        case .perform(let value):
+            timer = value
+        }
         timer?.setEventHandler {}
         timer?.cancel()
+        // Once no action block can still be executing, release physical input
+        // immediately. ScreenCaptureKit or an in-flight MLX eval may take
+        // seconds to drain, but they are no longer allowed to hold a key/button
+        // or leave relative mouse state associated during that wait.
+        await drain(queue: actionQueue)
+        injector.disableAndReleaseAll()
         safetyMonitor.stop()
         safetyMonitor.onSample = nil
         _ = try? await capture.stop()
-        await drain(queue: actionQueue)
         await drain(queue: inferenceQueue)
-        injector.disableAndReleaseAll()
         lock.withLock {
             predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
-            latestFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history.removeAll(keepingCapacity: false); historyWriteIndex = 0; processing = false
+            latestFrame = nil; lastUsableCaptureFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history.removeAll(keepingCapacity: false); historyWriteIndex = 0; processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
+        MLXMemoryLifecycle.reclaimCaches(after: "agent runtime")
         onStop?(reason)
+        let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            teardownInProgress = false
+            let waiters = teardownWaiters
+            teardownWaiters.removeAll(keepingCapacity: false)
+            return waiters
+        }
+        waiters.forEach { $0.resume() }
     }
 
     private func receive(_ buffer: CVPixelBuffer, timestamp: CMTime) {
+        schedule(buffer, countThrottledAsDropped: true)
+    }
+
+    private func receiveIdle(timestamp: CMTime) {
+        let frame = lock.withLock { stopped ? nil : lastUsableCaptureFrame }
+        if let frame { schedule(frame, countThrottledAsDropped: false) }
+    }
+
+    private func schedule(_ buffer: CVPixelBuffer, countThrottledAsDropped: Bool) {
         let now = CACurrentMediaTime()
         lock.lock()
         guard !stopped, let profile else { lock.unlock(); return }
+        if countThrottledAsDropped { lastUsableCaptureFrame = buffer }
         let interval = 1 / max(0.0001, profile.training.perceptionFPS)
-        guard now >= nextPerceptionTime else { metrics.droppedFrames += 1; lock.unlock(); return }
+        guard now >= nextPerceptionTime else {
+            if countThrottledAsDropped { metrics.droppedFrames += 1 }
+            lock.unlock()
+            return
+        }
         nextPerceptionTime = now + interval
         if mode == .ordered {
             let frame = SendablePixelBuffer(buffer)
@@ -493,6 +559,28 @@ final class AgentRuntime: @unchecked Sendable {
 
     private func drain(queue: DispatchQueue) async {
         await withCheckedContinuation { continuation in queue.async { continuation.resume() } }
+    }
+
+    private func waitForStartupCompletion() async {
+        await withCheckedContinuation { continuation in
+            let resumeImmediately = lock.withLock { () -> Bool in
+                guard starting else { return true }
+                startupWaiters.append(continuation)
+                return false
+            }
+            if resumeImmediately { continuation.resume() }
+        }
+    }
+
+    private func waitForTeardownCompletion() async {
+        await withCheckedContinuation { continuation in
+            let resumeImmediately = lock.withLock { () -> Bool in
+                guard teardownInProgress else { return true }
+                teardownWaiters.append(continuation)
+                return false
+            }
+            if resumeImmediately { continuation.resume() }
+        }
     }
 
     deinit {

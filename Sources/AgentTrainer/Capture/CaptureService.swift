@@ -22,8 +22,25 @@ struct CaptureResult: Sendable {
     let firstFrameHostNanos: UInt64
 }
 
+enum CaptureFrameDisposition: Equatable, Sendable {
+    case deliver
+    case reuseLastFrame
+    case drop
+
+    static func classify(_ status: SCFrameStatus?) -> Self {
+        guard let status else { return .deliver }
+        switch status {
+        case .complete, .started: return .deliver
+        case .idle: return .reuseLastFrame
+        case .blank, .suspended, .stopped: return .drop
+        @unknown default: return .drop
+        }
+    }
+}
+
 final class CaptureService: NSObject, @unchecked Sendable {
     typealias FrameHandler = @Sendable (CVPixelBuffer, CMTime) -> Void
+    typealias IdleFrameHandler = @Sendable (CMTime) -> Void
 
     private let outputQueue = DispatchQueue(label: "AgentTrainer.ScreenCapture", qos: .userInteractive)
     private var stream: SCStream?
@@ -43,7 +60,7 @@ final class CaptureService: NSObject, @unchecked Sendable {
         return result
     }
 
-    func start(spec: CaptureSpec, recordingURL: URL? = nil, exactOutputSize: CGSize? = nil, queueDepth: Int = 8, onFirstFrame: (@Sendable (UInt64) -> Void)? = nil, onFrame: FrameHandler? = nil, onUnexpectedStop: (@Sendable (Error) -> Void)? = nil) async throws {
+    func start(spec: CaptureSpec, recordingURL: URL? = nil, exactOutputSize: CGSize? = nil, queueDepth: Int = 8, onFirstFrame: (@Sendable (UInt64) -> Void)? = nil, onFrame: FrameHandler? = nil, onIdle: IdleFrameHandler? = nil, onUnexpectedStop: (@Sendable (Error) -> Void)? = nil) async throws {
         guard !isRunning else { throw AgentTrainerError.capture("A capture stream is already running.") }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
@@ -75,7 +92,7 @@ final class CaptureService: NSObject, @unchecked Sendable {
         if let sourceRect = selection.sourceRect { config.sourceRect = sourceRect }
 
         let writer = try recordingURL.map { try HEVCWriter(url: $0, width: config.width, height: config.height, fps: spec.requestedFPS) }
-        let output = StreamOutput(writer: writer, onFirstFrame: onFirstFrame, onFrame: onFrame, onUnexpectedStop: onUnexpectedStop)
+        let output = StreamOutput(writer: writer, onFirstFrame: onFirstFrame, onFrame: onFrame, onIdle: onIdle, onUnexpectedStop: onUnexpectedStop)
         let stream = SCStream(filter: selection.filter, configuration: config, delegate: output)
         try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: outputQueue)
         self.writer = writer
@@ -166,26 +183,36 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @u
     let writer: HEVCWriter?
     let onFirstFrame: (@Sendable (UInt64) -> Void)?
     let onFrame: CaptureService.FrameHandler?
+    let onIdle: CaptureService.IdleFrameHandler?
     let onUnexpectedStop: (@Sendable (Error) -> Void)?
     private(set) var droppedFrames = 0
     private(set) var firstFrameHostNanos: UInt64 = 0
     private let firstFrameLock = NSLock()
 
-    init(writer: HEVCWriter?, onFirstFrame: (@Sendable (UInt64) -> Void)?, onFrame: CaptureService.FrameHandler?, onUnexpectedStop: (@Sendable (Error) -> Void)?) {
+    init(writer: HEVCWriter?, onFirstFrame: (@Sendable (UInt64) -> Void)?, onFrame: CaptureService.FrameHandler?, onIdle: CaptureService.IdleFrameHandler?, onUnexpectedStop: (@Sendable (Error) -> Void)?) {
         self.writer = writer
         self.onFirstFrame = onFirstFrame
         self.onFrame = onFrame
+        self.onIdle = onIdle
         self.onUnexpectedStop = onUnexpectedStop
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, sampleBuffer.isValid else { return }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-           let raw = attachments.first?[.status] as? Int,
-           SCFrameStatus(rawValue: raw) != .complete {
+        let status = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])
+            .flatMap { $0.first?[.status] as? Int }
+            .flatMap(SCFrameStatus.init(rawValue:))
+        switch CaptureFrameDisposition.classify(status) {
+        case .reuseLastFrame:
+            onIdle?(sampleBuffer.presentationTimeStamp)
+            return
+        case .drop:
             droppedFrames += 1
             return
+        case .deliver:
+            break
         }
+        guard let pixelBuffer = sampleBuffer.imageBuffer else { droppedFrames += 1; return }
         let pts = sampleBuffer.presentationTimeStamp
         firstFrameLock.lock()
         if firstFrameHostNanos == 0 {
@@ -197,7 +224,7 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @u
         }
         firstFrameLock.unlock()
         writer?.append(sampleBuffer)
-        if let pixelBuffer = sampleBuffer.imageBuffer { onFrame?(pixelBuffer, sampleBuffer.presentationTimeStamp) }
+        onFrame?(pixelBuffer, pts)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

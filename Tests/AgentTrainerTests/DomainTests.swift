@@ -4,6 +4,7 @@ import CoreVideo
 import MLX
 import MLXNN
 import MLXOptimizers
+@preconcurrency import ScreenCaptureKit
 @testable import AgentTrainer
 
 final class DomainTests: XCTestCase {
@@ -74,6 +75,49 @@ final class DomainTests: XCTestCase {
         let parameterBytes = ModelSizing.parameterCount(profile) * 24
         XCTAssertGreaterThan(ModelSizing.estimatedTrainingWorkingSet(profile), parameterBytes)
         XCTAssertLessThan(ModelSizing.estimatedTrainingWorkingSet(profile), Int64.max)
+    }
+
+    func testMLXMemoryPolicyBoundsInferenceOnlySessions() {
+        let gibibyte = 1 << 30
+        let eightGiB = MLXMemoryLifecycle.limits(forPhysicalMemory: 8 * gibibyte)
+        XCTAssertEqual(eightGiB.memory, 6 * gibibyte)
+        XCTAssertEqual(eightGiB.cache, 512 << 20)
+
+        let thirtySixGiB = MLXMemoryLifecycle.limits(forPhysicalMemory: 36 * gibibyte)
+        XCTAssertEqual(thirtySixGiB.memory, 36 * gibibyte - Int(Double(36 * gibibyte) * 0.15))
+        XCTAssertEqual(thirtySixGiB.cache, 2 * gibibyte)
+        XCTAssertLessThanOrEqual(thirtySixGiB.cache, thirtySixGiB.memory)
+    }
+
+    func testScreenCaptureFrameStatusesDistinguishStaticFromUnsafeFrames() {
+        XCTAssertEqual(CaptureFrameDisposition.classify(nil), .deliver)
+        XCTAssertEqual(CaptureFrameDisposition.classify(.complete), .deliver)
+        XCTAssertEqual(CaptureFrameDisposition.classify(.started), .deliver)
+        XCTAssertEqual(CaptureFrameDisposition.classify(.idle), .reuseLastFrame)
+        XCTAssertEqual(CaptureFrameDisposition.classify(.blank), .drop)
+        XCTAssertEqual(CaptureFrameDisposition.classify(.suspended), .drop)
+        XCTAssertEqual(CaptureFrameDisposition.classify(.stopped), .drop)
+    }
+
+    func testInputMonitorSessionsJoinBeforeTheyCanRestart() async throws {
+        let monitor = InputCaptureService()
+        do {
+            try monitor.start()
+        } catch {
+            throw XCTSkip("The test host does not have Input Monitoring permission: \(error.localizedDescription)")
+        }
+        XCTAssertTrue(monitor.isRunning)
+        for _ in 0..<5 {
+            monitor.stop()
+            XCTAssertFalse(monitor.isRunning)
+            try monitor.start()
+            XCTAssertTrue(monitor.isRunning)
+        }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { monitor.stop() }
+            group.addTask { monitor.stop() }
+        }
+        XCTAssertFalse(monitor.isRunning)
     }
 
     func testNeuralInputSizingMirrorsPackedDenseCoordinateAndHistoryContracts() {

@@ -47,7 +47,7 @@ When cursor movement changes from enabled to disabled after Game Camera output w
 
 Runtime predictions contain two different semantics. Keyboard and mouse-button outputs are held state and may remain active across action ticks. Game Camera and scroll outputs are additive and are consumed only once for each new inference result; stale timer ticks write zero transient values into recurrent history instead of replaying the last movement. Game Camera always emits `.mouseMoved` independently of held buttons, and normal zero-delta predictions are suppressed. The explicit tagged zero-delta event used during disable/stop remains intentional.
 
-Policy v4 also has a freshness deadline. Once at least one prediction has been published, an action tick stops the complete runtime if that prediction is older than `max(350 ms, 3 / Perception FPS)`. Stop then drains inference/action queues and releases held state. Runtime vision, timing, history length, channels, cursor visibility, and Auto mouse mode come from the selected immutable version; mutable profile or Record-tab edits may not change a running brain's contract. Runtime startup is revision-tokened so Stop during weight loading cannot later install an orphan model or input injector.
+Policy v4 also has a freshness deadline. ScreenCaptureKit `idle` means the source did not change, so runtime reuses the last usable surface for a fresh perception rather than falsely tripping that deadline; blank/suspended/stopped frames are never reused. Once at least one prediction has been published, an action tick stops the complete runtime if MLX has not replaced it within `max(350 ms, 3 / Perception FPS)`. Stop blocks new action work, drains the action queue, and releases held state before waiting for capture and inference drains. Concurrent Stop callers join one teardown and the UI remains Starting/Stopping until it completes. Runtime vision, timing, history length, channels, cursor visibility, and Auto mouse mode come from the selected immutable version; mutable profile or Record-tab edits may not change a running brain's contract. App and runtime startup are both revision-tokened and single-flight so Stop during lookup or weight loading cannot later install an orphan model or input injector.
 
 Do not move these checks only into SwiftUI or `AppModel`. The injector must remain the final authority because it is the component that serializes and posts OS events.
 
@@ -62,7 +62,7 @@ Run the complete test suite:
 The feature-specific tests are:
 
 ```sh
-swift test -c debug --filter 'DomainTests/testRuntimeCursorPermissionBlocksMovementWithoutBlockingMouseButtons|DomainTests/testDisablingRuntimeKeyboardImmediatelyReleasesKeysAndPreventsRepress|DomainTests/testRuntimePredictionLatchConsumesTransientOutputsOnce|DomainTests/testGameCameraDoesNotReplayStaleOrZeroDeltasAndNeverUsesDragEvents'
+swift test -c debug --filter 'DomainTests/testRuntimeCursorPermissionBlocksMovementWithoutBlockingMouseButtons|DomainTests/testDisablingRuntimeKeyboardImmediatelyReleasesKeysAndPreventsRepress|DomainTests/testRuntimePredictionLatchConsumesTransientOutputsOnce|DomainTests/testGameCameraDoesNotReplayStaleOrZeroDeltasAndNeverUsesDragEvents|DomainTests/testScreenCaptureFrameStatusesDistinguishStaticFromUnsafeFrames|DomainTests/testInputMonitorSessionsJoinBeforeTheyCanRestart|DomainTests/testMLXMemoryPolicyBoundsInferenceOnlySessions'
 ```
 
 The complete current suite must pass; do not preserve a hard-coded historical test count in release decisions.
@@ -78,6 +78,8 @@ Manual checks with a disposable target are still required for a release:
 7. Slow inference below Action FPS and confirm each predicted Game Camera delta appears once, not once per timer tick.
 8. Hold the predicted left button while moving the Game Camera and confirm movement events remain `mouseMoved`, not drag events.
 9. Pause or stall inference after one prediction and confirm the freshness watchdog stops the AI and releases every held control.
+10. Leave the target visually unchanged and confirm `idle` frames keep perception alive without repeated stale-inference shutdowns.
+11. Run and stop the same AI repeatedly, including a double Run/Stop shortcut press during startup; confirm only one runtime exists, Stop remains visible until cleanup finishes, and MLX cache returns near its post-warm-up baseline.
 
 ## macOS permissions and code identity
 
@@ -102,7 +104,7 @@ identifier "local.agenttrainer.mac" and certificate leaf = H"51e78a945e47715731a
 
 The executable CDHash changes on every build; that is expected. The designated requirement above must remain stable. Ad-hoc signing (`-`) makes identity depend on the changing binary hash and commonly causes macOS to request permissions again.
 
-AgentTrainer 1.8.4 uses native hotkey registration when Carbon is available and compiles an AppKit global/local-monitor fallback otherwise. This does not change the three TCC categories or the designated-requirement rules on current systems. The release baseline supports Sequoia 15, Tahoe 26, and macOS 27; compile with Xcode 27 as a separate release check when that toolchain is available.
+AgentTrainer 1.8.5 uses native hotkey registration when Carbon is available and compiles an AppKit global/local-monitor fallback otherwise. This does not change the three TCC categories or the designated-requirement rules on current systems. The release baseline supports Sequoia 15, Tahoe 26, and macOS 27; compile with Xcode 27 as a separate release check when that toolchain is available.
 
 Do not reset TCC, delete privacy database entries, change the bundle identifier, switch signers, or move/recreate the authorized app as a troubleshooting shortcut. Those actions can discard working grants. If the stable signing identity is unavailable, stop and report the blocker instead of silently ad-hoc signing.
 

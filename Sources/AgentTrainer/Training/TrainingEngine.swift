@@ -67,6 +67,10 @@ final class TrainingEngine: @unchecked Sendable {
                 } catch {
                     outcome = .failure(error)
                 }
+                // The optimizer/model stack is out of scope here. Drop unused
+                // Metal buffers before publishing Idle so repeated training
+                // sessions cannot accumulate allocator cache until app quit.
+                MLXMemoryLifecycle.reclaimCaches(after: "training")
                 self.lock.withLock { self.task = nil }
                 completion(outcome)
             }
@@ -77,16 +81,7 @@ final class TrainingEngine: @unchecked Sendable {
     func stop() { lock.withLock { stopRequested = true; task?.cancel() } }
 
     private func train(profile: AIProfile, recordings: [RecordingItem], runSettings: TrainingRunSettings, randomState: MLXRandom.RandomState, metrics: @escaping MetricsHandler) async throws -> TrainingCompletion {
-        let physical = Int(ProcessInfo.processInfo.physicalMemory)
-        // Unified memory is also needed by macOS, ScreenCaptureKit, video decode,
-        // and the UI. Keeping at least 15% (and normally 2 GiB) outside MLX
-        // avoids swap-driven slowdowns during long unattended runs.
-        let reserved = max(2 << 30, Int(Double(physical) * 0.15))
-        Memory.memoryLimit = max(1 << 30, physical - reserved)
-        // Fixed-shape compiled batches reuse a small set of buffers. A bounded
-        // cache prevents allocator growth during multi-hour sessions without
-        // changing model math or precision.
-        Memory.cacheLimit = max(512 << 20, min(2 << 30, Int(Double(physical) * 0.06)))
+        MLXMemoryLifecycle.configure()
 
         let dataset = try await DatasetCacheBuilder.shared.cache(for: profile, recordings: recordings) { progress, status in
             var value = TrainingMetrics(); value.totalEpochs = profile.training.epochs

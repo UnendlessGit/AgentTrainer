@@ -29,6 +29,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isStartingRecording = false
     @Published var isTraining = false
     @Published var isRunning = false
+    @Published private(set) var isStartingAgent = false
     @Published var isReplaying = false
     /// UI-only visibility signal. Training/runtime keep working in the
     /// background, while decorative animation and chart refresh can pause.
@@ -87,7 +88,7 @@ final class AppModel: ObservableObject {
     private let regionSelector = RegionSelector()
     private lazy var panicHotkey = GlobalHotkeyMonitor(identifier: 1, binding: hotkeys.panic) { [weak self] in Task { @MainActor in self?.panic() } }
     private lazy var recordHotkey = GlobalHotkeyMonitor(identifier: 2, binding: hotkeys.record) { [weak self] in Task { @MainActor in guard let self else { return }; self.recordingIsActiveOrStarting ? await self.stopRecording() : await self.startRecording() } }
-    private lazy var runHotkey = GlobalHotkeyMonitor(identifier: 3, binding: hotkeys.run) { [weak self] in Task { @MainActor in guard let self else { return }; self.isRunning ? await self.stopAgent() : await self.startAgent() } }
+    private lazy var runHotkey = GlobalHotkeyMonitor(identifier: 3, binding: hotkeys.run) { [weak self] in Task { @MainActor in guard let self else { return }; self.agentIsActiveOrStarting ? await self.stopAgent() : await self.startAgent() } }
     private var agent: AgentRuntime?
     private var eventWriter: InputEventWriter?
     private var recordingDirectory: URL?
@@ -99,6 +100,7 @@ final class AppModel: ObservableObject {
     private var activeRecordingFolderID: UUID?
     private var activeRecordingExcludedKeyCodes: Set<UInt16> = []
     private var recordingLaunchRevision: UInt64 = 0
+    private var agentLaunchRevision: UInt64 = 0
     private var lastEventClock = RecordingClock()
     private var profileAutosaveTask: Task<Void, Never>?
     private var isRestoringWorkflowSettings = true
@@ -108,11 +110,13 @@ final class AppModel: ObservableObject {
     var selectedRecording: RecordingItem? { recordings.first { $0.id == selectedRecordingID } }
     var selectedProfile: AIProfile? { profiles.first { $0.id == selectedProfileID } }
     var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording }
+    var agentIsActiveOrStarting: Bool { isRunning || isStartingAgent }
     var canChangeStorageLocations: Bool {
-        !isChangingStorageLocation && !recordingIsActiveOrStarting && !isTraining && !isRunning && !isReplaying
+        !isChangingStorageLocation && !recordingIsActiveOrStarting && !isTraining && !agentIsActiveOrStarting && !isReplaying
     }
 
     init() {
+        MLXMemoryLifecycle.configure()
         var migratedMouseMode = false
         if let data = UserDefaults.standard.data(forKey: "AgentTrainer.WorkflowSettings"), let saved = try? JSONDecoder().decode(PersistentWorkflowSettings.self, from: data) {
             recordingExcludedKeyCodes = saved.recordingExcludedKeyCodes
@@ -287,7 +291,7 @@ final class AppModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !isRecording, !isStartingRecording, !isRunning else { return }
+        guard !isRecording, !isStartingRecording, !agentIsActiveOrStarting, !isReplaying else { return }
         guard let source = selectedSource else { present(AgentTrainerError.invalidConfiguration("Select a capture source.")); return }
         guard let destinationFolderID = recordingDestinationFolderID else { present(AgentTrainerError.invalidConfiguration("Create or select a recording folder.")); return }
         isStartingRecording = true
@@ -515,30 +519,23 @@ final class AppModel: ObservableObject {
 
     func startAgent() async {
         guard let profile = selectedProfile, let versionID = profile.activeVersionID,
-              let source = selectedSource, !isRecording, !isRunning, agent == nil else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop any current AI first.")); return }
+              let source = selectedSource, !recordingIsActiveOrStarting, !agentIsActiveOrStarting, agent == nil, !isReplaying else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop recording, replay, or any current AI first.")); return }
         guard trainingProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently training. Select another trained AI to run at the same time.")); return }
+        isStartingAgent = true
+        runningProfileID = profile.id
+        agentLaunchRevision &+= 1
+        let launchToken = agentLaunchRevision
+        runtimeStatus = "Preparing \(profile.name) for local inference…"
+        activityStatus = runtimeStatus
+        defer { isStartingAgent = false }
         var attemptedRuntime: AgentRuntime?
+        var installedRuntime = false
         do {
             guard let version = await WorkspaceStore.shared.version(profileID: profile.id, versionID: versionID) else {
                 throw AgentTrainerError.model("The active runnable brain is missing. Load Saved Brains in AI Models and choose another version.")
             }
-            let runtime = try AgentRuntime()
-            attemptedRuntime = runtime
-            runtime.onState = { [weak self] state in Task { @MainActor in self?.hudModel.update(state: state, source: .agent) } }
-            runtime.onMetrics = { [weak self] value in Task { @MainActor in self?.runtimeMetrics = value } }
-            runtime.onPreview = { [weak self] frame in Task { @MainActor in self?.hudModel.updateVision(frame) } }
-            runtime.onVisualization = { [weak self] frame in Task { @MainActor in self?.hudModel.updateCNNVisualization(frame) } }
-            runtime.onStop = { [weak self, weak runtime] reason in Task { @MainActor in
-                guard let self, let runtime, self.agent === runtime else { return }
-                self.agent = nil; self.isRunning = false; self.runningProfileID = nil; self.hudModel.hide(); self.runtimeStatus = reason ?? "Agent stopped"; self.activityStatus = self.runtimeStatus
-                AppLog.write(reason == nil ? .info : .warning, category: "Runtime", self.runtimeStatus)
-            } }
-            agent = runtime; isRunning = true; runningProfileID = profile.id; hudModel.show(source: .agent, vision: showVisionPreview, cnnVisualization: cnnVisualizationSettings)
-            runtimeStatus = "Agent starting at exactly \(version.preprocessing.width) × \(version.preprocessing.height)"; activityStatus = runtimeStatus
-            var runtimeSafety = safety
-            runtimeSafety.panicKeyCode = UInt16(clamping: hotkeys.panic.keyCode)
-            runtimeSafety.panicModifiers = hotkeys.panic.cgEventModifiers
-            let previewRate = visionPreviewMatchesPerception ? version.training.perceptionFPS : visionPreviewFPS
+            guard agentLaunchRevision == launchToken else { throw CancellationError() }
+
             let resolvedMouseMode: MouseControlMode
             if runMouseMode != .automatic {
                 resolvedMouseMode = runMouseMode
@@ -547,24 +544,92 @@ final class AppModel: ObservableObject {
             } else {
                 resolvedMouseMode = await self.resolvedMouseMode(for: profile)
             }
+            guard agentLaunchRevision == launchToken else { throw CancellationError() }
+
             let allowedKeyCodes: Set<UInt16>
             if let persisted = version.demonstratedKeyCodes { allowedKeyCodes = persisted }
             else { allowedKeyCodes = await demonstratedKeyCodes(for: profile) }
+            guard agentLaunchRevision == launchToken else { throw CancellationError() }
+
+            let runtime = try AgentRuntime()
+            attemptedRuntime = runtime
+            runtime.onState = { [weak self] state in Task { @MainActor in self?.hudModel.update(state: state, source: .agent) } }
+            runtime.onMetrics = { [weak self] value in Task { @MainActor in self?.runtimeMetrics = value } }
+            runtime.onPreview = { [weak self] frame in Task { @MainActor in self?.hudModel.updateVision(frame) } }
+            runtime.onVisualization = { [weak self] frame in Task { @MainActor in self?.hudModel.updateCNNVisualization(frame) } }
+            runtime.onStop = { [weak self, weak runtime] reason in Task { @MainActor in
+                guard let self, let runtime, self.agent === runtime else { return }
+                self.finishAgentRuntime(runtime, status: reason ?? "Agent stopped")
+            } }
+            guard agentLaunchRevision == launchToken else { throw CancellationError() }
+            agent = runtime; isRunning = true; runningProfileID = profile.id; hudModel.show(source: .agent, vision: showVisionPreview, cnnVisualization: cnnVisualizationSettings)
+            installedRuntime = true
+            runtimeStatus = "Agent starting at exactly \(version.preprocessing.width) × \(version.preprocessing.height)"; activityStatus = runtimeStatus
+            var runtimeSafety = safety
+            runtimeSafety.panicKeyCode = UInt16(clamping: hotkeys.panic.keyCode)
+            runtimeSafety.panicModifiers = hotkeys.panic.cgEventModifiers
+            let previewRate = visionPreviewMatchesPerception ? version.training.perceptionFPS : visionPreviewFPS
             try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: captureSpec(source: source), captureRect: effectiveCaptureRect(source), mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, safety: runtimeSafety, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run])
+            guard agentLaunchRevision == launchToken else { throw CancellationError() }
             if isRunning, agent === runtime { runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue)"; activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus; AppLog.write(category: "Runtime", "Agent started", details: "\(profile.name), \(resolvedMouseMode.rawValue), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")") }
         } catch is CancellationError {
-            guard attemptedRuntime == nil || agent === attemptedRuntime || agent == nil else { return }
-            isRunning = false; runningProfileID = nil; hudModel.hide(); if agent === attemptedRuntime { agent = nil }; runtimeStatus = "Agent start cancelled"; activityStatus = runtimeStatus
+            await attemptedRuntime?.stop(reason: nil)
+            // If an installed runtime already cleared itself, its onStop reason
+            // is more precise (focus loss, stale inference, capture failure,
+            // or explicit Stop) than replacing it with generic cancellation.
+            if !installedRuntime || agent === attemptedRuntime {
+                if agent === attemptedRuntime { agent = nil }
+                isRunning = false; runningProfileID = nil; runtimeMetrics = RuntimeMetrics(); hudModel.hide()
+                runtimeStatus = "Agent start cancelled; all hooks disabled and held inputs released"
+                activityStatus = isTraining ? trainingStatus : runtimeStatus
+            }
+            if attemptedRuntime != nil { MLXMemoryLifecycle.reclaimCaches(after: "cancelled agent start") }
         }
         catch {
+            await attemptedRuntime?.stop(reason: nil)
             guard attemptedRuntime == nil || agent === attemptedRuntime || agent == nil else { return }
-            isRunning = false; runningProfileID = nil; hudModel.hide(); if agent === attemptedRuntime { agent = nil }; runtimeStatus = error.localizedDescription; present(error)
+            if agent === attemptedRuntime { agent = nil }
+            isRunning = false; runningProfileID = nil; runtimeMetrics = RuntimeMetrics(); hudModel.hide(); runtimeStatus = error.localizedDescription
+            if attemptedRuntime != nil { MLXMemoryLifecycle.reclaimCaches(after: "failed agent start") }
+            present(error)
         }
     }
 
-    func stopAgent() async { let runtime = agent; agent = nil; await runtime?.stop(reason: "Agent stopped"); isRunning = false; runningProfileID = nil; runtimeMetrics = RuntimeMetrics(); hudModel.hide(); runtimeStatus = "Agent stopped; all hooks disabled and held inputs released"; activityStatus = isTraining ? trainingStatus : runtimeStatus; if runtime != nil { AppLog.write(category: "Runtime", "Agent stopped and input hooks released") } }
+    func stopAgent() async {
+        guard agentIsActiveOrStarting || agent != nil else { return }
+        agentLaunchRevision &+= 1
+        let wasStarting = isStartingAgent
+        let runtime = agent
+        let finalStatus = wasStarting
+            ? "Agent start cancelled; all hooks disabled and held inputs released"
+            : "Agent stopped; all hooks disabled and held inputs released"
+        runtimeStatus = wasStarting ? "Cancelling agent start and releasing inputs…" : "Stopping agent and releasing inputs…"
+        activityStatus = runtimeStatus
+        await runtime?.stop(reason: finalStatus)
+
+        if wasStarting {
+            // The launch method owns model loading/compilation. Keep the UI and
+            // termination path in a stopping state until that task observes its
+            // revision cancellation and releases its local graph as well.
+            while isStartingAgent { try? await Task.sleep(for: .milliseconds(20)) }
+            return
+        }
+        if let runtime { finishAgentRuntime(runtime, status: finalStatus) }
+    }
+
+    private func finishAgentRuntime(_ runtime: AgentRuntime, status: String) {
+        guard agent === runtime else { return }
+        agent = nil; isRunning = false; runningProfileID = nil; runtimeMetrics = RuntimeMetrics(); hudModel.hide()
+        runtimeStatus = status; activityStatus = isTraining ? trainingStatus : runtimeStatus
+        let level: AppLogLevel = status == "Agent stopped" || status.contains("all hooks disabled") ? .info : .warning
+        AppLog.write(level, category: "Runtime", status)
+    }
     func startReenactment() {
         guard let recording = selectedRecording else { return }
+        guard !agentIsActiveOrStarting, !recordingIsActiveOrStarting, !isReplaying else {
+            present(AgentTrainerError.invalidConfiguration("Stop the current agent or recording before reenacting real input."))
+            return
+        }
         do { try reenactor.start(recording: recording); isReplaying = true; activityStatus = "Guarded reenactment running"; AppLog.write(category: "Replay", "Reenactment started", details: recording.manifest.name) } catch { present(error) }
     }
     func stopReenactment() { reenactor.stop(); if isReplaying { AppLog.write(category: "Replay", "Reenactment stopped") }; isReplaying = false; activityStatus = "Reenactment stopped" }
