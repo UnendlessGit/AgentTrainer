@@ -93,7 +93,7 @@ final class AgentRuntime: @unchecked Sendable {
         // than mutable editor fields that may have changed after training.
         var runtimeProfile = profile
         runtimeProfile.preprocessing = version.preprocessing
-        runtimeProfile.channels = version.channels
+        runtimeProfile.channels = RuntimeActionSemantics.effectiveChannels(saved: version.channels, current: profile.channels)
         runtimeProfile.training = version.training
         let startRevisions = lock.withLock { (outputPermissionsRevision, visualizationSettingsRevision) }
         let model = AgentPolicy(profile: runtimeProfile)
@@ -405,7 +405,7 @@ final class AgentRuntime: @unchecked Sendable {
         case .movement: Array(mouseMode == .relative ? ActionLayout.relativeMouse : ActionLayout.absoluteMouse)
         case .mouseButtons: Array(ActionLayout.buttons)
         case .scroll: Array(ActionLayout.scroll)
-        case .keyboard: Array(ActionLayout.keyboardAndShift)
+        case .keyboard: ActionLayout.keyboardAndShiftIndices
         case .modifiers: Array(ActionLayout.commandOptionControl)
         }
         var values = [Float](repeating: 0, count: ActionLayout.count)
@@ -459,7 +459,9 @@ final class AgentRuntime: @unchecked Sendable {
         if profile.training.historyLength > 0, !history.isEmpty {
             history[historyWriteIndex] = RuntimeActionSemantics.historyValues(
                 prediction,
-                predictionIsFresh: latched.isFresh
+                predictionIsFresh: latched.isFresh,
+                channels: profile.channels,
+                restrictions: profile.effectiveRestrictions
             )
             historyWriteIndex = (historyWriteIndex + 1) % history.count
         }
@@ -544,14 +546,35 @@ struct RuntimePredictionLatch: Sendable {
 }
 
 enum RuntimeActionSemantics {
+    /// Saved channels define what a brain learned, but the current Modifiers
+    /// off switch is a safety override for every brain generation. Intersection
+    /// semantics prevent a later editor change from enabling an untrained head.
+    static func effectiveChannels(saved: ActionChannels, current: ActionChannels) -> ActionChannels {
+        var result = saved
+        result.modifiers = saved.modifiers && current.modifiers
+        return result
+    }
+
     /// Training history is one row per action tick. Reused policy state remains
     /// useful for held buttons/keys, while additive channels are zero on ticks
     /// where no new prediction was executed.
-    static func historyValues(_ prediction: [Float], predictionIsFresh: Bool) -> [Float] {
-        guard !predictionIsFresh, prediction.count >= ActionLayout.count else { return prediction }
+    static func historyValues(
+        _ prediction: [Float],
+        predictionIsFresh: Bool,
+        channels: ActionChannels? = nil,
+        restrictions: ActionRestrictions = ActionRestrictions()
+    ) -> [Float] {
+        guard prediction.count >= ActionLayout.count else { return prediction }
         var values = prediction
-        for index in ActionLayout.relativeMouse { values[index] = 0 }
-        for index in ActionLayout.scroll { values[index] = 0 }
+        if !predictionIsFresh {
+            for index in ActionLayout.relativeMouse { values[index] = 0 }
+            for index in ActionLayout.scroll { values[index] = 0 }
+        }
+        if let channels {
+            values.withUnsafeMutableBufferPointer {
+                ActionLayout.sanitizeTrainingRows($0, rowCount: 1, channels: channels, restrictions: restrictions)
+            }
+        }
         return values
     }
 }

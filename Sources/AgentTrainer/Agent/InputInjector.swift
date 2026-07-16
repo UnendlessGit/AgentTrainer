@@ -130,7 +130,10 @@ final class InputInjector: @unchecked Sendable {
         }
         let desiredKeys = outputPermissions.keyboard && channels.keyboard ? Set<UInt16>((0..<128).compactMap {
             let code = UInt16($0)
-            return prediction[14 + $0] >= 0.5 && allowedKeyCodes.contains(code) && restrictions.allowsKey(code) ? code : nil
+            return prediction[14 + $0] >= 0.5
+                && !ActionLayout.commandOptionControlKeyCodeSet.contains(code)
+                && allowedKeyCodes.contains(code)
+                && restrictions.allowsKey(code) ? code : nil
         }) : []
         var desiredWithModifiers = desiredKeys
         for i in 0..<4 where desiredModifiers & modifierMasks[i].rawValue != 0 { desiredWithModifiers.insert(modifierKeys[i]) }

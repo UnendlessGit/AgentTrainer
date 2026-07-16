@@ -326,16 +326,18 @@ final class TrainingEngine: @unchecked Sendable {
         let restrictions = profile.effectiveRestrictions
         targetData.withUnsafeMutableBytes { raw in
             let values = raw.bindMemory(to: Float.self)
-            for row in 0..<b {
-                let base = row * ActionLayout.count
-                for key in restrictions.blockedKeyCodes where key < 128 {
-                    values[base + 14 + Int(key)] = 0
-                }
-                for modifier in 0..<4 where !restrictions.allowsModifier(modifier) { values[base + 142 + modifier] = 0 }
-                for button in restrictions.blockedMouseButtons where button < 8 { values[base + 4 + Int(button)] = 0 }
-            }
+            ActionLayout.sanitizeTrainingRows(values, rowCount: b, channels: profile.channels, restrictions: restrictions)
         }
-        let historyData = dataset.historyBatch(at: indices)
+        var historyData = dataset.historyBatch(at: indices)
+        historyData.withUnsafeMutableBytes { raw in
+            let values = raw.bindMemory(to: Float.self)
+            ActionLayout.sanitizeTrainingRows(
+                values,
+                rowCount: b * max(1, profile.training.historyLength),
+                channels: profile.channels,
+                restrictions: restrictions
+            )
+        }
         return PreparedBatch(
             count: b,
             packedObservations: dataset.packedObservations(at: indices),
