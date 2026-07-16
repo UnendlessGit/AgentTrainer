@@ -85,7 +85,7 @@ struct RecordView: View {
                             HStack { LabeledNumber("FPS", value: $model.captureFPS); Toggle("Show cursor in video", isOn: $model.showsCursor); Spacer() }
                             HStack { LabeledNumber("Trim first (seconds)", value: $model.recordingTrimStart); LabeledNumber("Trim last (seconds)", value: $model.recordingTrimEnd); InfoTip("Trimming is non-destructive. Replay and training use only the retained time range; the original HEVC video remains intact."); Spacer() }
                         }
-                    }.frame(maxWidth: .infinity).disabled(model.isRecording)
+                    }.frame(maxWidth: .infinity).disabled(model.recordingIsActiveOrStarting)
                     OLEDCard {
                         VStack(alignment: .leading, spacing: 14) {
                             Label("Synchronized inputs", systemImage: "keyboard.badge.ellipsis").foregroundStyle(ATColor.cyan).font(.headline)
@@ -98,13 +98,13 @@ struct RecordView: View {
                             Text("Recording key blacklist").font(.subheadline.bold()).foregroundStyle(ATColor.coral)
                             RecordingKeyBlacklistEditor(keys: $model.recordingExcludedKeyCodes, model: model)
                         }
-                    }.frame(width: 330).disabled(model.isRecording)
+                    }.frame(width: 330).disabled(model.recordingIsActiveOrStarting)
                 }
                 HStack {
                     Label("The menu bar shows recording status; a compact capture-excluded keyboard shows only keys used in this recording.", systemImage: "keyboard").font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    if model.isRecording { Button("Stop & Save") { Task { await model.stopRecording() } }.primaryButton(color: ATColor.coral) }
-                    else { Button("Record") { Task { await model.startRecording() } }.primaryButton(color: ATColor.coral) }
+                    if model.recordingIsActiveOrStarting { Button(model.isRecording ? "Stop & Save" : "Cancel Start") { Task { await model.stopRecording() } }.primaryButton(color: ATColor.coral) }
+                    else { Button("Record") { Task { await model.startRecording() } }.primaryButton(color: ATColor.coral).disabled(model.agentIsActiveOrStarting || model.isReplaying) }
                 }
             }.padding(28)
         }
@@ -1161,7 +1161,7 @@ struct RunView: View {
                             }
                         }
                         .frame(maxWidth: 430)
-                        .disabled(model.isRunning)
+                        .disabled(model.agentIsActiveOrStarting)
                         InfoTip("Choose the trained AI to run here. The active saved brain for that AI is loaded directly, so the full autosave list does not need to be opened.")
                         Spacer()
                         if let progress = model.selectedProfile?.trainingProgress {
@@ -1171,7 +1171,7 @@ struct RunView: View {
                 }
                 if let profile = model.selectedProfile {
                     OLEDCard {
-                        HStack { VStack(alignment: .leading, spacing: 7) { Text(profile.name).font(.title2.bold()); Text("Model vision \(profile.preprocessing.width) × \(profile.preprocessing.height) — live capture will be exactly the same").foregroundStyle(ATColor.cyan); Text("\(profile.preprocessing.colorMode.rawValue), \(profile.preprocessing.bitDepth)-bit, \(profile.preprocessing.chroma.rawValue)").foregroundStyle(.secondary) }; Spacer(); StatusPill(text: model.isRunning ? "AI running" : profile.activeVersionID == nil ? "Training required" : "Ready", color: model.isRunning ? ATColor.green : ATColor.violet) }
+                        HStack { VStack(alignment: .leading, spacing: 7) { Text(profile.name).font(.title2.bold()); Text("Model vision \(profile.preprocessing.width) × \(profile.preprocessing.height) — live capture will be exactly the same").foregroundStyle(ATColor.cyan); Text("\(profile.preprocessing.colorMode.rawValue), \(profile.preprocessing.bitDepth)-bit, \(profile.preprocessing.chroma.rawValue)").foregroundStyle(.secondary) }; Spacer(); StatusPill(text: model.isStartingAgent ? "Starting / stopping" : model.isRunning ? "AI running" : profile.activeVersionID == nil ? "Training required" : "Ready", color: model.agentIsActiveOrStarting ? ATColor.green : ATColor.violet) }
                     }
                     OLEDCard {
                         VStack(alignment: .leading, spacing: 12) {
@@ -1272,10 +1272,10 @@ struct RunView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                             Divider()
                             Text("Per-AI key and mouse-button restrictions").font(.subheadline.bold())
-                            KeyRestrictionGrid(restrictions: Binding(get: { profile.effectiveRestrictions }, set: { value in var changed = profile; changed.restrictions = value; model.saveProfile(changed) }), model: model).disabled(model.isRunning)
+                            KeyRestrictionGrid(restrictions: Binding(get: { profile.effectiveRestrictions }, set: { value in var changed = profile; changed.restrictions = value; model.saveProfile(changed) }), model: model).disabled(model.agentIsActiveOrStarting)
                         }
                     }
-                    HStack { StatusPill(text: model.isTraining ? "Background training remains active" : "Custom panic shortcut armed", color: model.isTraining ? ATColor.cyan : ATColor.coral); Spacer(); if model.isRunning { Button("Stop AI & Disable All Hooks") { Task { await model.stopAgent() } }.primaryButton(color: ATColor.coral) } else { Button("Run AI") { Task { await model.startAgent() } }.primaryButton(color: ATColor.green).disabled(profile.activeVersionID == nil || model.trainingProfileID == profile.id) } }
+                    HStack { StatusPill(text: model.isTraining ? "Background training remains active" : "Custom panic shortcut armed", color: model.isTraining ? ATColor.cyan : ATColor.coral); Spacer(); if model.agentIsActiveOrStarting { Button(model.isStartingAgent ? "Cancel AI Start & Release Inputs" : "Stop AI & Disable All Hooks") { Task { await model.stopAgent() } }.primaryButton(color: ATColor.coral) } else { Button("Run AI") { Task { await model.startAgent() } }.primaryButton(color: ATColor.green).disabled(profile.activeVersionID == nil || model.trainingProfileID == profile.id || model.recordingIsActiveOrStarting || model.isReplaying) } }
                 } else { ContentUnavailableView("No AI profile selected", systemImage: "cpu") }
             }.padding(28)
         }
@@ -1381,7 +1381,7 @@ struct DiagnosticsView: View {
             }.padding(28)
         }
     }
-    private var appState: String { "recording=\(model.isRecording), training=\(model.isTraining), running=\(model.isRunning), replaying=\(model.isReplaying), activity=\(model.activityStatus)" }
+    private var appState: String { "recording=\(model.isRecording), recordingStarting=\(model.isStartingRecording), training=\(model.isTraining), running=\(model.isRunning), agentStarting=\(model.isStartingAgent), replaying=\(model.isReplaying), activity=\(model.activityStatus)" }
     private func hardwareName() -> String { var size = 0; sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0); var value = [CChar](repeating: 0, count: max(1, size)); sysctlbyname("machdep.cpu.brand_string", &value, &size, nil, 0); return String(decoding: value.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self) }
 }
 
@@ -1419,15 +1419,15 @@ struct SettingsView: View {
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack { Text("Global keybinds").font(.headline).foregroundStyle(ATColor.cyan); InfoTip("Click a shortcut, then press a new combination. Shortcuts work globally and are removed from recordings and human-interruption safety.") }
-                        HotkeySettingsEditor(model: model).disabled(model.isRunning || model.isRecording)
-                        if model.isRunning || model.isRecording { Text("Shortcuts are locked until the active recording or agent session stops.").font(.caption).foregroundStyle(ATColor.amber) }
+                        HotkeySettingsEditor(model: model).disabled(model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting)
+                        if model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting { Text("Shortcuts are locked until the active recording or agent session stops.").font(.caption).foregroundStyle(ATColor.amber) }
                     }
                 }
                 OLEDCard { VStack(alignment: .leading, spacing: 12) { HStack { Text("Global safety").font(.headline).foregroundStyle(ATColor.coral); InfoTip("The panic shortcut disables capture/action hooks, drains background work, releases every held control, and posts a neutral mouse event.") }; Toggle("Stop AI on any physical human input", isOn: $model.safety.stopOnHumanInput); Toggle("Allow full-Mac control by default", isOn: $model.safety.allowFullMac).tint(ATColor.coral) } }
                 ThemeSettingsView()
                 OLEDCard { HStack { VStack(alignment: .leading, spacing: 4) { Text("Diagnostics and app logs").font(.headline).foregroundStyle(ATColor.cyan); Text("Open the dedicated tab for persistent errors, prints, crash reports, MLX memory, and a copyable support report.").foregroundStyle(.secondary) }; Spacer(); Button("Open Diagnostics") { model.selection = .diagnostics }.primaryButton() } }
                 StorageSettingsView(model: model)
-                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.4") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "15"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
+                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.5") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "16"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
             }.padding(28)
         }
     }

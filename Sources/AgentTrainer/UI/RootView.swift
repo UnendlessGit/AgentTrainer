@@ -98,22 +98,22 @@ struct RootView: View {
                 StatusPill(text: activityTitle, color: activityColor)
 
                 Button {
-                    Task { model.isRecording ? await model.stopRecording() : await model.startRecording() }
+                    Task { model.recordingIsActiveOrStarting ? await model.stopRecording() : await model.startRecording() }
                 } label: {
-                    Image(systemName: model.isRecording ? "stop.fill" : "record.circle")
+                    Image(systemName: model.recordingIsActiveOrStarting ? "stop.fill" : "record.circle")
                 }
                 .primaryButton(color: ATColor.coral)
-                .help(model.isRecording ? "Stop and save recording" : "Start recording")
-                .disabled(model.isRunning)
+                .help(model.recordingIsActiveOrStarting ? "Stop or cancel recording" : "Start recording")
+                .disabled(model.agentIsActiveOrStarting)
 
                 Button {
-                    Task { model.isRunning ? await model.stopAgent() : await model.startAgent() }
+                    Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() }
                 } label: {
-                    Image(systemName: model.isRunning ? "stop.fill" : "play.fill")
+                    Image(systemName: model.agentIsActiveOrStarting ? "stop.fill" : "play.fill")
                 }
                 .primaryButton(color: ATColor.violet)
-                .help(model.isRunning ? "Stop AI and release inputs" : "Run selected AI")
-                .disabled(!model.isRunning && model.selectedProfile?.activeVersionID == nil)
+                .help(model.agentIsActiveOrStarting ? "Stop AI and release inputs" : "Run selected AI")
+                .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil)
 
                 Button(role: .destructive) { model.panic() } label: {
                     Image(systemName: "hand.raised.fill")
@@ -179,7 +179,8 @@ struct RootView: View {
 
     private var activityTitle: String {
         if model.isRecording { return "Recording" }
-        if model.isRunning && model.isTraining { return "Run + train" }
+        if model.agentIsActiveOrStarting && model.isTraining { return model.isStartingAgent ? "Start/stop + train" : "Run + train" }
+        if model.isStartingAgent { return "AI starting / stopping" }
         if model.isRunning { return "AI running" }
         if model.isTraining { return "Training" }
         return "Local only"
@@ -187,7 +188,7 @@ struct RootView: View {
 
     private var activityColor: Color {
         if model.isRecording { return ATColor.coral }
-        if model.isRunning { return ATColor.violet }
+        if model.agentIsActiveOrStarting { return ATColor.violet }
         if model.isTraining { return ATColor.cyan }
         return ATColor.green
     }

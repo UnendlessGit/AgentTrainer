@@ -216,7 +216,7 @@ struct LibraryView: View {
                         Toggle("Enable real-input reenactment", isOn: $reenactmentArmed).font(.caption)
                         HStack {
                             if model.isReplaying { Button("Stop Replay") { model.stopReenactment() }.primaryButton(color: ATColor.coral) }
-                            else { Button("Reenact") { model.startReenactment() }.primaryButton(color: ATColor.amber).disabled(!reenactmentArmed) }
+                            else { Button("Reenact") { model.startReenactment() }.primaryButton(color: ATColor.amber).disabled(!reenactmentArmed || model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting) }
                             Spacer(); Button("Delete", role: .destructive) { deleteRecording = item }.primaryButton(color: ATColor.coral)
                         }
                     }
