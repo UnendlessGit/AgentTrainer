@@ -28,6 +28,18 @@ private struct TrainingPaused: Error {
     let completion: TrainingCompletion
 }
 
+private enum TrainingSamplingContract {
+    /// Versioned independently from the dataset bytes so an older checkpoint
+    /// paused midway through an epoch can finish with its original exact order.
+    static let salienceBalanced = 1
+}
+
+private enum TrainingValidationContract {
+    /// Version 1 guarantees disjoint recurrent/perception context for a lone
+    /// recording and compares fine-tuned weights only on the current split.
+    static let disjointContext = 1
+}
+
 final class TrainingEngine: @unchecked Sendable {
     typealias MetricsHandler = @Sendable (TrainingMetrics, String) -> Void
     typealias CompletionHandler = @Sendable (Result<TrainingCompletion, Error>) -> Void
@@ -91,8 +103,29 @@ final class TrainingEngine: @unchecked Sendable {
             metrics(value, "\(status) • \(Int((progress * 100).rounded()))%")
         }
         guard dataset.count > 0 else { throw AgentTrainerError.noData }
-        let split = splitIndices(dataset: dataset, fraction: profile.training.validationSplit, seed: profile.training.seed)
+        let split = splitIndices(
+            dataset: dataset,
+            fraction: profile.training.validationSplit,
+            seed: profile.training.seed,
+            channels: profile.channels,
+            restrictions: profile.effectiveRestrictions
+        )
         guard !split.train.isEmpty else { throw AgentTrainerError.noData }
+        let batchSize = max(1, profile.training.batchSize)
+        let stepsPerEpoch = Int(ceil(Double(split.train.count) / Double(batchSize)))
+        // Salience depends only on immutable cached targets and profile output
+        // policy. Scan it once per run rather than repeating the CPU pass at
+        // every epoch boundary.
+        let salientTrainingIndices: Set<Int> = {
+            let detected = dataset.salientTrainingIndices(
+                at: split.train,
+                channels: profile.channels,
+                restrictions: profile.effectiveRestrictions
+            )
+            // When every row is active there is nothing to rebalance; release
+            // the potentially large membership set and use the normal shuffle.
+            return detected.count == split.train.count ? [] : detected
+        }()
         let positiveClassWeightValues = dataset.positiveClassWeights(
             at: split.train,
             restrictions: profile.effectiveRestrictions
@@ -100,12 +133,18 @@ final class TrainingEngine: @unchecked Sendable {
         let positiveClassWeights = MLXArray(positiveClassWeightValues, [ActionLayout.count])
         let validationEvaluationIndices = dataset.representativeValidationIndices(
             from: split.validation,
-            limit: max(1, profile.training.batchSize * 16)
+            limit: max(1, profile.training.batchSize * 16),
+            channels: profile.channels,
+            restrictions: profile.effectiveRestrictions
         )
 
         let model = AgentPolicy(profile: profile)
         model.train(true)
-        let optimizer = ResumableAdamW(learningRate: Float(profile.training.learningRate), weightDecay: Float(profile.training.weightDecay))
+        let optimizer = ResumableAdamW(
+            learningRate: Float(profile.training.learningRate),
+            weightDecay: Float(profile.training.weightDecay),
+            warmupSteps: Self.recommendedWarmupSteps(stepsPerEpoch: stepsPerEpoch)
+        )
         optimizer.initialize(model: model)
         let signature = try profileSignature(profile, recordings: recordings)
         let inputSummaries = try recordings.map { recording in
@@ -120,11 +159,40 @@ final class TrainingEngine: @unchecked Sendable {
             if value.1.mouse.isGameCamera { result.camera += duration } else { result.cursor += duration }
         }
         let recommendedMouseMode: MouseControlMode = mouseDurations.camera > mouseDurations.cursor ? .relative : .absolute
-        var state = CheckpointState(profileSignature: signature, epoch: 0, batchOffset: 0, globalStep: 0, elapsed: 0, lossHistory: [], validationHistory: [], demonstratedKeyCodes: demonstratedKeys, experienceSeconds: 0)
-        let restore = try await restoreCheckpointIfPresent(profile: profile, expectedSignature: signature, model: model, optimizer: optimizer, randomState: randomState, state: &state)
+        let recordingOrder = recordings.map(\.id)
+        var state = CheckpointState(
+            profileSignature: signature,
+            epoch: 0,
+            batchOffset: 0,
+            globalStep: 0,
+            elapsed: 0,
+            lossHistory: [],
+            validationHistory: [],
+            demonstratedKeyCodes: demonstratedKeys,
+            experienceSeconds: 0,
+            recordingOrder: recordingOrder,
+            samplingStrategy: TrainingSamplingContract.salienceBalanced,
+            validationStrategy: TrainingValidationContract.disjointContext
+        )
+        let restore = try await restoreCheckpointIfPresent(
+            profile: profile,
+            expectedSignature: signature,
+            expectedRecordingOrder: recordingOrder,
+            legacyValidationNeedsRefresh: dataset.manifest.segments.count == 1,
+            model: model,
+            optimizer: optimizer,
+            randomState: randomState,
+            state: &state
+        )
         // The raw event stream is authoritative, including taps shorter than one
         // action interval. Refresh after restoring an older checkpoint.
         state.demonstratedKeyCodes = demonstratedKeys
+        // Legacy checkpoints did not persist sample-to-recording order. Preserve
+        // their current epoch order, then make every subsequent save enforce it.
+        if state.recordingOrder == nil { state.recordingOrder = recordingOrder }
+        if state.samplingStrategy == nil, state.batchOffset == 0 {
+            state.samplingStrategy = TrainingSamplingContract.salienceBalanced
+        }
         state.recommendedMouseMode = recommendedMouseMode
         let cursorDurations = recordings.reduce(into: (shown: 0.0, total: 0.0)) { result, recording in
             let start = max(0, min(recording.manifest.duration, recording.manifest.trimStart))
@@ -136,6 +204,43 @@ final class TrainingEngine: @unchecked Sendable {
         state.trainingShowsCursor = cursorDurations.total > 0
             ? cursorDurations.shown >= cursorDurations.total / 2
             : recordings.filter { $0.manifest.capture.showsCursor }.count * 2 >= recordings.count
+
+        if split.validation.isEmpty {
+            // A checkpoint from an older split may contain a score and best
+            // weights even when the current disjoint split cannot hold out any
+            // honest samples. Never publish that stale score as if it applied.
+            state.validationHistory.removeAll(keepingCapacity: false)
+            state.bestValidationLoss = nil
+            state.bestGlobalStep = nil
+            state.bestEpoch = nil
+            state.bestTrainingLoss = nil
+            state.bestElapsed = nil
+            state.bestExperienceSeconds = nil
+        }
+
+        // A warm-started brain's saved validation number may belong to a
+        // different recording set, split, target contract, or loss definition.
+        // Re-score those exact selected weights on this run's held-out examples
+        // before comparing any fine-tuned epoch against them.
+        if restore.captureValidationBaseline, !split.validation.isEmpty {
+            let baselineValidationLoss = evaluate(
+                model: model,
+                dataset: dataset,
+                indices: validationEvaluationIndices,
+                profile: profile,
+                positiveClassWeights: positiveClassWeights
+            )
+            guard baselineValidationLoss.isFinite else {
+                throw AgentTrainerError.model("The selected brain produced an invalid validation baseline on the current recordings.")
+            }
+            state.validationHistory = [baselineValidationLoss]
+            state.bestValidationLoss = baselineValidationLoss
+            state.bestGlobalStep = state.globalStep
+            state.bestEpoch = state.batchOffset > 0 ? state.epoch + 1 : state.epoch
+            state.bestTrainingLoss = state.lossHistory.last
+            state.bestElapsed = state.elapsed
+            state.bestExperienceSeconds = state.experienceSeconds
+        }
 
         let trainingStep = compile(inputs: [model, optimizer, randomState], outputs: [model, optimizer, randomState]) { images, history, targets in
             // Capture the Sendable Swift values and materialize the constant while
@@ -150,8 +255,6 @@ final class TrainingEngine: @unchecked Sendable {
         }
         let started = ContinuousClock.now
         let baseElapsed = state.elapsed
-        let batchSize = max(1, profile.training.batchSize)
-        let stepsPerEpoch = Int(ceil(Double(split.train.count) / Double(batchSize)))
         if state.experienceSeconds == nil {
             // Old checkpoints did not persist the exact final-batch sizes. Step
             // count is the most stable approximation because it remains valid
@@ -193,7 +296,7 @@ final class TrainingEngine: @unchecked Sendable {
         // as the validation baseline before fine-tuning, while initializing a
         // fresh exact-resume checkpoint from it. A first worse epoch can no
         // longer replace the brain the user explicitly chose.
-        if restore.captureValidationBaseline {
+        if restore.captureValidationBaseline, !split.validation.isEmpty {
             try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer, randomState: randomState, state: state, captureBest: true)
         }
 
@@ -205,7 +308,17 @@ final class TrainingEngine: @unchecked Sendable {
         var samplesSinceRate = 0
 
         trainingLoop: for epoch in state.epoch..<targetEpoch {
-            let order = shuffled(split.train, seed: profile.training.seed &+ UInt64(epoch) &* 0x9E3779B97F4A7C15)
+            let epochSeed = profile.training.seed &+ UInt64(epoch) &* 0x9E3779B97F4A7C15
+            let order = state.samplingStrategy == TrainingSamplingContract.salienceBalanced
+                ? trainingOrder(
+                    dataset: dataset,
+                    indices: split.train,
+                    batchSize: batchSize,
+                    seed: epochSeed,
+                    profile: profile,
+                    precomputedSalientIndices: salientTrainingIndices
+                )
+                : shuffled(split.train, seed: epochSeed)
             var offset = epoch == state.epoch ? state.batchOffset : 0
             var prefetchedBatch: PreparedBatch?
             while offset < order.count {
@@ -285,6 +398,11 @@ final class TrainingEngine: @unchecked Sendable {
             }
             state.batchOffset = 0
             state.epoch = epoch + 1
+            // A legacy checkpoint paused inside this epoch used the historical
+            // uniform order above. Upgrade only after that exact epoch finishes.
+            if state.samplingStrategy == nil {
+                state.samplingStrategy = TrainingSamplingContract.salienceBalanced
+            }
             var capturedBest = false
             if !split.validation.isEmpty {
                 let validationLoss = evaluate(model: model, dataset: dataset, indices: validationEvaluationIndices, profile: profile, positiveClassWeights: positiveClassWeights)
@@ -372,8 +490,74 @@ final class TrainingEngine: @unchecked Sendable {
         return weightedLoss / Double(max(1, evaluated))
     }
 
-    func splitIndices(dataset: CachedDataset, fraction: Double, seed: UInt64) -> (train: [Int], validation: [Int]) {
+    /// One epoch of warmup is enough to stabilize small datasets, while the cap
+    /// preserves the established schedule for large runs. A ten-step floor keeps
+    /// the first update controlled without spending hundreds of steps at a tiny
+    /// learning rate when an entire epoch contains only a handful of batches.
+    static func recommendedWarmupSteps(stepsPerEpoch: Int) -> Int {
+        min(500, max(10, stepsPerEpoch))
+    }
+
+    /// Distributes high-signal rows across fixed-size batches without duplicating
+    /// or dropping any sample. Compared with a uniform shuffle, rare edges and
+    /// additive controls reach the optimizer throughout the epoch instead of
+    /// clustering in a few high-variance updates.
+    func trainingOrder(
+        dataset: CachedDataset,
+        indices: [Int],
+        batchSize rawBatchSize: Int,
+        seed: UInt64,
+        profile: AIProfile,
+        precomputedSalientIndices: Set<Int>? = nil
+    ) -> [Int] {
+        let randomized = shuffled(indices, seed: seed)
+        let batchSize = max(1, rawBatchSize)
+        guard randomized.count > batchSize else { return randomized }
+        let salient = precomputedSalientIndices ?? dataset.salientTrainingIndices(
+            at: indices,
+            channels: profile.channels,
+            restrictions: profile.effectiveRestrictions
+        )
+        guard !salient.isEmpty, salient.count < randomized.count else { return randomized }
+
+        let priority = randomized.filter(salient.contains)
+        let ordinary = randomized.filter { !salient.contains($0) }
+        let batchCount = Int(ceil(Double(randomized.count) / Double(batchSize)))
+        let targetSizes = (0..<batchCount).map { batch in
+            min(batchSize, randomized.count - batch * batchSize)
+        }
+        var batches = Array(repeating: [Int](), count: batchCount)
+        var placementRandom = SplitMix64(state: seed ^ 0xD1B54A32D192ED03)
+        var cursor = Int(placementRandom.next() % UInt64(batchCount))
+        for index in priority {
+            while batches[cursor].count >= targetSizes[cursor] {
+                cursor = (cursor + 1) % batchCount
+            }
+            batches[cursor].append(index)
+            cursor = (cursor + 1) % batchCount
+        }
+        var ordinaryOffset = 0
+        for batch in batches.indices {
+            while batches[batch].count < targetSizes[batch] {
+                batches[batch].append(ordinary[ordinaryOffset])
+                ordinaryOffset += 1
+            }
+        }
+        return batches.flatMap { $0 }
+    }
+
+    func splitIndices(
+        dataset: CachedDataset,
+        fraction: Double,
+        seed: UInt64,
+        channels: ActionChannels = .all,
+        restrictions: ActionRestrictions = ActionRestrictions()
+    ) -> (train: [Int], validation: [Int]) {
         let fraction = min(0.9, max(0, fraction))
+        let learnableBinaryOutputs = ActionLayout.learnableBinaryIndices(
+            channels: channels,
+            restrictions: restrictions
+        )
         if dataset.manifest.segments.count > 1 {
             let segments = dataset.manifest.segments
             let shuffledSegments = shuffled(Array(segments.indices), seed: seed)
@@ -390,12 +574,12 @@ final class TrainingEngine: @unchecked Sendable {
             var validationSegments: Set<Int> = []
             for segmentIndex in shuffledSegments.reversed() where validationSegments.count < validationCount {
                 let counts = segmentCounts[segmentIndex]
-                let wouldRemoveOnlyExample = ActionLayout.binary.contains { output in
+                let wouldRemoveOnlyExample = learnableBinaryOutputs.contains { output in
                     counts[output] > 0 && remainingCounts[output] - counts[output] <= 0
                 }
                 guard !wouldRemoveOnlyExample else { continue }
                 validationSegments.insert(segmentIndex)
-                for output in ActionLayout.binary { remainingCounts[output] -= counts[output] }
+                for output in learnableBinaryOutputs { remainingCounts[output] -= counts[output] }
             }
             var train: [Int] = [], validation: [Int] = []
             for (i, segment) in segments.enumerated() {
@@ -405,30 +589,38 @@ final class TrainingEngine: @unchecked Sendable {
             return (train, validation)
         }
         let validationCount = Int(Double(dataset.count) * fraction)
-        let splitPoint = max(0, dataset.count - validationCount)
-        var train = Array(0..<splitPoint)
-        var validation = Array(splitPoint..<dataset.count)
-        guard !train.isEmpty, !validation.isEmpty else { return (train, validation) }
+        let proposedValidationStart = max(0, dataset.count - validationCount)
+        guard validationCount > 0, proposedValidationStart > 0 else {
+            return (Array(0..<dataset.count), [])
+        }
+        var trainingEnd = proposedValidationStart
         let totalCounts = dataset.binaryPositiveCounts(in: 0..<dataset.count)
-        let trainCounts = dataset.binaryPositiveCounts(at: train)
-        var missing = Set(ActionLayout.binary.filter { totalCounts[$0] > 0 && trainCounts[$0] == 0 })
+        let trainCounts = dataset.binaryPositiveCounts(in: 0..<trainingEnd)
+        var missing = Set(learnableBinaryOutputs.filter { totalCounts[$0] > 0 && trainCounts[$0] == 0 })
         if !missing.isEmpty {
-            var moved: Set<Int> = []
-            for index in validation where !missing.isEmpty {
+            // Keep a single recording temporally contiguous. Moving isolated
+            // validation rows into training leaks their neighboring frames and
+            // action history; extend the boundary through the needed example.
+            for index in trainingEnd..<dataset.count where !missing.isEmpty {
                 let action = dataset.action(at: index)
                 let covered = missing.filter { action[$0] >= 0.5 }
                 if !covered.isEmpty {
-                    moved.insert(index)
+                    trainingEnd = index + 1
                     missing.subtract(covered)
                 }
             }
-            if !moved.isEmpty {
-                train.append(contentsOf: moved)
-                train.sort()
-                validation.removeAll(where: moved.contains)
-            }
         }
-        return (train, validation)
+        guard missing.isEmpty,
+              let validationStart = dataset.firstDisjointValidationIndex(
+                trainingEnd: trainingEnd,
+                proposedStart: max(proposedValidationStart, trainingEnd)
+              ),
+              validationStart < dataset.count else {
+            // A false held-out score is worse than no held-out score. When the
+            // sole recording cannot supply disjoint context, train on all rows.
+            return (Array(0..<dataset.count), [])
+        }
+        return (Array(0..<trainingEnd), Array(validationStart..<dataset.count))
     }
 
     private func shuffled(_ input: [Int], seed: UInt64) -> [Int] {
@@ -575,18 +767,41 @@ final class TrainingEngine: @unchecked Sendable {
         return TrainingCompletion(profile: updated, version: version, completed: completed)
     }
 
-    private func restoreCheckpointIfPresent(profile: AIProfile, expectedSignature: String, model: AgentPolicy, optimizer: ResumableAdamW, randomState: MLXRandom.RandomState, state: inout CheckpointState) async throws -> CheckpointRestore {
+    private func restoreCheckpointIfPresent(
+        profile: AIProfile,
+        expectedSignature: String,
+        expectedRecordingOrder: [UUID],
+        legacyValidationNeedsRefresh: Bool,
+        model: AgentPolicy,
+        optimizer: ResumableAdamW,
+        randomState: MLXRandom.RandomState,
+        state: inout CheckpointState
+    ) async throws -> CheckpointRestore {
         let directory = await WorkspaceStore.shared.checkpointDirectory(profileID: profile.id)
         let stateURL = directory.appendingPathComponent("state.json")
         if FileManager.default.fileExists(atPath: stateURL.path) {
             let restored = try JSONDecoder().decode(CheckpointState.self, from: Data(contentsOf: stateURL))
-            if restored.profileSignature == expectedSignature {
+            let recordingOrderMatches = restored.recordingOrder.map { $0 == expectedRecordingOrder } ?? true
+            let samplingStrategyIsKnown = restored.samplingStrategy == nil
+                || restored.samplingStrategy == TrainingSamplingContract.salienceBalanced
+            if restored.profileSignature == expectedSignature,
+               recordingOrderMatches,
+               samplingStrategyIsKnown {
+                let validationNeedsRefresh = restored.validationStrategy.map {
+                    $0 != TrainingValidationContract.disjointContext
+                } ?? legacyValidationNeedsRefresh
                 try model.loadWeights(from: directory.appendingPathComponent("weights.safetensors"))
                 try optimizer.load(from: directory.appendingPathComponent("optimizer.safetensors"))
                 let randomStateURL = directory.appendingPathComponent("random.safetensors")
                 if FileManager.default.fileExists(atPath: randomStateURL.path) { try TrainingRandomState.load(randomState, from: randomStateURL) }
                 state = restored
-                return CheckpointRestore(status: "Restored exact checkpoint; compiling resumed MLX graph", captureValidationBaseline: false)
+                state.validationStrategy = TrainingValidationContract.disjointContext
+                return CheckpointRestore(
+                    status: validationNeedsRefresh
+                        ? "Restored exact optimizer state; recalibrated validation for the current split"
+                        : "Restored exact checkpoint; compiling resumed MLX graph",
+                    captureValidationBaseline: validationNeedsRefresh
+                )
             }
         }
 
@@ -617,7 +832,7 @@ final class TrainingEngine: @unchecked Sendable {
                 state.bestExperienceSeconds = state.experienceSeconds
                 return CheckpointRestore(status: "Loaded the selected best brain; optimizer restarted safely", captureValidationBaseline: true)
             }
-            return CheckpointRestore(status: "Loaded the active brain for fine-tuning; optimizer restarted safely", captureValidationBaseline: false)
+            return CheckpointRestore(status: "Loaded the active brain for fine-tuning; optimizer restarted safely", captureValidationBaseline: true)
         }
         return CheckpointRestore(status: "Compiling fused MLX training graph on Apple GPU", captureValidationBaseline: false)
     }
@@ -665,6 +880,16 @@ private struct CheckpointState: Codable {
     /// Cursor visibility is frozen from the duration-weighted recording mix.
     var trainingShowsCursor: Bool? = nil
     var recommendedMouseMode: MouseControlMode? = nil
+    /// Dataset row indices depend on segment order. The profile signature treats
+    /// the selected recordings as a set, so exact resume separately enforces the
+    /// order that produced the saved batch offset.
+    var recordingOrder: [UUID]? = nil
+    /// Optional keeps pre-curriculum checkpoints decodable. A legacy checkpoint
+    /// paused midway through an epoch finishes that epoch with uniform shuffling.
+    var samplingStrategy: Int? = nil
+    /// Changes to held-out context or comparison semantics refresh the baseline
+    /// without discarding otherwise compatible model and optimizer state.
+    var validationStrategy: Int? = nil
 }
 
 private struct SplitMix64 {

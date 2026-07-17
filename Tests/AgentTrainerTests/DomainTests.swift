@@ -1128,6 +1128,64 @@ final class DomainTests: XCTestCase {
         XCTAssertNil(latch.consume())
     }
 
+    func testRuntimeHistoryContainsOnlyThresholdedExecutableActions() {
+        var prediction = [Float](repeating: 0, count: ActionLayout.count)
+        prediction[0] = 1.4
+        prediction[2] = -0.8
+        prediction[ActionLayout.buttons.lowerBound] = 0.51
+        prediction[ActionLayout.buttons.lowerBound + 1] = 0.99
+        prediction[ActionLayout.scroll.lowerBound] = 0.25
+        prediction[ActionLayout.keyboard.lowerBound + 2] = 0.99  // Never demonstrated.
+        prediction[ActionLayout.keyboard.lowerBound + 12] = 0.49
+        prediction[ActionLayout.keyboard.lowerBound + 13] = 0.51
+        prediction[ActionLayout.keyboard.lowerBound + 59] = 0.99 // Duplicate Control path.
+        prediction[ActionLayout.commandOptionControl.lowerBound] = 0.75
+
+        var restrictions = ActionRestrictions()
+        restrictions.blockedMouseButtons = [1]
+        let history = RuntimeActionSemantics.historyValues(
+            prediction,
+            predictionIsFresh: true,
+            channels: .all,
+            restrictions: restrictions,
+            allowedKeyCodes: [12, 13, 59],
+            outputPermissions: RuntimeOutputPermissions(),
+            shiftUsesKeyboardChannel: true
+        )
+        XCTAssertEqual(history[0], 1, "Continuous history should use the same bounded value as execution")
+        XCTAssertEqual(history[2], -0.8, accuracy: 0.000_001)
+        XCTAssertEqual(history[ActionLayout.buttons.lowerBound], 1)
+        XCTAssertEqual(history[ActionLayout.buttons.lowerBound + 1], 0)
+        XCTAssertEqual(history[ActionLayout.keyboard.lowerBound + 2], 0, "The demonstrated-key firewall must also guard recurrent state")
+        XCTAssertEqual(history[ActionLayout.keyboard.lowerBound + 12], 0)
+        XCTAssertEqual(history[ActionLayout.keyboard.lowerBound + 13], 1)
+        XCTAssertEqual(history[ActionLayout.keyboard.lowerBound + 59], 0, "Duplicate modifier key-code slots must never become hidden state")
+        XCTAssertEqual(history[ActionLayout.commandOptionControl.lowerBound], 1)
+
+        let blocked = RuntimeActionSemantics.historyValues(
+            prediction,
+            predictionIsFresh: true,
+            channels: .all,
+            allowedKeyCodes: [13, 59],
+            outputPermissions: RuntimeOutputPermissions(cursorMovement: false, keyboard: false)
+        )
+        XCTAssertTrue(ActionLayout.absoluteMouse.allSatisfy { blocked[$0] == 0 })
+        XCTAssertTrue(ActionLayout.relativeMouse.allSatisfy { blocked[$0] == 0 })
+        XCTAssertTrue(ActionLayout.keyboardAndShift.allSatisfy { blocked[$0] == 0 })
+        XCTAssertTrue(ActionLayout.commandOptionControl.allSatisfy { blocked[$0] == 0 })
+
+        var oldChannels = ActionChannels.all
+        oldChannels.keyboard = false
+        let oldShift = RuntimeActionSemantics.historyValues(
+            prediction.enumerated().map { $0.offset == ActionLayout.shift.lowerBound ? 1 : $0.element },
+            predictionIsFresh: true,
+            channels: oldChannels,
+            allowedKeyCodes: [56],
+            shiftUsesKeyboardChannel: false
+        )
+        XCTAssertEqual(oldShift[ActionLayout.shift.lowerBound], 1, "Legacy brains route Shift through their saved Modifiers channel")
+    }
+
     func testGameCameraDoesNotReplayStaleOrZeroDeltasAndNeverUsesDragEvents() {
         let collector = EventCollector()
         let injector = InputInjector(eventSink: { collector.append($0) }, cursorWarp: { collector.warp($0) })
@@ -1494,6 +1552,29 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(grid.detail.contains("top 4 maps"))
     }
 
+    func testAdaptiveWarmupIsBoundedAndPersistsWithOptimizerState() throws {
+        XCTAssertEqual(TrainingEngine.recommendedWarmupSteps(stepsPerEpoch: 1), 10)
+        XCTAssertEqual(TrainingEngine.recommendedWarmupSteps(stepsPerEpoch: 120), 120)
+        XCTAssertEqual(TrainingEngine.recommendedWarmupSteps(stepsPerEpoch: 5_000), 500)
+
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        profile.training.architecture = .small
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        let saved = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01, warmupSteps: 17)
+        saved.initialize(model: model)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try saved.save(to: url)
+
+        let restored = ResumableAdamW(learningRate: 0.5, weightDecay: 0.5)
+        try restored.load(from: url)
+        XCTAssertEqual(restored.warmupSteps, 17)
+        XCTAssertEqual(restored.learningRate, 0.001, accuracy: 0.000_001)
+        XCTAssertEqual(restored.weightDecay, 0.01, accuracy: 0.000_001)
+    }
+
     func testCompiledTrainingStepMatchesUncompiledAdamW() throws {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 16, height: 12, colorMode: .grayscale, bitDepth: 8)
@@ -1720,6 +1801,80 @@ final class DomainTests: XCTestCase {
         let trainedKeys = dataset.demonstratedKeyCodes(at: split.train)
         XCTAssertEqual(trainedKeys, [10, 13])
         XCTAssertEqual(dataset.demonstratedKeyCodes(at: split.validation), [13])
+    }
+
+    func testSingleRecordingValidationPurgesSharedHistoryAndPerceptionFrames() throws {
+        let mappings: [(UInt32, UInt32)] = [
+            (0, 0), (0, 0), (0, 0), (1, 0), (1, 0),
+            (1, 0), (1, 0), (1, 0), (2, 1), (2, 1),
+            (2, 1), (2, 1), (2, 1), (2, 1), (2, 1),
+            (2, 1), (3, 2), (3, 2), (4, 3), (4, 3)
+        ]
+        let rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: mappings.count)
+        let fixture = try makeSyntheticDataset(name: "purged-validation", historyLength: 3, mappings: mappings, actionRows: rows)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        let split = TrainingEngine().splitIndices(dataset: fixture.dataset, fraction: 0.25, seed: 42)
+        XCTAssertEqual(split.train, Array(0..<15))
+        XCTAssertEqual(split.validation, [18, 19])
+        XCTAssertTrue(Set(split.train).isDisjoint(with: split.validation))
+        XCTAssertGreaterThanOrEqual(split.validation.first ?? 0, (split.train.last ?? 0) + 1 + 3, "Validation history may not reach back into training")
+    }
+
+    func testValidationAvailabilityIgnoresBlockedControls() throws {
+        let mappings = (0..<20).map { row -> (UInt32, UInt32) in
+            (UInt32(row), UInt32(max(0, row - 1)))
+        }
+        var rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: mappings.count)
+        rows[18][ActionLayout.keyboard.lowerBound + 13] = 1
+        let fixture = try makeSyntheticDataset(name: "blocked-validation", historyLength: 3, mappings: mappings, actionRows: rows)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        let unrestricted = TrainingEngine().splitIndices(dataset: fixture.dataset, fraction: 0.25, seed: 42)
+        XCTAssertTrue(unrestricted.validation.isEmpty, "The only learnable key example must remain in training")
+
+        let blocked = TrainingEngine().splitIndices(
+            dataset: fixture.dataset,
+            fraction: 0.25,
+            seed: 42,
+            channels: .all,
+            restrictions: ActionRestrictions(blockedKeyCodes: [13])
+        )
+        XCTAssertEqual(blocked.train, Array(0..<15))
+        XCTAssertEqual(blocked.validation, [18, 19], "A blocked output must not erase otherwise honest validation data")
+        let representatives = fixture.dataset.representativeValidationIndices(
+            from: Array(15..<20),
+            limit: 1,
+            channels: .all,
+            restrictions: ActionRestrictions(blockedKeyCodes: [13])
+        )
+        XCTAssertNotEqual(representatives, [18], "Blocked positives must not consume the representative-validation budget")
+    }
+
+    func testSalienceBalancedTrainingOrderSpreadsTransitionsWithoutResampling() throws {
+        let mappings = (0..<12).map { row -> (UInt32, UInt32) in
+            (UInt32(row), UInt32(max(0, row - 1)))
+        }
+        var rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: mappings.count)
+        rows[1][ActionLayout.keyboard.lowerBound + 13] = 1
+        rows[7][ActionLayout.scroll.lowerBound] = 0.5
+        let fixture = try makeSyntheticDataset(name: "balanced-order", historyLength: 1, mappings: mappings, actionRows: rows)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        var profile = AIProfile.fresh()
+        profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: true, keyboard: true, modifiers: false)
+        let indices = Array(0..<mappings.count)
+        let salient = fixture.dataset.salientTrainingIndices(at: indices, channels: profile.channels, restrictions: profile.effectiveRestrictions)
+        XCTAssertEqual(salient, [1, 2, 7])
+
+        let engine = TrainingEngine()
+        let order = engine.trainingOrder(dataset: fixture.dataset, indices: indices, batchSize: 4, seed: 91, profile: profile)
+        XCTAssertEqual(order, engine.trainingOrder(dataset: fixture.dataset, indices: indices, batchSize: 4, seed: 91, profile: profile), "Exact resume requires deterministic epoch order")
+        XCTAssertEqual(Set(order), Set(indices))
+        XCTAssertEqual(order.count, indices.count)
+        for start in stride(from: 0, to: order.count, by: 4) {
+            XCTAssertFalse(Set(order[start..<min(order.count, start + 4)]).isDisjoint(with: salient), "Every batch should receive a high-signal row when enough exist")
+        }
     }
 
     func testCorruptDatasetCacheSizesThrowInsteadOfOverflowing() throws {
@@ -2086,6 +2241,46 @@ final class DomainTests: XCTestCase {
         var values = [Float](repeating: 0, count: batch * width * height * 2)
         for pixel in 0..<(batch * width * height) { values[pixel * 2] = value }
         return MLXArray(values, [batch, height, width, 2])
+    }
+
+    private func makeSyntheticDataset(
+        name: String,
+        historyLength: Int,
+        mappings: [(UInt32, UInt32)],
+        actionRows: [[Float]]
+    ) throws -> (dataset: CachedDataset, directory: URL) {
+        precondition(mappings.count == actionRows.count)
+        precondition(actionRows.allSatisfy { $0.count == ActionLayout.count })
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).atrcache", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            let observationCount = Int(mappings.flatMap { [$0.0, $0.1] }.max() ?? 0) + 1
+            let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale, bitDepth: 8)
+            let manifest = DatasetCacheManifest(
+                key: name,
+                createdAt: Date(),
+                preprocessing: spec,
+                actionFPS: 60,
+                perceptionFPS: 30,
+                historyLength: historyLength,
+                sampleCount: mappings.count,
+                observationCount: observationCount,
+                observationBytesPerSample: 1,
+                actionValuesPerSample: ActionLayout.count,
+                segments: [CacheSegment(recordingID: UUID(), start: 0, count: mappings.count)]
+            )
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
+            try Data((0..<observationCount).map { UInt8(clamping: $0) }).write(to: directory.appendingPathComponent("observations.bin"))
+            try observationMappings(mappings).write(to: directory.appendingPathComponent("observation-indices.bin"))
+            var actions = Data(capacity: actionRows.count * ActionLayout.count * MemoryLayout<Float>.size)
+            for row in actionRows { row.withUnsafeBytes { actions.append(contentsOf: $0) } }
+            try actions.write(to: directory.appendingPathComponent("actions.bin"))
+            return (try CachedDataset(directory: directory), directory)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
     }
 
     private func observationMappings(_ pairs: [(UInt32, UInt32)]) -> Data {

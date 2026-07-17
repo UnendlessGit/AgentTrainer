@@ -273,6 +273,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
 final class ResumableAdamW: Updatable, @unchecked Sendable {
     var learningRate: Float
     var weightDecay: Float
+    private(set) var warmupSteps: Int
     let beta1: Float = 0.9
     let beta2: Float = 0.999
     let epsilon: Float = 1e-8
@@ -283,9 +284,10 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
 
     var step: Int { MLX.eval(stepArray); return Int(stepArray.item(Float.self).rounded()) }
 
-    init(learningRate: Float, weightDecay: Float) {
+    init(learningRate: Float, weightDecay: Float, warmupSteps: Int = 500) {
         self.learningRate = learningRate
         self.weightDecay = weightDecay
+        self.warmupSteps = max(1, warmupSteps)
     }
 
     func initialize(model: Module) {
@@ -307,7 +309,7 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         // decay lets very long runs refine instead of oscillating forever at a
         // constant learning rate. The schedule depends only on the persisted
         // optimizer step, so exact resume remains exact.
-        let warmupSteps: Float = 500
+        let warmupSteps = MLXArray(Float(self.warmupSteps), dtype: .float32)
         let warmupScale = minimum(stepArray / warmupSteps, MLXArray(1, dtype: .float32))
         let decayScale = sqrt(warmupSteps / stepArray)
         let scheduledLearningRate = learningRate * minimum(warmupScale, decayScale)
@@ -334,7 +336,16 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         var arrays: [String: MLXArray] = [:]
         for (key, value) in firstMoments { arrays["m.\(key)"] = value }
         for (key, value) in secondMoments { arrays["v.\(key)"] = value }
-        try MLX.save(arrays: arrays, metadata: ["step": String(step), "learningRate": String(learningRate), "weightDecay": String(weightDecay)], url: url)
+        try MLX.save(
+            arrays: arrays,
+            metadata: [
+                "step": String(step),
+                "learningRate": String(learningRate),
+                "weightDecay": String(weightDecay),
+                "warmupSteps": String(warmupSteps)
+            ],
+            url: url
+        )
     }
 
     func stateArrays() -> [MLXArray] {
@@ -353,5 +364,8 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         stepArray = MLXArray(Float(Int(loaded.1["step"] ?? "0") ?? 0), dtype: .float32)
         learningRate = Float(loaded.1["learningRate"] ?? "") ?? learningRate
         weightDecay = Float(loaded.1["weightDecay"] ?? "") ?? weightDecay
+        // Checkpoints from the fixed-schedule trainer did not save this field;
+        // retaining 500 preserves their exact continuation behavior.
+        warmupSteps = max(1, Int(loaded.1["warmupSteps"] ?? "500") ?? 500)
     }
 }

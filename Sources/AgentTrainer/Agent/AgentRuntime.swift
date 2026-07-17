@@ -497,7 +497,7 @@ final class AgentRuntime: @unchecked Sendable {
         lock.lock()
         guard !stopped, let latched = predictionLatch.consume(), let profile else { lock.unlock(); return }
         let prediction = latched.values
-        let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes, shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel
+        let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes, shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel, outputPermissions = self.outputPermissions
         let now = CACurrentMediaTime()
         let maximumPredictionAge = max(0.35, 3 / max(0.0001, profile.training.perceptionFPS))
         if now - latched.publishedAt > maximumPredictionAge {
@@ -527,7 +527,10 @@ final class AgentRuntime: @unchecked Sendable {
                 prediction,
                 predictionIsFresh: latched.isFresh,
                 channels: profile.channels,
-                restrictions: profile.effectiveRestrictions
+                restrictions: profile.effectiveRestrictions,
+                allowedKeyCodes: allowedKeyCodes,
+                outputPermissions: outputPermissions,
+                shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
             )
             historyWriteIndex = (historyWriteIndex + 1) % history.count
         }
@@ -650,18 +653,64 @@ enum RuntimeActionSemantics {
         _ prediction: [Float],
         predictionIsFresh: Bool,
         channels: ActionChannels? = nil,
-        restrictions: ActionRestrictions = ActionRestrictions()
+        restrictions: ActionRestrictions = ActionRestrictions(),
+        allowedKeyCodes: Set<UInt16>? = nil,
+        outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions(),
+        shiftUsesKeyboardChannel: Bool = true
     ) -> [Float] {
         guard prediction.count >= ActionLayout.count else { return prediction }
         var values = prediction
+        let mouseMovementEnabled = channels?.mouseMovement ?? true
+        let buttonsEnabled = channels?.buttons ?? true
+        let scrollEnabled = channels?.scroll ?? true
+        let keyboardEnabled = channels?.keyboard ?? true
+        let modifiersEnabled = channels?.modifiers ?? true
+
+        for index in ActionLayout.absoluteMouse {
+            values[index] = outputPermissions.cursorMovement && mouseMovementEnabled
+                ? min(1, max(0, values[index])) : 0
+        }
+        for index in ActionLayout.relativeMouse {
+            values[index] = outputPermissions.cursorMovement && mouseMovementEnabled
+                ? min(1, max(-1, values[index])) : 0
+        }
         if !predictionIsFresh {
             for index in ActionLayout.relativeMouse { values[index] = 0 }
             for index in ActionLayout.scroll { values[index] = 0 }
         }
-        if let channels {
-            values.withUnsafeMutableBufferPointer {
-                ActionLayout.sanitizeTrainingRows($0, rowCount: 1, channels: channels, restrictions: restrictions)
-            }
+        for button in 0..<8 {
+            let allowed = buttonsEnabled && restrictions.allowsButton(UInt8(button))
+            values[ActionLayout.buttons.lowerBound + button] = allowed && values[ActionLayout.buttons.lowerBound + button] >= 0.5 ? 1 : 0
+        }
+        for index in ActionLayout.scroll {
+            values[index] = scrollEnabled ? min(1, max(-1, values[index])) : 0
+        }
+
+        let keyboardOutputEnabled = outputPermissions.keyboard && keyboardEnabled
+        for key in 0..<128 {
+            let code = UInt16(key)
+            let capabilityAllows = allowedKeyCodes?.contains(code) ?? true
+            let allowed = keyboardOutputEnabled
+                && capabilityAllows
+                && restrictions.allowsKey(code)
+                && !ActionLayout.commandOptionControlKeyCodeSet.contains(code)
+            let index = ActionLayout.keyboard.lowerBound + key
+            values[index] = allowed && values[index] >= 0.5 ? 1 : 0
+        }
+
+        let modifierEquivalents: [[UInt16]] = [[56, 60], [59, 62], [58, 61], [55, 54]]
+        for modifier in 0..<4 {
+            let channelEnabled = modifier == 0 && shiftUsesKeyboardChannel
+                ? keyboardEnabled : modifiersEnabled
+            let capabilityAllows = allowedKeyCodes.map {
+                !$0.isDisjoint(with: modifierEquivalents[modifier])
+            } ?? true
+            let allowed = outputPermissions.keyboard
+                && channelEnabled
+                && capabilityAllows
+                && restrictions.allowsModifier(modifier)
+            let index = ActionLayout.modifiers.lowerBound + modifier
+            values[index] = allowed && values[index] >= 0.5 ? 1 : 0
         }
         return values
     }
