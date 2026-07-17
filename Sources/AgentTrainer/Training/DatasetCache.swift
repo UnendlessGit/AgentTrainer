@@ -25,6 +25,30 @@ enum ActionLayout {
     static let keyboardAndShiftIndices = Array(keyboardAndShift).filter { !commandOptionControlKeyboardIndexSet.contains($0) }
     static let binary = Array(buttons) + keyboardAndShiftIndices + Array(commandOptionControl)
 
+    static func learnableBinaryIndices(
+        channels: ActionChannels,
+        restrictions: ActionRestrictions
+    ) -> [Int] {
+        var result: [Int] = []
+        if channels.buttons {
+            result += buttons.filter {
+                restrictions.allowsButton(UInt8($0 - buttons.lowerBound))
+            }
+        }
+        if channels.keyboard {
+            result += keyboardAndShiftIndices.filter { index in
+                if index == shift.lowerBound { return restrictions.allowsModifier(0) }
+                return restrictions.allowsKey(UInt16(index - keyboard.lowerBound))
+            }
+        }
+        if channels.modifiers {
+            result += commandOptionControl.filter {
+                restrictions.allowsModifier($0 - modifiers.lowerBound)
+            }
+        }
+        return result
+    }
+
     /// Removes controls that do not belong to the selected training channels
     /// from targets and recurrent action history. This prevents a disabled
     /// channel from becoming a hidden shortcut through the history branch.
@@ -280,17 +304,92 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
+    /// Finds action rows that carry substantially more learning signal than an
+    /// ordinary held-state frame. The trainer still consumes every row exactly
+    /// once per epoch; it only spreads these transitions and active additive
+    /// controls across batches to reduce gradient variance.
+    func salientTrainingIndices(
+        at indices: [Int],
+        channels: ActionChannels,
+        restrictions: ActionRestrictions
+    ) -> Set<Int> {
+        guard !indices.isEmpty else { return [] }
+        let binaryOutputs = ActionLayout.learnableBinaryIndices(
+            channels: channels,
+            restrictions: restrictions
+        )
+        let continuousOutputs =
+            (channels.mouseMovement ? Array(ActionLayout.relativeMouse) : [])
+            + (channels.scroll ? Array(ActionLayout.scroll) : [])
+
+        var result: Set<Int> = []
+        actions.withUnsafeBytes { raw in
+            guard let address = raw.baseAddress else { return }
+            let values = address.assumingMemoryBound(to: UInt32.self)
+            func value(row: Int, output: Int) -> Float {
+                Float(bitPattern: UInt32(littleEndian: values[row * manifest.actionValuesPerSample + output]))
+            }
+            for row in indices {
+                if continuousOutputs.contains(where: { abs(value(row: row, output: $0)) > 0.0001 }) {
+                    result.insert(row)
+                    continue
+                }
+                let segmentStart = segmentStart(for: row)
+                for output in binaryOutputs {
+                    let current = value(row: row, output: output) >= 0.5
+                    let previous = row > segmentStart ? value(row: row - 1, output: output) >= 0.5 : false
+                    if current != previous {
+                        result.insert(row)
+                        break
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    /// Returns the first single-recording validation row whose complete action
+    /// history and current/preceding perception pair are disjoint from training.
+    /// Recorded frame delivery can be irregular, so an FPS-derived fixed gap is
+    /// not sufficient: a static frame may back many action rows.
+    func firstDisjointValidationIndex(trainingEnd: Int, proposedStart: Int) -> Int? {
+        guard trainingEnd > 0, trainingEnd < count else { return nil }
+        let lastTrainingPair = observationPair(at: trainingEnd - 1)
+        let maximumTrainingObservation = max(lastTrainingPair.current, lastTrainingPair.previous)
+        var candidate = max(proposedStart, trainingEnd + manifest.historyLength)
+        while candidate < count {
+            let pair = observationPair(at: candidate)
+            if pair.current > maximumTrainingObservation,
+               pair.previous > maximumTrainingObservation {
+                return candidate
+            }
+            candidate += 1
+        }
+        return nil
+    }
+
     /// Builds a fixed held-out subset once per run. At least one positive for
     /// every demonstrated binary output comes first so an inert policy cannot
     /// look good on a tiny validation budget. Press/release boundaries and
     /// active delta/scroll examples follow; remaining slots are distributed
     /// evenly across the entire held-out timeline.
-    func representativeValidationIndices(from indices: [Int], limit rawLimit: Int) -> [Int] {
+    func representativeValidationIndices(
+        from indices: [Int],
+        limit rawLimit: Int,
+        channels: ActionChannels = .all,
+        restrictions: ActionRestrictions = ActionRestrictions()
+    ) -> [Int] {
         let limit = min(indices.count, max(1, rawLimit))
         guard indices.count > limit else { return indices }
+        let binaryOutputs = ActionLayout.learnableBinaryIndices(
+            channels: channels,
+            restrictions: restrictions
+        )
         var transitionRows = [Int?](repeating: nil, count: ActionLayout.count)
         var positiveRows = [Int?](repeating: nil, count: ActionLayout.count)
-        let continuousOutputs = Array(ActionLayout.relativeMouse) + Array(ActionLayout.scroll)
+        let continuousOutputs =
+            (channels.mouseMovement ? Array(ActionLayout.relativeMouse) : [])
+            + (channels.scroll ? Array(ActionLayout.scroll) : [])
         var continuousRows = [Int?](repeating: nil, count: continuousOutputs.count)
         actions.withUnsafeBytes { raw in
             guard let address = raw.baseAddress else { return }
@@ -300,7 +399,7 @@ final class CachedDataset: @unchecked Sendable {
             }
             for row in indices {
                 let segmentStart = segmentStart(for: row)
-                for output in ActionLayout.binary {
+                for output in binaryOutputs {
                     let current = value(row: row, output: output) >= 0.5
                     if current, positiveRows[output] == nil { positiveRows[output] = row }
                     let previous = row > segmentStart ? value(row: row - 1, output: output) >= 0.5 : current
@@ -408,6 +507,10 @@ final class CachedDataset: @unchecked Sendable {
             let offset = (sample * 2 + slot) * MemoryLayout<UInt32>.size
             return Int(raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian)
         }
+    }
+
+    private func observationPair(at sample: Int) -> (current: Int, previous: Int) {
+        (observationIndex(at: sample, slot: 0), observationIndex(at: sample, slot: 1))
     }
 }
 
