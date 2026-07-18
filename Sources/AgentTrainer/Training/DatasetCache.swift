@@ -402,7 +402,7 @@ final class CachedDataset: @unchecked Sendable {
                 for output in binaryOutputs {
                     let current = value(row: row, output: output) >= 0.5
                     if current, positiveRows[output] == nil { positiveRows[output] = row }
-                    let previous = row > segmentStart ? value(row: row - 1, output: output) >= 0.5 : current
+                    let previous = row > segmentStart ? value(row: row - 1, output: output) >= 0.5 : false
                     if current != previous, transitionRows[output] == nil { transitionRows[output] = row }
                 }
                 for (offset, output) in continuousOutputs.enumerated()
@@ -419,6 +419,19 @@ final class CachedDataset: @unchecked Sendable {
         include(positiveRows)
         include(transitionRows)
         include(continuousRows)
+        // Every held-out recording should influence the score when the budget
+        // permits. Purely even sampling over one concatenated timeline can omit
+        // short recordings and make a long easy recording dominate selection.
+        var rowsBySegment: [Int: [Int]] = [:]
+        for row in indices { rowsBySegment[segmentIndex(for: row), default: []].append(row) }
+        let orderedSegments = rowsBySegment.keys.sorted()
+        include(orderedSegments.map { segment in
+            rowsBySegment[segment].map { $0[$0.count / 2] }
+        })
+        include(orderedSegments.flatMap { segment -> [Int?] in
+            guard let rows = rowsBySegment[segment], let first = rows.first, let last = rows.last else { return [] }
+            return [first, last]
+        })
         let fillCount = limit - selected.count
         if fillCount > 0 {
             for slot in 0..<fillCount {
@@ -459,6 +472,29 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
+    /// Returns the real immediately preceding action row for transition loss,
+    /// independently of how much history the model is configured to observe.
+    /// Segment starts use zero state. This closes the zero-history loophole
+    /// where the placeholder recurrent row made every held positive look like a
+    /// fresh press on every training tick.
+    func previousActionBatch(at indices: [Int]) -> Data {
+        let rowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
+        var result = Data(count: indices.count * rowBytes)
+        result.withUnsafeMutableBytes { destination in
+            actions.withUnsafeBytes { source in
+                guard let destinationBase = destination.baseAddress, let sourceBase = source.baseAddress else { return }
+                for (row, index) in indices.enumerated() where index > segmentStart(for: index) {
+                    memcpy(
+                        destinationBase.advanced(by: row * rowBytes),
+                        sourceBase.advanced(by: (index - 1) * rowBytes),
+                        rowBytes
+                    )
+                }
+            }
+        }
+        return result
+    }
+
     func historyBatch(at indices: [Int]) -> Data {
         let historyLength = max(1, manifest.historyLength)
         let rowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
@@ -493,13 +529,24 @@ final class CachedDataset: @unchecked Sendable {
         return values
     }
 
+    func segmentCount(at indices: [Int]) -> Int {
+        var segments: Set<Int> = []
+        for index in indices { segments.insert(segmentIndex(for: index)) }
+        return segments.count
+    }
+
     private func segmentStart(for index: Int) -> Int {
+        let index = segmentIndex(for: index)
+        return manifest.segments.indices.contains(index) ? manifest.segments[index].start : 0
+    }
+
+    private func segmentIndex(for index: Int) -> Int {
         var low = 0, high = manifest.segments.count
         while low < high {
             let mid = (low + high) / 2
             if manifest.segments[mid].start <= index { low = mid + 1 } else { high = mid }
         }
-        return low > 0 ? manifest.segments[low - 1].start : 0
+        return max(0, low - 1)
     }
 
     private func observationIndex(at sample: Int, slot: Int) -> Int {
