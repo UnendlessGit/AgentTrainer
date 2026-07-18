@@ -873,7 +873,7 @@ struct TrainingView: View {
                 HStack {
                     if model.isTraining, let profile = displayedProfile {
                         Text(profile.name).font(.title2.bold())
-                        StatusPill(text: "GPU training", color: ATColor.green)
+                        StatusPill(text: model.isAutoTraining ? "Auto training" : "GPU training", color: ATColor.green)
                     } else {
                         Picker("AI to train", selection: $model.selectedProfileID) {
                             Text("Select an AI…").tag(UUID?.none)
@@ -887,7 +887,10 @@ struct TrainingView: View {
                     }
                     Spacer()
                     if model.isTraining { Button("Pause → Runnable Brain") { model.pauseTraining() }.primaryButton(color: ATColor.amber); Button("Stop") { model.stopTraining() }.primaryButton(color: ATColor.coral) }
-                    else { Button("Start / Exact Resume") { model.startTraining() }.primaryButton(color: ATColor.green) }
+                    else {
+                        Button("Start / Exact Resume") { model.startTraining() }.primaryButton(color: ATColor.green)
+                        Button("Auto Train") { model.startAutoTraining() }.primaryButton(color: ATColor.cyan).help("Keep starting another configured epoch block whenever training completes, until paused or stopped.")
+                    }
                 }
                 OLEDCard {
                     HStack(alignment: .bottom, spacing: 14) {
