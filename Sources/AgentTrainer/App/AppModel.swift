@@ -28,6 +28,7 @@ final class AppModel: ObservableObject {
     @Published var isRecording = false
     @Published private(set) var isStartingRecording = false
     @Published var isTraining = false
+    @Published private(set) var isAutoTraining = false
     @Published var isRunning = false
     @Published private(set) var isStartingAgent = false
     @Published var isReplaying = false
@@ -105,6 +106,13 @@ final class AppModel: ObservableObject {
     private var profileAutosaveTask: Task<Void, Never>?
     private var isRestoringWorkflowSettings = true
     private var updateCheckStarted = false
+    private var autoTrainingProfileID: UUID?
+    private var trainingInterruption: TrainingInterruption?
+
+    private enum TrainingInterruption: Equatable {
+        case pause
+        case stop
+    }
 
     var selectedSource: CaptureSourceOption? { captureSources.first { $0.id == selectedSourceID && sourceMatchesKind($0) } }
     var selectedRecording: RecordingItem? { recordings.first { $0.id == selectedRecordingID } }
@@ -487,7 +495,11 @@ final class AppModel: ObservableObject {
         } catch { present(error) }
     }
 
-    func startTraining() {
+    func startTraining() { startTraining(automaticallyRepeating: false) }
+
+    func startAutoTraining() { startTraining(automaticallyRepeating: true) }
+
+    private func startTraining(automaticallyRepeating: Bool) {
         guard let profile = selectedProfile, !isTraining else { return }
         guard runningProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently running. Select a different AI to train in the background.")); return }
         guard trainingRunSettings.maximumSteps >= 0,
@@ -499,23 +511,100 @@ final class AppModel: ObservableObject {
         let folderIDs = Set(profile.effectiveFolderIDs)
         let selected = recordings.filter { profile.recordingIDs.contains($0.id) || $0.manifest.folderID.map(folderIDs.contains) == true }
         guard !selected.isEmpty else { present(AgentTrainerError.noData); return }
+        trainingInterruption = nil
+        isAutoTraining = automaticallyRepeating
+        autoTrainingProfileID = automaticallyRepeating ? profile.id : nil
+        launchTraining(profile: profile, recordings: selected)
+    }
+
+    private func launchTraining(profile: AIProfile, recordings selected: [RecordingItem]) {
         isTraining = true; trainingProfileID = profile.id; trainingStatus = "Preparing packed dataset cache for \(profile.name)"; activityStatus = trainingStatus
-        AppLog.write(category: "Training", "Training started", details: "\(profile.name), \(selected.count) recordings, batch \(profile.training.batchSize), \(profile.preprocessing.width)×\(profile.preprocessing.height)")
+        AppLog.write(category: "Training", isAutoTraining ? "Auto training started" : "Training started", details: "\(profile.name), \(selected.count) recordings, batch \(profile.training.batchSize), \(profile.preprocessing.width)×\(profile.preprocessing.height)")
         training.start(profile: profile, recordings: selected, runSettings: trainingRunSettings) { [weak self] value, status in
             Task { @MainActor in self?.trainingMetrics = value; self?.trainingStatus = status; self?.activityStatus = self?.isRunning == true ? "AI running • \(status)" : status }
         } completion: { [weak self] result in
             Task { @MainActor in
-                guard let self else { return }; self.isTraining = false; self.trainingProfileID = nil
-                switch result {
-                case .success(let completion): self.trainingStatus = completion.completed ? "Training complete — runnable brain saved" : "Paused — current brain is ready to run and resume"; self.activityStatus = self.trainingStatus; AppLog.write(category: "Training", self.trainingStatus, details: "step \(completion.version.globalStep), loss \(completion.version.trainingLoss)"); await self.refreshLibrary()
-                case .failure(let error): self.trainingStatus = error.localizedDescription; self.activityStatus = error.localizedDescription; if !error.localizedDescription.localizedCaseInsensitiveContains("paused") && !error.localizedDescription.localizedCaseInsensitiveContains("stopped") { self.present(error) }
-                }
+                await self?.handleTrainingCompletion(result, profileID: profile.id)
             }
         }
     }
 
-    func pauseTraining() { training.pauseAndSave(); trainingStatus = "Saving exact training state…"; activityStatus = trainingStatus }
-    func stopTraining() { training.stop(); trainingStatus = "Stopping training safely…"; activityStatus = trainingStatus }
+    private func handleTrainingCompletion(_ result: Result<TrainingCompletion, Error>, profileID: UUID) async {
+        switch result {
+        case .success(let completion):
+            AppLog.write(category: "Training", completion.completed ? "Training block complete" : "Training paused", details: "step \(completion.version.globalStep), loss \(completion.version.trainingLoss)")
+            await refreshLibrary()
+            if completion.completed,
+               trainingInterruption == nil,
+               isAutoTraining,
+               autoTrainingProfileID == profileID,
+               let profile = profiles.first(where: { $0.id == profileID }) {
+                do { try validateProfile(profile) } catch { finishTraining(with: error); present(error); return }
+                let folderIDs = Set(profile.effectiveFolderIDs)
+                let selected = recordings.filter { profile.recordingIDs.contains($0.id) || $0.manifest.folderID.map(folderIDs.contains) == true }
+                guard !selected.isEmpty else { let error = AgentTrainerError.noData; finishTraining(with: error); present(error); return }
+                trainingStatus = "Training block complete — starting the next \(profile.training.epochs)-epoch block"
+                activityStatus = trainingStatus
+                launchTraining(profile: profile, recordings: selected)
+                return
+            }
+            finishTraining(with: completion)
+        case .failure(let error):
+            let wasStopped = trainingInterruption == .stop
+            finishTraining(with: error)
+            if !wasStopped,
+               !error.localizedDescription.localizedCaseInsensitiveContains("paused"),
+               !error.localizedDescription.localizedCaseInsensitiveContains("stopped") {
+                present(error)
+            }
+        }
+    }
+
+    private func finishTraining(with completion: TrainingCompletion) {
+        let interruption = trainingInterruption
+        isTraining = false
+        trainingProfileID = nil
+        isAutoTraining = false
+        autoTrainingProfileID = nil
+        trainingInterruption = nil
+        switch interruption {
+        case .pause: trainingStatus = "Paused — current brain is ready to run and resume"
+        case .stop: trainingStatus = "Training stopped."
+        case nil: trainingStatus = completion.completed ? "Training complete — runnable brain saved" : "Paused — current brain is ready to run and resume"
+        }
+        activityStatus = trainingStatus
+    }
+
+    private func finishTraining(with error: Error) {
+        let interruption = trainingInterruption
+        isTraining = false
+        trainingProfileID = nil
+        isAutoTraining = false
+        autoTrainingProfileID = nil
+        trainingInterruption = nil
+        trainingStatus = interruption == .stop ? "Training stopped." : error.localizedDescription
+        activityStatus = trainingStatus
+    }
+
+    func pauseTraining() {
+        guard isTraining else { return }
+        trainingInterruption = .pause
+        isAutoTraining = false
+        autoTrainingProfileID = nil
+        training.pauseAndSave()
+        trainingStatus = training.isRunning ? "Saving exact training state…" : "Pausing automatic training after the completed block…"
+        activityStatus = trainingStatus
+    }
+
+    func stopTraining() {
+        guard isTraining else { return }
+        trainingInterruption = .stop
+        isAutoTraining = false
+        autoTrainingProfileID = nil
+        training.stop()
+        trainingStatus = training.isRunning ? "Stopping training safely…" : "Stopping automatic training after the completed block…"
+        activityStatus = trainingStatus
+    }
 
     func startAgent() async {
         guard let profile = selectedProfile, let versionID = profile.activeVersionID,
