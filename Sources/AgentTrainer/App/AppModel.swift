@@ -955,19 +955,28 @@ final class AppModel: ObservableObject {
     private func validateProfile(_ profile: AIProfile) throws {
         _ = try profile.preprocessing.validated()
         let training = profile.training
+        let cycleEpochs = training.cosineCycleEpochs ?? 8
+        let plateauPatience = training.plateauPatience ?? 5
+        let minimumLearningRateRatio = training.minimumLearningRateRatio ?? 0.05
+        let binaryFocalGamma = training.binaryFocalGamma ?? 0
         guard training.learningRate.isFinite, training.weightDecay.isFinite,
               training.perceptionFPS.isFinite, training.actionFPS.isFinite,
-              training.validationSplit.isFinite,
+              training.validationSplit.isFinite, minimumLearningRateRatio.isFinite,
+              binaryFocalGamma.isFinite,
               (1...1_000_000).contains(training.epochs),
               (1...4_096).contains(training.batchSize),
               (0...256).contains(training.historyLength),
+              (1...10_000).contains(cycleEpochs),
+              (1...1_000).contains(plateauPatience),
               training.learningRate >= 0.000_000_1, training.learningRate <= 0.003,
               training.weightDecay >= 0, training.weightDecay <= 1,
               training.perceptionFPS > 0, training.actionFPS > 0,
               training.perceptionFPS <= training.actionFPS,
               training.perceptionFPS <= 240, training.actionFPS <= 240,
-              training.validationSplit >= 0, training.validationSplit < 1 else {
-            throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, history 0–256, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
+              training.validationSplit >= 0, training.validationSplit < 1,
+              minimumLearningRateRatio >= 0.001, minimumLearningRateRatio <= 0.5,
+              binaryFocalGamma >= 0, binaryFocalGamma <= 4 else {
+            throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, history 0–256, cosine cycles 1–10,000 epochs, plateau patience 1–1,000, minimum learning-rate ratio 0.001–0.5, focal gamma 0–4, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
         }
         let architecture = training.architecture
         guard architecture.dropout.isFinite,
@@ -981,8 +990,9 @@ final class AppModel: ObservableObject {
               (1...16_384).contains(architecture.recurrentWidth),
               architecture.fusionWidths.count <= 16,
               architecture.fusionWidths.allSatisfy({ (1...16_384).contains($0) }),
+              (1...64).contains(architecture.attentionHeads ?? 8),
               architecture.dropout >= 0, architecture.dropout <= 0.5 else {
-            throw AgentTrainerError.invalidConfiguration("Use 1–8 convolution stages with one kernel and stride per stage, positive bounded widths, and dropout from 0 through 0.5.")
+            throw AgentTrainerError.invalidConfiguration("Use 1–8 convolution stages with one kernel and stride per stage, positive bounded widths, 1–64 attention keypoints, and dropout from 0 through 0.5.")
         }
         let channels = profile.channels
         guard channels.mouseMovement || channels.buttons || channels.scroll || channels.keyboard || channels.modifiers else { throw AgentTrainerError.invalidConfiguration("Enable at least one control channel before training.") }

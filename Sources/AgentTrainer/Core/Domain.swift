@@ -204,6 +204,20 @@ enum RecurrentKind: String, Codable, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 }
 
+enum VisualPoolingKind: String, Codable, CaseIterable, Identifiable, Sendable {
+    /// Preserves the exact Policy-v4 projection used by existing brains. It is
+    /// expressive, but the first visual dense layer grows with every output
+    /// grid position and therefore dominates larger models.
+    case flattened = "Flattened Grid (Legacy)"
+    /// Learns a small set of spatial keypoints, pools both features and exact
+    /// coordinates around them, and retains global context. This keeps layout
+    /// information while making parameter count nearly independent of vision
+    /// resolution.
+    case attention = "Attention Keypoints"
+
+    var id: String { rawValue }
+}
+
 struct ArchitectureSpec: Codable, Hashable, Sendable {
     /// The stride-four stem cuts the dominant high-resolution convolution cost,
     /// while the extra stage expands the receptive field before spatial
@@ -218,9 +232,18 @@ struct ArchitectureSpec: Codable, Hashable, Sendable {
     var fusionWidths: [Int] = [384, 256]
     var dropout: Double = 0.1
 
-    static let small = ArchitectureSpec(convolutionChannels: [24, 48, 72, 96], visualEmbedding: 192, recurrentWidth: 128, fusionWidths: [256, 192])
+    /// Optional fields keep every existing profile and immutable brain
+    /// byte-compatible. A missing value means the historical flattened
+    /// projection; newly created profiles use efficient attention pooling.
+    var visualPooling: VisualPoolingKind? = .attention
+    var attentionHeads: Int? = 8
+
+    var effectiveVisualPooling: VisualPoolingKind { visualPooling ?? .flattened }
+    var effectiveAttentionHeads: Int { min(64, max(1, attentionHeads ?? 8)) }
+
+    static let small = ArchitectureSpec(convolutionChannels: [24, 48, 72, 96], visualEmbedding: 192, recurrentWidth: 128, fusionWidths: [256, 192], visualPooling: .attention, attentionHeads: 6)
     static let balanced = ArchitectureSpec()
-    static let large = ArchitectureSpec(convolutionChannels: [48, 96, 160, 224], visualEmbedding: 384, recurrentWidth: 256, fusionWidths: [512, 384], dropout: 0.12)
+    static let large = ArchitectureSpec(convolutionChannels: [48, 96, 160, 224], visualEmbedding: 384, recurrentWidth: 256, fusionWidths: [512, 384], dropout: 0.12, visualPooling: .attention, attentionHeads: 12)
 }
 
 struct CNNLayerGeometry: Hashable, Sendable {
@@ -281,6 +304,17 @@ enum TrainingPrecision: String, Codable, CaseIterable, Identifiable, Sendable {
 enum FrameMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case newest = "Newest Frame"
     case ordered = "Every Frame"
+    var id: String { rawValue }
+}
+
+enum LearningRateSchedule: String, Codable, CaseIterable, Identifiable, Sendable {
+    /// Linear warmup followed by bounded cosine restarts. Epoch-end validation
+    /// (or epoch-average training loss when no validation is possible) reduces
+    /// the cycle envelope when progress stalls.
+    case adaptiveCosine = "Adaptive Cosine + Plateau"
+    /// Compatibility schedule for checkpoints created before adaptive training.
+    case legacyInverseSquareRoot = "Legacy Inverse Square Root"
+
     var id: String { rawValue }
 }
 
@@ -345,7 +379,28 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     /// Nil is decoded from older profiles. It intentionally maps to the new safe default.
     var maximumSteps: Int? = 10_000
 
+    /// Optional adaptive fields preserve exact behavior for profiles created by
+    /// older releases: a missing schedule selects inverse-square-root decay and
+    /// a missing focal gamma selects ordinary class-balanced BCE. New profiles
+    /// receive the stronger defaults below.
+    var learningRateSchedule: LearningRateSchedule? = .adaptiveCosine
+    var cosineCycleEpochs: Int? = 8
+    var plateauPatience: Int? = 5
+    var minimumLearningRateRatio: Double? = 0.05
+    var binaryFocalGamma: Double? = 1.5
+
     var effectiveMaximumSteps: Int { maximumSteps ?? 10_000 }
+    var effectiveLearningRateSchedule: LearningRateSchedule { learningRateSchedule ?? .legacyInverseSquareRoot }
+    var effectiveCosineCycleEpochs: Int { max(1, cosineCycleEpochs ?? 8) }
+    var effectivePlateauPatience: Int { max(1, plateauPatience ?? 5) }
+    var effectiveMinimumLearningRateRatio: Double {
+        let value = minimumLearningRateRatio ?? 0.05
+        return value.isFinite ? min(0.5, max(0.001, value)) : 0.05
+    }
+    var effectiveBinaryFocalGamma: Double {
+        let value = binaryFocalGamma ?? 0
+        return value.isFinite ? min(4, max(0, value)) : 0
+    }
 }
 
 struct TrainingRunSettings: Codable, Hashable, Sendable {
@@ -471,6 +526,67 @@ struct ActionRestrictions: Codable, Hashable, Sendable {
     }
 }
 
+/// Micro-averaged classification quality for one collection of binary control
+/// outputs. Raw counts are retained so reports remain auditable and can be
+/// recombined without rounding loss.
+struct BinaryValidationMetrics: Codable, Hashable, Sendable {
+    var truePositives: Int
+    var falsePositives: Int
+    var falseNegatives: Int
+    var trueNegatives: Int
+
+    var precision: Double {
+        Double(truePositives) / Double(max(1, truePositives + falsePositives))
+    }
+    var recall: Double {
+        Double(truePositives) / Double(max(1, truePositives + falseNegatives))
+    }
+    var f1: Double {
+        let denominator = 2 * truePositives + falsePositives + falseNegatives
+        return Double(2 * truePositives) / Double(max(1, denominator))
+    }
+    var falsePositiveRate: Double {
+        Double(falsePositives) / Double(max(1, falsePositives + trueNegatives))
+    }
+    var positiveSupport: Int { truePositives + falseNegatives }
+    var negativeSupport: Int { falsePositives + trueNegatives }
+}
+
+/// Held-out quality is deliberately multi-dimensional. A single weighted loss
+/// can improve while a sparse keyboard head collapses or an idle policy starts
+/// emitting false actions; these fields make those failure modes visible.
+struct ValidationReport: Codable, Hashable, Sendable {
+    var sampleCount: Int
+    var binary: BinaryValidationMetrics?
+    var buttons: BinaryValidationMetrics?
+    var keyboard: BinaryValidationMetrics?
+    var modifiers: BinaryValidationMetrics?
+    var absoluteMouseMAE: Double?
+    var activeRelativeMouseMAE: Double?
+    var activeScrollMAE: Double?
+    var idleContinuousFalseActionRate: Double?
+
+    /// Aggregate weighted loss remains the primary selector, but it may hide a
+    /// collapsed sparse head. On the same fixed held-out rows, reject only large
+    /// regressions with enough support to be meaningful; small tradeoffs remain
+    /// eligible and visible metrics still guide the user.
+    func hasSevereBinaryRegression(comparedTo baseline: ValidationReport) -> Bool {
+        let pairs = [
+            (buttons, baseline.buttons),
+            (keyboard, baseline.keyboard),
+            (modifiers, baseline.modifiers)
+        ]
+        return pairs.contains { current, previous in
+            guard let current, let previous else { return false }
+            let f1Collapsed = previous.positiveSupport >= 5
+                && current.f1 + 0.10 < previous.f1
+            let falsePositivesSpiked = previous.negativeSupport >= 20
+                && current.falsePositiveRate > previous.falsePositiveRate + 0.03
+            return f1Collapsed || falsePositivesSpiked
+        }
+    }
+}
+
 struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     var schemaVersion = ModelContract.schemaVersion
     var id: UUID
@@ -513,6 +629,9 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// immutable brain. Editing a profile's recording selection later cannot
     /// silently switch a game-camera policy into absolute cursor control.
     var recommendedMouseMode: MouseControlMode? = nil
+    /// Optional keeps existing manifests decodable. New brains retain the
+    /// per-head held-out report that justified best-brain selection.
+    var validationReport: ValidationReport? = nil
 }
 
 struct TrainingProgressSummary: Codable, Hashable, Sendable {
@@ -630,12 +749,18 @@ struct TrainingMetrics: Sendable {
     var nextAutosaveStep: Int?
     var autosavesPublished = 0
     var trainingLoss = 0.0
+    var epochTrainingLoss: Double?
     var validationLoss: Double?
+    var validationReport: ValidationReport?
+    var effectiveLearningRate = 0.0
+    var learningRateScale = 1.0
     var samplesPerSecond = 0.0
     var elapsed = 0.0
     var experienceElapsed = 0.0
     var lossHistory: [Double] = []
+    var epochLossHistory: [Double] = []
     var validationHistory: [Double] = []
+    var learningRateHistory: [Double] = []
     var mlxActiveMemory = 0
     var mlxCacheMemory = 0
     var mlxPeakMemory = 0
@@ -732,8 +857,20 @@ enum ModelSizing {
             input = output
         }
         let output = CNNGeometry.outputSize(width: profile.preprocessing.width, height: profile.preprocessing.height, architecture: architecture)
-        let spatialFeatures = multiply(multiply(Int64(output.width), Int64(output.height)), Int64(max(1, input)))
-        total = add(total, multiply(add(spatialFeatures, 1), Int64(max(1, architecture.visualEmbedding))))
+        let finalChannels = Int64(max(1, input))
+        let visualProjectionInput: Int64
+        switch architecture.effectiveVisualPooling {
+        case .flattened:
+            visualProjectionInput = multiply(multiply(Int64(output.width), Int64(output.height)), finalChannels)
+        case .attention:
+            let heads = Int64(architecture.effectiveAttentionHeads)
+            // A learned score per head and spatial feature, including bias.
+            total = add(total, multiply(add(finalChannels, 1), heads))
+            // Each attention head retains pooled features plus exact X/Y, while
+            // global mean and maximum features preserve whole-scene context.
+            visualProjectionInput = add(multiply(heads, add(finalChannels, 2)), multiply(2, finalChannels))
+        }
+        total = add(total, multiply(add(visualProjectionInput, 1), Int64(max(1, architecture.visualEmbedding))))
         total = add(total, multiply(2, Int64(max(1, architecture.visualEmbedding))))
         let recurrent = max(1, architecture.recurrentWidth)
         let gates = architecture.recurrentKind == .gru ? 3 : 4

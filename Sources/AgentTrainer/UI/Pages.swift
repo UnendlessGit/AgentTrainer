@@ -208,11 +208,29 @@ private struct ProfileEditor: View {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack { Text("Training configuration").font(.headline).foregroundStyle(ATColor.green); InfoTip("Maximum Steps and Autosave Steps are universal run controls in the Training tab, so they do not change a model's learning identity. Architecture and exact vision changes require a fresh brain, and the app asks before clearing training.") }
                         HStack { IntField("Epochs per block", value: $draft.training.epochs, help: "How many complete dataset passes to add. If a block is paused, Train finishes it first; after a completed block, Train adds another block of this size."); IntField("Batch", value: $draft.training.batchSize, help: "Samples evaluated together. Larger batches use more unified memory."); IntField("History", value: $draft.training.historyLength, help: "Earlier actions supplied to the recurrent encoder. Keep this short: motion comes directly from consecutive screen frames, and training masks history on half the samples so the policy cannot succeed by copying it.") }
-                        HStack { DoubleField("Learning rate", value: $draft.training.learningRate, help: "Peak AdamW update size. Training warms up for one epoch (bounded to 10–500 steps), then decays automatically so small datasets learn promptly and long runs keep refining."); DoubleField("Weight decay", value: $draft.training.weightDecay, help: "Regularization applied by AdamW."); DoubleField("Validation", value: $draft.training.validationSplit, help: "Fraction of whole recordings held out. Rare controls stay in training. A lone recording gets a history/frame embargo; if no honest held-out tail remains, validation is disabled instead of reporting a leaked score.") }
+                        HStack { DoubleField("Learning rate", value: $draft.training.learningRate, help: "Peak AdamW update size. Adaptive scheduling warms up, uses bounded cosine restarts so updates never decay silently to zero, and reduces its envelope only after a measured plateau."); DoubleField("Weight decay", value: $draft.training.weightDecay, help: "Regularization applied by AdamW."); DoubleField("Validation", value: $draft.training.validationSplit, help: "Fraction of whole recordings held out. Splits target sample count, keep rare controls in training, purge shared context, and score diverse examples from every held-out recording.") }
+                        HStack {
+                            Picker("Learning-rate schedule", selection: Binding(get: { draft.training.effectiveLearningRateSchedule }, set: { draft.training.learningRateSchedule = $0 })) { ForEach(LearningRateSchedule.allCases) { Text($0.rawValue).tag($0) } }
+                            IntField("Cosine cycle epochs", value: Binding(get: { draft.training.effectiveCosineCycleEpochs }, set: { draft.training.cosineCycleEpochs = $0 }), help: "Length of each cosine restart. Restarts periodically restore useful update size instead of letting learning freeze.")
+                            IntField("Plateau patience", value: Binding(get: { draft.training.effectivePlateauPatience }, set: { draft.training.plateauPatience = $0 }), help: "Completed epochs without a meaningful validation improvement before the learning-rate envelope is halved.")
+                        }
+                        HStack {
+                            DoubleField("Minimum LR ratio", value: Binding(get: { draft.training.effectiveMinimumLearningRateRatio }, set: { draft.training.minimumLearningRateRatio = $0 }), help: "Lowest fraction of the peak rate inside a cosine cycle and the final adaptive envelope floor.")
+                            DoubleField("Binary focal gamma", value: Binding(get: { draft.training.effectiveBinaryFocalGamma }, set: { draft.training.binaryFocalGamma = $0 }), help: "Focuses button, key, and modifier learning on current mistakes instead of easy idle frames. Use 0 for ordinary class-balanced BCE.")
+                            Spacer()
+                            InfoTip("Changing scheduler or loss settings keeps the active brain weights but safely starts a new optimizer sequence. Older profiles remain on their exact legacy schedule until you explicitly select Adaptive Cosine + Plateau.")
+                        }
                         HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives a new screen frame and signed motion difference. It cannot exceed Action FPS."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the AI may update mouse, keyboard, button, and scroll output."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
                         HStack { Text("Architecture preset").foregroundStyle(.secondary); Button("Small") { draft.training.architecture = .small }.primaryButton(); Button("Balanced") { draft.training.architecture = .balanced }.primaryButton(); Button("Large") { draft.training.architecture = .large }.primaryButton() }
                         HStack { IntField("Visual width", value: $draft.training.architecture.visualEmbedding, help: "How much visual information is kept after the convolution layers."); IntField("Recurrent width", value: $draft.training.architecture.recurrentWidth, help: "How much capacity is used to remember the recent action history."); Picker("History encoder", selection: $draft.training.architecture.recurrentKind) { ForEach(RecurrentKind.allCases) { Text($0.rawValue).tag($0) } } }
-                        HStack { InfoTip("The four-stage spatial encoder sees the current frame, signed frame-to-frame motion, and screen coordinates. It preserves layout instead of averaging the screen into one vector. Convolution channels control visual capacity; recurrent width controls short action history."); Spacer() }
+                        HStack {
+                            Picker("Spatial pooling", selection: Binding(get: { draft.training.architecture.effectiveVisualPooling }, set: { draft.training.architecture.visualPooling = $0 })) { ForEach(VisualPoolingKind.allCases) { Text($0.rawValue).tag($0) } }
+                            IntField("Attention keypoints", value: Binding(get: { draft.training.architecture.effectiveAttentionHeads }, set: { draft.training.architecture.attentionHeads = $0 }), help: "Independent learned spatial queries. Each retains visual features and exact X/Y while global mean/max preserve whole-screen context.")
+                                .disabled(draft.training.architecture.effectiveVisualPooling != .attention)
+                            Spacer()
+                            InfoTip("Attention Keypoints preserves spatial position with a compact learned pool whose dense parameter count barely changes with resolution. Flattened Grid is retained only for exact compatibility with older brains.")
+                        }
+                        HStack { InfoTip("The four-stage encoder sees the current frame, signed frame-to-frame motion, and screen coordinates. Convolution channels control visual capacity; recurrent width controls short action history."); Spacer() }
                         HStack { IntArrayField("Conv channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
                         HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
                     }
@@ -252,7 +270,7 @@ private struct ProfileEditor: View {
                         } else {
                             ForEach(model.versions) { version in
                                 HStack {
-                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
+                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
                                     Spacer(); Button(version.optimizerFile == nil ? "Run this" : "Revert & Resume") { Task { await model.activateVersion(version); draft.activeVersionID = version.id } }.primaryButton(color: ATColor.violet)
                                     if !draft.isDeletionProtected { Button("Delete") { Task { await model.deleteVersion(version) } }.primaryButton(color: ATColor.coral) }
                                 }.padding(.vertical, 4)
@@ -838,7 +856,13 @@ private struct IntArrayField: View {
 }
 
 struct TrainingView: View {
-    private enum GraphKind: String, CaseIterable, Identifiable { case current = "Current Loss"; case validation = "Validation Loss"; var id: String { rawValue } }
+    private enum GraphKind: String, CaseIterable, Identifiable {
+        case current = "Batch Loss"
+        case epoch = "Epoch Average"
+        case validation = "Validation"
+        case learningRate = "Learning Rate"
+        var id: String { rawValue }
+    }
     @ObservedObject var model: AppModel
     @State private var graphKind: GraphKind = .current
     @State private var zoomFraction = 0.25
@@ -866,10 +890,45 @@ struct TrainingView: View {
         return profile.trainingProgress?.globalStep ?? 0
     }
 
+    private var graphValues: [Double] {
+        switch graphKind {
+        case .current: model.trainingMetrics.lossHistory
+        case .epoch: model.trainingMetrics.epochLossHistory
+        case .validation: model.trainingMetrics.validationHistory
+        case .learningRate: model.trainingMetrics.learningRateHistory
+        }
+    }
+
+    private var graphAccent: Color {
+        switch graphKind {
+        case .current: ATColor.cyan
+        case .epoch: ATColor.green
+        case .validation: ATColor.violet
+        case .learningRate: ATColor.amber
+        }
+    }
+
+    private func lossText(_ value: Double?) -> String {
+        value.map { $0.formatted(.number.precision(.fractionLength(6))) } ?? "—"
+    }
+
+    private func validationSummary(_ report: ValidationReport) -> String {
+        var components = ["Validation report: \(report.sampleCount.formatted()) diverse held-out samples"]
+        if let binary = report.binary {
+            components.append("binary precision \((100 * binary.precision).formatted(.number.precision(.fractionLength(1))))%")
+            components.append("recall \((100 * binary.recall).formatted(.number.precision(.fractionLength(1))))%")
+            components.append("F1 \((100 * binary.f1).formatted(.number.precision(.fractionLength(1))))%")
+            components.append("false-positive rate \((100 * binary.falsePositiveRate).formatted(.number.precision(.fractionLength(2))))%")
+        }
+        if let value = report.activeRelativeMouseMAE { components.append("active mouse MAE \(value.formatted(.number.precision(.fractionLength(4))))") }
+        if let value = report.activeScrollMAE { components.append("active scroll MAE \(value.formatted(.number.precision(.fractionLength(4))))") }
+        return components.joined(separator: " • ")
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                SectionTitle("Training", "Compiled MLX training uses temporal vision, class-balanced controls, transition-balanced batches, anti-shortcut history masking, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
+                SectionTitle("Training", "Compiled MLX training uses compact spatial attention, temporal vision, focal class-balanced controls, transition-balanced batches, anti-shortcut history masking, adaptive cosine scheduling, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
                 HStack {
                     if model.isTraining, let profile = displayedProfile {
                         Text(profile.name).font(.title2.bold())
@@ -905,18 +964,23 @@ struct TrainingView: View {
                         HStack {
                             VStack(alignment: .leading) { Text("Learning curves").font(.headline); Text("Newest data stays in view; only visible points are rendered.").font(.caption).foregroundStyle(.secondary) }
                             Spacer()
-                            Picker("Graph", selection: $graphKind) { ForEach(GraphKind.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).frame(width: 290)
+                            Picker("Graph", selection: $graphKind) { ForEach(GraphKind.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).frame(width: 540)
                             Button { zoomFraction = max(0.02, zoomFraction / 1.6) } label: { Image(systemName: "plus.magnifyingglass") }.primaryButton().help("Zoom in")
                             Button { zoomFraction = min(1, zoomFraction * 1.6) } label: { Image(systemName: "minus.magnifyingglass") }.primaryButton().help("Zoom out")
                             Text("\(Int(zoomFraction * 100))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 38)
                         }
-                        let values = graphKind == .current ? model.trainingMetrics.lossHistory : model.trainingMetrics.validationHistory
-                        let accent = graphKind == .current ? ATColor.cyan : ATColor.violet
-                        LossChart(values: values, zoomFraction: zoomFraction, color: accent, isActive: model.isAppActive)
+                        LossChart(values: graphValues, zoomFraction: zoomFraction, color: graphAccent, isActive: model.isAppActive)
                             .id("\(graphKind.rawValue)-\(zoomFraction)")
                             .frame(height: 250)
-                        HStack { Text(graphKind.rawValue).foregroundStyle(accent).font(.caption.bold()); Spacer(); Text(values.last?.formatted(.number.precision(.fractionLength(6))) ?? "No data yet").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+                        HStack { Text(graphKind.rawValue).foregroundStyle(graphAccent).font(.caption.bold()); Spacer(); Text(graphValues.last?.formatted(.number.precision(.fractionLength(8))) ?? "No data yet").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                     }
+                }
+                HStack(spacing: 12) {
+                    MetricCard(title: "Batch loss", value: lossText(model.trainingMetrics.lossHistory.last), symbol: "waveform.path.ecg", color: ATColor.cyan)
+                    MetricCard(title: "Epoch-average loss", value: lossText(model.trainingMetrics.epochTrainingLoss), symbol: "chart.xyaxis.line", color: ATColor.green)
+                    MetricCard(title: "Held-out loss", value: lossText(model.trainingMetrics.validationLoss), symbol: "checkmark.shield.fill", color: ATColor.violet)
+                    MetricCard(title: "Effective LR • envelope", value: model.trainingMetrics.effectiveLearningRate > 0 ? String(format: "%.2e • %.3fx", model.trainingMetrics.effectiveLearningRate, model.trainingMetrics.learningRateScale) : "—", symbol: "speedometer", color: ATColor.amber)
+                    MetricCard(title: "Held-out binary F1", value: model.trainingMetrics.validationReport?.binary.map { "\((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))%" } ?? "—", symbol: "scope", color: ATColor.coral)
                 }
                 HStack(spacing: 12) {
                     MetricCard(title: "Actual training time", value: TrainingDurationFormatter.string(seconds: displayedTiming.trainingSeconds), symbol: "clock.fill", color: ATColor.cyan)
@@ -950,8 +1014,11 @@ struct TrainingView: View {
                             Label("Next periodic autosave at step \(next) • \(model.trainingMetrics.autosavesPublished) published this run", systemImage: "externaldrive.badge.timemachine")
                                 .font(.caption).foregroundStyle(ATColor.amber)
                         }
+                        if let report = model.trainingMetrics.validationReport {
+                            Text(validationSummary(report)).font(.caption).foregroundStyle(ATColor.green)
+                        }
                         if let profile = displayedProfile { Text("\(profile.preprocessing.width) × \(profile.preprocessing.height) • \(profile.preprocessing.bitDepth)-bit \(profile.preprocessing.chroma.rawValue) • \(profile.training.precision.rawValue) • perception \(profile.training.perceptionFPS.formatted()) FPS • action \(profile.training.actionFPS.formatted()) FPS").font(.caption).foregroundStyle(.secondary) }
-                        Text("Exact continuation always uses the latest optimizer checkpoint. When a validation split exists, completed training runs the lowest-loss held-out brain so late regression is never silently activated.").font(.caption2).foregroundStyle(.secondary)
+                        Text("Exact continuation always uses the latest optimizer and adaptive-scheduler checkpoint. When a validation split exists, completed training runs the lowest-loss held-out brain so late regression is never silently activated.").font(.caption2).foregroundStyle(.secondary)
                         Text("MLX reports allocator-backed unified memory: active arrays, reusable cache, and process-lifetime peak. It is not separate VRAM on Apple silicon.").font(.caption2).foregroundStyle(.tertiary)
                     }
                 }
@@ -1430,7 +1497,7 @@ struct SettingsView: View {
                 ThemeSettingsView()
                 OLEDCard { HStack { VStack(alignment: .leading, spacing: 4) { Text("Diagnostics and app logs").font(.headline).foregroundStyle(ATColor.cyan); Text("Open the dedicated tab for persistent errors, prints, crash reports, MLX memory, and a copyable support report.").foregroundStyle(.secondary) }; Spacer(); Button("Open Diagnostics") { model.selection = .diagnostics }.primaryButton() } }
                 StorageSettingsView(model: model)
-                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.6") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "17"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
+                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.8") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "19"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
             }.padding(28)
         }
     }

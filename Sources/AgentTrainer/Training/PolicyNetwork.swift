@@ -11,9 +11,11 @@ final class AgentPolicy: Module, @unchecked Sendable {
     // putting it in AdamW would waste two Float32 moment arrays and allow
     // optimization to distort the meaning of X/Y coordinates.
     private let _coordinateGrid: MLXArray
+    private let _poolCoordinates: MLXArray?
 
     @ModuleInfo var convolutions: [Conv2d]
     @ModuleInfo var convolutionNormalizations: [GroupNorm]
+    @ModuleInfo var spatialAttention: Linear?
     @ModuleInfo var visualProjection: Linear
     @ModuleInfo var visualNormalization: LayerNorm
     @ModuleInfo var gru: GRU?
@@ -56,8 +58,28 @@ final class AgentPolicy: Module, @unchecked Sendable {
         convolutions = convs
         self.convolutionNormalizations = convolutionNormalizations
         let visualSize = CNNGeometry.outputSize(width: width, height: height, architecture: architecture)
-        let flattenedVisualSize = max(1, visualSize.width * visualSize.height * inputChannels)
-        visualProjection = Linear(flattenedVisualSize, architecture.visualEmbedding)
+        let visualProjectionInput: Int
+        if architecture.effectiveVisualPooling == .attention {
+            let heads = architecture.effectiveAttentionHeads
+            spatialAttention = Linear(inputChannels, heads)
+            let poolX = broadcast(
+                MLXArray.linspace(Float(-1), Float(1), count: visualSize.width).reshaped([1, 1, visualSize.width, 1]),
+                to: [1, visualSize.height, visualSize.width, 1]
+            )
+            let poolY = broadcast(
+                MLXArray.linspace(Float(-1), Float(1), count: visualSize.height).reshaped([1, visualSize.height, 1, 1]),
+                to: [1, visualSize.height, visualSize.width, 1]
+            )
+            _poolCoordinates = concatenated([poolX, poolY], axis: -1)
+                .reshaped([1, visualSize.width * visualSize.height, 2])
+                .asType(dtype)
+            visualProjectionInput = heads * (inputChannels + 2) + 2 * inputChannels
+        } else {
+            spatialAttention = nil
+            _poolCoordinates = nil
+            visualProjectionInput = max(1, visualSize.width * visualSize.height * inputChannels)
+        }
+        visualProjection = Linear(visualProjectionInput, architecture.visualEmbedding)
         visualNormalization = LayerNorm(dimensions: architecture.visualEmbedding)
         if architecture.recurrentKind == .gru {
             gru = GRU(inputSize: ActionLayout.count, hiddenSize: architecture.recurrentWidth)
@@ -116,7 +138,25 @@ final class AgentPolicy: Module, @unchecked Sendable {
 
     func logits(visualFeatures: MLXArray, history: MLXArray) -> MLXArray {
         let batch = visualFeatures.dim(0)
-        var vision = visualFeatures.reshaped([batch, -1])
+        var vision: MLXArray
+        if let spatialAttention, let poolCoordinates = _poolCoordinates {
+            let spatial = visualFeatures.reshaped([batch, -1, visualFeatures.dim(3)])
+            // Softmax over locations makes each learned head an interpretable
+            // spatial keypoint. Pooling exact coordinates retains layout while
+            // global mean/max features preserve scene-wide context.
+            let attention = softmax(spatialAttention(spatial), axis: 1, precise: true)
+            let coordinates = broadcast(poolCoordinates, to: [batch, spatial.dim(1), 2])
+            let attended = attention.transposed(0, 2, 1)
+                .matmul(concatenated([spatial, coordinates], axis: -1))
+                .reshaped([batch, -1])
+            vision = concatenated([
+                attended,
+                spatial.mean(axis: 1),
+                spatial.max(axis: 1)
+            ], axis: -1)
+        } else {
+            vision = visualFeatures.reshaped([batch, -1])
+        }
         vision = silu(visualNormalization(visualProjection(vision)))
 
         var history = history.asType(dtype)
@@ -130,7 +170,10 @@ final class AgentPolicy: Module, @unchecked Sendable {
         if training, profile.training.historyLength > 0 {
             let keepProbability: Float = 0.5
             let mask = MLXRandom.bernoulli(keepProbability, [batch, 1, 1]).asType(dtype)
-            history = history * mask / keepProbability
+            // This is structured branch masking rather than ordinary inverted
+            // dropout. Kept histories retain their inference-time magnitude;
+            // doubling them would create a train/run distribution mismatch.
+            history = history * mask
         }
         let recurrent: MLXArray
         if let gru {
@@ -194,10 +237,21 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return sampled[.ellipsis, indices]
     }
 
-    func loss(images: MLXArray, history: MLXArray, targets: MLXArray, positiveWeights: MLXArray? = nil) -> MLXArray {
+    func loss(
+        images: MLXArray,
+        history: MLXArray,
+        targets: MLXArray,
+        positiveWeights: MLXArray? = nil,
+        previousTargets: MLXArray? = nil
+    ) -> MLXArray {
         let logits = callAsFunction(images: images, history: history)
         let targets = targets.asType(dtype)
-        let previous = history.asType(dtype)[.ellipsis, -1, 0...]
+        // Training passes the actual preceding cached action explicitly. This
+        // remains correct when model history is disabled; using the mandatory
+        // zero placeholder row incorrectly marked every held control as a new
+        // transition and upweighted long holds fourfold.
+        let previous = previousTargets?.asType(dtype)
+            ?? history.asType(dtype)[.ellipsis, -1, 0...]
         let positiveWeights = positiveWeights?.asType(dtype)
         var losses: [MLXArray] = []
         let channels = profile.channels
@@ -231,7 +285,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         // middle of a long hold. Upweighting transitions prevents a policy from
         // learning only action persistence.
         let transitionWeights = 1 + 3 * abs(selectedTargets - selectedPrevious)
-        let weights = classWeights * transitionWeights
+        let weights = classWeights * transitionWeights * binaryFocalWeights(logits: selectedLogits, targets: selectedTargets)
         return (raw * weights).sum() / (weights.sum() + 1e-6)
     }
 
@@ -250,8 +304,17 @@ final class AgentPolicy: Module, @unchecked Sendable {
             classWeights = MLXArray.ones(like: selectedTargets)
         }
         let transitionWeights = 1 + 3 * abs(selectedTargets - selectedPrevious)
-        let weights = classWeights * transitionWeights
+        let weights = classWeights * transitionWeights * binaryFocalWeights(logits: selectedLogits, targets: selectedTargets)
         return (raw * weights).sum() / (weights.sum() + 1e-6)
+    }
+
+    private func binaryFocalWeights(logits: MLXArray, targets: MLXArray) -> MLXArray {
+        let gamma = profile.training.effectiveBinaryFocalGamma
+        guard gamma > 0 else { return MLXArray.ones(like: targets) }
+        // |target - probability| is p_t's complement. Raising it focuses the
+        // already class-balanced loss on mistakes and ambiguous transitions
+        // instead of spending most updates on easy idle negatives.
+        return pow(abs(targets - sigmoid(logits)), Float(gamma))
     }
 
     private func activeContinuousLoss(predictions: MLXArray, targets: MLXArray) -> MLXArray {
@@ -274,20 +337,38 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     var learningRate: Float
     var weightDecay: Float
     private(set) var warmupSteps: Int
+    private(set) var schedule: LearningRateSchedule
+    private(set) var cycleSteps: Int
+    private(set) var minimumLearningRateRatio: Float
     let beta1: Float = 0.9
     let beta2: Float = 0.999
     let epsilon: Float = 1e-8
     private var stepArray = MLXArray(0, dtype: .float32)
+    private var learningRateScaleArray = MLXArray(1, dtype: .float32)
     private var firstMoments: [String: MLXArray] = [:]
     private var secondMoments: [String: MLXArray] = [:]
     private var parameterNames: [String] = []
 
     var step: Int { MLX.eval(stepArray); return Int(stepArray.item(Float.self).rounded()) }
+    var learningRateScale: Float {
+        MLX.eval(learningRateScaleArray)
+        return learningRateScaleArray.item(Float.self)
+    }
 
-    init(learningRate: Float, weightDecay: Float, warmupSteps: Int = 500) {
+    init(
+        learningRate: Float,
+        weightDecay: Float,
+        warmupSteps: Int = 500,
+        schedule: LearningRateSchedule = .adaptiveCosine,
+        cycleSteps: Int = 4_000,
+        minimumLearningRateRatio: Float = 0.05
+    ) {
         self.learningRate = learningRate
         self.weightDecay = weightDecay
         self.warmupSteps = max(1, warmupSteps)
+        self.schedule = schedule
+        self.cycleSteps = max(1, cycleSteps)
+        self.minimumLearningRateRatio = min(0.5, max(0.001, minimumLearningRateRatio))
     }
 
     func initialize(model: Module) {
@@ -305,14 +386,31 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     func update(model: Module, gradients: ModuleParameters, targetType: DType) {
         initialize(model: model)
         stepArray = stepArray + 1
-        // Linear warmup prevents unstable first updates; inverse-square-root
-        // decay lets very long runs refine instead of oscillating forever at a
-        // constant learning rate. The schedule depends only on the persisted
-        // optimizer step, so exact resume remains exact.
+        // Both schedules depend only on persisted optimizer state. New training
+        // uses bounded cosine restarts so the update size never silently tends
+        // to zero; validation-driven envelope reductions still allow late-stage
+        // refinement. Old checkpoints retain inverse-square-root behavior.
         let warmupSteps = MLXArray(Float(self.warmupSteps), dtype: .float32)
         let warmupScale = minimum(stepArray / warmupSteps, MLXArray(1, dtype: .float32))
-        let decayScale = sqrt(warmupSteps / stepArray)
-        let scheduledLearningRate = learningRate * minimum(warmupScale, decayScale)
+        let scheduleScale: MLXArray
+        switch schedule {
+        case .legacyInverseSquareRoot:
+            let decayScale = sqrt(warmupSteps / stepArray)
+            scheduleScale = minimum(warmupScale, decayScale)
+        case .adaptiveCosine:
+            let cycleSteps = MLXArray(Float(self.cycleSteps), dtype: .float32)
+            let afterWarmup = maximum(stepArray - warmupSteps, MLXArray(0, dtype: .float32))
+            let phase = remainder(afterWarmup, cycleSteps) / cycleSteps
+            let cosine = (1 + cos(Float.pi * phase)) / 2
+            let floor = MLXArray(minimumLearningRateRatio, dtype: .float32)
+            let cycleScale = (floor + (1 - floor) * cosine) * learningRateScaleArray
+            // Plateau reductions lower the peaks, but the effective rate never
+            // falls below the configured global floor. Multiplying two floors
+            // would quietly recreate the near-zero learning wall this schedule
+            // is designed to remove.
+            scheduleScale = warmupScale * maximum(floor, cycleScale)
+        }
+        let scheduledLearningRate = learningRate * scheduleScale
         let gradientMap = Dictionary(uniqueKeysWithValues: gradients.flattened())
         var updated: [(String, MLXArray)] = []
         for (name, parameter) in model.parameters().flattened() {
@@ -342,7 +440,11 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
                 "step": String(step),
                 "learningRate": String(learningRate),
                 "weightDecay": String(weightDecay),
-                "warmupSteps": String(warmupSteps)
+                "warmupSteps": String(warmupSteps),
+                "schedule": schedule.rawValue,
+                "cycleSteps": String(cycleSteps),
+                "minimumLearningRateRatio": String(minimumLearningRateRatio),
+                "learningRateScale": String(learningRateScale)
             ],
             url: url
         )
@@ -353,7 +455,43 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     }
 
     func innerState() -> [MLXArray] {
-        [stepArray] + parameterNames.flatMap { name in [firstMoments[name], secondMoments[name]].compactMap { $0 } }
+        [stepArray, learningRateScaleArray] + parameterNames.flatMap { name in [firstMoments[name], secondMoments[name]].compactMap { $0 } }
+    }
+
+    /// Reduces the cosine envelope after a measured plateau. The mutable scalar
+    /// is part of the compiled graph's explicit state, so changing it does not
+    /// trigger graph recompilation and remains exactly checkpointable.
+    @discardableResult
+    func reduceLearningRate(factor: Float = 0.5) -> Float {
+        let current = learningRateScale
+        let next = max(minimumLearningRateRatio, min(1, current * min(0.99, max(0.01, factor))))
+        learningRateScaleArray._updateInternal(MLXArray(next, dtype: .float32))
+        MLX.eval(learningRateScaleArray)
+        return next
+    }
+
+    func effectiveLearningRate() -> Float {
+        effectiveLearningRate(at: step)
+    }
+
+    /// Scalar mirror of the compiled MLX schedule used by telemetry and tests.
+    /// Keeping it callable for an explicit step makes restart/floor behavior
+    /// auditable without executing a synthetic optimizer update.
+    func effectiveLearningRate(at rawStep: Int) -> Float {
+        let step = max(1, rawStep)
+        let warmup = min(1, Float(step) / Float(max(1, warmupSteps)))
+        let scale: Float
+        switch schedule {
+        case .legacyInverseSquareRoot:
+            scale = min(warmup, sqrt(Float(warmupSteps) / Float(step)))
+        case .adaptiveCosine:
+            let afterWarmup = max(0, step - warmupSteps)
+            let phase = Float(afterWarmup % max(1, cycleSteps)) / Float(max(1, cycleSteps))
+            let cosine = (1 + Foundation.cos(Float.pi * phase)) / 2
+            let cycleScale = (minimumLearningRateRatio + (1 - minimumLearningRateRatio) * cosine) * learningRateScale
+            scale = warmup * max(minimumLearningRateRatio, cycleScale)
+        }
+        return learningRate * scale
     }
 
     func load(from url: URL) throws {
@@ -367,5 +505,14 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         // Checkpoints from the fixed-schedule trainer did not save this field;
         // retaining 500 preserves their exact continuation behavior.
         warmupSteps = max(1, Int(loaded.1["warmupSteps"] ?? "500") ?? 500)
+        if let rawSchedule = loaded.1["schedule"], let restoredSchedule = LearningRateSchedule(rawValue: rawSchedule) {
+            schedule = restoredSchedule
+        } else {
+            schedule = .legacyInverseSquareRoot
+        }
+        cycleSteps = max(1, Int(loaded.1["cycleSteps"] ?? "4000") ?? 4_000)
+        minimumLearningRateRatio = min(0.5, max(0.001, Float(loaded.1["minimumLearningRateRatio"] ?? "0.05") ?? 0.05))
+        let restoredScale = min(1, max(minimumLearningRateRatio, Float(loaded.1["learningRateScale"] ?? "1") ?? 1))
+        learningRateScaleArray = MLXArray(restoredScale, dtype: .float32)
     }
 }

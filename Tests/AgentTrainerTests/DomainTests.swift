@@ -183,10 +183,44 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(clamped.inputsPerParameter, 0)
     }
 
+    func testBinaryValidationMetricsExposeSparseHeadFailureModes() {
+        let metrics = BinaryValidationMetrics(truePositives: 8, falsePositives: 2, falseNegatives: 2, trueNegatives: 88)
+        XCTAssertEqual(metrics.precision, 0.8, accuracy: 0.000_001)
+        XCTAssertEqual(metrics.recall, 0.8, accuracy: 0.000_001)
+        XCTAssertEqual(metrics.f1, 0.8, accuracy: 0.000_001)
+        XCTAssertEqual(metrics.falsePositiveRate, 2.0 / 90.0, accuracy: 0.000_001)
+
+        let baseline = ValidationReport(
+            sampleCount: 100,
+            binary: metrics,
+            buttons: nil,
+            keyboard: metrics,
+            modifiers: nil,
+            absoluteMouseMAE: nil,
+            activeRelativeMouseMAE: nil,
+            activeScrollMAE: nil,
+            idleContinuousFalseActionRate: nil
+        )
+        var collapsed = baseline
+        collapsed.keyboard = BinaryValidationMetrics(truePositives: 3, falsePositives: 2, falseNegatives: 7, trueNegatives: 88)
+        XCTAssertTrue(collapsed.hasSevereBinaryRegression(comparedTo: baseline))
+        var ordinaryNoise = baseline
+        ordinaryNoise.keyboard = BinaryValidationMetrics(truePositives: 7, falsePositives: 2, falseNegatives: 3, trueNegatives: 88)
+        XCTAssertFalse(ordinaryNoise.hasSevereBinaryRegression(comparedTo: baseline))
+
+        var unsupportedBaseline = baseline
+        unsupportedBaseline.keyboard = BinaryValidationMetrics(truePositives: 3, falsePositives: 0, falseNegatives: 1, trueNegatives: 96)
+        var unsupportedCollapse = unsupportedBaseline
+        unsupportedCollapse.keyboard = BinaryValidationMetrics(truePositives: 0, falsePositives: 0, falseNegatives: 4, trueNegatives: 96)
+        XCTAssertFalse(unsupportedCollapse.hasSevereBinaryRegression(comparedTo: unsupportedBaseline), "Four positives are too few for a hard publication gate.")
+    }
+
     func testArchitecturePresetsHaveNoZeroWidths() {
         for architecture in [ArchitectureSpec.small, .balanced, .large] {
             XCTAssertTrue(architecture.convolutionChannels.allSatisfy { $0 > 0 })
             XCTAssertTrue(architecture.fusionWidths.allSatisfy { $0 > 0 })
+            XCTAssertEqual(architecture.effectiveVisualPooling, .attention)
+            XCTAssertGreaterThan(architecture.effectiveAttentionHeads, 0)
         }
         XCTAssertEqual(CNNGeometry.layer(0, architecture: .balanced), CNNLayerGeometry(kernelSize: 7, effectiveStride: 4, receptiveField: 7))
         XCTAssertEqual(CNNGeometry.layer(1, architecture: .balanced), CNNLayerGeometry(kernelSize: 3, effectiveStride: 8, receptiveField: 15))
@@ -199,6 +233,52 @@ final class DomainTests: XCTestCase {
         var convolutionFree = ArchitectureSpec.balanced
         convolutionFree.convolutionChannels = []
         XCTAssertEqual(CNNGeometry.layer(-1, architecture: convolutionFree), CNNLayerGeometry(kernelSize: 1, effectiveStride: 1, receptiveField: 1))
+    }
+
+    func testAttentionPoolingIsResolutionStableAndMuchSmallerThanLegacyFlattening() {
+        var attention = AIProfile.fresh()
+        attention.preprocessing = PreprocessingSpec(width: 640, height: 360)
+        attention.training.architecture = .balanced
+        let attentionParameters = ModelSizing.parameterCount(attention)
+
+        var higherResolution = attention
+        higherResolution.preprocessing.width = 1_280
+        higherResolution.preprocessing.height = 720
+        XCTAssertEqual(ModelSizing.parameterCount(higherResolution), attentionParameters, "Attention pooling must not grow its learned projection with every pixel.")
+
+        var legacy = attention
+        legacy.training.architecture.visualPooling = .flattened
+        let legacyParameters = ModelSizing.parameterCount(legacy)
+        XCTAssertLessThan(attentionParameters * 4, legacyParameters, "The compact architecture should remove the resolution-dominated dense bottleneck.")
+    }
+
+    func testLegacyProfileDecodingPreservesExactArchitectureAndSchedule() throws {
+        let encoded = try JSONEncoder().encode(TrainingConfiguration())
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "learningRateSchedule")
+        object.removeValue(forKey: "cosineCycleEpochs")
+        object.removeValue(forKey: "plateauPatience")
+        object.removeValue(forKey: "minimumLearningRateRatio")
+        object.removeValue(forKey: "binaryFocalGamma")
+        var architecture = try XCTUnwrap(object["architecture"] as? [String: Any])
+        architecture.removeValue(forKey: "visualPooling")
+        architecture.removeValue(forKey: "attentionHeads")
+        object["architecture"] = architecture
+        let legacyData = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        let legacy = try JSONDecoder().decode(TrainingConfiguration.self, from: legacyData)
+
+        XCTAssertNil(legacy.learningRateSchedule)
+        XCTAssertEqual(legacy.effectiveLearningRateSchedule, .legacyInverseSquareRoot)
+        XCTAssertEqual(legacy.effectiveBinaryFocalGamma, 0)
+        XCTAssertNil(legacy.architecture.visualPooling)
+        XCTAssertEqual(legacy.architecture.effectiveVisualPooling, .flattened)
+        XCTAssertEqual(TrainingConfiguration().effectiveLearningRateSchedule, .adaptiveCosine)
+        XCTAssertEqual(TrainingConfiguration().architecture.effectiveVisualPooling, .attention)
+
+        let roundTripped = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? [String: Any])
+        XCTAssertNil(roundTripped["learningRateSchedule"], "Nil compatibility fields must remain absent so legacy checkpoint signatures stay stable.")
+        let roundTrippedArchitecture = try XCTUnwrap(roundTripped["architecture"] as? [String: Any])
+        XCTAssertNil(roundTrippedArchitecture["visualPooling"])
     }
 
     func testDefaultResolutionPolicyProjectionMatchesTheActualCNNGrid() {
@@ -225,17 +305,22 @@ final class DomainTests: XCTestCase {
 
     func testModelSizingMatchesActualGRUAndLSTMParameterTrees() {
         for recurrentKind in [RecurrentKind.gru, .lstm] {
-            var profile = AIProfile.fresh()
-            profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale)
-            profile.training.architecture = .small
-            profile.training.architecture.recurrentKind = recurrentKind
-            profile.training.precision = .float32
-            let model = AgentPolicy(profile: profile)
-            let actual = model.parameters().flattened().reduce(Int64(0)) { total, item in
-                total + item.1.shape.reduce(Int64(1)) { $0 * Int64($1) }
+            for pooling in VisualPoolingKind.allCases {
+                var profile = AIProfile.fresh()
+                profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale)
+                profile.training.architecture = .small
+                profile.training.architecture.recurrentKind = recurrentKind
+                profile.training.architecture.visualPooling = pooling
+                profile.training.precision = .float32
+                let model = AgentPolicy(profile: profile)
+                let parameters = model.parameters().flattened()
+                let actual = parameters.reduce(Int64(0)) { total, item in
+                    total + item.1.shape.reduce(Int64(1)) { $0 * Int64($1) }
+                }
+                XCTAssertEqual(actual, ModelSizing.parameterCount(profile), "Sizing drifted for \(recurrentKind.rawValue) / \(pooling.rawValue).")
+                XCTAssertFalse(parameters.contains { $0.0.contains("coordinate") })
+                XCTAssertEqual(parameters.contains { $0.0.contains("spatialAttention") }, pooling == .attention)
             }
-            XCTAssertEqual(actual, ModelSizing.parameterCount(profile), "Sizing drifted for \(recurrentKind.rawValue).")
-            XCTAssertFalse(model.parameters().flattened().contains { $0.0.contains("coordinate") })
         }
     }
 
@@ -1556,14 +1641,47 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(TrainingEngine.recommendedWarmupSteps(stepsPerEpoch: 1), 10)
         XCTAssertEqual(TrainingEngine.recommendedWarmupSteps(stepsPerEpoch: 120), 120)
         XCTAssertEqual(TrainingEngine.recommendedWarmupSteps(stepsPerEpoch: 5_000), 500)
+        XCTAssertEqual(TrainingEngine.recommendedCycleSteps(stepsPerEpoch: 120, cycleEpochs: 8), 960)
+        XCTAssertEqual(TrainingEngine.recommendedCycleSteps(stepsPerEpoch: Int.max, cycleEpochs: Int.max), 1_000_000)
+        XCTAssertEqual(TrainingEngine.recommendedValidationSampleLimit(total: 10_000, batchSize: 32, segmentCount: 20), 3_200)
+        XCTAssertEqual(TrainingEngine.recommendedValidationSampleLimit(total: 200, batchSize: 32, segmentCount: 20), 200)
+
+        let baseline = TrainingEngine.adaptivePlateauUpdate(metric: 1, best: nil, plateauEpochs: 0, patience: 2)
+        XCTAssertEqual(baseline.best, 1)
+        XCTAssertFalse(baseline.shouldReduce)
+        let noise = TrainingEngine.adaptivePlateauUpdate(metric: 0.999, best: baseline.best, plateauEpochs: 0, patience: 2)
+        XCTAssertEqual(noise.best, 1, "Sub-threshold noise must not continually move the plateau target.")
+        XCTAssertEqual(noise.plateauEpochs, 1)
+        let plateau = TrainingEngine.adaptivePlateauUpdate(metric: 1.001, best: noise.best, plateauEpochs: noise.plateauEpochs, patience: 2)
+        XCTAssertTrue(plateau.shouldReduce)
+        XCTAssertEqual(plateau.plateauEpochs, 0)
+        let improvement = TrainingEngine.adaptivePlateauUpdate(metric: 0.99, best: plateau.best, plateauEpochs: 1, patience: 2)
+        XCTAssertEqual(improvement.best, 0.99)
+        XCTAssertEqual(improvement.plateauEpochs, 0)
+        XCTAssertFalse(improvement.shouldReduce)
 
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
         profile.training.architecture = .small
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
-        let saved = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01, warmupSteps: 17)
+        let saved = ResumableAdamW(
+            learningRate: 0.001,
+            weightDecay: 0.01,
+            warmupSteps: 17,
+            schedule: .adaptiveCosine,
+            cycleSteps: 80,
+            minimumLearningRateRatio: 0.1
+        )
         saved.initialize(model: model)
+        XCTAssertEqual(saved.effectiveLearningRate(at: 17), 0.001, accuracy: 0.000_001)
+        XCTAssertEqual(saved.effectiveLearningRate(at: 97), 0.001, accuracy: 0.000_001, "A completed cosine cycle must restart at peak learning rate.")
+        XCTAssertGreaterThanOrEqual(saved.effectiveLearningRate(at: 96), 0.0001)
+        XCTAssertEqual(saved.reduceLearningRate(), 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(saved.effectiveLearningRate(at: 97), 0.0005, accuracy: 0.000_001)
+        for _ in 0..<8 { _ = saved.reduceLearningRate() }
+        XCTAssertEqual(saved.learningRateScale, 0.1, accuracy: 0.000_001)
+        XCTAssertEqual(saved.effectiveLearningRate(at: 57), 0.0001, accuracy: 0.000_001, "Plateau reduction and cosine troughs must share one global non-zero floor.")
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-\(UUID().uuidString).safetensors")
         defer { try? FileManager.default.removeItem(at: url) }
         try saved.save(to: url)
@@ -1573,6 +1691,29 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(restored.warmupSteps, 17)
         XCTAssertEqual(restored.learningRate, 0.001, accuracy: 0.000_001)
         XCTAssertEqual(restored.weightDecay, 0.01, accuracy: 0.000_001)
+        XCTAssertEqual(restored.schedule, .adaptiveCosine)
+        XCTAssertEqual(restored.cycleSteps, 80)
+        XCTAssertEqual(restored.minimumLearningRateRatio, 0.1, accuracy: 0.000_001)
+        XCTAssertEqual(restored.learningRateScale, 0.1, accuracy: 0.000_001)
+    }
+
+    func testOptimizerMetadataWithoutScheduleRestoresLegacyDecay() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("legacy-optimizer-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try MLX.save(
+            arrays: ["m.placeholder": MLXArray.zeros([1])],
+            metadata: [
+                "step": "2000",
+                "learningRate": "0.0003",
+                "weightDecay": "0.01",
+                "warmupSteps": "500"
+            ],
+            url: url
+        )
+        let restored = ResumableAdamW(learningRate: 0.5, weightDecay: 0.5)
+        try restored.load(from: url)
+        XCTAssertEqual(restored.schedule, .legacyInverseSquareRoot)
+        XCTAssertEqual(restored.effectiveLearningRate(), 0.00015, accuracy: 0.000_001)
     }
 
     func testCompiledTrainingStepMatchesUncompiledAdamW() throws {
@@ -1705,6 +1846,10 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(dataset.precedingPackedObservations(at: [2, 0, 1]), Data([2, 1, 1]))
         let targets = MLXArray(dataset.actionBatch(at: [2, 0]), [2, ActionLayout.count], type: Float.self).asArray(Float.self)
         XCTAssertEqual(targets[0], 3); XCTAssertEqual(targets[ActionLayout.count], 1)
+        let previous = MLXArray(dataset.previousActionBatch(at: [2, 0, 1]), [3, ActionLayout.count], type: Float.self).asArray(Float.self)
+        XCTAssertEqual(previous[0], 2)
+        XCTAssertEqual(previous[ActionLayout.count], 0, "A recording boundary must start from released controls.")
+        XCTAssertEqual(previous[2 * ActionLayout.count], 1)
         let history = MLXArray(dataset.historyBatch(at: [2]), [1, 2, ActionLayout.count], type: Float.self).asArray(Float.self)
         XCTAssertEqual(history[0], 1); XCTAssertEqual(history[ActionLayout.count], 2)
     }
@@ -1801,6 +1946,35 @@ final class DomainTests: XCTestCase {
         let trainedKeys = dataset.demonstratedKeyCodes(at: split.train)
         XCTAssertEqual(trainedKeys, [10, 13])
         XCTAssertEqual(dataset.demonstratedKeyCodes(at: split.validation), [13])
+    }
+
+    func testWholeRecordingValidationTargetsSamplesAndCoversEverySegment() throws {
+        let counts = [2, 10, 50]
+        var start = 0
+        let segments = counts.map { count -> CacheSegment in
+            defer { start += count }
+            return CacheSegment(recordingID: UUID(), start: start, count: count)
+        }
+        let rowCount = counts.reduce(0, +)
+        let mappings = Array(repeating: (UInt32(0), UInt32(0)), count: rowCount)
+        let rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: rowCount)
+        let fixture = try makeSyntheticDataset(
+            name: "sample-balanced-split",
+            historyLength: 1,
+            mappings: mappings,
+            actionRows: rows,
+            segments: segments
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        let split = TrainingEngine().splitIndices(dataset: fixture.dataset, fraction: 0.34, seed: 42)
+        XCTAssertEqual(split.validation, Array(2..<12), "The recording closest to the requested sample fraction should be held out, not a random huge recording.")
+        XCTAssertEqual(split.train.count, 52)
+
+        let representatives = fixture.dataset.representativeValidationIndices(from: Array(0..<rowCount), limit: 6)
+        for segment in segments {
+            XCTAssertTrue(representatives.contains { (segment.start..<(segment.start + segment.count)).contains($0) }, "Every recording should influence a sufficiently large representative score.")
+        }
     }
 
     func testSingleRecordingValidationPurgesSharedHistoryAndPerceptionFrames() throws {
@@ -1949,9 +2123,12 @@ final class DomainTests: XCTestCase {
 
         model.train(false)
         let inference = model.predictions(images: images, history: history)
-        MLX.eval(inference)
+        let maskedInference = model.predictions(images: images, history: MLXArray.zeros(like: history))
+        MLX.eval(inference, maskedInference)
         let inferenceValues = inference.asArray(Float.self)
+        let maskedInferenceValues = maskedInference.asArray(Float.self)
         let firstInferenceRow = Array(inferenceValues[0..<ActionLayout.count])
+        let firstMaskedRow = Array(maskedInferenceValues[0..<ActionLayout.count])
         for row in 1..<batch {
             XCTAssertEqual(Array(inferenceValues[row * ActionLayout.count..<(row + 1) * ActionLayout.count]), firstInferenceRow)
         }
@@ -1960,12 +2137,44 @@ final class DomainTests: XCTestCase {
         let training = model.predictions(images: images, history: history)
         MLX.eval(training)
         let trainingValues = training.asArray(Float.self)
-        let firstTrainingRow = trainingValues[0..<ActionLayout.count]
-        let hasMaskedAndKeptRows = (1..<batch).contains { row in
-            zip(firstTrainingRow, trainingValues[row * ActionLayout.count..<(row + 1) * ActionLayout.count])
-                .contains { abs($0 - $1) > 0.000_001 }
+        var keptRows = 0, maskedRows = 0
+        for row in 0..<batch {
+            let values = trainingValues[row * ActionLayout.count..<(row + 1) * ActionLayout.count]
+            let matchesKept = zip(values, firstInferenceRow).allSatisfy { abs($0 - $1) < 0.000_01 }
+            let matchesMasked = zip(values, firstMaskedRow).allSatisfy { abs($0 - $1) < 0.000_01 }
+            XCTAssertTrue(matchesKept || matchesMasked, "Kept history must retain inference-time magnitude instead of being doubled like ordinary dropout.")
+            keptRows += matchesKept ? 1 : 0
+            maskedRows += matchesMasked ? 1 : 0
         }
-        XCTAssertTrue(hasMaskedAndKeptRows, "Anti-shortcut history masking must not depend on ordinary feature dropout.")
+        XCTAssertGreaterThan(keptRows, 0)
+        XCTAssertGreaterThan(maskedRows, 0, "Anti-shortcut history masking must not depend on ordinary feature dropout.")
+    }
+
+    func testZeroHistoryTransitionLossUsesTheRealPreviousAction() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: true, scroll: false, keyboard: false, modifiers: false)
+        profile.training.historyLength = 0
+        profile.training.binaryFocalGamma = 0
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+        let images = MLXArray.zeros([1, 8, 8, 2], dtype: .float32)
+        let history = MLXArray.zeros([1, 1, ActionLayout.count], dtype: .float32)
+        var targetValues = [Float](repeating: 0, count: ActionLayout.count)
+        targetValues[ActionLayout.buttons.lowerBound] = 1
+        let targets = MLXArray(targetValues, [1, ActionLayout.count])
+        let placeholderLoss = model.loss(images: images, history: history, targets: targets)
+        let heldActionLoss = model.loss(images: images, history: history, targets: targets, previousTargets: targets)
+        MLX.eval(placeholderLoss, heldActionLoss)
+        XCTAssertNotEqual(
+            placeholderLoss.item(Float.self),
+            heldActionLoss.item(Float.self),
+            accuracy: 0.000_001,
+            "A held action and a fresh transition need different weighting even when recurrent history is disabled."
+        )
     }
 
     func testPolicyLearnsAVisualControlSignalInsteadOfAnInertShortcut() {
@@ -2247,10 +2456,13 @@ final class DomainTests: XCTestCase {
         name: String,
         historyLength: Int,
         mappings: [(UInt32, UInt32)],
-        actionRows: [[Float]]
+        actionRows: [[Float]],
+        segments: [CacheSegment]? = nil
     ) throws -> (dataset: CachedDataset, directory: URL) {
         precondition(mappings.count == actionRows.count)
         precondition(actionRows.allSatisfy { $0.count == ActionLayout.count })
+        let segments = segments ?? [CacheSegment(recordingID: UUID(), start: 0, count: mappings.count)]
+        precondition(segments.reduce(0) { $0 + $1.count } == mappings.count)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).atrcache", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         do {
@@ -2267,7 +2479,7 @@ final class DomainTests: XCTestCase {
                 observationCount: observationCount,
                 observationBytesPerSample: 1,
                 actionValuesPerSample: ActionLayout.count,
-                segments: [CacheSegment(recordingID: UUID(), start: 0, count: mappings.count)]
+                segments: segments
             )
             let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
