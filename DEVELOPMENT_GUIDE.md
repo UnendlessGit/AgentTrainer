@@ -29,6 +29,8 @@ For the complete Run-tab cursor/keyboard output-permission contract and the veri
 - Exact vision or `ArchitectureSpec` edits on a trained profile require explicit destructive confirmation. `WorkspaceStore.resetLearning` clears Versions/Checkpoint/active progress while retaining source recordings. Protected AIs may not cross this boundary; duplicate them first.
 - Persistent diagnostics must never contain high-rate per-frame logging. Errors and important lifecycle boundaries go to OSLog and bounded JSONL storage.
 - Training-data and model-library locations are independently persisted. Relocation is forbidden during any active workflow, never merges two populated libraries, and never deletes the source until an empty destination has been copied, verified, selected, and prepared.
+- The recording interchange boundary is platform-neutral. Windows and macOS must write the same schema-2 `.atrrecord` package, `ATREVT01` binary records, Apple-policy key codes, Quartz modifier masks, coordinate/delta signs, trim semantics, and first-frame clock boundary. `RECORDING_FORMAT.md` is normative.
+- Windows is Record + Library + recorder Settings only. Do not add training, models, inference, or synthetic-input runtime to `WindowsRecorder`; exported packages are imported and trained by the macOS app.
 
 ## Source map
 
@@ -57,6 +59,10 @@ For the complete Run-tab cursor/keyboard output-permission contract and the veri
 - `UI/UIAppearance.swift`: balanced palettes plus bounded persisted corner, surface, accent, sidebar-width, and interface-motion controls.
 - `UI/Pages.swift`: remaining feature pages and parameter editors.
 - `IN_PLACE_UPDATE_GUIDE.md`: run-only output firewall design, live-toggle race guarantees, regression checks, macOS TCC/code-identity rules, and incremental in-place app replacement.
+- `RECORDING_FORMAT.md`: byte-for-byte and semantic cross-platform recording contract.
+- `WindowsRecorder/src/AgentTrainer.Recorder.Core`: portable C# manifest/event validation and transactional recording library, testable on macOS, Windows, and Linux.
+- `WindowsRecorder/src/AgentTrainer.Recorder`: x64 WPF Record/Library/Settings UI mirroring the Mac visual system, raw `WM_INPUT` capture, configurable global-hotkey registration/filtering, source geometry, Media Foundation video orchestration, and capture-excluded HUD.
+- `WindowsRecorder/tests`: format, key-map, validation, rollback, folder, import, and export compatibility tests.
 
 ## Persistent workspace
 
@@ -98,6 +104,8 @@ The two selected root paths are persisted separately. `WorkspaceStore.prepare` v
 
 For launch/UI smoke tests only, set `AGENTTRAINER_WORKSPACE_ROOT` to an absolute disposable directory. `WorkspaceStore.shared` then ignores persisted external-library paths and keeps support data, recordings, caches, models, and logs beneath that root. This prevents a schema-migration test from touching the user's real library; production launches leave the variable unset.
 
+The Windows companion stores its independent local library beneath `%LOCALAPPDATA%\AgentTrainer Recorder`. Its `Recordings/<uuid>.atrrecord` directories are portable, but `recording-folders.json` and folder IDs are library-local. Export atomically wraps one validated package in a shareable `.atrrecord.zip`; macOS import preflights/extracts that archive privately, replaces its ID and folder assignment, and preserves video/input semantics. Unpacked package directories remain supported. Neither side should train directly from removable/import source paths.
+
 `events.atrevents` begins with `ATREVT01`, a UInt32 version, then 72-byte little-endian records. Readers reject unknown kinds, truncated records, non-finite values, and decreasing timestamps before use. Keep old manifests decodable by using optional fields or explicit custom decoding when a required field is introduced. The cache key includes the complete recording manifests, preprocessing, rates, and history length; trims and recording exclusions therefore invalidate derived caches automatically.
 
 Strict recording validation must run only after `repairInvalidRecordingManifests`. The recovery pass enumerates `.atrrecord` directories directly so malformed-but-decodable legacy duration/trim metadata cannot hide a recording before repair. It derives the real video duration, clamps safe metadata, retains `manifest.pre-1.8.1-recovery.json`, and must never alter or remove the video or event stream. Training/model storage destinations inside an `.app` bundle are rejected because bundle replacement during an update would replace that directory.
@@ -113,6 +121,10 @@ Strict recording validation must run only after `repairInvalidRecordingManifests
 6. The menu-bar extra indicates recording status. A capture-excluded floating input HUD shows the human keyboard/mouse state without vision; the vision PIP remains AI-run-only.
 
 Recording startup is revision-tokened. Stop, panic, quit, and the global Record shortcut may cancel an in-flight ScreenCaptureKit start; cancelled startup drains capture/input and deletes only its incomplete recording directory. The recording key blacklist and Record-shortcut modifier mask are frozen before the first await so UI edits cannot alter a session halfway through startup.
+
+The Windows pipeline preserves the same lifecycle with platform-native pieces: `WM_INPUT` supplies unaccelerated deltas and physical set-1 scan codes; `QueryPerformanceCounter` supplies monotonic nanoseconds; ScreenRecorderLib uses Desktop Duplication/Windows Graphics Capture plus Media Foundation; and the first encoded-frame callback opens the event clock. HEVC hardware encoding is attempted first, with a Mac-decodable H.264 ISO Base Media fallback when Windows cannot initialize HEVC. It records no audio or preview bitmaps, uses a pooled 256 KiB event buffer, filters repeats, blacklists, and the currently configured global recording chord before persistence, and writes the manifest only after video and inputs finish. Display coordinates, window bounds, regions, and `GetCursorPos` all remain in per-monitor-DPI-aware physical pixels.
+
+`WorkspaceStore.importRecordings` and the Windows `RecordingLibrary.ImportRecordings` validate the entire selected batch before creating public destinations. The macOS boundary additionally loads AVFoundation video metadata and decodes the first frame. Imports reject symlinked payloads, unsafe/duplicate names, malformed or decreasing events, count/timeline disagreement, empty video, and dimension/duration mismatch. A failure removes only private staging/new destination directories and never edits the sources.
 
 ## Vision and action contract
 

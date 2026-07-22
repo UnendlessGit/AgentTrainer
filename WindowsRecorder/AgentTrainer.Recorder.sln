@@ -1,0 +1,31 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentTrainer.Recorder.Core", "src\AgentTrainer.Recorder.Core\AgentTrainer.Recorder.Core.csproj", "{D1F47D63-40C2-49EA-9710-90CA68FD46E7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentTrainer.Recorder", "src\AgentTrainer.Recorder\AgentTrainer.Recorder.csproj", "{360F21F6-CE53-45D0-A4D2-9D03F02632F2}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentTrainer.Recorder.Core.Tests", "tests\AgentTrainer.Recorder.Core.Tests\AgentTrainer.Recorder.Core.Tests.csproj", "{82E19503-B1B6-4C2E-B613-18DB0DE7C53A}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{D1F47D63-40C2-49EA-9710-90CA68FD46E7}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{D1F47D63-40C2-49EA-9710-90CA68FD46E7}.Debug|x64.Build.0 = Debug|Any CPU
+		{D1F47D63-40C2-49EA-9710-90CA68FD46E7}.Release|x64.ActiveCfg = Release|Any CPU
+		{D1F47D63-40C2-49EA-9710-90CA68FD46E7}.Release|x64.Build.0 = Release|Any CPU
+		{360F21F6-CE53-45D0-A4D2-9D03F02632F2}.Debug|x64.ActiveCfg = Debug|x64
+		{360F21F6-CE53-45D0-A4D2-9D03F02632F2}.Debug|x64.Build.0 = Debug|x64
+		{360F21F6-CE53-45D0-A4D2-9D03F02632F2}.Release|x64.ActiveCfg = Release|x64
+		{360F21F6-CE53-45D0-A4D2-9D03F02632F2}.Release|x64.Build.0 = Release|x64
+		{82E19503-B1B6-4C2E-B613-18DB0DE7C53A}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{82E19503-B1B6-4C2E-B613-18DB0DE7C53A}.Debug|x64.Build.0 = Debug|Any CPU
+		{82E19503-B1B6-4C2E-B613-18DB0DE7C53A}.Release|x64.ActiveCfg = Release|Any CPU
+		{82E19503-B1B6-4C2E-B613-18DB0DE7C53A}.Release|x64.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

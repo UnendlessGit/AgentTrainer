@@ -1,0 +1,19 @@
+<Window x:Class="AgentTrainer.Recorder.CaptureHudWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="AgentTrainer capture status" Width="370" SizeToContent="Height"
+        WindowStyle="None" ResizeMode="NoResize" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ShowActivated="False">
+    <Border Margin="10" Padding="14" CornerRadius="14" Background="#F211141C" BorderBrush="#8840D9FF" BorderThickness="1">
+        <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+            <Ellipse Width="11" Height="11" Fill="{StaticResource CoralBrush}" VerticalAlignment="Top" Margin="0,6,11,0" />
+            <StackPanel Grid.Column="1">
+                <TextBlock x:Name="DurationLabel" Text="REC 00:00" Foreground="{StaticResource CoralBrush}" FontWeight="Bold" FontSize="16" />
+                <TextBlock x:Name="ControlsLabel" Text="Waiting for input" Foreground="{StaticResource SecondaryTextBrush}" FontSize="12" Margin="0,3,8,0" TextTrimming="CharacterEllipsis" />
+                <TextBlock x:Name="HotkeyLabel" Text="Ctrl+Alt+Win+R" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,2,0,0" />
+            </StackPanel>
+            <Button Grid.Column="2" x:Name="StopButton" Content="Stop &amp; Save" Style="{StaticResource DangerButton}" Click="OnStop" VerticalAlignment="Center" />
+        </Grid>
+    </Border>
+</Window>

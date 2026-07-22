@@ -1,0 +1,361 @@
+<Window x:Class="AgentTrainer.Recorder.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:AgentTrainer.Recorder"
+        Title="AgentTrainer Recorder" Width="1280" Height="820" MinWidth="1180" MinHeight="760"
+        WindowStartupLocation="CenterScreen" Background="{StaticResource CanvasBrush}">
+    <Grid Background="{StaticResource CanvasBrush}">
+        <Grid.RowDefinitions><RowDefinition Height="48" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="205" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+
+        <!-- The same solid app/section bar used by the Mac app. -->
+        <Border Grid.Row="0" Grid.Column="0" Background="{StaticResource SidebarBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,1">
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,10,0">
+                <Border Width="23" Height="23" CornerRadius="6" Background="#263A55" BorderBrush="#6659DFFF" BorderThickness="1" Margin="0,0,9,0">
+                    <TextBlock Text="AT" FontSize="9" FontWeight="Bold" Foreground="{StaticResource CyanBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Border>
+                <TextBlock Text="AgentTrainer" FontWeight="SemiBold" VerticalAlignment="Center" />
+            </StackPanel>
+        </Border>
+        <Border Grid.Row="0" Grid.Column="1" Background="{StaticResource CanvasBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+            <Grid Margin="16,0,12,0">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock x:Name="TopSectionIcon" Text="●" Foreground="{StaticResource CoralBrush}" FontSize="11" Margin="0,0,8,0" />
+                    <TextBlock x:Name="TopSectionTitle" Text="Record" FontWeight="SemiBold" Foreground="{StaticResource CoralBrush}" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Border x:Name="StatusPill" Background="#17352A" CornerRadius="13" Padding="10,5" Margin="0,0,9,0" BorderBrush="#414BE49B" BorderThickness="1">
+                        <StackPanel Orientation="Horizontal">
+                            <Ellipse x:Name="StatusPillDot" Width="6" Height="6" Fill="{StaticResource GreenBrush}" Margin="0,0,6,0" VerticalAlignment="Center" />
+                            <TextBlock x:Name="StatusPillText" Text="Local only" Foreground="{StaticResource GreenBrush}" FontWeight="SemiBold" FontSize="11" />
+                        </StackPanel>
+                    </Border>
+                    <TextBlock x:Name="TopHotkeyLabel" Text="Ctrl+Alt+Win+R" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" VerticalAlignment="Center" Margin="0,0,9,0" />
+                    <Button x:Name="TopRecordButton" Content="●" Style="{StaticResource CoralButton}" Width="36" Padding="0" ToolTip="Start recording" Click="RecordClicked" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource SidebarBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
+            <Grid Margin="10,14,10,12">
+                <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                <StackPanel>
+                    <Button x:Name="RecordNavigationButton" Content="◉   Record" Style="{StaticResource NavButton}" Click="ShowRecordPage" />
+                    <Button x:Name="LibraryNavigationButton" Content="▣   Library" Style="{StaticResource NavButton}" Click="ShowLibraryPage" />
+                    <Button x:Name="SettingsNavigationButton" Content="⚙   Settings" Style="{StaticResource NavButton}" Click="ShowSettingsPage" />
+                </StackPanel>
+                <StackPanel Grid.Row="2" Margin="2,0">
+                    <Border Background="#17352A" CornerRadius="12" Padding="9,5" BorderBrush="#354BE49B" BorderThickness="1" HorizontalAlignment="Left">
+                        <StackPanel Orientation="Horizontal">
+                            <Ellipse Width="6" Height="6" Fill="{StaticResource GreenBrush}" Margin="0,0,6,0" VerticalAlignment="Center" />
+                            <TextBlock Text="Local only" Foreground="{StaticResource GreenBrush}" FontSize="11" FontWeight="SemiBold" />
+                        </StackPanel>
+                    </Border>
+                    <TextBlock x:Name="ActivityStatus" Text="Ready" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="1,7,0,0" TextWrapping="Wrap" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1" Grid.Column="1">
+            <!-- RECORD -->
+            <ScrollViewer x:Name="RecordPage" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="24">
+                    <TextBlock Text="Record" Style="{StaticResource PageTitleStyle}" />
+                    <TextBlock Text="Hardware HEVC video with frame-accurate input synchronization and configurable cleanup at both ends."
+                               Foreground="{StaticResource SecondaryTextBrush}" Margin="0,4,0,17" />
+                    <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="14" /><ColumnDefinition Width="330" /></Grid.ColumnDefinitions>
+                        <Border Style="{StaticResource CardStyle}">
+                            <StackPanel>
+                                <TextBlock Text="Capture source" FontWeight="SemiBold" FontSize="14" Margin="0,0,0,13" />
+                                <TextBlock Text="TYPE" Style="{StaticResource EyebrowStyle}" Margin="0,0,0,5" />
+                                <UniformGrid x:Name="CaptureTypePanel" Rows="1" Columns="4">
+                                    <RadioButton x:Name="CaptureDisplayButton" Content="Display" GroupName="CaptureKind" Tag="Display" Style="{StaticResource SegmentButtonStyle}" Checked="CaptureKindChecked" Margin="0,0,3,0" />
+                                    <RadioButton x:Name="CaptureWindowButton" Content="Window" GroupName="CaptureKind" Tag="Window" Style="{StaticResource SegmentButtonStyle}" Checked="CaptureKindChecked" Margin="0,0,3,0" />
+                                    <RadioButton x:Name="CaptureWindowRegionButton" Content="Window Region" GroupName="CaptureKind" Tag="Window Region" Style="{StaticResource SegmentButtonStyle}" Checked="CaptureKindChecked" Margin="0,0,3,0" />
+                                    <RadioButton x:Name="CaptureScreenRegionButton" Content="Screen Region" GroupName="CaptureKind" Tag="Screen Region" Style="{StaticResource SegmentButtonStyle}" Checked="CaptureKindChecked" />
+                                </UniformGrid>
+
+                                <Grid Margin="0,13,0,0">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="SOURCE" Style="{StaticResource EyebrowStyle}" Margin="0,0,0,5" />
+                                        <ComboBox x:Name="CaptureSourceCombo" MinWidth="330" />
+                                    </StackPanel>
+                                    <Button Grid.Column="1" Content="Refresh" Click="RefreshSourcesClicked" Margin="8,20,0,0" />
+                                </Grid>
+                                <Grid Margin="0,13,0,0">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="SAVE IN FOLDER" Style="{StaticResource EyebrowStyle}" Margin="0,0,0,5" />
+                                        <ComboBox x:Name="DestinationFolderCombo" SelectedValuePath="Id">
+                                            <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextWrapping="NoWrap" /></DataTemplate></ComboBox.ItemTemplate>
+                                        </ComboBox>
+                                    </StackPanel>
+                                    <Button Grid.Column="1" Content="New folder" Click="CreateFolderClicked" Margin="8,20,0,0" Style="{StaticResource CyanButton}" />
+                                </Grid>
+
+                                <StackPanel x:Name="RegionPanel" Visibility="Collapsed" Margin="0,14,0,0">
+                                    <Separator />
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" /><ColumnDefinition Width="8" /><ColumnDefinition Width="*" /><ColumnDefinition Width="8" />
+                                            <ColumnDefinition Width="*" /><ColumnDefinition Width="8" /><ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel><TextBlock Text="X" Style="{StaticResource EyebrowStyle}" /><TextBox x:Name="RegionXText" Text="0" /></StackPanel>
+                                        <StackPanel Grid.Column="2"><TextBlock Text="Y" Style="{StaticResource EyebrowStyle}" /><TextBox x:Name="RegionYText" Text="0" /></StackPanel>
+                                        <StackPanel Grid.Column="4"><TextBlock Text="WIDTH" Style="{StaticResource EyebrowStyle}" /><TextBox x:Name="RegionWidthText" Text="1280" /></StackPanel>
+                                        <StackPanel Grid.Column="6"><TextBlock Text="HEIGHT" Style="{StaticResource EyebrowStyle}" /><TextBox x:Name="RegionHeightText" Text="720" /></StackPanel>
+                                    </Grid>
+                                    <Grid Margin="0,9,0,0">
+                                        <TextBlock x:Name="RegionHelpText" Text="Screen coordinates are global physical pixels." Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" VerticalAlignment="Center" />
+                                        <Button x:Name="DrawRegionButton" Content="Select region on screen" Click="DrawRegionClicked" HorizontalAlignment="Right" Style="{StaticResource CyanButton}" />
+                                    </Grid>
+                                </StackPanel>
+
+                                <Separator Margin="0,16,0,12" />
+                                <Grid>
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="145" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="FPS" Style="{StaticResource EyebrowStyle}" Margin="0,0,0,5" />
+                                        <ComboBox x:Name="FramesPerSecondCombo" IsEditable="True"><ComboBoxItem Content="30" /><ComboBoxItem Content="60" /><ComboBoxItem Content="120" /></ComboBox>
+                                    </StackPanel>
+                                    <CheckBox Grid.Column="1" x:Name="ShowCursorCheck" Content="Show cursor in video" VerticalAlignment="Bottom" Margin="18,0,0,7" />
+                                </Grid>
+                                <Grid Margin="0,14,0,0">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="12" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <StackPanel><TextBlock Text="TRIM FIRST (SECONDS)" Style="{StaticResource EyebrowStyle}" Margin="0,0,0,5" /><TextBox x:Name="TrimStartText" Text="0.5" /></StackPanel>
+                                    <StackPanel Grid.Column="2"><TextBlock Text="TRIM LAST (SECONDS)" Style="{StaticResource EyebrowStyle}" Margin="0,0,0,5" /><TextBox x:Name="TrimEndText" Text="0.5" /></StackPanel>
+                                </Grid>
+                                <TextBlock Text="Trimming is non-destructive. Replay and Mac training use only the retained range; the full video stays in the package."
+                                           Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,8,0,0" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border Grid.Column="2" Style="{StaticResource CardStyle}">
+                            <StackPanel>
+                                <TextBlock Text="▤  Synchronized inputs" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource CyanBrush}" />
+                                <TextBlock Text="⌁  Mouse position + raw deltas" Margin="0,14,0,4" Foreground="{StaticResource SecondaryTextBrush}" />
+                                <TextBlock Text="◫  Buttons, holds, and drags" Margin="0,4" Foreground="{StaticResource SecondaryTextBrush}" />
+                                <TextBlock Text="↕  Two-axis scrolling" Margin="0,4" Foreground="{StaticResource SecondaryTextBrush}" />
+                                <TextBlock Text="⌨  Keys, chords, and modifiers" Margin="0,4" Foreground="{StaticResource SecondaryTextBrush}" />
+                                <TextBlock Text="◎  Relative game-camera movement" Margin="0,4" Foreground="{StaticResource SecondaryTextBrush}" />
+                                <Separator Margin="0,10,0,10" />
+                                <TextBlock Text="RECORDING KEY BLACKLIST" Style="{StaticResource EyebrowStyle}" Foreground="{StaticResource CoralBrush}" />
+                                <TextBlock x:Name="ExcludedKeysSummaryText" Text="No excluded keys." Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,6,0,8" />
+                                <Expander Header="Choose excluded keys" Foreground="{StaticResource CoralBrush}">
+                                    <StackPanel Margin="0,8,0,0">
+                                        <TextBox x:Name="KeySearchText" TextChanged="KeySearchChanged" ToolTip="Filter keys" />
+                                        <ScrollViewer MaxHeight="215" VerticalScrollBarVisibility="Auto" Margin="0,7,0,0">
+                                            <ItemsControl x:Name="KeyBlacklistItems">
+                                                <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate><CheckBox Content="{Binding Display}" IsChecked="{Binding IsExcluded}" Click="BlacklistChanged" Width="92" Margin="0,2" /></DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </ScrollViewer>
+                                    </StackPanel>
+                                </Expander>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+                    <Grid Margin="0,16,0,0">
+                        <TextBlock Text="The app and live-input HUD are excluded from capture. Audio is omitted because Mac training consumes video and control events."
+                                   Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" VerticalAlignment="Center" Margin="0,0,190,0" />
+                        <Button x:Name="RecordButton" Content="Record" Style="{StaticResource CoralButton}" Click="RecordClicked" HorizontalAlignment="Right" MinWidth="155" />
+                    </Grid>
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- LIBRARY -->
+            <Grid x:Name="LibraryPage" Visibility="Collapsed" Margin="24">
+                <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="14" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="Library" Style="{StaticResource PageTitleStyle}" />
+                        <TextBlock Text="Expand folders to browse recordings, inspect captured controls, and replay locally."
+                                   Foreground="{StaticResource SecondaryTextBrush}" Margin="0,4,0,0" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Bottom">
+                        <TextBox x:Name="RecordingSearchText" TextChanged="RecordingFilterChanged" ToolTip="Search recordings" Width="210" />
+                        <ComboBox x:Name="RecordingSortCombo" SelectionChanged="RecordingFilterChanged" Width="120" Margin="8,0,0,0">
+                            <ComboBoxItem Content="Newest" /><ComboBoxItem Content="Oldest" /><ComboBoxItem Content="Name" /><ComboBoxItem Content="Duration" />
+                        </ComboBox>
+                        <Button Content="Import" Click="ImportClicked" Style="{StaticResource GreenButton}" Margin="8,0,0,0" ToolTip="Import a portable recording" />
+                        <Button Content="Refresh" Click="RefreshLibraryClicked" Style="{StaticResource CyanButton}" Margin="8,0,0,0" />
+                    </StackPanel>
+                </Grid>
+
+                <Grid Grid.Row="2">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="430" /><ColumnDefinition Width="14" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                    <Border Style="{StaticResource CardStyle}" Padding="12">
+                        <Grid>
+                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                <TextBlock Text="▣  Recording folders" FontWeight="SemiBold" Foreground="{StaticResource VioletBrush}" VerticalAlignment="Center" />
+                                <TextBlock Grid.Column="1" x:Name="RecordingCountLabel" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" VerticalAlignment="Center" />
+                            </Grid>
+                            <Grid Grid.Row="1" Margin="0,10,0,0">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                <TextBox x:Name="NewFolderText" ToolTip="New folder name" />
+                                <Button Grid.Column="1" Content="Create" Click="CreateFolderInlineClicked" Style="{StaticResource CyanButton}" Margin="7,0,0,0" />
+                            </Grid>
+                            <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,8,0,5">
+                                <Button Content="Rename folder" Click="RenameFolderClicked" Padding="10,5" />
+                                <Button Content="Delete folder" Click="DeleteFolderClicked" Style="{StaticResource CoralButton}" Padding="10,5" Margin="7,0,0,0" />
+                            </StackPanel>
+                            <TreeView Grid.Row="3" x:Name="RecordingTree" SelectedItemChanged="RecordingTreeSelectionChanged" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <TreeView.ItemTemplate>
+                                    <HierarchicalDataTemplate ItemsSource="{Binding Children}">
+                                        <Border x:Name="NodeBorder" Padding="7,5" CornerRadius="7">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions><ColumnDefinition Width="22" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                                <TextBlock x:Name="NodeIcon" Text="●" Foreground="{StaticResource CyanBrush}" VerticalAlignment="Top" Margin="0,2,0,0" />
+                                                <StackPanel Grid.Column="1">
+                                                    <TextBlock x:Name="NodeName" Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" />
+                                                    <TextBlock Text="{Binding Detail}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" />
+                                                </StackPanel>
+                                            </Grid>
+                                        </Border>
+                                        <HierarchicalDataTemplate.Triggers>
+                                            <DataTrigger Binding="{Binding IsFolder}" Value="True">
+                                                <Setter TargetName="NodeIcon" Property="TextBlock.Text" Value="▰" />
+                                                <Setter TargetName="NodeIcon" Property="TextBlock.Foreground" Value="{StaticResource VioletBrush}" />
+                                                <Setter TargetName="NodeName" Property="TextBlock.Foreground" Value="{StaticResource TextBrush}" />
+                                            </DataTrigger>
+                                        </HierarchicalDataTemplate.Triggers>
+                                    </HierarchicalDataTemplate>
+                                </TreeView.ItemTemplate>
+                            </TreeView>
+                        </Grid>
+                    </Border>
+
+                    <Border Grid.Column="2" Style="{StaticResource CardStyle}" Padding="14">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel x:Name="InspectorContent" IsEnabled="False">
+                                <Border Background="Black" CornerRadius="12" Height="286" ClipToBounds="True">
+                                    <Grid>
+                                        <MediaElement x:Name="InspectorVideo" LoadedBehavior="Manual" UnloadedBehavior="Stop" Stretch="Uniform" ScrubbingEnabled="True" MediaOpened="InspectorMediaOpened" MediaEnded="InspectorMediaEnded" />
+                                        <TextBlock x:Name="VideoPlaceholder" Text="Select a recording" Foreground="{StaticResource SecondaryTextBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                    </Grid>
+                                </Border>
+                                <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
+                                    <Button x:Name="PlayPauseButton" Content="Play" Click="PlayPauseClicked" Style="{StaticResource CyanButton}" />
+                                    <Button Content="Restart" Click="RestartVideoClicked" Margin="7,0,0,0" />
+                                    <Button Content="Show package" Click="RevealRecordingClicked" Margin="7,0,0,0" />
+                                </StackPanel>
+                                <Grid Margin="0,15,0,0">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                    <TextBox x:Name="RecordingNameText" FontSize="18" FontWeight="SemiBold" />
+                                    <Button Grid.Column="1" Content="Save name" Click="RenameRecordingClicked" Margin="8,0,0,0" />
+                                </Grid>
+                                <WrapPanel Margin="0,10,0,0">
+                                    <Border Background="#163A48" CornerRadius="10" Padding="9,4" Margin="0,0,7,5"><TextBlock x:Name="DurationBadge" Foreground="{StaticResource CyanBrush}" /></Border>
+                                    <Border Background="#2A2142" CornerRadius="10" Padding="9,4" Margin="0,0,7,5"><TextBlock x:Name="ResolutionBadge" Foreground="{StaticResource VioletBrush}" /></Border>
+                                    <Border Background="#17352A" CornerRadius="10" Padding="9,4" Margin="0,0,7,5"><TextBlock x:Name="FpsBadge" Foreground="{StaticResource GreenBrush}" /></Border>
+                                    <Border Background="#3A2D15" CornerRadius="10" Padding="9,4" Margin="0,0,7,5"><TextBlock x:Name="InputsBadge" Foreground="{StaticResource AmberBrush}" /></Border>
+                                </WrapPanel>
+                                <TextBlock x:Name="CaptureDetailText" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,4,0,0" />
+                                <TextBlock x:Name="TrimDetailText" Foreground="{StaticResource AmberBrush}" FontSize="11" Margin="0,3,0,0" />
+                                <Separator />
+                                <Grid>
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <TextBlock Text="Folder" VerticalAlignment="Center" FontWeight="SemiBold" />
+                                    <ComboBox Grid.Column="1" x:Name="RecordingFolderCombo" SelectedValuePath="Id" SelectionChanged="MoveRecordingFolderChanged" Margin="12,0,0,0">
+                                        <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextWrapping="NoWrap" /></DataTemplate></ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                </Grid>
+                                <Separator />
+                                <TextBlock Text="Recorded keyboard" FontWeight="SemiBold" />
+                                <TextBlock x:Name="RecordedKeysText" Text="Loading…" Foreground="{StaticResource CyanBrush}" FontWeight="SemiBold" FontSize="11" Margin="0,6,0,0" />
+                                <TextBlock x:Name="InputCountsText" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,5,0,0" />
+                                <TextBlock x:Name="MouseDiagnosticsText" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,4,0,0" />
+                                <Expander Header="Input timeline preview" Foreground="{StaticResource CyanBrush}" Margin="0,10,0,0">
+                                    <ListBox x:Name="TimelineList" MaxHeight="190" FontFamily="Consolas" FontSize="11" />
+                                </Expander>
+                                <Separator />
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                    <Button Content="Export for Mac" Click="ExportClicked" Style="{StaticResource VioletButton}" />
+                                    <Button Content="Delete recording" Click="DeleteRecordingClicked" Style="{StaticResource CoralButton}" Margin="8,0,0,0" />
+                                </StackPanel>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Border>
+                </Grid>
+            </Grid>
+
+            <!-- SETTINGS -->
+            <ScrollViewer x:Name="SettingsPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="24">
+                    <TextBlock Text="Settings" Style="{StaticResource PageTitleStyle}" />
+                    <TextBlock Text="Shortcut, recording behavior, diagnostics, storage, and local-only runtime preferences."
+                               Foreground="{StaticResource SecondaryTextBrush}" Margin="0,4,0,17" />
+
+                    <Border Style="{StaticResource CardStyle}" Margin="0,0,0,13">
+                        <Grid>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock Text="Global keybind" FontWeight="SemiBold" Foreground="{StaticResource VioletBrush}" />
+                                <TextBlock Text="Start / stop recording from any application. The complete shortcut is removed from every saved input stream."
+                                           Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,5,20,0" />
+                            </StackPanel>
+                            <Button Grid.Column="1" x:Name="HotkeyCaptureButton" Content="Ctrl+Alt+Win+R" Style="{StaticResource VioletButton}"
+                                    Click="HotkeyCaptureClicked" MinWidth="175" ToolTip="Click, then press a new shortcut" />
+                        </Grid>
+                    </Border>
+
+                    <Border Style="{StaticResource CardStyle}" Margin="0,0,0,13">
+                        <StackPanel>
+                            <TextBlock Text="Recording behavior" FontWeight="SemiBold" Foreground="{StaticResource CoralBrush}" />
+                            <CheckBox x:Name="SettingsShowHudCheck" Content="Show the capture-excluded live input HUD" Click="SettingsChanged" Margin="0,12,0,2" />
+                            <TextBlock Text="Displays elapsed time and the currently held keys/buttons without entering the video."
+                                       Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="22,0,0,4" />
+                            <CheckBox x:Name="SettingsOpenLibraryCheck" Content="Open Library after a recording is saved" Click="SettingsChanged" />
+                            <CheckBox x:Name="SettingsMinimizeCheck" Content="Minimize the main window while recording" Click="SettingsChanged" />
+                            <CheckBox x:Name="SettingsPreferHevcCheck" Content="Prefer hardware HEVC (recommended for exact Mac parity)" Click="SettingsChanged" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardStyle}" Margin="0,0,0,13">
+                        <StackPanel>
+                            <TextBlock Text="Storage and diagnostics" FontWeight="SemiBold" Foreground="{StaticResource AmberBrush}" />
+                            <Grid Margin="0,12,0,0">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="Recording library" FontWeight="SemiBold" />
+                                    <TextBlock x:Name="LibraryPathText" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,3,20,0" TextWrapping="Wrap" />
+                                </StackPanel>
+                                <Button Grid.Column="1" Content="Open library" Click="OpenLibraryFolderClicked" Style="{StaticResource AmberButton}" />
+                            </Grid>
+                            <Separator />
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="Application logs" FontWeight="SemiBold" />
+                                    <TextBlock Text="Local startup, capture, and validation diagnostics for troubleshooting."
+                                               Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,3,20,0" />
+                                </StackPanel>
+                                <Button Grid.Column="1" Content="Open logs" Click="OpenLogsFolderClicked" />
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardStyle}">
+                        <Grid>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock Text="AgentTrainer Recorder for Windows" FontWeight="SemiBold" Foreground="{StaticResource GreenBrush}" />
+                                <TextBlock Text="v1.8.8  •  Record + Library only  •  No training or AI runtime  •  Data stays local"
+                                           Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,5,0,0" />
+                            </StackPanel>
+                            <Button Grid.Column="1" Content="Reset settings" Click="ResetSettingsClicked" Style="{StaticResource AmberButton}" />
+                        </Grid>
+                    </Border>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+    </Grid>
+</Window>

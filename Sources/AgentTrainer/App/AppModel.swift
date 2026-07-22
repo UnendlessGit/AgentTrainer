@@ -27,6 +27,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLoadingVersions = false
     @Published var isRecording = false
     @Published private(set) var isStartingRecording = false
+    @Published private(set) var isImportingRecordings = false
     @Published var isTraining = false
     @Published private(set) var isAutoTraining = false
     @Published var isRunning = false
@@ -120,7 +121,7 @@ final class AppModel: ObservableObject {
     var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording }
     var agentIsActiveOrStarting: Bool { isRunning || isStartingAgent }
     var canChangeStorageLocations: Bool {
-        !isChangingStorageLocation && !recordingIsActiveOrStarting && !isTraining && !agentIsActiveOrStarting && !isReplaying
+        !isChangingStorageLocation && !isImportingRecordings && !recordingIsActiveOrStarting && !isTraining && !agentIsActiveOrStarting && !isReplaying
     }
 
     init() {
@@ -299,7 +300,7 @@ final class AppModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !isRecording, !isStartingRecording, !agentIsActiveOrStarting, !isReplaying else { return }
+        guard !isRecording, !isStartingRecording, !isImportingRecordings, !agentIsActiveOrStarting, !isReplaying else { return }
         guard let source = selectedSource else { present(AgentTrainerError.invalidConfiguration("Select a capture source.")); return }
         guard let destinationFolderID = recordingDestinationFolderID else { present(AgentTrainerError.invalidConfiguration("Create or select a recording folder.")); return }
         isStartingRecording = true
@@ -396,6 +397,39 @@ final class AppModel: ObservableObject {
             if selectedRecordingID == item.id { selectedRecordingID = nextSelection }
             await refreshLibrary()
             activityStatus = "Recording deleted"
+        } catch { present(error) }
+    }
+    func importRecordings() async {
+        guard !isImportingRecordings, !recordingIsActiveOrStarting, !agentIsActiveOrStarting, !isTraining, !isReplaying else {
+            present(AgentTrainerError.storage("Stop active work before importing recordings."))
+            return
+        }
+        guard let destinationFolderID = recordingDestinationFolderID else {
+            present(AgentTrainerError.storage("Create or select a recording folder before importing."))
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Import AgentTrainer recordings"
+        panel.message = "Choose .atrrecord.zip files exported on Windows, .atrrecord folders, a Recordings folder, or an AgentTrainer training-data library. Sources are validated and copied; they are never modified."
+        panel.prompt = "Import"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.canCreateDirectories = false
+        panel.resolvesAliases = true
+        panel.treatsFilePackagesAsDirectories = true
+        guard panel.runModal() == .OK else { return }
+
+        isImportingRecordings = true
+        activityStatus = "Validating recordings for import…"
+        defer { isImportingRecordings = false }
+        do {
+            let imported = try await WorkspaceStore.shared.importRecordings(from: panel.urls, into: destinationFolderID)
+            await refreshLibrary()
+            await ensureRecordingThumbnails()
+            if let first = imported.first { selectedRecordingID = first.id }
+            activityStatus = "Imported \(imported.count) recording\(imported.count == 1 ? "" : "s")"
+            AppLog.write(category: "Storage", "Portable recordings imported", details: "\(imported.count) validated portable packages")
         } catch { present(error) }
     }
     func renameRecording(_ item: RecordingItem, name: String) async { do { try await WorkspaceStore.shared.renameRecording(item, to: name); await refreshLibrary() } catch { present(error) } }
