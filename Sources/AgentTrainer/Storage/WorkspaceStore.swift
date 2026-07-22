@@ -326,6 +326,73 @@ actor WorkspaceStore {
         try atomicWrite(try encoder.encode(manifest), to: directory.appendingPathComponent("manifest.json"))
     }
 
+    /// Imports portable `.atrrecord` directories without trusting their folder
+    /// name, local folder ID, filenames, event count, or video metadata. Every
+    /// source is validated before any destination is published. The source is
+    /// never modified, and a failed batch removes only its private staging/new
+    /// destination directories.
+    func importRecordings(from selectedURLs: [URL], into folderID: UUID) async throws -> [RecordingItem] {
+        try prepare()
+        guard listRecordingFolders().contains(where: { $0.id == folderID }) else {
+            throw AgentTrainerError.storage("Choose an existing recording folder before importing.")
+        }
+        var extractionRoots: [URL] = []
+        defer { for root in extractionRoots { try? FileManager.default.removeItem(at: root) } }
+        let sources = try recordingImportSources(from: selectedURLs, extractionRoots: &extractionRoots)
+        guard !sources.isEmpty else {
+            throw AgentTrainerError.storage("Choose one or more .atrrecord.zip files, .atrrecord folders, or a folder that contains recordings.")
+        }
+
+        var validated: [(source: URL, manifest: RecordingManifest, hasThumbnail: Bool)] = []
+        validated.reserveCapacity(sources.count)
+        for source in sources {
+            validated.append(try await validateRecordingImport(at: source))
+        }
+
+        var stagingDirectories: [URL] = []
+        var publishedDirectories: [URL] = []
+        do {
+            for item in validated {
+                let newID = UUID()
+                let staging = recordingsRoot.appendingPathComponent(".import-\(newID.uuidString)", isDirectory: true)
+                let destination = recordingsRoot.appendingPathComponent("\(newID.uuidString).atrrecord", isDirectory: true)
+                try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+                stagingDirectories.append(staging)
+
+                try copyRegularImportFile(
+                    item.source.appendingPathComponent(item.manifest.videoFile),
+                    to: staging.appendingPathComponent(item.manifest.videoFile)
+                )
+                try copyRegularImportFile(
+                    item.source.appendingPathComponent(item.manifest.eventFile),
+                    to: staging.appendingPathComponent(item.manifest.eventFile)
+                )
+
+                var manifest = item.manifest
+                manifest.id = newID
+                manifest.folderID = folderID
+                if let thumbnail = manifest.thumbnailFile, item.hasThumbnail {
+                    try copyRegularImportFile(
+                        item.source.appendingPathComponent(thumbnail),
+                        to: staging.appendingPathComponent(thumbnail)
+                    )
+                } else {
+                    manifest.thumbnailFile = nil
+                }
+                try atomicWrite(try encoder.encode(manifest), to: staging.appendingPathComponent("manifest.json"))
+                try FileManager.default.moveItem(at: staging, to: destination)
+                stagingDirectories.removeAll { $0 == staging }
+                publishedDirectories.append(destination)
+            }
+        } catch {
+            for directory in stagingDirectories + publishedDirectories { try? FileManager.default.removeItem(at: directory) }
+            throw AgentTrainerError.storage("The recordings could not be imported transactionally: \(error.localizedDescription)")
+        }
+
+        let published = Set(publishedDirectories.map { $0.standardizedFileURL })
+        return listRecordings().filter { published.contains($0.directory.standardizedFileURL) }
+    }
+
     /// Repairs legacy manifests before the strict library scan runs. Policy
     /// v4 added defensive validation, but filtering first made an older
     /// recording with a stale duration/trim disappear from the UI before the
@@ -387,6 +454,7 @@ actor WorkspaceStore {
     func listRecordings() -> [RecordingItem] {
         guard let urls = try? FileManager.default.contentsOfDirectory(at: recordingsRoot, includingPropertiesForKeys: nil) else { return [] }
         return urls.compactMap { directory in
+            guard directory.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame else { return nil }
             let manifestURL = directory.appendingPathComponent("manifest.json")
             guard let data = try? Data(contentsOf: manifestURL),
                   let manifest = try? decoder.decode(RecordingManifest.self, from: data),
@@ -818,7 +886,241 @@ actor WorkspaceStore {
     }
 
     private static func isSafeLeafName(_ value: String) -> Bool {
-        !value.isEmpty && value != "." && value != ".." && !value.contains("/") && !value.contains("\0")
+        !value.isEmpty && value != "." && value != ".." && !value.contains("/") && !value.contains("\\") && !value.contains(":") && !value.contains("\0")
+    }
+
+    private func recordingImportSources(from selectedURLs: [URL], extractionRoots: inout [URL]) throws -> [URL] {
+        var result: [URL] = []
+        for selected in selectedURLs {
+            let source = normalized(selected)
+            guard source.isFileURL else { continue }
+            let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isSymbolicLink != true else {
+                throw AgentTrainerError.storage("Linked files and folders cannot be imported: \(selected.lastPathComponent).")
+            }
+            if values.isDirectory == true,
+               source.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame {
+                result.append(source)
+                continue
+            }
+            if values.isRegularFile == true,
+               source.pathExtension.localizedCaseInsensitiveCompare("zip") == .orderedSame {
+                let extractionRoot = try extractRecordingArchive(source)
+                extractionRoots.append(extractionRoot)
+                let extracted = try importDirectories(in: extractionRoot)
+                guard !extracted.isEmpty else {
+                    throw AgentTrainerError.storage("\(source.lastPathComponent) does not contain an .atrrecord package.")
+                }
+                result.append(contentsOf: extracted)
+                continue
+            }
+            guard values.isDirectory == true else { continue }
+            let directRecordings = try importDirectories(in: source)
+            if !directRecordings.isEmpty {
+                result.append(contentsOf: directRecordings)
+                continue
+            }
+            let libraryRecordings = source.appendingPathComponent("Recordings", isDirectory: true)
+            result.append(contentsOf: try importDirectories(in: libraryRecordings))
+        }
+        var seen: Set<String> = []
+        return result.filter { seen.insert(normalized($0).path).inserted }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func extractRecordingArchive(_ archive: URL) throws -> URL {
+        let values = try archive.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+              let size = values.fileSize, size > 0 else {
+            throw AgentTrainerError.storage("\(archive.lastPathComponent) is not a regular recording archive.")
+        }
+
+        // Preflight every ZIP member before invoking the system extractor. The
+        // exported format has one .atrrecord directory at its root; absolute,
+        // parent-relative, Windows-style, and NUL-bearing paths are rejected.
+        let listing = try runImportProcess("/usr/bin/unzip", ["-Z1", archive.path])
+        guard let listingText = String(data: listing, encoding: .utf8) else {
+            throw AgentTrainerError.storage("\(archive.lastPathComponent) has an unreadable ZIP directory.")
+        }
+        let entries = listingText.split(whereSeparator: \Character.isNewline).map(String.init)
+        guard !entries.isEmpty, entries.count <= 128 else {
+            throw AgentTrainerError.storage("\(archive.lastPathComponent) has an empty or unreasonably large ZIP directory.")
+        }
+        for entry in entries {
+            let normalizedEntry = entry.replacingOccurrences(of: "\\", with: "/")
+            let components = normalizedEntry.split(separator: "/", omittingEmptySubsequences: false)
+            guard !normalizedEntry.hasPrefix("/"), !normalizedEntry.contains("\0"), !entry.contains("\\"),
+                  !components.contains(where: { $0 == ".." }),
+                  components.first.map({ !$0.contains(":") }) ?? false else {
+                throw AgentTrainerError.storage("\(archive.lastPathComponent) contains an unsafe ZIP path.")
+            }
+        }
+
+        let extractionRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentTrainer-Recording-Import-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: extractionRoot, withIntermediateDirectories: false)
+            _ = try runImportProcess("/usr/bin/ditto", ["-x", "-k", "--noqtn", archive.path, extractionRoot.path])
+            try rejectLinkedImportEntries(in: extractionRoot)
+            return extractionRoot
+        } catch {
+            try? FileManager.default.removeItem(at: extractionRoot)
+            if let error = error as? AgentTrainerError { throw error }
+            throw AgentTrainerError.storage("\(archive.lastPathComponent) could not be safely extracted: \(error.localizedDescription)")
+        }
+    }
+
+    private func rejectLinkedImportEntries(in root: URL) throws {
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            throw AgentTrainerError.storage("The recording archive could not be inspected after extraction.")
+        }
+        let rootPath = root.standardizedFileURL.path + "/"
+        for case let entry as URL in enumerator {
+            guard entry.standardizedFileURL.path.hasPrefix(rootPath),
+                  try entry.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+                throw AgentTrainerError.storage("Recording archives may not contain links or paths outside their package.")
+            }
+        }
+    }
+
+    private func runImportProcess(_ executable: String, _ arguments: [String]) throws -> Data {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        let stdout = output.fileHandleForReading.readDataToEndOfFile()
+        let stderr = errors.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else {
+            let detail = String(data: stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw AgentTrainerError.storage(detail?.isEmpty == false ? detail! : "The recording archive tool failed.")
+        }
+        return stdout
+    }
+
+    private func importDirectories(in directory: URL) throws -> [URL] {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else { return [] }
+        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles])
+            .filter { url in
+                guard url.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame,
+                      let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return false }
+                return values.isDirectory == true && values.isSymbolicLink != true
+            }
+    }
+
+    private func validateRecordingImport(at requestedSource: URL) async throws -> (source: URL, manifest: RecordingManifest, hasThumbnail: Bool) {
+        let source = normalized(requestedSource)
+        guard !isSameOrDescendant(source, of: recordingsRoot) else {
+            throw AgentTrainerError.storage("\(requestedSource.lastPathComponent) is already inside the active AgentTrainer library.")
+        }
+        let sourceValues = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard source.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame,
+              sourceValues.isDirectory == true, sourceValues.isSymbolicLink != true else {
+            throw AgentTrainerError.storage("\(requestedSource.lastPathComponent) is not a regular .atrrecord directory.")
+        }
+
+        let manifestURL = source.appendingPathComponent("manifest.json")
+        try requireRegularImportFile(manifestURL)
+        let manifestSize = try manifestURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard manifestSize > 0, manifestSize <= 1_048_576 else {
+            throw AgentTrainerError.storage("\(source.lastPathComponent) has an empty or unreasonably large manifest.")
+        }
+        let manifest: RecordingManifest
+        do { manifest = try decoder.decode(RecordingManifest.self, from: Data(contentsOf: manifestURL)) }
+        catch { throw AgentTrainerError.storage("\(source.lastPathComponent) has an unreadable AgentTrainer manifest.") }
+        guard manifest.isStructurallyValid, manifest.hostStartNanos > 0,
+              Self.isSafeLeafName(manifest.videoFile), Self.isSafeLeafName(manifest.eventFile),
+              manifest.thumbnailFile.map(Self.isSafeLeafName) ?? true else {
+            throw AgentTrainerError.storage("\(manifest.name) has an invalid or unsafe recording manifest.")
+        }
+        let payloadNames = [manifest.videoFile, manifest.eventFile] + (manifest.thumbnailFile.map { [$0] } ?? [])
+        guard Set(payloadNames.map { $0.lowercased() }).count == payloadNames.count,
+              payloadNames.allSatisfy({ $0.caseInsensitiveCompare("manifest.json") != .orderedSame }) else {
+            throw AgentTrainerError.storage("\(manifest.name) uses duplicate or reserved recording filenames.")
+        }
+
+        let eventURL = source.appendingPathComponent(manifest.eventFile)
+        let videoURL = source.appendingPathComponent(manifest.videoFile)
+        try requireRegularImportFile(eventURL)
+        try requireRegularImportFile(videoURL)
+        let events: InputEventReader.MappedEvents
+        do { events = try InputEventReader.mapped(url: eventURL) }
+        catch { throw AgentTrainerError.storage("\(manifest.name) has an invalid input stream: \(error.localizedDescription)") }
+        guard events.count == manifest.eventCount else {
+            throw AgentTrainerError.storage("\(manifest.name) declares \(manifest.eventCount) inputs but contains \(events.count).")
+        }
+        if let first = events.first, first.timestampNanos < manifest.hostStartNanos {
+            throw AgentTrainerError.storage("\(manifest.name) contains input from before its first video frame.")
+        }
+        let inputDuration = events.last.flatMap { event -> Double? in
+            guard event.timestampNanos >= manifest.hostStartNanos else { return nil }
+            return Double(event.timestampNanos - manifest.hostStartNanos) / 1_000_000_000
+        } ?? 0
+        guard inputDuration <= manifest.duration + 0.001 else {
+            throw AgentTrainerError.storage("\(manifest.name) has input timestamps beyond its declared duration.")
+        }
+
+        let asset = AVURLAsset(url: videoURL)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw AgentTrainerError.storage("\(manifest.name) has no readable video track.")
+        }
+        let time = try await asset.load(.duration)
+        let videoDuration = CMTimeGetSeconds(time)
+        guard videoDuration.isFinite, videoDuration > 0 else {
+            throw AgentTrainerError.storage("\(manifest.name) has an invalid video duration.")
+        }
+        let naturalSize = try await track.load(.naturalSize)
+        let transform = try await track.load(.preferredTransform)
+        let transformed = CGRect(origin: .zero, size: naturalSize).applying(transform).standardized
+        let actualWidth = Int(abs(transformed.width).rounded())
+        let actualHeight = Int(abs(transformed.height).rounded())
+        guard abs(actualWidth - manifest.pixelWidth) <= 2, abs(actualHeight - manifest.pixelHeight) <= 2 else {
+            throw AgentTrainerError.storage("\(manifest.name) video dimensions do not match its manifest.")
+        }
+        let expectedDuration = max(videoDuration, inputDuration)
+        let durationTolerance = max(1, 2 / max(1, manifest.capture.requestedFPS))
+        guard abs(manifest.duration - expectedDuration) <= durationTolerance else {
+            throw AgentTrainerError.storage("\(manifest.name) video/input duration does not match its manifest.")
+        }
+
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        ])
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { throw AgentTrainerError.storage("\(manifest.name) cannot be decoded for training.") }
+        reader.add(output)
+        guard reader.startReading(), output.copyNextSampleBuffer() != nil else {
+            throw reader.error ?? AgentTrainerError.storage("\(manifest.name) cannot be decoded for training.")
+        }
+        reader.cancelReading()
+
+        let hasThumbnail: Bool
+        if let thumbnail = manifest.thumbnailFile {
+            let url = source.appendingPathComponent(thumbnail)
+            hasThumbnail = (try? requireRegularImportFile(url)) != nil
+        } else { hasThumbnail = false }
+        return (source, manifest, hasThumbnail)
+    }
+
+    private func requireRegularImportFile(_ url: URL) throws {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw AgentTrainerError.storage("The import contains a missing, non-regular, or linked file: \(url.lastPathComponent).")
+        }
+    }
+
+    private func copyRegularImportFile(_ source: URL, to destination: URL) throws {
+        try requireRegularImportFile(source)
+        try FileManager.default.copyItem(at: source, to: destination)
     }
 
     private func ensureLocationIsAvailable(_ location: URL, name: String) throws {

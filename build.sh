@@ -110,7 +110,7 @@ cp "$ROOT/README.md" "$ROOT/outputs/README.md"
 SOURCE_ARCHIVE="$ROOT/outputs/AgentTrainer-Source.zip"
 rm -f "$SOURCE_ARCHIVE"
 cd "$ROOT"
-/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources build.sh test.sh README.md DEVELOPMENT_GUIDE.md IN_PLACE_UPDATE_GUIDE.md TRAINING_AUDIT.md -x '*.DS_Store'
+/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources WindowsRecorder .github RECORDING_FORMAT.md build.sh test.sh README.md DEVELOPMENT_GUIDE.md IN_PLACE_UPDATE_GUIDE.md TRAINING_AUDIT.md -x '*.DS_Store' '*/bin/*' '*/obj/*' '*/artifacts/*'
 
 DMG_STAGE="$BUILD_ROOT/DMG"
 DMG_APP="$DMG_STAGE/AgentTrainer.app"

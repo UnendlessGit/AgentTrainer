@@ -77,12 +77,55 @@ struct LibraryView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 12) {
-            SectionTitle("Library", "Expand folders to browse recordings, inspect captured controls, and replay locally.")
-            TextField("Search recordings", text: $search).textFieldStyle(.roundedBorder).frame(width: 240)
-            Picker("Sort", selection: $sortOrder) { ForEach(SortOrder.allCases) { Text($0.rawValue).tag($0) } }.frame(width: 130)
-            Button { Task { await model.refreshLibrary(); ensureSelection() } } label: { Image(systemName: "arrow.clockwise") }.primaryButton()
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                libraryTitle
+                libraryActions
+            }
+            HStack {
+                Spacer(minLength: 0)
+                libraryFilters
+            }
         }
+    }
+
+    private var libraryTitle: some View {
+        SectionTitle("Library", "Expand folders to browse recordings, inspect captured controls, and replay locally.")
+            .layoutPriority(1)
+    }
+
+    private var libraryFilters: some View {
+        HStack(spacing: 10) {
+            TextField("Search recordings", text: $search)
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 180, idealWidth: 240, maxWidth: 240)
+            Picker("Sort", selection: $sortOrder) {
+                ForEach(SortOrder.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .frame(width: 130)
+        }
+    }
+
+    private var libraryActions: some View {
+        HStack(spacing: 8) {
+            Button {
+                Task { await model.importRecordings(); ensureSelection() }
+            } label: {
+                Label(model.isImportingRecordings ? "Importing…" : "Import", systemImage: "square.and.arrow.down")
+            }
+            .primaryButton(color: ATColor.green)
+            .disabled(model.isImportingRecordings || model.recordingIsActiveOrStarting || model.agentIsActiveOrStarting || model.isTraining || model.isReplaying)
+            .help("Import recordings exported from AgentTrainer on Windows or another Mac")
+
+            Button {
+                Task { await model.refreshLibrary(); ensureSelection() }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .primaryButton()
+            .help("Refresh library")
+        }
+        .fixedSize()
     }
 
     private var folderBrowser: some View {

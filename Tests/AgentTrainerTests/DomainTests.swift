@@ -524,6 +524,134 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(foldersAfter.isEmpty)
     }
 
+    func testPortableWindowsRecordingImportsTransactionallyIntoTheNativeLibrary() async throws {
+        let container = FileManager.default.temporaryDirectory.appendingPathComponent("portable-import-\(UUID().uuidString)", isDirectory: true)
+        let root = container.appendingPathComponent("Library", isDirectory: true)
+        let transfer = container.appendingPathComponent("Transfer", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        try FileManager.default.createDirectory(at: transfer, withIntermediateDirectories: true)
+
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let destinationFolder = RecordingFolder(id: UUID(), name: "Windows demonstrations", createdAt: Date())
+        try await store.saveRecordingFolder(destinationFolder)
+
+        let originalID = UUID()
+        let source = transfer.appendingPathComponent("\(originalID.uuidString).atrrecord", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        try await writeTestMovie(to: source.appendingPathComponent("capture.mov"), width: 16, height: 16, frameCount: 6, fps: 30)
+        let eventsURL = source.appendingPathComponent("events.atrevents")
+        let eventWriter = try InputEventWriter(url: eventsURL)
+        eventWriter.append(InputSample(timestampNanos: 9_000_000_000, kind: .mouseMove, x: 8, y: 8, modifiers: 0))
+        eventWriter.append(InputSample(timestampNanos: 9_100_000_000, kind: .key, keyCode: 13, modifiers: 0, isDown: true))
+        XCTAssertEqual(try eventWriter.finish(), 2)
+        let eventBytesBefore = try Data(contentsOf: eventsURL)
+        let videoBytesBefore = try Data(contentsOf: source.appendingPathComponent("capture.mov"))
+
+        // This is intentionally authored as the Windows System.Text.Json shape,
+        // including its platform-translated Apple key codes and second-precision
+        // ISO date, rather than encoded through Swift's RecordingManifest.
+        let manifestJSON = """
+        {
+          "schemaVersion": 2,
+          "id": "\(originalID.uuidString)",
+          "name": "Windows example",
+          "createdAt": "2026-07-19T12:00:00Z",
+          "hostStartNanos": 9000000000,
+          "duration": 0.2,
+          "capture": {
+            "kind": "Display",
+            "displayID": 7,
+            "requestedFPS": 30,
+            "showsCursor": false
+          },
+          "globalRect": { "x": 0, "y": 0, "width": 16, "height": 16 },
+          "pixelWidth": 16,
+          "pixelHeight": 16,
+          "deliveredFPS": 30,
+          "eventCount": 2,
+          "videoFile": "capture.mov",
+          "eventFile": "events.atrevents",
+          "trimStart": 0,
+          "trimEnd": 0.2,
+          "excludedKeyCodes": [56, 0]
+        }
+        """
+        try Data(manifestJSON.utf8).write(to: source.appendingPathComponent("manifest.json"))
+
+        let imported = try await store.importRecordings(from: [source], into: destinationFolder.id)
+        XCTAssertEqual(imported.count, 1)
+        let item = try XCTUnwrap(imported.first)
+        XCTAssertNotEqual(item.id, originalID, "Imports get a fresh local ID and cannot overwrite an existing recording")
+        XCTAssertEqual(item.manifest.folderID, destinationFolder.id)
+        XCTAssertEqual(item.manifest.name, "Windows example")
+        XCTAssertEqual(item.manifest.excludedKeyCodes, [0, 56])
+        XCTAssertEqual(try InputEventReader.read(url: item.directory.appendingPathComponent(item.manifest.eventFile)).map(\.keyCode), [0, 13])
+        XCTAssertEqual(try Data(contentsOf: item.directory.appendingPathComponent(item.manifest.eventFile)), eventBytesBefore)
+        XCTAssertEqual(try Data(contentsOf: item.directory.appendingPathComponent(item.manifest.videoFile)), videoBytesBefore)
+        XCTAssertEqual(try Data(contentsOf: eventsURL), eventBytesBefore, "Import must never modify its source")
+        XCTAssertEqual(try Data(contentsOf: source.appendingPathComponent("capture.mov")), videoBytesBefore)
+
+        let archive = transfer.appendingPathComponent("Windows example.atrrecord.zip")
+        let zipProcess = Process()
+        zipProcess.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        zipProcess.arguments = ["-c", "-k", "--keepParent", source.path, archive.path]
+        try zipProcess.run()
+        zipProcess.waitUntilExit()
+        XCTAssertEqual(zipProcess.terminationStatus, 0)
+
+        let archiveImport = try await store.importRecordings(from: [archive], into: destinationFolder.id)
+        let archivedItem = try XCTUnwrap(archiveImport.first)
+        XCTAssertEqual(archiveImport.count, 1)
+        XCTAssertNotEqual(archivedItem.id, originalID)
+        XCTAssertNotEqual(archivedItem.id, item.id)
+        XCTAssertEqual(try Data(contentsOf: archivedItem.directory.appendingPathComponent(archivedItem.manifest.eventFile)), eventBytesBefore)
+        XCTAssertEqual(try Data(contentsOf: archivedItem.directory.appendingPathComponent(archivedItem.manifest.videoFile)), videoBytesBefore)
+    }
+
+    func testPortableRecordingBatchValidationPublishesNothingWhenOneSourceIsCorrupt() async throws {
+        let container = FileManager.default.temporaryDirectory.appendingPathComponent("portable-import-reject-\(UUID().uuidString)", isDirectory: true)
+        let root = container.appendingPathComponent("Library", isDirectory: true)
+        let transfer = container.appendingPathComponent("Transfer", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        try FileManager.default.createDirectory(at: transfer, withIntermediateDirectories: true)
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let folder = RecordingFolder(id: UUID(), name: "Imports", createdAt: Date())
+        try await store.saveRecordingFolder(folder)
+
+        var sources: [URL] = []
+        for index in 0..<2 {
+            let id = UUID()
+            let source = transfer.appendingPathComponent("\(id.uuidString).atrrecord", isDirectory: true)
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+            try await writeTestMovie(to: source.appendingPathComponent("capture.mov"), width: 8, height: 8, frameCount: 3, fps: 30)
+            let writer = try InputEventWriter(url: source.appendingPathComponent("events.atrevents"))
+            writer.append(InputSample(timestampNanos: 1_000_000_000, kind: .mouseMove, x: 4, y: 4))
+            _ = try writer.finish()
+            let manifest = RecordingManifest(
+                id: id, name: "Import \(index)", createdAt: Date(), hostStartNanos: 1_000_000_000,
+                duration: 0.1, capture: CaptureSpec(requestedFPS: 30),
+                globalRect: CodableRect(CGRect(x: 0, y: 0, width: 8, height: 8)),
+                pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 1
+            )
+            try await store.writeRecording(manifest, to: source)
+            sources.append(source)
+        }
+        var corrupt = try Data(contentsOf: sources[1].appendingPathComponent("events.atrevents"))
+        corrupt[12 + 8] = 0xFF // First record's event kind.
+        try corrupt.write(to: sources[1].appendingPathComponent("events.atrevents"))
+
+        do {
+            _ = try await store.importRecordings(from: sources, into: folder.id)
+            XCTFail("A corrupt source must reject the complete import batch")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("invalid input stream"))
+        }
+        let importedRecordings = await store.listRecordings()
+        XCTAssertTrue(importedRecordings.isEmpty)
+    }
+
     func testLegacyInvalidRecordingIsRecoveredBeforeStrictLibraryScanWithoutTouchingSources() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("recording-recovery-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }

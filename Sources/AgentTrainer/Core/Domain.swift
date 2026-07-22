@@ -497,7 +497,7 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
             && eventCount >= 0
             && trimStart.isFinite && trimStart >= 0 && trimStart <= duration
             && end.isFinite && end >= trimStart && end <= duration
-            && safeFileNames.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0") }
+            && safeFileNames.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\\") && !$0.contains(":") && !$0.contains("\0") }
     }
 }
 

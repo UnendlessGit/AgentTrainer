@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <PlatformTarget>x64</PlatformTarget>
+    <Platform>x64</Platform>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <PublishTrimmed>false</PublishTrimmed>
+    <RootNamespace>AgentTrainer.Recorder</RootNamespace>
+    <AssemblyName>AgentTrainer Recorder</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>1.8.8</Version>
+    <Company>AgentTrainer</Company>
+    <Product>AgentTrainer Recorder</Product>
+    <Description>Portable AgentTrainer recorder and recording library for Windows.</Description>
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+    <NoWarn>$(NoWarn);SYSLIB1054</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../AgentTrainer.Recorder.Core/AgentTrainer.Recorder.Core.csproj" />
+    <PackageReference Include="ScreenRecorderLib" Version="6.6.0" />
+  </ItemGroup>
+</Project>
