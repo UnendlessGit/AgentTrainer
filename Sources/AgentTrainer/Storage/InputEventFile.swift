@@ -107,10 +107,54 @@ enum InputEventReader {
         var nonzeroDeltaFraction: Double { Double(nonzeroDeltaCount) / Double(max(1, moveEventCount)) }
         var absolutePositionChangeFraction: Double { Double(absolutePositionChangeCount) / Double(max(1, moveEventCount - 1)) }
         var meanActiveDeltaMagnitude: Double { accumulatedDeltaMagnitude / Double(max(1, nonzeroDeltaCount)) }
-        var isGameCamera: Bool {
-            moveEventCount >= 20 && nonzeroDeltaCount > 0 && absolutePositionChangeFraction < 0.05
+        var controlEvidence: MouseControlEvidence {
+            guard moveEventCount >= 20 else { return .insufficient }
+            if nonzeroDeltaCount > 0, absolutePositionChangeFraction < 0.05 {
+                return .gameCamera
+            }
+            if absolutePositionChangeCount > 0, absolutePositionChangeFraction >= 0.05 {
+                return .movingCursor
+            }
+            return .insufficient
         }
+        var isGameCamera: Bool { controlEvidence == .gameCamera }
         var positionsAreValid: Bool { outOfCaptureBoundsCount == 0 }
+    }
+
+    enum MouseControlEvidence: Sendable, Equatable {
+        case gameCamera
+        case movingCursor
+        case insufficient
+    }
+
+    /// Aggregates only recordings that contain classifiable movement. Long
+    /// recordings with a stationary pointer previously counted as Absolute
+    /// Cursor and could outvote hundreds of short, genuine camera captures.
+    struct MouseModeEvidence: Sendable, Equatable {
+        private(set) var gameCameraRecordings = 0
+        private(set) var movingCursorRecordings = 0
+        private(set) var gameCameraMoveEvents = 0
+        private(set) var movingCursorMoveEvents = 0
+
+        mutating func include(_ diagnostics: MouseDiagnostics) {
+            switch diagnostics.controlEvidence {
+            case .gameCamera:
+                gameCameraRecordings += 1
+                gameCameraMoveEvents += diagnostics.moveEventCount
+            case .movingCursor:
+                movingCursorRecordings += 1
+                movingCursorMoveEvents += diagnostics.moveEventCount
+            case .insufficient:
+                break
+            }
+        }
+
+        var recommendedMode: MouseControlMode {
+            if gameCameraRecordings != movingCursorRecordings {
+                return gameCameraRecordings > movingCursorRecordings ? .relative : .absolute
+            }
+            return gameCameraMoveEvents > movingCursorMoveEvents ? .relative : .absolute
+        }
     }
 
     struct Summary: Sendable {

@@ -218,8 +218,9 @@ actor WorkspaceStore {
 
             for item in versionItems {
                 let manifestURL = item.appendingPathComponent("manifest.json")
-                if let data = try? Data(contentsOf: manifestURL),
-                   let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
+                let manifest = (try? Data(contentsOf: manifestURL))
+                    .flatMap { try? decoder.decode(ModelVersionManifest.self, from: $0) }
+                if let manifest,
                    manifest.schemaVersion == currentSchema,
                    manifest.id.uuidString.caseInsensitiveCompare(item.lastPathComponent) == .orderedSame {
                     compatibleVersionIDs.insert(manifest.id)
@@ -228,7 +229,7 @@ actor WorkspaceStore {
                         item,
                         profileRoot: profileRoot,
                         category: "Versions",
-                        storedSchema: storedSchema
+                        storedSchema: manifest?.schemaVersion
                     )
                     archived += 1
                 }
@@ -239,21 +240,17 @@ actor WorkspaceStore {
             if FileManager.default.fileExists(atPath: checkpoint.path) {
                 let checkpointMarker = checkpoint.appendingPathComponent("model-schema.json")
                 let checkpointSchema = (try? Data(contentsOf: checkpointMarker)).flatMap { try? decoder.decode(Int.self, from: $0) }
+                // Policy-v5 checkpoints have carried this marker since the
+                // contract was introduced. A sibling runnable version proves
+                // nothing about an unmarked checkpoint's tensor shapes, so an
+                // uncertain checkpoint is always archived rather than trusted.
                 keepsCheckpoint = checkpointSchema == currentSchema
-                    || (checkpointSchema == nil && (storedSchema == currentSchema || !compatibleVersionIDs.isEmpty))
-                if keepsCheckpoint {
-                    // Checkpoints created before 1.8.2 did not carry their own
-                    // schema marker. Once compatibility is established from a
-                    // current library or version manifest, make it explicit.
-                    if checkpointSchema == nil {
-                        try atomicWrite(try encoder.encode(currentSchema), to: checkpointMarker)
-                    }
-                } else {
+                if !keepsCheckpoint {
                     try archiveModelArtifact(
                         checkpoint,
                         profileRoot: profileRoot,
                         category: "Checkpoints",
-                        storedSchema: checkpointSchema ?? storedSchema
+                        storedSchema: checkpointSchema
                     )
                     archived += 1
                 }
@@ -262,14 +259,51 @@ actor WorkspaceStore {
             let activeIsCompatible = profile.activeVersionID.map(compatibleVersionIDs.contains) ?? false
             if profile.activeVersionID != nil && !activeIsCompatible {
                 profile.activeVersionID = nil
-                profile.trainingProgress = nil
+                if !keepsCheckpoint { profile.trainingProgress = nil }
             }
 
             // A compatible saved brain or checkpoint proves that this profile
             // already uses the current contract. Never rewrite its settings.
             if compatibleVersionIDs.isEmpty && !keepsCheckpoint {
+                // Progress with no compatible version/checkpoint is stale even
+                // when an older profile had already lost its active-version ID.
+                profile.trainingProgress = nil
                 profile.training.architecture = migratedArchitecture(profile.training.architecture)
-                profile.training.historyLength = min(32, max(0, profile.training.historyLength))
+                // There is no optimizer/model behavior left to preserve at
+                // this boundary. Fill only absent legacy fields so explicit
+                // user choices survive, while profiles whose older weights were
+                // archived receive the current visual-memory, scheduler, and
+                // sparse-control defaults.
+                let defaults = TrainingConfiguration()
+                if profile.training.visualMemoryFrames == nil {
+                    profile.training.visualMemoryFrames = defaults.visualMemoryFrames
+                }
+                if profile.training.visualMemoryStride == nil {
+                    profile.training.visualMemoryStride = defaults.visualMemoryStride
+                }
+                if profile.training.visualMemoryDropout == nil {
+                    profile.training.visualMemoryDropout = defaults.visualMemoryDropout
+                }
+                if profile.training.learningRateSchedule == nil {
+                    profile.training.learningRateSchedule = defaults.learningRateSchedule
+                }
+                if profile.training.cosineCycleEpochs == nil {
+                    profile.training.cosineCycleEpochs = defaults.cosineCycleEpochs
+                }
+                if profile.training.plateauPatience == nil {
+                    profile.training.plateauPatience = defaults.plateauPatience
+                }
+                if profile.training.minimumLearningRateRatio == nil {
+                    profile.training.minimumLearningRateRatio = defaults.minimumLearningRateRatio
+                }
+                if profile.training.binaryFocalGamma == nil {
+                    profile.training.binaryFocalGamma = defaults.binaryFocalGamma
+                }
+                // Policy v9 deliberately removes teacher-forced actions from
+                // the model. Retain the legacy Codable field for old profile
+                // files, but normalize it so UI, sizing, and saved versions
+                // all describe the perception-only input contract exactly.
+                profile.training.historyLength = PolicyInputContract.actionHistoryLength
                 if !profile.training.learningRate.isFinite || profile.training.learningRate <= 0 {
                     profile.training.learningRate = 0.0003
                 } else {
@@ -281,7 +315,9 @@ actor WorkspaceStore {
             }
             try saveProfile(profile)
         }
-        try clearCaches()
+        // Policy-v9 visual memory is derived from the existing deduplicated
+        // observation index. Model archival therefore does not discard the
+        // lossless sampled-video cache or force an unnecessary video decode.
         try atomicWrite(try encoder.encode(currentSchema), to: marker)
         try atomicWrite(try encoder.encode(currentSchema), to: auditMarker)
         return archived
@@ -303,16 +339,19 @@ actor WorkspaceStore {
 
     private func migratedArchitecture(_ previous: ArchitectureSpec) -> ArchitectureSpec {
         let widestConvolution = previous.convolutionChannels.max() ?? 0
-        var architecture: ArchitectureSpec
+        let family = previous.family == nil ? PolicyArchitectureFamily.hybrid : previous.effectiveFamily
+        let scale: Int
         if previous.visualEmbedding <= 128, previous.recurrentWidth <= 128, widestConvolution <= 64 {
-            architecture = .small
+            scale = 0
         } else if previous.visualEmbedding >= 384 || previous.recurrentWidth >= 320 || widestConvolution >= 192 {
-            architecture = .large
+            scale = 2
         } else {
-            architecture = .balanced
+            scale = 1
         }
-        architecture.recurrentKind = previous.recurrentKind
-        return architecture
+        // Preserve an explicit Pure Transformer choice across a model-contract
+        // boundary instead of silently turning it into Hybrid. Legacy profiles
+        // with no family remain unambiguously Hybrid.
+        return .preset(family: family, scale: scale)
     }
 
     func createRecordingDirectory(id: UUID) throws -> URL {
@@ -615,8 +654,10 @@ actor WorkspaceStore {
         }
     }
 
-    /// Explicitly discards learned artifacts after the user confirms a brain-
-    /// incompatible configuration change. Crystal V4 remains immutable.
+    /// Detaches learned artifacts after a confirmed brain-incompatible change.
+    /// The old tensors cannot be loaded by the new architecture, but they are
+    /// moved into a recovery archive instead of deleted. Crystal V4 remains
+    /// immutable.
     func resetLearning(for profile: AIProfile) throws -> AIProfile {
         guard !profile.isDeletionProtected else {
             throw AgentTrainerError.storage("This AI is protected. Duplicate it before changing brain architecture or vision settings.")
@@ -625,25 +666,30 @@ actor WorkspaceStore {
         reset.activeVersionID = nil
         reset.trainingProgress = nil
         let root = profileDirectory(profile.id)
-        let staging = root.appendingPathComponent(".LearningReset.\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let archive = root
+            .appendingPathComponent("Archived Model Artifacts", isDirectory: true)
+            .appendingPathComponent("Manual Architecture Changes", isDirectory: true)
+            .appendingPathComponent("\(timestamp)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
         var moved: [(from: URL, to: URL)] = []
         do {
             for name in ["Versions", "Checkpoint"] {
                 let source = root.appendingPathComponent(name, isDirectory: true)
                 guard FileManager.default.fileExists(atPath: source.path) else { continue }
-                let destination = staging.appendingPathComponent(name, isDirectory: true)
+                let destination = archive.appendingPathComponent(name, isDirectory: true)
                 try FileManager.default.moveItem(at: source, to: destination)
                 moved.append((source, destination))
             }
             try saveProfile(reset)
-            try FileManager.default.removeItem(at: staging)
+            if moved.isEmpty { try? FileManager.default.removeItem(at: archive) }
             return reset
         } catch {
             for item in moved.reversed() where FileManager.default.fileExists(atPath: item.to.path) {
                 try? FileManager.default.moveItem(at: item.to, to: item.from)
             }
-            try? FileManager.default.removeItem(at: staging)
+            try? FileManager.default.removeItem(at: archive)
             throw error
         }
     }

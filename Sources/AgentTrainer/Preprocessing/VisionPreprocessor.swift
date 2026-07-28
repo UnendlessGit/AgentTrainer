@@ -4,12 +4,107 @@ import Foundation
 import Metal
 import MLX
 
+struct PackedVisualMemoryContext: Sendable {
+    /// Batch-major remembered frames. A runtime context has batch size one;
+    /// dataset batches use `(batchRow * frameCount + slot) * frameBytes`.
+    var packedFrames: Data
+    /// Normalized actual/requested lag for each matching packed frame.
+    var availability: [Float]
+}
+
+/// Fixed-capacity ring used by live inference. It retains only the largest
+/// configured lag, moves Data values without copying their frame bytes, and
+/// materializes one contiguous MLX input buffer only when a perception runs.
+struct PackedFrameHistory: Sendable {
+    private var storage: [Data?]
+    private var nextWrite = 0
+    private(set) var count = 0
+
+    init(capacity: Int) {
+        storage = Array(repeating: nil, count: max(0, capacity))
+    }
+
+    var capacity: Int { storage.count }
+
+    mutating func removeAll() {
+        storage = Array(repeating: nil, count: storage.count)
+        nextWrite = 0
+        count = 0
+    }
+
+    mutating func append(_ frame: Data) {
+        guard !storage.isEmpty else { return }
+        storage[nextWrite] = frame
+        nextWrite = (nextWrite + 1) % storage.count
+        count = min(storage.count, count + 1)
+    }
+
+    func frame(lag: Int) -> Data? {
+        guard lag > 0, lag <= count, !storage.isEmpty else { return nil }
+        let index = (nextWrite - lag + storage.count) % storage.count
+        return storage[index]
+    }
+
+    /// Missing history clamps to the oldest available perception and carries a
+    /// fractional availability value. On the first perception it uses current
+    /// pixels with availability zero, which is distinct from a genuinely
+    /// unchanged, fully available remembered frame.
+    func context(current: Data, lags: [Int]) -> PackedVisualMemoryContext {
+        guard !lags.isEmpty else {
+            return PackedVisualMemoryContext(packedFrames: Data(), availability: [])
+        }
+        let frameBytes = current.count
+        var packed = Data(count: frameBytes * lags.count)
+        var availability = [Float](repeating: 0, count: lags.count)
+        packed.withUnsafeMutableBytes { destination in
+            guard let destinationBase = destination.baseAddress else { return }
+            current.withUnsafeBytes { currentSource in
+                guard let currentBase = currentSource.baseAddress else { return }
+                for (slot, requestedLag) in lags.enumerated() {
+                    let requested = max(1, requestedLag)
+                    let actual = min(requested, count)
+                    availability[slot] = Float(actual) / Float(requested)
+                    if actual > 0, let remembered = frame(lag: actual), remembered.count == frameBytes {
+                        remembered.withUnsafeBytes { source in
+                            guard let sourceBase = source.baseAddress else { return }
+                            memcpy(destinationBase.advanced(by: slot * frameBytes), sourceBase, frameBytes)
+                        }
+                    } else {
+                        memcpy(destinationBase.advanced(by: slot * frameBytes), currentBase, frameBytes)
+                    }
+                }
+            }
+        }
+        return PackedVisualMemoryContext(packedFrames: packed, availability: availability)
+    }
+}
+
 final class VisionPreprocessor: @unchecked Sendable {
+    final class PackedFrameJob: @unchecked Sendable {
+        fileprivate let command: MTLCommandBuffer
+        fileprivate let output: MTLBuffer
+        fileprivate let byteCount: Int
+        // Retain the source surface and CVMetalTexture wrappers until Metal has
+        // completed; AVAssetReader is then free to advance concurrently.
+        fileprivate let pixelBuffer: CVPixelBuffer
+        fileprivate let textures: [CVMetalTexture]
+        fileprivate let lock = NSLock()
+        fileprivate var consumed = false
+
+        fileprivate init(command: MTLCommandBuffer, output: MTLBuffer, byteCount: Int, pixelBuffer: CVPixelBuffer, textures: [CVMetalTexture]) {
+            self.command = command
+            self.output = output
+            self.byteCount = byteCount
+            self.pixelBuffer = pixelBuffer
+            self.textures = textures
+        }
+    }
+
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
-    private var reusableOutput: MTLBuffer?
+    private var availableOutputs: [MTLBuffer] = []
     private let lock = NSLock()
 
     init() throws {
@@ -32,6 +127,14 @@ final class VisionPreprocessor: @unchecked Sendable {
     /// callback. Cache construction can copy it directly into its large output
     /// buffer instead of allocating and copying an intermediate Data per frame.
     func withPackedBytes<R>(_ pixelBuffer: CVPixelBuffer, spec: PreprocessingSpec, _ body: (UnsafeRawBufferPointer) throws -> R) throws -> R {
+        try finishPackedBytes(try submitPackedFrame(pixelBuffer, spec: spec), body)
+    }
+
+    /// Enqueues the exact preprocessing kernel without waiting. Dataset cache
+    /// construction keeps a tiny ordered queue of these jobs so VideoToolbox
+    /// decode, Metal resize/packing, and buffered disk writes overlap. The
+    /// kernel, quantization, output bytes, and frame order are unchanged.
+    func submitPackedFrame(_ pixelBuffer: CVPixelBuffer, spec: PreprocessingSpec) throws -> PackedFrameJob {
         let spec = try spec.validated()
         lock.lock()
         defer { lock.unlock() }
@@ -61,8 +164,16 @@ final class VisionPreprocessor: @unchecked Sendable {
         let chromaTexture = cvChroma.flatMap(CVMetalTextureGetTexture)
         if sourceFormat != 0, chromaTexture == nil { throw AgentTrainerError.model("The decoded video chroma texture is unavailable.") }
 
-        if reusableOutput?.length ?? 0 < spec.sampleByteCount { reusableOutput = device.makeBuffer(length: spec.sampleByteCount, options: .storageModeShared) }
-        guard let output = reusableOutput, let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else {
+        let output: MTLBuffer
+        if let reusableIndex = availableOutputs.firstIndex(where: { $0.length >= spec.sampleByteCount }) {
+            output = availableOutputs.remove(at: reusableIndex)
+        } else if let created = device.makeBuffer(length: spec.sampleByteCount, options: .storageModeShared) {
+            output = created
+        } else {
+            throw AgentTrainerError.model("Metal could not allocate the preprocessing output buffer.")
+        }
+        guard let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else {
+            availableOutputs.append(output)
             throw AgentTrainerError.model("Metal could not allocate the preprocessing workload.")
         }
 
@@ -83,9 +194,34 @@ final class VisionPreprocessor: @unchecked Sendable {
         encoder.dispatchThreads(MTLSize(width: spec.width, height: spec.height, depth: 1), threadsPerThreadgroup: threads)
         encoder.endEncoding()
         command.commit()
-        command.waitUntilCompleted()
-        if let error = command.error { throw error }
-        return try body(UnsafeRawBufferPointer(start: output.contents(), count: spec.sampleByteCount))
+        var retainedTextures = [cvLuma]
+        if let cvChroma { retainedTextures.append(cvChroma) }
+        return PackedFrameJob(
+            command: command,
+            output: output,
+            byteCount: spec.sampleByteCount,
+            pixelBuffer: pixelBuffer,
+            textures: retainedTextures
+        )
+    }
+
+    func finishPackedBytes<R>(_ job: PackedFrameJob, _ body: (UnsafeRawBufferPointer) throws -> R) throws -> R {
+        let accepted = job.lock.withLock { () -> Bool in
+            guard !job.consumed else { return false }
+            job.consumed = true
+            return true
+        }
+        guard accepted else { throw AgentTrainerError.model("A completed preprocessing frame was consumed more than once.") }
+        job.command.waitUntilCompleted()
+        defer {
+            lock.withLock {
+                // Cache only the small in-flight working set; an unusually
+                // wide custom frame cannot grow this pool without bound.
+                if availableOutputs.count < 3 { availableOutputs.append(job.output) }
+            }
+        }
+        if let error = job.command.error { throw error }
+        return try body(UnsafeRawBufferPointer(start: job.output.contents(), count: job.byteCount))
     }
 
     private static func sourceMatrix(for pixelBuffer: CVPixelBuffer) -> UInt32 {
@@ -144,8 +280,78 @@ final class VisionPreprocessor: @unchecked Sendable {
         return concatenated([y, cb, cr], axis: -1)
     }
 
-    /// Builds the temporal vision input used by Policy v4. Supplying both the
-    /// current frame and its signed difference from the preceding perception
+    /// Builds the historical vision input shared by both Policy-v9 families.
+    /// Current pixels stay exact. Each remembered frame becomes a signed
+    /// current-minus-past difference, and each slot receives one full-resolution
+    /// availability plane so startup/clamped history cannot masquerade as an
+    /// unchanged screen. The model fuses the memory evidence pointwise before
+    /// its spatial CNN or patch projection.
+    static func mlxVisualMemoryTensor(
+        current: Data,
+        memory: PackedVisualMemoryContext,
+        batch: Int,
+        frameCount: Int,
+        spec: PreprocessingSpec
+    ) -> MLXArray {
+        let currentTensor = mlxTensor(current, batch: batch, spec: spec)
+        guard frameCount > 0 else { return currentTensor }
+        precondition(
+            memory.packedFrames.count == batch * frameCount * spec.sampleByteCount,
+            "Visual-memory packed bytes do not match the requested batch shape."
+        )
+        precondition(
+            memory.availability.count == batch * frameCount,
+            "Visual-memory availability does not match the requested batch shape."
+        )
+        let remembered = mlxTensor(
+            memory.packedFrames,
+            batch: batch * frameCount,
+            spec: spec
+        ).reshaped([
+            batch,
+            frameCount,
+            spec.height,
+            spec.width,
+            spec.channelCount
+        ])
+        let rememberedFrames = remembered
+            .split(parts: frameCount, axis: 1)
+            .map { $0.squeezed(axis: 1) }
+        let availability = MLXArray(
+            memory.availability,
+            [batch, frameCount]
+        )
+        return visualMemoryTensor(
+            current: currentTensor,
+            remembered: rememberedFrames,
+            availability: availability
+        )
+    }
+
+    static func visualMemoryTensor(
+        current: MLXArray,
+        remembered: [MLXArray],
+        availability: MLXArray
+    ) -> MLXArray {
+        guard !remembered.isEmpty else { return current }
+        precondition(
+            availability.ndim == 2
+                && availability.dim(0) == current.dim(0)
+                && availability.dim(1) == remembered.count,
+            "Visual-memory availability must be [batch, remembered frames]."
+        )
+        let agePlanes = broadcast(
+            availability.reshaped([current.dim(0), 1, 1, remembered.count]),
+            to: [current.dim(0), current.dim(1), current.dim(2), remembered.count]
+        )
+        return concatenated(
+            [current] + remembered.map { current - $0 } + [agePlanes],
+            axis: -1
+        )
+    }
+
+    /// Focused single-lag helper used to verify signed preprocessing math.
+    /// Supplying both the current frame and its signed difference from the preceding perception
     /// gives the policy motion/velocity evidence without running the CNN once
     /// per history frame. A missing predecessor deliberately produces a zero
     /// difference at recording and runtime segment boundaries.

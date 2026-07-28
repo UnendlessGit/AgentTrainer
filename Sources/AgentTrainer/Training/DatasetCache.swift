@@ -25,6 +25,20 @@ enum ActionLayout {
     static let keyboardAndShiftIndices = Array(keyboardAndShift).filter { !commandOptionControlKeyboardIndexSet.contains($0) }
     static let binary = Array(buttons) + keyboardAndShiftIndices + Array(commandOptionControl)
 
+    static func diagnosticName(for outputIndex: Int) -> String {
+        if buttons.contains(outputIndex) {
+            return "mouse button \(outputIndex - buttons.lowerBound + 1)"
+        }
+        if keyboard.contains(outputIndex) {
+            return "key code \(outputIndex - keyboard.lowerBound)"
+        }
+        if outputIndex == shift.lowerBound { return "Shift" }
+        if commandOptionControl.contains(outputIndex) {
+            return ["Control", "Option", "Command"][outputIndex - commandOptionControl.lowerBound]
+        }
+        return "output \(outputIndex)"
+    }
+
     static func learnableBinaryIndices(
         channels: ActionChannels,
         restrictions: ActionRestrictions
@@ -50,8 +64,8 @@ enum ActionLayout {
     }
 
     /// Removes controls that do not belong to the selected training channels
-    /// from targets and recurrent action history. This prevents a disabled
-    /// channel from becoming a hidden shortcut through the history branch.
+    /// from targets, preceding targets, and legacy history buffers. Current
+    /// policies receive only the zero compatibility row.
     static func sanitizeTrainingRows(
         _ values: UnsafeMutableBufferPointer<Float>,
         rowCount: Int,
@@ -110,12 +124,138 @@ struct DatasetCacheManifest: Codable, Hashable, Sendable {
     var preprocessing: PreprocessingSpec
     var actionFPS: Double
     var perceptionFPS: Double
+    /// Build-time value retained for schema-7 decoding and standalone cache
+    /// inspection. Training supplies the current profile value explicitly;
+    /// history is derived from action rows and is not part of cache identity.
     var historyLength: Int
     var sampleCount: Int
     var observationCount: Int
     var observationBytesPerSample: Int
     var actionValuesPerSample: Int
     var segments: [CacheSegment]
+}
+
+/// One CPU-side optimizer batch gathered in a single pass over the mapped
+/// cache. Keeping the outputs separate avoids an extra split/copy when
+/// they become MLX arrays, while one mapped traversal removes repeated locks,
+/// binary searches, and observation-index lookups.
+struct CachedTrainingBatch: Sendable {
+    var currentObservations: Data
+    /// Batch-major remembered perception frames for the requested fixed lags.
+    var visualMemoryObservations: Data
+    var visualMemoryAvailability: [Float]
+    var history: Data
+    var targets: Data
+    var previousTargets: Data
+}
+
+enum BinaryBalanceContract {
+    /// Repeated presses establish that a short-lived control was intentional.
+    /// A sustained hold is an equally valid demonstration for movement keys:
+    /// requiring four releases would otherwise discard a long, deliberate W
+    /// hold even though it contributes hundreds of causal training targets.
+    static let minimumPressEpisodes = 4
+    static let minimumHeldDurationSeconds = 0.5
+    /// Keeps an observed output distinct from the zero loss-mask sentinel even
+    /// when it is active for virtually the complete recording.
+    static let minimumPositiveWeight: Float = 0.000_001
+    /// Must stay identical to the press/release bonus in `binaryControlLoss`.
+    /// Class weights balance the effective static mass after this bonus, not
+    /// merely raw frame counts.
+    static let transitionBonus: Float = 3
+
+    static func hasReliableKeyboardEvidence(
+        positiveSamples: Int,
+        pressEpisodes: Int,
+        actionFPS: Double
+    ) -> Bool {
+        guard positiveSamples > 0 else { return false }
+        let activeDuration = Double(positiveSamples) / max(0.0001, actionFPS)
+        return pressEpisodes >= minimumPressEpisodes
+            || activeDuration >= minimumHeldDurationSeconds
+    }
+
+    static func preservesTrainingEvidence(
+        outputIndex: Int,
+        totalPositiveSamples: Int,
+        totalPressEpisodes: Int,
+        trainingPositiveSamples: Int,
+        trainingPressEpisodes: Int,
+        actionFPS: Double
+    ) -> Bool {
+        guard totalPositiveSamples > 0 else { return true }
+        let isKeyboardCapability = ActionLayout.keyboardAndShift.contains(outputIndex)
+            || ActionLayout.commandOptionControl.contains(outputIndex)
+        if isKeyboardCapability,
+           hasReliableKeyboardEvidence(
+               positiveSamples: totalPositiveSamples,
+               pressEpisodes: totalPressEpisodes,
+               actionFPS: actionFPS
+           ) {
+            return hasReliableKeyboardEvidence(
+                positiveSamples: trainingPositiveSamples,
+                pressEpisodes: trainingPressEpisodes,
+                actionFPS: actionFPS
+            )
+        }
+        // Mouse buttons have no runtime capability gate. For a keyboard
+        // control whose complete dataset is itself under-demonstrated, retain
+        // at least one target so adding later recordings can build on it.
+        return trainingPositiveSamples > 0
+    }
+}
+
+struct BinaryBalancePlan: Sendable {
+    var positiveWeights: [Float]
+    var report: TrainingBalanceReport
+    var supportedKeyCodes: Set<UInt16>
+}
+
+enum ContinuousBalanceContract {
+    /// A handful of noisy deltas must not outweigh an entire recording, while
+    /// genuinely sparse camera/scroll actions still need enough authority to
+    /// escape the all-zero Smooth L1 optimum.
+    static let maximumActiveWeight: Float = 4_096
+    static let activityEpsilon: Float = 0.0001
+}
+
+struct ContinuousBalancePlan: Sendable {
+    var activeWeights: [Float]
+    var outputs: [ContinuousOutputBalance]
+}
+
+struct BinaryTargetStatistics: Sendable {
+    var sampleCount: Int
+    var positives: [Int]
+    var pressEpisodes: [Int]
+    var releaseEpisodes: [Int]
+
+    static var zero: BinaryTargetStatistics {
+        BinaryTargetStatistics(
+            sampleCount: 0,
+            positives: [Int](repeating: 0, count: ActionLayout.count),
+            pressEpisodes: [Int](repeating: 0, count: ActionLayout.count),
+            releaseEpisodes: [Int](repeating: 0, count: ActionLayout.count)
+        )
+    }
+
+    mutating func add(_ other: BinaryTargetStatistics) {
+        sampleCount += other.sampleCount
+        for output in 0..<ActionLayout.count {
+            positives[output] += other.positives[output]
+            pressEpisodes[output] += other.pressEpisodes[output]
+            releaseEpisodes[output] += other.releaseEpisodes[output]
+        }
+    }
+
+    mutating func subtract(_ other: BinaryTargetStatistics) {
+        sampleCount = max(0, sampleCount - other.sampleCount)
+        for output in 0..<ActionLayout.count {
+            positives[output] = max(0, positives[output] - other.positives[output])
+            pressEpisodes[output] = max(0, pressEpisodes[output] - other.pressEpisodes[output])
+            releaseEpisodes[output] = max(0, releaseEpisodes[output] - other.releaseEpisodes[output])
+        }
+    }
 }
 
 final class CachedDataset: @unchecked Sendable {
@@ -197,13 +337,11 @@ final class CachedDataset: @unchecked Sendable {
     /// This works for both new and already-existing caches without another pass
     /// over the source recordings.
     func demonstratedKeyCodes(at indices: [Int]? = nil) -> Set<UInt16> {
-        let counts = indices.map { binaryPositiveCounts(at: $0) }
-            ?? binaryPositiveCounts(in: 0..<manifest.sampleCount)
-        var result: Set<UInt16> = []
-        for key in 0..<128 where counts[ActionLayout.keyboard.lowerBound + key] > 0 { result.insert(UInt16(key)) }
-        let modifierKeys: [UInt16] = [56, 59, 58, 55]
-        for modifier in 0..<4 where counts[ActionLayout.modifiers.lowerBound + modifier] > 0 { result.insert(modifierKeys[modifier]) }
-        return result
+        binaryBalancePlan(
+            at: indices ?? Array(0..<manifest.sampleCount),
+            channels: .all,
+            restrictions: ActionRestrictions()
+        ).supportedKeyCodes
     }
 
     func binaryPositiveCounts(in range: Range<Int>) -> [Int] {
@@ -266,42 +404,202 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
-    /// Per-output positive weights for class-balanced binary control losses.
-    /// A keyboard tensor has 128 mostly-zero values, so unweighted BCE rewards
-    /// an inert policy. Weights are derived only from the training split and are
-    /// bounded so a handful of noisy samples cannot dominate every batch. The
-    /// ceiling remains high enough for brief but intentional controls to matter.
-    func positiveClassWeights(at indices: [Int], restrictions: ActionRestrictions) -> [Float] {
-        guard !indices.isEmpty else { return [Float](repeating: 1, count: ActionLayout.count) }
-        let positiveCounts = binaryPositiveCounts(at: indices)
-
-        var result = [Float](repeating: 1, count: ActionLayout.count)
-        for index in ActionLayout.binary {
-            let isBlocked: Bool
-            switch index {
-            case ActionLayout.buttons: isBlocked = restrictions.blockedMouseButtons.contains(UInt8(index - ActionLayout.buttons.lowerBound))
-            case ActionLayout.keyboard: isBlocked = restrictions.blockedKeyCodes.contains(UInt16(index - ActionLayout.keyboard.lowerBound))
-            case ActionLayout.modifiers: isBlocked = !restrictions.allowsModifier(index - ActionLayout.modifiers.lowerBound)
-            default: isBlocked = false
-            }
-            if isBlocked {
-                result[index] = 0
-                continue
-            }
-            let positives = positiveCounts[index]
-            if positives == 0 {
-                // Keyboard and modifier outputs are protected by the runtime's
-                // demonstrated-key firewall, so completely unseen dimensions
-                // should not let thousands of easy zero labels dominate the
-                // useful controls. Mouse buttons have no equivalent capability
-                // firewall and remain trained toward off when unseen.
-                if ActionLayout.keyboard.contains(index) || ActionLayout.modifiers.contains(index) { result[index] = 0 }
-                continue
-            }
-            let negatives = max(1, indices.count - positives)
-            result[index] = min(1_024, max(1, Float(negatives) / Float(positives)))
+    /// Evidence-gated, transition-aware positive weights for binary controls.
+    /// Every supported output receives enough positive mass to make 0.5 the
+    /// neutral constant prediction. That invariant is essential: a weaker
+    /// square-root correction makes "always off" the objective optimum for
+    /// every control active on less than half of the timeline.
+    func binaryBalancePlan(
+        at indices: [Int],
+        channels: ActionChannels,
+        restrictions: ActionRestrictions
+    ) -> BinaryBalancePlan {
+        guard !indices.isEmpty else {
+            return BinaryBalancePlan(
+                positiveWeights: [Float](repeating: 1, count: ActionLayout.count),
+                report: TrainingBalanceReport(outputs: []),
+                supportedKeyCodes: []
+            )
         }
-        return result
+        let statistics = binaryTargetStatistics(at: indices)
+        let learnable = Set(ActionLayout.learnableBinaryIndices(channels: channels, restrictions: restrictions))
+        let configured = Set(ActionLayout.learnableBinaryIndices(
+            channels: channels,
+            restrictions: ActionRestrictions()
+        ))
+        var weights = [Float](repeating: 1, count: ActionLayout.count)
+        var outputs: [BinaryOutputBalance] = []
+        var supportedKeyCodes: Set<UInt16> = []
+
+        for index in ActionLayout.binary {
+            if configured.contains(index), !learnable.contains(index) { weights[index] = 0 }
+            guard learnable.contains(index) else { continue }
+            let positives = statistics.positives[index]
+            let presses = statistics.pressEpisodes[index]
+            let releases = statistics.releaseEpisodes[index]
+            let activeDuration = Double(positives) / max(0.0001, manifest.actionFPS)
+            let hasRuntimeCapabilityFirewall = ActionLayout.keyboardAndShift.contains(index)
+                || ActionLayout.commandOptionControl.contains(index)
+            let supported = positives > 0
+                && (!hasRuntimeCapabilityFirewall || BinaryBalanceContract.hasReliableKeyboardEvidence(
+                    positiveSamples: positives,
+                    pressEpisodes: presses,
+                    actionFPS: manifest.actionFPS
+                ))
+
+            if hasRuntimeCapabilityFirewall, !supported {
+                // Mask both positive and negative loss for unsupported keyboard
+                // dimensions. The same evidence rule removes them from the
+                // immutable runtime capability set, so random logits cannot act.
+                weights[index] = 0
+            } else if positives > 0 {
+                let negatives = max(0, indices.count - positives)
+                let positiveMass = Float(positives)
+                    + BinaryBalanceContract.transitionBonus * Float(presses)
+                let negativeMass = Float(negatives)
+                    + BinaryBalanceContract.transitionBonus * Float(releases)
+                weights[index] = negativeMass > 0
+                    ? max(
+                        BinaryBalanceContract.minimumPositiveWeight,
+                        negativeMass / max(1, positiveMass)
+                    )
+                    : 1
+            }
+
+            outputs.append(BinaryOutputBalance(
+                outputIndex: index,
+                positiveSamples: positives,
+                pressEpisodes: presses,
+                releaseEpisodes: releases,
+                activeDurationSeconds: activeDuration,
+                positiveWeight: Double(weights[index]),
+                isSupported: supported
+            ))
+            guard supported else { continue }
+            if ActionLayout.keyboard.contains(index) {
+                supportedKeyCodes.insert(UInt16(index - ActionLayout.keyboard.lowerBound))
+            } else if index == ActionLayout.shift.lowerBound {
+                supportedKeyCodes.insert(56)
+            } else if ActionLayout.commandOptionControl.contains(index) {
+                let modifierKeys: [UInt16] = [59, 58, 55]
+                supportedKeyCodes.insert(modifierKeys[index - ActionLayout.commandOptionControl.lowerBound])
+            }
+        }
+        return BinaryBalancePlan(
+            positiveWeights: weights,
+            report: TrainingBalanceReport(outputs: outputs.sorted { $0.outputIndex < $1.outputIndex }),
+            supportedKeyCodes: supportedKeyCodes
+        )
+    }
+
+    func positiveClassWeights(
+        at indices: [Int],
+        channels: ActionChannels = .all,
+        restrictions: ActionRestrictions
+    ) -> [Float] {
+        binaryBalancePlan(at: indices, channels: channels, restrictions: restrictions).positiveWeights
+    }
+
+    /// Exact dataset-level active/idle correction for signed transient outputs.
+    /// Fixed minibatch constants cannot account for profiles where camera
+    /// motion occurs on one row in two versus one row in two thousand.
+    func continuousBalancePlan(
+        at indices: [Int],
+        channels: ActionChannels
+    ) -> ContinuousBalancePlan {
+        let configured =
+            (channels.mouseMovement ? Array(ActionLayout.relativeMouse) : [])
+            + (channels.scroll ? Array(ActionLayout.scroll) : [])
+        var weights = [Float](repeating: 0, count: ActionLayout.count)
+        guard !indices.isEmpty, !configured.isEmpty else {
+            return ContinuousBalancePlan(activeWeights: weights, outputs: [])
+        }
+        var activeCounts = [Int](repeating: 0, count: ActionLayout.count)
+        var activeMagnitudes = [Double](repeating: 0, count: ActionLayout.count)
+        actions.withUnsafeBytes { raw in
+            guard let address = raw.baseAddress else { return }
+            let values = address.assumingMemoryBound(to: UInt32.self)
+            for row in indices {
+                let base = row * manifest.actionValuesPerSample
+                for output in configured {
+                    let value = Float(bitPattern: UInt32(littleEndian: values[base + output]))
+                    guard value.isFinite, abs(value) > ContinuousBalanceContract.activityEpsilon else {
+                        continue
+                    }
+                    activeCounts[output] += 1
+                    activeMagnitudes[output] += Double(abs(value))
+                }
+            }
+        }
+        var outputs: [ContinuousOutputBalance] = []
+        outputs.reserveCapacity(configured.count)
+        for output in configured {
+            let active = activeCounts[output]
+            let inactive = max(0, indices.count - active)
+            let supported = active > 0
+            let weight: Float
+            if supported {
+                weight = min(
+                    ContinuousBalanceContract.maximumActiveWeight,
+                    max(
+                        BinaryBalanceContract.minimumPositiveWeight,
+                        inactive > 0 ? Float(inactive) / Float(active) : 1
+                    )
+                )
+                weights[output] = weight
+            } else {
+                weight = 0
+            }
+            outputs.append(ContinuousOutputBalance(
+                outputIndex: output,
+                activeSamples: active,
+                meanActiveMagnitude: active > 0 ? activeMagnitudes[output] / Double(active) : 0,
+                activeWeight: Double(weight),
+                isSupported: supported
+            ))
+        }
+        return ContinuousBalancePlan(activeWeights: weights, outputs: outputs)
+    }
+
+    func binaryTargetStatistics<S: Sequence>(
+        at indices: S
+    ) -> BinaryTargetStatistics where S.Element == Int {
+        var sampleCount = 0
+        var positives = [Int](repeating: 0, count: ActionLayout.count)
+        var pressEpisodes = [Int](repeating: 0, count: ActionLayout.count)
+        var releaseEpisodes = [Int](repeating: 0, count: ActionLayout.count)
+        actions.withUnsafeBytes { raw in
+            guard let address = raw.baseAddress else { return }
+            let values = address.assumingMemoryBound(to: UInt32.self)
+            func active(row: Int, output: Int) -> Bool {
+                let bits = UInt32(littleEndian: values[row * manifest.actionValuesPerSample + output])
+                return Float(bitPattern: bits) >= 0.5
+            }
+            for row in indices {
+                sampleCount += 1
+                let segmentStart = segmentStart(for: row)
+                for output in ActionLayout.binary {
+                    let current = active(row: row, output: output)
+                    let previous = row > segmentStart
+                        ? active(row: row - 1, output: output)
+                        : false
+                    if current {
+                        positives[output] += 1
+                    }
+                    if current, !previous {
+                        pressEpisodes[output] += 1
+                    } else if !current, previous {
+                        releaseEpisodes[output] += 1
+                    }
+                }
+            }
+        }
+        return BinaryTargetStatistics(
+            sampleCount: sampleCount,
+            positives: positives,
+            pressEpisodes: pressEpisodes,
+            releaseEpisodes: releaseEpisodes
+        )
     }
 
     /// Finds action rows that carry substantially more learning signal than an
@@ -349,23 +647,92 @@ final class CachedDataset: @unchecked Sendable {
     }
 
     /// Returns the first single-recording validation row whose complete action
-    /// history and current/preceding perception pair are disjoint from training.
+    /// and visual histories are disjoint from training.
     /// Recorded frame delivery can be irregular, so an FPS-derived fixed gap is
     /// not sufficient: a static frame may back many action rows.
-    func firstDisjointValidationIndex(trainingEnd: Int, proposedStart: Int) -> Int? {
+    func firstDisjointValidationIndex(
+        trainingEnd: Int,
+        proposedStart: Int,
+        historyLength requestedHistoryLength: Int? = nil,
+        visualMemoryMaximumLag: Int
+    ) -> Int? {
         guard trainingEnd > 0, trainingEnd < count else { return nil }
         let lastTrainingPair = observationPair(at: trainingEnd - 1)
         let maximumTrainingObservation = max(lastTrainingPair.current, lastTrainingPair.previous)
-        var candidate = max(proposedStart, trainingEnd + manifest.historyLength)
+        let historyLength = max(0, requestedHistoryLength ?? manifest.historyLength)
+        let firstObservation = observationIndex(at: segmentStart(for: trainingEnd), slot: 0)
+        let maximumLag = max(0, visualMemoryMaximumLag)
+        var candidate = max(proposedStart, trainingEnd + historyLength)
         while candidate < count {
             let pair = observationPair(at: candidate)
+            let availableLag = max(0, pair.current - firstObservation)
+            let oldestRemembered = pair.current - min(maximumLag, availableLag)
+            let predecessorIsDisjoint = maximumLag == 0 || pair.previous > maximumTrainingObservation
             if pair.current > maximumTrainingObservation,
-               pair.previous > maximumTrainingObservation {
+               predecessorIsDisjoint,
+               oldestRemembered > maximumTrainingObservation {
                 return candidate
             }
             candidate += 1
         }
         return nil
+    }
+
+    /// Extends a single-recording training prefix only as far as necessary to
+    /// retain the binary evidence available in the complete recording. This
+    /// avoids holding out three of four key presses (or most of one sustained
+    /// hold) and then silently masking that control from the objective.
+    func minimumTrainingEndPreservingBinaryEvidence(
+        proposedEnd: Int,
+        outputs: [Int]
+    ) -> Int? {
+        guard proposedEnd > 0, proposedEnd <= count else { return nil }
+        let total = binaryTargetStatistics(at: 0..<count)
+        var training = binaryTargetStatistics(at: 0..<proposedEnd)
+        func isComplete() -> Bool {
+            outputs.allSatisfy { output in
+                BinaryBalanceContract.preservesTrainingEvidence(
+                    outputIndex: output,
+                    totalPositiveSamples: total.positives[output],
+                    totalPressEpisodes: total.pressEpisodes[output],
+                    trainingPositiveSamples: training.positives[output],
+                    trainingPressEpisodes: training.pressEpisodes[output],
+                    actionFPS: manifest.actionFPS
+                )
+            }
+        }
+        if isComplete() { return proposedEnd }
+
+        var result: Int?
+        actions.withUnsafeBytes { raw in
+            guard let address = raw.baseAddress else { return }
+            let values = address.assumingMemoryBound(to: UInt32.self)
+            func active(row: Int, output: Int) -> Bool {
+                let bits = UInt32(littleEndian: values[row * manifest.actionValuesPerSample + output])
+                return Float(bitPattern: bits) >= 0.5
+            }
+            for row in proposedEnd..<count {
+                training.sampleCount += 1
+                let segmentStart = segmentStart(for: row)
+                for output in outputs {
+                    let current = active(row: row, output: output)
+                    let previous = row > segmentStart
+                        ? active(row: row - 1, output: output)
+                        : false
+                    if current { training.positives[output] += 1 }
+                    if current, !previous {
+                        training.pressEpisodes[output] += 1
+                    } else if !current, previous {
+                        training.releaseEpisodes[output] += 1
+                    }
+                }
+                if isComplete() {
+                    result = row + 1
+                    break
+                }
+            }
+        }
+        return result
     }
 
     /// Builds a fixed held-out subset once per run. At least one positive for
@@ -475,7 +842,7 @@ final class CachedDataset: @unchecked Sendable {
     /// Returns the real immediately preceding action row for transition loss,
     /// independently of how much history the model is configured to observe.
     /// Segment starts use zero state. This closes the zero-history loophole
-    /// where the placeholder recurrent row made every held positive look like a
+    /// where the placeholder history row made every held positive look like a
     /// fresh press on every training tick.
     func previousActionBatch(at indices: [Int]) -> Data {
         let rowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
@@ -495,18 +862,19 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
-    func historyBatch(at indices: [Int]) -> Data {
-        let historyLength = max(1, manifest.historyLength)
+    func historyBatch(at indices: [Int], historyLength requestedHistoryLength: Int? = nil) -> Data {
+        let requestedHistoryLength = max(0, requestedHistoryLength ?? manifest.historyLength)
+        let historyLength = max(1, requestedHistoryLength)
         let rowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
         var result = Data(count: indices.count * historyLength * rowBytes)
-        guard manifest.historyLength > 0 else { return result }
+        guard requestedHistoryLength > 0 else { return result }
         result.withUnsafeMutableBytes { destination in
             actions.withUnsafeBytes { source in
                 guard let destinationBase = destination.baseAddress, let sourceBase = source.baseAddress else { return }
                 for (batchRow, index) in indices.enumerated() {
                     let segmentStart = segmentStart(for: index)
-                    for historyRow in 0..<manifest.historyLength {
-                        let sourceIndex = index - manifest.historyLength + historyRow
+                    for historyRow in 0..<requestedHistoryLength {
+                        let sourceIndex = index - requestedHistoryLength + historyRow
                         guard sourceIndex >= segmentStart, sourceIndex < index else { continue }
                         let destinationOffset = (batchRow * historyLength + historyRow) * rowBytes
                         memcpy(destinationBase.advanced(by: destinationOffset), sourceBase.advanced(by: sourceIndex * rowBytes), rowBytes)
@@ -517,12 +885,117 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
-    func history(at index: Int) -> [Float] {
+    func trainingBatch(
+        at indices: [Int],
+        historyLength requestedHistoryLength: Int,
+        visualMemoryLags requestedVisualMemoryLags: [Int]
+    ) -> CachedTrainingBatch {
+        let observationBytes = manifest.observationBytesPerSample
+        let actionRowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
+        let requestedHistoryLength = max(0, requestedHistoryLength)
+        let storedHistoryLength = max(1, requestedHistoryLength)
+        let visualMemoryLags = Array(
+            requestedVisualMemoryLags
+                .prefix(VisualMemoryContract.maximumFrameCount)
+                .map { min(VisualMemoryContract.maximumStride * VisualMemoryContract.maximumFrameCount, max(1, $0)) }
+        )
+        let visualMemoryCount = visualMemoryLags.count
+        var current = Data(count: indices.count * observationBytes)
+        var visualMemory = Data(count: indices.count * visualMemoryCount * observationBytes)
+        var visualMemoryAvailability = [Float](repeating: 0, count: indices.count * visualMemoryCount)
+        var history = Data(count: indices.count * storedHistoryLength * actionRowBytes)
+        var targets = Data(count: indices.count * actionRowBytes)
+        var previousTargets = Data(count: indices.count * actionRowBytes)
+        guard !indices.isEmpty else {
+            return CachedTrainingBatch(
+                currentObservations: current,
+                visualMemoryObservations: visualMemory,
+                visualMemoryAvailability: visualMemoryAvailability,
+                history: history,
+                targets: targets,
+                previousTargets: previousTargets
+            )
+        }
+
+        current.withUnsafeMutableBytes { currentDestination in
+            visualMemory.withUnsafeMutableBytes { visualMemoryDestination in
+                history.withUnsafeMutableBytes { historyDestination in
+                    targets.withUnsafeMutableBytes { targetDestination in
+                        previousTargets.withUnsafeMutableBytes { previousTargetDestination in
+                            observations.withUnsafeBytes { observationSource in
+                                observationIndices.withUnsafeBytes { mappingSource in
+                                    actions.withUnsafeBytes { actionSource in
+                                        guard let currentBase = currentDestination.baseAddress,
+                                              let historyBase = historyDestination.baseAddress,
+                                              let targetBase = targetDestination.baseAddress,
+                                              let previousTargetBase = previousTargetDestination.baseAddress,
+                                              let observationBase = observationSource.baseAddress,
+                                              let mappingBase = mappingSource.baseAddress,
+                                              let actionBase = actionSource.baseAddress else { return }
+                                        let visualMemoryBase = visualMemoryDestination.baseAddress
+                                        for (batchRow, sampleIndex) in indices.enumerated() {
+                                            let mappingOffset = sampleIndex * 2 * MemoryLayout<UInt32>.size
+                                            let currentIndex = Int(mappingBase.loadUnaligned(fromByteOffset: mappingOffset, as: UInt32.self).littleEndian)
+                                            memcpy(currentBase.advanced(by: batchRow * observationBytes), observationBase.advanced(by: currentIndex * observationBytes), observationBytes)
+                                            memcpy(targetBase.advanced(by: batchRow * actionRowBytes), actionBase.advanced(by: sampleIndex * actionRowBytes), actionRowBytes)
+
+                                            let segmentStart = segmentStart(for: sampleIndex)
+                                            if let visualMemoryBase, visualMemoryCount > 0 {
+                                                let segmentMappingOffset = segmentStart * 2 * MemoryLayout<UInt32>.size
+                                                let firstObservation = Int(mappingBase.loadUnaligned(
+                                                    fromByteOffset: segmentMappingOffset,
+                                                    as: UInt32.self
+                                                ).littleEndian)
+                                                let availableLag = max(0, currentIndex - firstObservation)
+                                                for (slot, requestedLag) in visualMemoryLags.enumerated() {
+                                                    let actualLag = min(requestedLag, availableLag)
+                                                    let rememberedIndex = currentIndex - actualLag
+                                                    let destinationOffset = (batchRow * visualMemoryCount + slot) * observationBytes
+                                                    memcpy(
+                                                        visualMemoryBase.advanced(by: destinationOffset),
+                                                        observationBase.advanced(by: rememberedIndex * observationBytes),
+                                                        observationBytes
+                                                    )
+                                                    visualMemoryAvailability[batchRow * visualMemoryCount + slot]
+                                                        = Float(actualLag) / Float(requestedLag)
+                                                }
+                                            }
+                                            if sampleIndex > segmentStart {
+                                                memcpy(previousTargetBase.advanced(by: batchRow * actionRowBytes), actionBase.advanced(by: (sampleIndex - 1) * actionRowBytes), actionRowBytes)
+                                            }
+                                            guard requestedHistoryLength > 0 else { continue }
+                                            for historyRow in 0..<requestedHistoryLength {
+                                                let sourceIndex = sampleIndex - requestedHistoryLength + historyRow
+                                                guard sourceIndex >= segmentStart, sourceIndex < sampleIndex else { continue }
+                                                let destinationOffset = (batchRow * storedHistoryLength + historyRow) * actionRowBytes
+                                                memcpy(historyBase.advanced(by: destinationOffset), actionBase.advanced(by: sourceIndex * actionRowBytes), actionRowBytes)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return CachedTrainingBatch(
+            currentObservations: current,
+            visualMemoryObservations: visualMemory,
+            visualMemoryAvailability: visualMemoryAvailability,
+            history: history,
+            targets: targets,
+            previousTargets: previousTargets
+        )
+    }
+
+    func history(at index: Int, historyLength requestedHistoryLength: Int? = nil) -> [Float] {
         let segmentStart = segmentStart(for: index)
-        var values = [Float](repeating: 0, count: max(1, manifest.historyLength) * ActionLayout.count)
-        guard manifest.historyLength > 0 else { return values }
-        for h in 0..<manifest.historyLength {
-            let source = index - manifest.historyLength + h
+        let historyLength = max(0, requestedHistoryLength ?? manifest.historyLength)
+        var values = [Float](repeating: 0, count: max(1, historyLength) * ActionLayout.count)
+        guard historyLength > 0 else { return values }
+        for h in 0..<historyLength {
+            let source = index - historyLength + h
             guard source >= segmentStart, source < index else { continue }
             values.replaceSubrange(h * ActionLayout.count..<(h + 1) * ActionLayout.count, with: action(at: source))
         }
@@ -570,15 +1043,17 @@ actor DatasetCacheBuilder {
 
     func cache(for profile: AIProfile, recordings: [RecordingItem], progress: @escaping @Sendable (Double, String) -> Void) async throws -> CachedDataset {
         guard !recordings.isEmpty else { throw AgentTrainerError.noData }
-        if preprocessor == nil { preprocessor = try VisionPreprocessor() }
         try await workspace.prepare()
         let root = await workspace.cacheDirectory()
         let key = try cacheKey(profile: profile, recordings: recordings)
         let directory = root.appendingPathComponent("\(key).atrcache", isDirectory: true)
         if FileManager.default.fileExists(atPath: directory.appendingPathComponent("manifest.json").path), let cached = try? CachedDataset(directory: directory) {
-            progress(1, "Reusing packed dataset cache")
+            progress(1, "Reusing lossless sampled-video cache")
             return cached
         }
+        // Do not compile the Metal kernel or retain its in-flight buffers when
+        // the mapped cache already exists.
+        if preprocessor == nil { preprocessor = try VisionPreprocessor() }
 
         let temporary = root.appendingPathComponent(".\(key).\(UUID().uuidString).tmp", isDirectory: true)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -588,6 +1063,7 @@ actor DatasetCacheBuilder {
         var segments: [CacheSegment] = []
         var sampleCount = 0
         var observationCount = 0
+        var publishedDirectory = false
         let usableDurations = recordings.map { recording in
             let start = max(0, min(recording.manifest.duration, recording.manifest.trimStart))
             let end = max(start, min(recording.manifest.duration, recording.manifest.trimEnd ?? recording.manifest.duration))
@@ -599,7 +1075,7 @@ actor DatasetCacheBuilder {
             for (recordingIndex, recording) in recordings.enumerated() {
                 try Task.checkCancellation()
                 let recordingDuration = usableDurations[recordingIndex]
-                progress(completedDuration / totalUsableDuration, "Packing \(recording.manifest.name) • \(Int((completedDuration / totalUsableDuration * 100).rounded()))%")
+                progress(completedDuration / totalUsableDuration, "Sampling \(recording.manifest.name) • \(Int((completedDuration / totalUsableDuration * 100).rounded()))%")
                 let start = sampleCount
                 let appended = try await appendRecording(
                     recording,
@@ -610,7 +1086,7 @@ actor DatasetCacheBuilder {
                     actions: actions,
                     progress: { recordingFraction in
                         let overall = min(0.999, (completedDuration + recordingDuration * recordingFraction) / totalUsableDuration)
-                        progress(overall, "Packing \(recording.manifest.name) • \(Int((overall * 100).rounded()))%")
+                        progress(overall, "Sampling \(recording.manifest.name) • \(Int((overall * 100).rounded()))%")
                     }
                 )
                 completedDuration += recordingDuration
@@ -621,15 +1097,22 @@ actor DatasetCacheBuilder {
                 }
             }
             try observations.finish(); try observationIndices.finish(); try actions.finish()
-            let manifest = DatasetCacheManifest(key: key, createdAt: Date(), preprocessing: profile.preprocessing, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, historyLength: profile.training.historyLength, sampleCount: sampleCount, observationCount: observationCount, observationBytesPerSample: profile.preprocessing.sampleByteCount, actionValuesPerSample: ActionLayout.count, segments: segments)
+            let manifest = DatasetCacheManifest(key: key, createdAt: Date(), preprocessing: profile.preprocessing, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, historyLength: PolicyInputContract.actionHistoryLength, sampleCount: sampleCount, observationCount: observationCount, observationBytesPerSample: profile.preprocessing.sampleByteCount, actionValuesPerSample: ActionLayout.count, segments: segments)
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(manifest).write(to: temporary.appendingPathComponent("manifest.json"), options: .atomic)
             if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
             try FileManager.default.moveItem(at: temporary, to: directory)
-            progress(1, "Dataset cache ready")
-            return try CachedDataset(directory: directory)
+            publishedDirectory = true
+            progress(1, "Lossless sampled-video cache ready")
+            let cached = try CachedDataset(directory: directory)
+            // Sampling is complete; release the Metal texture cache and the
+            // three-frame output pool before optimizer tensors claim memory.
+            preprocessor = nil
+            return cached
         } catch {
             try? observations.finish(); try? observationIndices.finish(); try? actions.finish(); try? FileManager.default.removeItem(at: temporary)
+            if publishedDirectory { try? FileManager.default.removeItem(at: directory) }
+            preprocessor = nil
             throw error
         }
     }
@@ -640,11 +1123,14 @@ actor DatasetCacheBuilder {
             let preprocessing: PreprocessingSpec
             let actionFPS: Double
             let perceptionFPS: Double
-            let historyLength: Int
             let recordings: [RecordingManifest]
         }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]; encoder.dateEncodingStrategy = .iso8601
-        let identity = Identity(cacheSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, historyLength: profile.training.historyLength, recordings: recordings.map(\.manifest))
+        // History is derived from immutable cached action rows at batch time.
+        // Excluding both history layouts lets users tune action/visual memory
+        // or switch either Policy-v9 family without losslessly decoding the
+        // same videos again.
+        let identity = Identity(cacheSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, recordings: recordings.map(\.manifest))
         let digest = SHA256.hash(data: try encoder.encode(identity))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
@@ -689,6 +1175,14 @@ actor DatasetCacheBuilder {
         let usableDuration = trainingEnd - trainingStart
         let progressInterval = max(2, usableDuration / 100)
         var nextProgressTime = trainingStart
+        var pendingFrames: [VisionPreprocessor.PackedFrameJob] = []
+        let preprocessingDepth = 3
+
+        func writeOldestPackedFrame() throws {
+            guard !pendingFrames.isEmpty else { return }
+            let job = pendingFrames.removeFirst()
+            try preprocessor.finishPackedBytes(job) { try observations.append($0) }
+        }
 
         // Establish the held-control and pointer state at the trim boundary,
         // but discard movement/scroll that happened before the usable range.
@@ -718,12 +1212,15 @@ actor DatasetCacheBuilder {
                 }
             }
             if latestObservationIndex == nil || t + 0.000_001 >= nextPerception {
-                try preprocessor.withPackedBytes(buffer, spec: profile.preprocessing) { try observations.append($0) }
+                pendingFrames.append(try preprocessor.submitPackedFrame(buffer, spec: profile.preprocessing))
                 let newIndex = observationBase + localObservationCount
                 localObservationCount += 1
                 precedingObservationIndex = latestObservationIndex ?? newIndex
                 latestObservationIndex = newIndex
                 while nextPerception <= t { nextPerception += perceptionInterval }
+                if pendingFrames.count >= preprocessingDepth {
+                    try writeOldestPackedFrame()
+                }
             }
             if let currentObservation = latestObservationIndex, let precedingObservation = precedingObservationIndex {
                 while nextAction <= t + 0.000_001 && nextAction <= trainingEnd {
@@ -732,6 +1229,7 @@ actor DatasetCacheBuilder {
                 }
             }
         }
+        while !pendingFrames.isEmpty { try writeOldestPackedFrame() }
         if reader.status == .failed { throw reader.error ?? AgentTrainerError.storage("Video decoding failed while building the cache.") }
         if let currentObservation = latestObservationIndex, let precedingObservation = precedingObservationIndex {
             while nextAction <= trainingEnd {
