@@ -224,7 +224,14 @@ struct LibraryView: View {
                         HStack { Label("\(summary.keyEventCount) key events", systemImage: "keyboard"); Label("\(summary.mouseEventCount) pointer events", systemImage: "computermouse") }.font(.caption2).foregroundStyle(.secondary)
                         if summary.mouse.moveEventCount > 0 {
                             HStack(spacing: 7) {
-                                StatusPill(text: summary.mouse.isGameCamera ? "Game camera detected" : "Moving cursor detected", color: summary.mouse.isGameCamera ? ATColor.green : ATColor.cyan)
+                                switch summary.mouse.controlEvidence {
+                                case .gameCamera:
+                                    StatusPill(text: "Game camera detected", color: ATColor.green)
+                                case .movingCursor:
+                                    StatusPill(text: "Moving cursor detected", color: ATColor.cyan)
+                                case .insufficient:
+                                    StatusPill(text: "Too little motion to classify", color: ATColor.amber)
+                                }
                                 StatusPill(text: summary.mouse.positionsAreValid ? "Positions valid" : "\(summary.mouse.outOfCaptureBoundsCount) invalid positions", color: summary.mouse.positionsAreValid ? ATColor.green : ATColor.coral)
                             }
                             Text("Raw delta active on \((summary.mouse.nonzeroDeltaFraction * 100).formatted(.number.precision(.fractionLength(1))))% of move samples • mean active |Δ| \(summary.mouse.meanActiveDeltaMagnitude.formatted(.number.precision(.fractionLength(2)))) px • max \(summary.mouse.maximumDeltaMagnitude.formatted(.number.precision(.fractionLength(1)))) px")

@@ -33,6 +33,7 @@ final class AgentRuntime: @unchecked Sendable {
     private var predictionFunction: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     private var activationVisualizationFunctions: [VisualizationFunction] = []
     private var channelVisualizationFunction: (@Sendable ([MLXArray]) -> [MLXArray])?
+    private var spatialTokenVisualizationFunction: (@Sendable ([MLXArray]) -> [MLXArray])?
     private var saliencyVisualizationFunction: (@Sendable ([MLXArray]) -> [MLXArray])?
     private var saliencyGradientFunction: (([MLXArray]) -> MLXArray)?
     private var profile: AIProfile?
@@ -44,13 +45,17 @@ final class AgentRuntime: @unchecked Sendable {
     private var outputPermissions = RuntimeOutputPermissions()
     private var outputPermissionsRevision = 0
     private var allowedKeyCodes: Set<UInt16> = []
+    private var binaryDecisionThresholds: [Float] = []
+    private var gameCameraMinimumPostedMagnitude =
+        GameCameraContract.defaultMinimumPostedMagnitude
     private var shiftUsesKeyboardChannel = false
     private var latestFrame: CVPixelBuffer?
     private var lastUsableCaptureFrame: CVPixelBuffer?
     private var processing = false
     private var predictionLatch = RuntimePredictionLatch()
-    private var history: [[Float]] = []
-    private var historyWriteIndex = 0
+    /// Policy v9 keeps one immutable zero row only to preserve the compiled
+    /// inference function's compatibility boundary.
+    private var placeholderHistory = [Float](repeating: 0, count: ActionLayout.count)
     private var actionTimer: DispatchSourceTimer?
     private var nextPerceptionTime = 0.0
     private var metrics = RuntimeMetrics()
@@ -64,7 +69,7 @@ final class AgentRuntime: @unchecked Sendable {
     private var lastVisualizationTime = 0.0
     private var lastMetricsReportTime = 0.0
     private var lastFocusCheckTime = 0.0
-    private var previousPackedVision: Data?
+    private var visualFrameHistory = PackedFrameHistory(capacity: 0)
     private var launchRevision: UInt64 = 0
     private var starting = false
     private var teardownInProgress = false
@@ -85,7 +90,7 @@ final class AgentRuntime: @unchecked Sendable {
         }
         guard version.schemaVersion == ModelContract.schemaVersion,
               version.relativeMouseScale == GameCameraContract.deltaScale else {
-            throw AgentTrainerError.model("This brain predates the current visual and Game Camera contracts. Retrain it from the original recordings.")
+            throw AgentTrainerError.model("This brain predates the Policy-v9 perception-backed contract or current Game Camera contract. Its files remain archived; retrain from the preserved original recordings.")
         }
         let launchToken: UInt64? = lock.withLock {
             guard stopped, !starting, !teardownInProgress else { return nil }
@@ -133,10 +138,16 @@ final class AgentRuntime: @unchecked Sendable {
             let logits = model.logits(visualFeatures: layers.last!, history: inputs[1])
             return [model.activatedPredictions(logits: logits), model.strongestChannelsForVisualization(layers.last!)]
         }
+        let spatialTokenVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
+            let layers = model.visualActivations(images: inputs[0])
+            let logits = model.logits(visualFeatures: layers.last!, history: inputs[1])
+            let routing = model.spatialTokensForVisualization(layers.last!)
+            return [model.activatedPredictions(logits: logits), routing]
+        }
         let saliencyVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
             let layers = model.visualActivations(images: inputs[0])
             let logits = model.logits(visualFeatures: layers.last!, history: inputs[1])
-            // Keep the exact final tensor on GPU for the post-CNN gradient.
+            // Keep the exact final visual tensor on GPU for the post-encoder gradient.
             // This graph intentionally omits the channel ranking used by the
             // separate feature-grid view.
             return [model.activatedPredictions(logits: logits), layers.last!]
@@ -151,10 +162,18 @@ final class AgentRuntime: @unchecked Sendable {
             self.predictionFunction = predictionFunction
             self.activationVisualizationFunctions = activationVisualizationFunctions
             self.channelVisualizationFunction = channelVisualizationFunction
+            self.spatialTokenVisualizationFunction = spatialTokenVisualizationFunction
             self.saliencyVisualizationFunction = saliencyVisualizationFunction
             self.saliencyGradientFunction = saliencyGradient
             self.profile = runtimeProfile
             self.allowedKeyCodes = allowedKeyCodes
+            self.binaryDecisionThresholds = BinaryDecisionThresholds.values(
+                from: version.validationReport
+            )
+            self.gameCameraMinimumPostedMagnitude =
+                GameCameraContract.minimumPostedMagnitude(
+                    from: version.validationReport
+                )
             self.shiftUsesKeyboardChannel = (version.trainingDataSchema ?? 0) >= 7
             self.safety = safety
             self.captureRect = captureRect
@@ -170,8 +189,12 @@ final class AgentRuntime: @unchecked Sendable {
             self.previewFPS = max(0, previewFPS)
             self.lastPreviewTime = 0
             self.lastVisualizationTime = 0
-            latestFrame = nil; lastUsableCaptureFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: max(1, runtimeProfile.training.historyLength))
-            historyWriteIndex = 0; metrics = RuntimeMetrics(); startedAt = CACurrentMediaTime(); nextPerceptionTime = 0; lastMetricsReportTime = 0; lastFocusCheckTime = 0; stopped = false
+            latestFrame = nil
+            lastUsableCaptureFrame = nil
+            visualFrameHistory = PackedFrameHistory(capacity: runtimeProfile.training.visualMemoryMaximumLag)
+            predictionLatch.reset()
+            placeholderHistory = [Float](repeating: 0, count: ActionLayout.count)
+            metrics = RuntimeMetrics(); startedAt = CACurrentMediaTime(); nextPerceptionTime = 0; lastMetricsReportTime = 0; lastFocusCheckTime = 0; stopped = false
             // Keep session enablement ordered with live permission changes. A
             // toggle made while model weights are loading must not be replaced
             // by the older settings captured when `start` was first called.
@@ -251,7 +274,7 @@ final class AgentRuntime: @unchecked Sendable {
             stopped = true
             teardownInProgress = true
             let timer = actionTimer; actionTimer = nil
-            latestFrame = nil; lastUsableCaptureFrame = nil; previousPackedVision = nil; predictionLatch.reset(); targetPID = nil
+            latestFrame = nil; lastUsableCaptureFrame = nil; visualFrameHistory = PackedFrameHistory(capacity: 0); predictionLatch.reset(); targetPID = nil
             return .perform(timer)
         }
         let timer: DispatchSourceTimer?
@@ -280,8 +303,8 @@ final class AgentRuntime: @unchecked Sendable {
         _ = try? await capture.stop()
         await drain(queue: inferenceQueue)
         lock.withLock {
-            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
-            latestFrame = nil; lastUsableCaptureFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history.removeAll(keepingCapacity: false); historyWriteIndex = 0; processing = false
+            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; spatialTokenVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false); binaryDecisionThresholds.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
+            latestFrame = nil; lastUsableCaptureFrame = nil; visualFrameHistory = PackedFrameHistory(capacity: 0); predictionLatch.reset(); placeholderHistory = [Float](repeating: 0, count: ActionLayout.count); processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
         MLXMemoryLifecycle.reclaimCaches(after: "agent runtime")
@@ -347,15 +370,14 @@ final class AgentRuntime: @unchecked Sendable {
     private func infer(_ buffer: CVPixelBuffer) {
         lock.lock()
         guard !stopped, let predictionFunction, let model, let profile else { lock.unlock(); return }
-        let history: [Float] = (0..<self.history.count).flatMap { offset in
-            self.history[(historyWriteIndex + offset) % self.history.count]
-        }
+        let history = placeholderHistory
         let now = CACurrentMediaTime()
         let settings = visualizationSettings
         let visualizationDue = settings.enabled && now - lastVisualizationTime >= 1 / settings.framesPerSecond
         if visualizationDue { lastVisualizationTime = now }
         let activationVisualizationFunctions = self.activationVisualizationFunctions
         let channelVisualizationFunction = self.channelVisualizationFunction
+        let spatialTokenVisualizationFunction = self.spatialTokenVisualizationFunction
         let saliencyVisualizationFunction = self.saliencyVisualizationFunction
         let saliencyGradientFunction = self.saliencyGradientFunction
         let mouseMode = self.mouseMode
@@ -363,13 +385,29 @@ final class AgentRuntime: @unchecked Sendable {
         let began = CACurrentMediaTime()
         do {
             let packed = try preprocessor.process(buffer, spec: profile.preprocessing)
-            let previousPacked = lock.withLock { () -> Data? in
-                let previous = previousPackedVision
-                previousPackedVision = packed
-                return previous
+            let visualMemory = lock.withLock { () -> PackedVisualMemoryContext in
+                metrics.visualMemoryDepth = min(
+                    visualFrameHistory.count,
+                    profile.training.visualMemoryMaximumLag
+                )
+                let context = visualFrameHistory.context(
+                    current: packed,
+                    lags: profile.training.visualMemoryLags
+                )
+                visualFrameHistory.append(packed)
+                return context
             }
-            let image = VisionPreprocessor.mlxTemporalTensor(current: packed, previous: previousPacked, batch: 1, spec: profile.preprocessing)
-            let historyArray = MLXArray(history, [1, max(1, profile.training.historyLength), ActionLayout.count])
+            let image = VisionPreprocessor.mlxVisualMemoryTensor(
+                current: packed,
+                memory: visualMemory,
+                batch: 1,
+                frameCount: profile.training.effectiveVisualMemoryFrames,
+                spec: profile.preprocessing
+            )
+            let historyArray = MLXArray(
+                history,
+                [1, PolicyInputContract.placeholderHistoryRows, ActionLayout.count]
+            )
             let result: [MLXArray] = Device.withDefaultDevice(.gpu) {
                 guard visualizationDue else { return [predictionFunction(image, historyArray)] }
                 switch settings.mode {
@@ -379,6 +417,9 @@ final class AgentRuntime: @unchecked Sendable {
                     return activationVisualizationFunctions[selectedLayer]([image, historyArray])
                 case .featureChannels:
                     guard let forward = channelVisualizationFunction?([image, historyArray]), forward.count >= 2 else { return [predictionFunction(image, historyArray)] }
+                    return forward
+                case .spatialTokens:
+                    guard let forward = spatialTokenVisualizationFunction?([image, historyArray]), forward.count >= 2 else { return [predictionFunction(image, historyArray)] }
                     return forward
                 case .actionSaliency:
                     let selector = Self.actionSelector(focus: settings.actionFocus, mouseMode: mouseMode)
@@ -457,7 +498,7 @@ final class AgentRuntime: @unchecked Sendable {
         case .activationOverlay:
             guard outputs.indices.contains(1) else { return nil }
             selected = [(outputs[1], hasConvolutions ? settings.convolutionLayer : -1)]
-        case .featureChannels, .actionSaliency:
+        case .featureChannels, .spatialTokens, .actionSaliency:
             guard outputs.indices.contains(1) else { return nil }
             selected = [(outputs[1], finalLayer)]
         }
@@ -497,7 +538,16 @@ final class AgentRuntime: @unchecked Sendable {
         lock.lock()
         guard !stopped, let latched = predictionLatch.consume(), let profile else { lock.unlock(); return }
         let prediction = latched.values
-        let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes, shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel, outputPermissions = self.outputPermissions
+        let safety = self.safety
+        let rect = captureRect
+        let targetPID = self.targetPID
+        let mouseMode = self.mouseMode
+        let gameCamera = self.gameCamera
+        let allowedKeyCodes = self.allowedKeyCodes
+        let binaryDecisionThresholds = self.binaryDecisionThresholds
+        let gameCameraMinimumPostedMagnitude =
+            self.gameCameraMinimumPostedMagnitude
+        let shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel
         let now = CACurrentMediaTime()
         let maximumPredictionAge = max(0.35, 3 / max(0.0001, profile.training.perceptionFPS))
         if now - latched.publishedAt > maximumPredictionAge {
@@ -519,21 +569,6 @@ final class AgentRuntime: @unchecked Sendable {
         metrics.actionCount += 1
         let elapsed = max(0.001, CACurrentMediaTime() - startedAt)
         metrics.actionFPS = Double(metrics.actionCount) / elapsed
-        // A configured history of zero still uses one placeholder tensor row,
-        // matching training, but that row must remain zero rather than becoming
-        // an accidental one-step runtime history.
-        if profile.training.historyLength > 0, !history.isEmpty {
-            history[historyWriteIndex] = RuntimeActionSemantics.historyValues(
-                prediction,
-                predictionIsFresh: latched.isFresh,
-                channels: profile.channels,
-                restrictions: profile.effectiveRestrictions,
-                allowedKeyCodes: allowedKeyCodes,
-                outputPermissions: outputPermissions,
-                shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
-            )
-            historyWriteIndex = (historyWriteIndex + 1) % history.count
-        }
         let snapshot: RuntimeMetrics? = now - lastMetricsReportTime >= 0.1 ? metrics : nil
         if snapshot != nil { lastMetricsReportTime = now }
         lock.unlock()
@@ -546,6 +581,9 @@ final class AgentRuntime: @unchecked Sendable {
             safety: safety,
             gameCamera: gameCamera,
             predictionIsFresh: latched.isFresh,
+            binaryDecisionThresholds: binaryDecisionThresholds,
+            gameCameraMinimumPostedMagnitude:
+                gameCameraMinimumPostedMagnitude,
             shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
         )
         if let snapshot { onMetrics?(snapshot) }
@@ -645,73 +683,21 @@ enum RuntimeActionSemantics {
         result.modifiers = saved.modifiers && current.modifiers
         return result
     }
+}
 
-    /// Training history is one row per action tick. Reused policy state remains
-    /// useful for held buttons/keys, while additive channels are zero on ticks
-    /// where no new prediction was executed.
-    static func historyValues(
-        _ prediction: [Float],
-        predictionIsFresh: Bool,
-        channels: ActionChannels? = nil,
-        restrictions: ActionRestrictions = ActionRestrictions(),
-        allowedKeyCodes: Set<UInt16>? = nil,
-        outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions(),
-        shiftUsesKeyboardChannel: Bool = true
-    ) -> [Float] {
-        guard prediction.count >= ActionLayout.count else { return prediction }
-        var values = prediction
-        let mouseMovementEnabled = channels?.mouseMovement ?? true
-        let buttonsEnabled = channels?.buttons ?? true
-        let scrollEnabled = channels?.scroll ?? true
-        let keyboardEnabled = channels?.keyboard ?? true
-        let modifiersEnabled = channels?.modifiers ?? true
+enum BinaryDecisionThresholds {
+    static func values(from report: ValidationReport?) -> [Float] {
+        var result = [Float](repeating: 0.5, count: ActionLayout.count)
+        guard let outputs = report?.binaryOutputs else { return result }
+        for output in outputs where result.indices.contains(output.outputIndex) {
+            guard output.decisionThreshold.isFinite else { continue }
+            result[output.outputIndex] = Float(min(0.95, max(0.5, output.decisionThreshold)))
+        }
+        return result
+    }
 
-        for index in ActionLayout.absoluteMouse {
-            values[index] = outputPermissions.cursorMovement && mouseMovementEnabled
-                ? min(1, max(0, values[index])) : 0
-        }
-        for index in ActionLayout.relativeMouse {
-            values[index] = outputPermissions.cursorMovement && mouseMovementEnabled
-                ? min(1, max(-1, values[index])) : 0
-        }
-        if !predictionIsFresh {
-            for index in ActionLayout.relativeMouse { values[index] = 0 }
-            for index in ActionLayout.scroll { values[index] = 0 }
-        }
-        for button in 0..<8 {
-            let allowed = buttonsEnabled && restrictions.allowsButton(UInt8(button))
-            values[ActionLayout.buttons.lowerBound + button] = allowed && values[ActionLayout.buttons.lowerBound + button] >= 0.5 ? 1 : 0
-        }
-        for index in ActionLayout.scroll {
-            values[index] = scrollEnabled ? min(1, max(-1, values[index])) : 0
-        }
-
-        let keyboardOutputEnabled = outputPermissions.keyboard && keyboardEnabled
-        for key in 0..<128 {
-            let code = UInt16(key)
-            let capabilityAllows = allowedKeyCodes?.contains(code) ?? true
-            let allowed = keyboardOutputEnabled
-                && capabilityAllows
-                && restrictions.allowsKey(code)
-                && !ActionLayout.commandOptionControlKeyCodeSet.contains(code)
-            let index = ActionLayout.keyboard.lowerBound + key
-            values[index] = allowed && values[index] >= 0.5 ? 1 : 0
-        }
-
-        let modifierEquivalents: [[UInt16]] = [[56, 60], [59, 62], [58, 61], [55, 54]]
-        for modifier in 0..<4 {
-            let channelEnabled = modifier == 0 && shiftUsesKeyboardChannel
-                ? keyboardEnabled : modifiersEnabled
-            let capabilityAllows = allowedKeyCodes.map {
-                !$0.isDisjoint(with: modifierEquivalents[modifier])
-            } ?? true
-            let allowed = outputPermissions.keyboard
-                && channelEnabled
-                && capabilityAllows
-                && restrictions.allowsModifier(modifier)
-            let index = ActionLayout.modifiers.lowerBound + modifier
-            values[index] = allowed && values[index] >= 0.5 ? 1 : 0
-        }
-        return values
+    static func threshold(for outputIndex: Int, in values: [Float]) -> Float {
+        guard values.indices.contains(outputIndex), values[outputIndex].isFinite else { return 0.5 }
+        return min(0.95, max(0.5, values[outputIndex]))
     }
 }

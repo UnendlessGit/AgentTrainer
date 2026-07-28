@@ -67,7 +67,20 @@ final class InputInjector: @unchecked Sendable {
         onState?(state)
     }
 
-    func execute(_ prediction: [Float], profile: AIProfile, allowedKeyCodes: Set<UInt16>, mouseMode: MouseControlMode, captureRect: CGRect, safety: AgentSafetyPolicy, gameCamera: GameCameraSettings = GameCameraSettings(), predictionIsFresh: Bool = true, shiftUsesKeyboardChannel: Bool = false) {
+    func execute(
+        _ prediction: [Float],
+        profile: AIProfile,
+        allowedKeyCodes: Set<UInt16>,
+        mouseMode: MouseControlMode,
+        captureRect: CGRect,
+        safety: AgentSafetyPolicy,
+        gameCamera: GameCameraSettings = GameCameraSettings(),
+        predictionIsFresh: Bool = true,
+        binaryDecisionThresholds: [Float] = [],
+        gameCameraMinimumPostedMagnitude: CGFloat =
+            GameCameraContract.defaultMinimumPostedMagnitude,
+        shiftUsesKeyboardChannel: Bool = false
+    ) {
         guard prediction.count >= ActionLayout.count,
               prediction.prefix(ActionLayout.count).allSatisfy(\.isFinite) else { return }
         lock.lock()
@@ -80,10 +93,16 @@ final class InputInjector: @unchecked Sendable {
         var scrollDelta = CGSize.zero
 
         if predictionIsFresh, outputPermissions.cursorMovement, channels.mouseMovement, mouseMode == .relative {
-            let dx = GameCameraContract.runtimeDelta(forPrediction: prediction[2], sensitivity: gameCamera.sensitivity)
-            let dy = GameCameraContract.runtimeDelta(forPrediction: prediction[3], sensitivity: gameCamera.sensitivity)
-            let postedDX = Int64(dx.rounded())
-            let postedDY = Int64(dy.rounded())
+            let postedDX = GameCameraContract.postedDelta(
+                forPrediction: prediction[2],
+                sensitivity: gameCamera.sensitivity,
+                minimumMagnitude: gameCameraMinimumPostedMagnitude
+            )
+            let postedDY = GameCameraContract.postedDelta(
+                forPrediction: prediction[3],
+                sensitivity: gameCamera.sensitivity,
+                minimumMagnitude: gameCameraMinimumPostedMagnitude
+            )
             // Game-camera mode keeps the system cursor at a stable anchor while
             // emitting raw deltas, so movement never stalls against a screen edge.
             cursor = CGPoint(x: captureRect.midX, y: captureRect.midY).clamped(to: allowed)
@@ -100,7 +119,13 @@ final class InputInjector: @unchecked Sendable {
         }
 
         if channels.buttons {
-            let desired = Set((0..<8).compactMap { prediction[4 + $0] >= 0.5 && restrictions.allowsButton(UInt8($0)) ? UInt8($0) : nil })
+            let desired = Set((0..<8).compactMap { button -> UInt8? in
+                let index = ActionLayout.buttons.lowerBound + button
+                return prediction[index] >= BinaryDecisionThresholds.threshold(
+                    for: index,
+                    in: binaryDecisionThresholds
+                ) && restrictions.allowsButton(UInt8(button)) ? UInt8(button) : nil
+            })
             for button in heldButtons.subtracting(desired) { postButton(button, down: false, at: cursor) }
             for button in desired.subtracting(heldButtons) { postButton(button, down: true, at: cursor) }
             heldButtons = desired
@@ -122,7 +147,10 @@ final class InputInjector: @unchecked Sendable {
         let modifierKeys: [UInt16] = [56, 59, 58, 55]
         if outputPermissions.keyboard {
             for i in 0..<4 where (i == 0 && shiftUsesKeyboardChannel ? channels.keyboard : channels.modifiers)
-                && prediction[142 + i] >= 0.5
+                && prediction[142 + i] >= BinaryDecisionThresholds.threshold(
+                    for: 142 + i,
+                    in: binaryDecisionThresholds
+                )
                 && restrictions.allowsModifier(i)
                 && allowsDemonstratedModifier(i, keys: allowedKeyCodes) {
                 desiredModifiers |= modifierMasks[i].rawValue
@@ -130,7 +158,11 @@ final class InputInjector: @unchecked Sendable {
         }
         let desiredKeys = outputPermissions.keyboard && channels.keyboard ? Set<UInt16>((0..<128).compactMap {
             let code = UInt16($0)
-            return prediction[14 + $0] >= 0.5
+            let index = ActionLayout.keyboard.lowerBound + $0
+            return prediction[index] >= BinaryDecisionThresholds.threshold(
+                for: index,
+                in: binaryDecisionThresholds
+            )
                 && !ActionLayout.commandOptionControlKeyCodeSet.contains(code)
                 && allowedKeyCodes.contains(code)
                 && restrictions.allowsKey(code) ? code : nil

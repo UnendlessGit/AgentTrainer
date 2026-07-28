@@ -145,12 +145,12 @@ private struct InputHUDView: View {
             if model.showsCNNVisualization {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Label("CNN INTERNALS", systemImage: "waveform.path.ecg").font(.system(size: 9, weight: .bold)).foregroundStyle(.cyan)
+                        Label("POLICY INTERNALS", systemImage: "waveform.path.ecg").font(.system(size: 9, weight: .bold)).foregroundStyle(.cyan)
                         Spacer()
                         Text(model.cnnVisualizationMode.rawValue.uppercased()).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
                     }
                     Group {
-                        if let image = model.cnnVisualizationImage { Image(nsImage: image).resizable().interpolation(model.cnnVisualizationMode == .featureChannels ? .none : .medium).scaledToFit() }
+                        if let image = model.cnnVisualizationImage { Image(nsImage: image).resizable().interpolation(model.cnnVisualizationMode == .featureChannels || model.cnnVisualizationMode == .spatialTokens ? .none : .medium).scaledToFit() }
                         else { ZStack { Color.black; ProgressView().controlSize(.small) } }
                     }.frame(maxWidth: .infinity, minHeight: 152, maxHeight: 152).background(Color.black).clipShape(RoundedRectangle(cornerRadius: ATCorner.scaled(10), style: .continuous))
                     Text(model.cnnVisualizationDetail.isEmpty ? "Waiting for the next diagnostic frame" : model.cnnVisualizationDetail).font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
