@@ -264,7 +264,16 @@ final class TrainingEngine: @unchecked Sendable {
             minimumLearningRateRatio: Float(profile.training.effectiveMinimumLearningRateRatio)
         )
         optimizer.initialize(model: model)
-        let signature = try profileSignature(profile, recordings: recordings)
+        let signature = try profileSignature(
+            profile,
+            recordings: recordings,
+            stableRecordingIdentity: true
+        )
+        let legacySignature = try profileSignature(
+            profile,
+            recordings: recordings,
+            stableRecordingIdentity: false
+        )
         let inputSummaries = try recordings.map { recording in
             let url = recording.directory.appendingPathComponent(recording.manifest.eventFile)
             return try InputEventReader.summarize(
@@ -308,6 +317,7 @@ final class TrainingEngine: @unchecked Sendable {
         let restore = try await restoreCheckpointIfPresent(
             profile: profile,
             expectedSignature: signature,
+            compatibleSignatures: Set([signature, legacySignature]),
             expectedRecordingOrder: recordingOrder,
             legacyValidationNeedsRefresh: dataset.manifest.segments.count == 1,
             model: model,
@@ -1202,17 +1212,11 @@ final class TrainingEngine: @unchecked Sendable {
         return result.overflow ? Int.max : result.partialValue
     }
 
-    private func profileSignature(_ profile: AIProfile, recordings: [RecordingItem]) throws -> String {
-        struct TrainingIdentity: Encodable {
-            let trainingDataSchema: Int
-            let trainingObjectiveSchema: Int
-            let preprocessing: PreprocessingSpec
-            let channels: ActionChannels
-            let training: TrainingConfiguration
-            let recordings: [RecordingManifest]
-            let folderIDs: [UUID]
-            let restrictions: ActionRestrictions
-        }
+    private func profileSignature(
+        _ profile: AIProfile,
+        recordings: [RecordingItem],
+        stableRecordingIdentity: Bool
+    ) throws -> String {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         var resumeCompatibleTraining = profile.training
         // These values control how long/often to run, not the meaning of a saved brain.
@@ -1231,18 +1235,56 @@ final class TrainingEngine: @unchecked Sendable {
         var normalizedChannels = profile.channels
         normalizedChannels.absoluteMouse = profile.channels.mouseMovement
         normalizedChannels.relativeMouse = profile.channels.mouseMovement
-        let manifests = recordings.map(\.manifest).sorted { $0.id.uuidString < $1.id.uuidString }
-        let identity = TrainingIdentity(
-            trainingDataSchema: TrainingDataContract.schemaVersion,
-            trainingObjectiveSchema: TrainingObjectiveContract.schemaVersion,
-            preprocessing: profile.preprocessing,
-            channels: normalizedChannels,
-            training: resumeCompatibleTraining,
-            recordings: manifests,
-            folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString },
-            restrictions: profile.effectiveRestrictions
-        )
-        return SHA256.hash(data: try encoder.encode(identity)).map { String(format: "%02x", $0) }.joined()
+        let encoded: Data
+        if stableRecordingIdentity {
+            struct TrainingIdentity: Encodable {
+                let trainingDataSchema: Int
+                let trainingObjectiveSchema: Int
+                let preprocessing: PreprocessingSpec
+                let channels: ActionChannels
+                let training: TrainingConfiguration
+                let recordings: [RecordingContentIdentity]
+                let restrictions: ActionRestrictions
+            }
+            let identities = try recordings
+                .map { try RecordingContentIdentity(recording: $0) }
+                .sorted { $0.id.uuidString < $1.id.uuidString }
+            encoded = try encoder.encode(TrainingIdentity(
+                trainingDataSchema: TrainingDataContract.schemaVersion,
+                trainingObjectiveSchema: TrainingObjectiveContract.schemaVersion,
+                preprocessing: profile.preprocessing,
+                channels: normalizedChannels,
+                training: resumeCompatibleTraining,
+                recordings: identities,
+                restrictions: profile.effectiveRestrictions
+            ))
+        } else {
+            struct LegacyTrainingIdentity: Encodable {
+                let trainingDataSchema: Int
+                let trainingObjectiveSchema: Int
+                let preprocessing: PreprocessingSpec
+                let channels: ActionChannels
+                let training: TrainingConfiguration
+                let recordings: [RecordingManifest]
+                let folderIDs: [UUID]
+                let restrictions: ActionRestrictions
+            }
+            let manifests = recordings.map(\.manifest)
+                .sorted { $0.id.uuidString < $1.id.uuidString }
+            encoded = try encoder.encode(LegacyTrainingIdentity(
+                trainingDataSchema: TrainingDataContract.schemaVersion,
+                trainingObjectiveSchema: TrainingObjectiveContract.schemaVersion,
+                preprocessing: profile.preprocessing,
+                channels: normalizedChannels,
+                training: resumeCompatibleTraining,
+                recordings: manifests,
+                folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString },
+                restrictions: profile.effectiveRestrictions
+            ))
+        }
+        return SHA256.hash(data: encoded)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private func saveCheckpoint(profile: AIProfile, model: AgentPolicy, optimizer: ResumableAdamW, randomState: MLXRandom.RandomState, state: CheckpointState, captureBest: Bool = false) async throws {
@@ -1386,6 +1428,7 @@ final class TrainingEngine: @unchecked Sendable {
     private func restoreCheckpointIfPresent(
         profile: AIProfile,
         expectedSignature: String,
+        compatibleSignatures: Set<String>,
         expectedRecordingOrder: [UUID],
         legacyValidationNeedsRefresh: Bool,
         model: AgentPolicy,
@@ -1400,7 +1443,7 @@ final class TrainingEngine: @unchecked Sendable {
             let recordingOrderMatches = restored.recordingOrder.map { $0 == expectedRecordingOrder } ?? true
             let samplingStrategyIsKnown = restored.samplingStrategy == nil
                 || restored.samplingStrategy == TrainingSamplingContract.salienceBalanced
-            if restored.profileSignature == expectedSignature,
+            if compatibleSignatures.contains(restored.profileSignature),
                recordingOrderMatches,
                samplingStrategyIsKnown {
                 let validationNeedsRefresh = restored.validationStrategy.map {
@@ -1411,6 +1454,7 @@ final class TrainingEngine: @unchecked Sendable {
                 let randomStateURL = directory.appendingPathComponent("random.safetensors")
                 if FileManager.default.fileExists(atPath: randomStateURL.path) { try TrainingRandomState.load(randomState, from: randomStateURL) }
                 state = restored
+                state.profileSignature = expectedSignature
                 state.validationStrategy = TrainingValidationContract.disjointContext
                 return CheckpointRestore(
                     status: validationNeedsRefresh

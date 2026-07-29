@@ -1,56 +1,197 @@
 # AgentTrainer
 
-AgentTrainer 1.9.4 is a privacy-first Apple-silicon app for macOS Sequoia 15, macOS Tahoe 26, and macOS 27. It records screen content and synchronized human input, trains imitation policies with MLX, and runs those policies as guarded OS-wide agents. On launch, its only network feature checks the public `UnendlessGit/AgentTrainer` GitHub Releases feed for a newer version; recordings, models, diagnostics, and usage data are never uploaded. A pre-library recovery pass repairs malformed-but-decodable legacy duration/trim metadata before strict validation can hide it, retaining a backup of the original manifest and never modifying the source video or input stream.
+AgentTrainer is a local-first macOS app for recording screen-and-input
+demonstrations, training an imitation-learning policy with MLX, and running the
+trained policy on the same Mac. Version 1.9.4.1 targets Apple silicon and macOS
+15 or newer.
 
-## Windows recording companion
+Video, input streams, caches, profiles, checkpoints, and model weights remain
+local. The only normal network request is the signed GitHub Releases update
+check.
 
-[`WindowsRecorder`](WindowsRecorder) is a separate, polished x64 Windows app containing only **Record**, **Library**, and recorder **Settings**—there is no Windows training or AI runtime. Its layout, palette, capture cards, nested folder library, and inspector mirror the matching Mac screens. It supports the Mac recorder's Display, Window, Window Region, and Screen Region choices, FPS/cursor/trimming controls, library folders, key blacklist, synchronized raw input, inspection, customizable global recording shortcut, capture-HUD behavior, and portable export workflow. Windows writes the exact same schema-2 `.atrrecord` package and `ATREVT01` event layout. Physical Windows keys are translated into the existing Apple virtual-key policy space, so the Mac trainer can use Windows and Mac recordings together in one dataset without a platform switch or conversion step.
+## What the app does
 
-The macOS Library has a permanently visible, validated, transactional **Import** action. Windows **Export for Mac** creates one shareable `.atrrecord.zip` file; select that file on the Mac (unpacked `.atrrecord` folders and parent libraries also remain supported). AgentTrainer safely extracts archives and verifies paths/links, filenames, manifest structure, event counts/order/timing, video dimensions/duration, and an actual decoded frame before assigning fresh local IDs and publishing the complete batch. See [`RECORDING_FORMAT.md`](RECORDING_FORMAT.md) for the normative interchange contract and [`WindowsRecorder/README.md`](WindowsRecorder/README.md) for Windows requirements, transfer steps, build, installer, and packaging.
+1. **Record** a display, window, or region together with synchronized keyboard,
+   pointer, button, modifier, and scroll input.
+2. **Inspect** recordings, organize them in folders, trim their usable ranges,
+   and optionally reenact recorded input behind an explicit safety toggle.
+3. **Configure** an AI profile: vision size, visual memory, architecture,
+   control channels, restrictions, and selected recordings.
+4. **Train** locally with MLX. Packed dataset caches decode each perception
+   frame once and reuse it across training runs and memory settings.
+5. **Run** a saved brain with independent output permissions, focus/staleness
+   guards, human-input stopping, and a global panic shortcut.
 
-Recordings live in real library folders that expand in place and can be selected as whole training datasets. The AI Models recording picker mirrors that folder hierarchy, while every Library row offers direct, confirmed deletion. Legacy unfiled recordings are migrated into a `Recordings` folder. Recording-time key blacklists remove selected keys and modifier state before they reach disk, redundant macOS key-repeat events are discarded, and presses shorter than one action tick are preserved as learnable targets. Independent start/end trims are non-destructive and are honored by replay and dataset generation; replay reconstructs the held keys, buttons, modifiers, and pointer state at a trim boundary. Every periodic autosave and manual pause publishes the exact current weights plus optimizer, epoch, batch offset, timing, loss history, and isolated MLX random state for running or continuation. Mid-epoch versions deliberately omit an older validation report that does not describe those exact tensors. Completed training recommends the strongest measured execution-quality brain—macro F1 across evidenced controls plus executable camera/scroll recall with an idle-stability discount—using validation loss only as a close-score tie-breaker, while retaining the latest exact optimizer checkpoint. Quality thresholds are advisory: weak recall, inactive controls, or idle motion warnings never block saving, activation, or Run. Autosaves are capped at the newest ten per AI; paused and completed brains are retained. At a model-contract boundary, the audit reads every saved brain's own manifest and every checkpoint's own schema marker: compatible artifacts remain byte-for-byte intact even when the library marker is missing or stale, while incompatible or unreadable artifacts move into a schema-labelled per-profile recovery archive instead of being deleted.
+Policy v9 is perception-first: live decisions use current and remembered visual
+frames, never demonstrated previous actions. The runtime retains held controls
+in the output injector instead of feeding them back into the model.
 
-Settings can place **Training data** and **AI models** in separate folders on internal or mounted external disks. Training data includes recordings and rebuildable dataset caches; the model library includes profiles, runnable brains, exact checkpoints, optimizer state, and saved versions. Moving to an empty folder uses copy-then-verify semantics and switches locations only after every managed item is present. Selecting an existing AgentTrainer library switches to it without merging or deleting the current library. Storage changes are locked while recording, training, running, or replaying, and persistent diagnostic logs stay in Application Support so a missing external disk remains diagnosable.
+## Requirements
 
-Live inference consumes the same packed UInt8 vision format used for training at the model's exact width and height. Policy v9 makes **Hybrid CNN + Transformer** and **Pure Transformer (ViT)** first-class selectable model families, adds real multi-timescale visual memory, and is deliberately perception-first. The balanced default remembers perception lags 1, 5, 9, and 13: each slot contributes a signed current-minus-past visual field plus an explicit availability field, so a newly started run cannot confuse missing context with an unchanged screen. One learned pointwise projection compresses that evidence to eight values per pixel while exact current Y or Y/Cb/Cr pixels bypass the compression. Visual-memory length and spacing are bounded, editable learned-contract fields; older slots receive configurable structured dropout during training, while the immediate predecessor and all live-run memory remain available. Both families then receive explicit X/Y coordinates, visual tokens, a learned readout token, deterministic positions, pre-normalized attention, gated SiLU feed-forwards, and the same guarded action heads. After the Transformer, the learned readout is fused with the parameter-free transformed-visual mean and first visual-token anchor. This unavoidable perception path prevents a poorly seeded learned readout from settling into a constant-output solution while retaining exact optimizer resumability. Demonstrated or predicted previous actions never enter the policy, preventing teacher-forced validation from rewarding a key-state shortcut that becomes an all-released feedback loop when a live run starts.
+- Apple-silicon Mac.
+- macOS 15.0 or newer.
+- Xcode with command-line tools for building.
+- Screen Recording and Input Monitoring permission for recording.
+- Accessibility permission only when reenacting input or running an AI with
+  output enabled.
 
-Visual memory does not create Transformer tokens or quadratic attention growth. Hybrid uses a four-stage GroupNorm/SiLU CNN plus learned coordinate-bearing spatial tokens and two global summaries; its Balanced sequence is only 11 tokens and 121 attention pairs per block. Pure Transformer has no spatial CNN hierarchy: one optimized kernel=stride projection is the standard shared linear ViT patch tokenizer, partial edge patches retain every source pixel through edge padding, separable 2-D sinusoidal positions preserve patch layout, and the readout attends to every patch. At 640×360, Pure Balanced uses a 20×12 patch grid, 241 total tokens, and 58,081 attention pairs per block. The editor reports the raw remembered window, signed memory, availability, fused per-pixel evidence, packed/dense payload, parameters, working set, temporal coverage, tokens, and attention costs.
+AgentTrainer asks for permissions when needed. After changing a permission,
+macOS may require the app to be reopened.
 
-The optional capture-excluded PIP renders the exact processed frame at a bounded display size and appears only while running AI. A separate, fully disableable policy inspector adapts to either architecture: Hybrid exposes selectable CNN stages, strongest final features, learned routing maps, and action-head Grad-CAM; Pure exposes the direct patch projection, strongest embedding channels, normalized patch-token strength, and action-head saliency. Diagnostic tensors remain on the GPU until reduced, transfers are bounded, renderer work coalesces off the inference queue, and disabling inspection restores the normal prediction-only graph. Recording and running both show a compact capture-excluded keyboard whose unused keys and empty rows are omitted. Per-profile output restrictions can permanently block individual keys and mouse buttons during both training and running; the runtime additionally refuses any keyboard or modifier control without either four independent press episodes or at least half a second of sustained held evidence in that brain's training split. Run-only cursor-movement and keyboard toggles can be changed during an active session without editing or retraining the AI; disabling keyboard output immediately releases every AI-held key and modifier.
+## Build and test
 
-The AI Models editor provides a prominent model-family selector, family-specific tuned presets and controls, and a live **Input size check**. Hybrid exposes CNN widths/kernels/strides and learned spatial-token count; Pure exposes patch size and its exact patch grid. The exact packed vision, dense current/memory evidence, coordinates, Transformer tokens and attention pairs, rates, parameters, nominal payload, and conservative training working set remain visible. The editor labels Policy v9 as perception-backed instead of exposing the obsolete Action History setting. Validation enforces compatible token/head dimensions, bounded Hybrid CNN or Pure patch geometry, a 4,096-token safety ceiling, block/feed-forward/fusion/dropout limits, and a unified-memory reserve before training begins.
+Run the complete test suite:
 
-Training uses compiled MLX forward/backward/AdamW and validation graphs on a dedicated Apple-GPU stream, packed memory-mapped UInt8 caches, bounded graph history, Metal preprocessing, and Apple-silicon unified memory. Each model family has separately tuned Small, Balanced, and Large presets. Learned parameter count remains resolution-independent for both: Hybrid shares convolution kernels, while Pure shares one patch-projection matrix; Pure attention work still grows quadratically with patch count and is reported explicitly. AdamW keeps moments and numerically sensitive updates in Float32, globally clips gradients, and decays capacity-bearing matrix/kernel weights while excluding biases, normalization affine values, and learned token identities.
-
-Perception frames are stored once and action-rate rows use compact current/previous frame indices, eliminating duplicated images when Action FPS exceeds Perception FPS. Multi-lag visual memory is derived from that immutable observation index at batch time, so changing visual-memory length/spacing or Hybrid/Pure reuses the same sampled frames and never duplicates them on disk. Recorded H.264/HEVC stays in VideoToolbox's native bi-planar YUV decode path instead of expanding every full-resolution source frame to BGRA. The exact existing Metal matrix/resize/chroma/quantization kernel runs through a three-frame ordered in-flight queue, overlapping decode, GPU preprocessing, and buffered writes without changing selected frames or a single packed output byte. Each optimizer batch gathers current and all requested remembered frames, availability, targets, and actual previous targets in one mapped pass; the latter exists only for transition-aware loss and never enters the policy. CPU preparation overlaps the preceding GPU update. Validation shares one compiled forward between loss and metrics instead of evaluating the whole policy twice. These are compute/IO reductions, not lower-resolution, lower-precision, frame-dropping, or approximate shortcuts. A deterministic, compute-neutral curriculum spreads control transitions and active mouse/scroll rows across batches while still consuming every row exactly once per epoch. A process-wide MLX policy retains a macOS memory reserve, caps reusable allocator cache, and clears unused buffers after run/training boundaries. One AI may train while a different AI runs.
-
-The objective is designed for sparse controls instead of rewarding “do nothing.” Every supported binary output exactly balances its effective pressed and released mass after transition emphasis, placing an uninformative constant prediction at the neutral 0.5 boundary instead of below the runtime threshold. The loss divides by a fixed count of active decisions rather than the current minibatch's weighted mass, so a rare positive correction cannot cancel precisely when that positive appears. Keyboard and modifier evidence can be either four independent presses or at least half a second held; weaker traces remain loss-masked and outside the immutable runtime capability set. This prevents both idle-class collapse and one accidental tap steering an entire head. Configurable focal weighting concentrates updates on mistakes while the fixed active-decision denominator lets the reported value fall as examples become easy. Objective v4 gives each relative-camera and scroll axis an exact dataset-level active/idle correction, masks axes with no real motion, and divides Smooth L1 by its beta so small but executable normalized deltas cannot disappear beneath an easy centered-cursor head. Gradients remain globally clipped. Transition loss receives the real preceding cached action only for loss weighting, so a long held input is not treated as a fresh press on every frame. Shift belongs to the Keyboard channel, while the separate Modifiers channel controls only Command, Option, and Control. macOS reports those three modifiers as both flags and ordinary key codes, so AgentTrainer removes the duplicate key-code path from targets, loss, visualization, and runtime output; disabling Modifiers is therefore a hard block for new and existing brains.
-
-Whole-recording validation targets the requested sample fraction, never removes the repeated-press or held-duration evidence required to keep a control learnable, covers every held-out recording when budget permits, and evaluates up to 8,192 representative rare positives, transitions, active deltas, and timeline anchors. A lone recording extends its contiguous training prefix only far enough to preserve the same evidence before applying the complete visual-memory embargo. One compiled forward publishes separate Mouse, Buttons, Scroll, Keyboard, and Modifiers losses alongside precision/recall/F1, continuous MAE, idle false-action rate, and correctly directed executable camera/scroll recall at the exact runtime scale and deadzone. Each supported binary control receives a conservative activation threshold between 0.5 and 0.95; sparse evidence stays at 0.5 and support confidence shrinks large changes. Game Camera similarly selects and persists the smallest tested 0.5–4.5 pixel pre-rounding deadzone that keeps executable recall at or above 5% and idle execution at or below 10%; older reports use a conservative 1.5-pixel fallback. Validation contract 8 closes a zero-split execution gap: when Validation is exactly 0, every row still trains and scheduler/best-brain logic still treats held-out quality as unavailable, but each exact runnable snapshot receives a bounded 2,048-row in-sample pass solely to calibrate live binary thresholds and the Game Camera deadzone. The manifest and Training UI label that report **In-sample**, never publish its loss as validation, and never use it to rank brains. This prevents a weak learned camera signal from being discarded by the larger legacy fallback merely because no held-out split was requested. The Training page also shows binary and transient-motion evidence weights, controls awaiting more demonstrations, per-head losses, the camera deadzone, the most error-prone per-control thresholds and confusion counts, and explicit execution warnings. Recall below the recommended binary or continuous floors and excess idle motion remain visible warnings, but no quality threshold blocks a runnable version. With honest held-out data, best-brain recommendation considers every finite, structurally compatible candidate and prefers equal-weight per-control F1 plus executable transient-motion recall rather than letting aggregate validation loss reward inactivity; loss remains the scheduler metric and close-score tie-breaker. Fine-tuning re-scores compatible selected weights on the current held-out set instead of comparing against a stale score from different data or objective semantics. New brains use one-epoch warmup followed by bounded cosine restarts and plateau-driven envelope reductions; a configurable global floor prevents learning rate from asymptotically collapsing to zero. The scheduler, envelope, and monitor state are exactly checkpointed. Objective changes preserve shape-compatible weights but intentionally restart optimizer state and historical loss comparisons.
-
-Mouse demonstrations always train both position and delta representations. Each captured frame is paired with the control interval immediately after it, so training learns the action to perform next instead of an action already visible in the frame. Trimmed lead-in movement is used to establish state but is never collapsed into the first target. Run defaults to **Auto** and uses classified movement evidence from the immutable recordings that produced the selected brain, so later profile edits cannot silently change execution semantics. Locked-position recordings with real deltas vote for Game Camera, moving absolute positions vote for Absolute Cursor, and stationary/too-short recordings do not vote at all. Game Camera uses a fixed 80-pixel raw-HID learning scale instead of dividing by capture resolution, then reverses that scale at runtime with bounded configurable sensitivity and optional before/after recentering. Held keyboard/button state remains active in the injector between perception updates, while additive Game Camera and scroll outputs are consumed exactly once per newly published prediction. Raw camera movement always posts as `mouseMoved`, independently of button edges. The shared execution contract suppresses predictions below the immutable brain's calibrated pre-rounding deadzone, eliminating idle jitter while retaining validated camera movement; validator and injector call the same conversion with the same saved value. ScreenCaptureKit's unchanged-screen `idle` status reuses the last safe surface as a fresh perception and advances the bounded visual-memory ring with an unchanged frame; blank, suspended, and stopped frames remain unsafe. Run reports the live remembered-perception depth against the saved maximum lag so startup readiness is visible. A real stale-prediction watchdog releases all outputs if inference stops producing fresh results. Stop first blocks new actions, drains the action queue, releases physical input, and drops visual memory before waiting for ScreenCaptureKit or an in-flight MLX evaluation, while the UI remains in Starting/Stopping state until all teardown callers have joined.
-
-Policy v9 intentionally does not load Policy-v7 or Policy-v8 tensors. Policy v7 placed demonstrated previous actions beside visual tokens and could achieve excellent teacher-forced validation by copying held key state while producing constant, sub-threshold outputs from perception; live inference begins with released controls, turning that shortcut into the observed “press nothing” absorbing state. Policy v8 removed that action path, but a seed-sensitive learned readout could still settle into a constant visual summary, producing one always-on key and leaving the other evidenced keys and camera inactive. Policy v9 adds the parameter-free transformed-visual mean/anchor path and execution-quality diagnostics/ranking that address both failures without taking publication control away from the user. On first launch, incompatible versions and schema-marked checkpoints move—not copy or delete—into each profile's matching `Archived Model Artifacts/Model Contract 7` or `Model Contract 8` recovery tree; unmarked uncertain artifacts go under `Model Contract Unknown`. Compatible recording packages and deduplicated sampled-video caches remain in place, Action History is normalized to zero, and training restarts from fresh Policy-v9 weights. Profiles retain their selected Hybrid/Pure family, restrictions, recording/folder selection, and every original source recording.
-
-The AI Models list is newest-first and shows model family, steps, epochs, actual training time, and equivalent demonstration experience without loading every version manifest. Counters stay in hours until a full day, then switch to days. **Duplicate** performs a deep copy of the active brain, saved versions, timing/progress summary, and exact resumable checkpoint; the copy can be fine-tuned independently. Its saved-brain/autosave list is opened only with **Load Saved Brains**, keeping the page responsive after long runs. Run and Training each provide their own direct AI picker. Changing exact vision or a tensor/semantic architecture field on a trained AI requires confirmation and moves incompatible versions/checkpoints into `Archived Model Artifacts/Manual Architecture Changes`; it never deletes recordings. Training-only dropout and legacy decode metadata remain outside the learned-brain contract. Protected AIs must be duplicated first.
-
-Epochs are configured as repeatable blocks: pausing or stopping midway preserves the current goal, while pressing Train after completing a block adds another block of the configured size. **Auto Train**, beside the normal Train button, starts the next configured epoch block whenever one completes and continues until Pause or Stop is pressed. Maximum Steps is a per-session budget, so a high global step count never prevents a later training session from continuing.
-
-Diagnostics is a dedicated tab with cache controls and macOS crash reports above the persistent searchable application log, plus a copyable support report. Info buttons use larger click targets, plain-English technical popovers, and native hover help. The top bar and sidebar are explicit opaque app surfaces instead of system sidebar/toolbar materials, keeping their color, focus, and contrast consistent on Sequoia, Tahoe, and macOS 27 without depending on version-specific glass behavior. Global shortcuts use native hotkey registration when that framework is present, with an AppKit-monitor fallback guarded for a future SDK that removes it. The draggable top bar keeps native traffic lights, live status, and quick safety controls above every page. Settings offers four deliberately balanced palettes—Midnight, Daylight, Graphite, and Ember—plus bounded global controls for corner radius, surface separation, accent fill, and sidebar width. The controls update cards, rows, HUDs, buttons, status treatments, and navigation as one coherent system and can be reset independently of the chosen palette. Lightweight hover, press, page, and chart-reveal animations can be disabled globally, honor Reduce Motion, and stop when the app is inactive. Batch loss, epoch-average loss, validation loss, and effective-learning-rate curves use bounded, extrema-preserving sampling and smooth Canvas paths; live cards expose held-out F1 and the complete report. Curves observe changing bounded snapshots rather than only their length, so long training sessions continue updating in real time. Each incoming snapshot morphs for 160 ms, with no continuous animation between updates. Hidden tabs are not mounted and inactive charts stop accepting new render data.
-
-Recording timestamps begin on the first usable ScreenCaptureKit frame (`started` or `complete`). Global record, run, and panic shortcuts are filtered out of both recording data and the human-input safety monitor, including their modifier transitions and trailing key releases. Agent startup is single-flight and revision-tokened, and recording, live agent output, and real-input reenactment are mutually exclusive so two OS-input producers cannot overlap behind one UI state.
-
-```sh
-chmod +x build.sh
-./build.sh
-open outputs/AgentTrainer.app
+```bash
 ./test.sh
 ```
 
-`build.sh` produces the native arm64 app, a source archive, and exactly one versioned DMG. The staged DMG copy strips link/debug symbols and omits only the duplicate Resources copy of `mlx.metallib`; it retains the executable-adjacent Metal library, optimized release code, and model quality. The build fails if that single DMG reaches 10,000,000 bytes. The script verifies the executable and plist both target macOS 15.0, preserves an existing authorized app bundle in place, refuses to modify a running copy, removes superseded DMGs, and validates the app signature and disk image before returning. Xcode builds MLX's Metal shaders; SwiftPM separately builds the shipped optimized executable so Xcode's generated package-scheme coverage counters never enter the hot inference or training paths. On this Mac the script automatically uses the installed long-lived `MimicClone Local Code Signing` identity, retaining the same designated requirement across rebuilt binaries so macOS permission grants survive updates. The first stable-signed build replaces the old ad-hoc identity and therefore needs one final permission grant; subsequent builds using the same bundle identifier, signer, and install path do not. Set `CODE_SIGN_IDENTITY` and optionally `CODE_SIGN_KEYCHAIN` to override the local identity for Developer ID distribution. If no stable identity exists, the build stops instead of silently breaking TCC identity; `ALLOW_ADHOC_SIGNING=1` is available only for disposable builds.
+Build the release app and distribution artifacts:
 
-The app requires Screen Recording and Input Monitoring to record, plus Accessibility to replay or run an agent. It has no accounts, telemetry, or Python runtime. Update checks use GitHub Releases only. Accepting a prompt shows live download/install progress, verifies the DMG checksum and the embedded app's exact code-signing identity, stages a transactional replacement at the current app path, then restarts automatically. A failed verification or staging step leaves the running app unchanged.
+```bash
+./build.sh
+```
 
-Global panic, record, and run shortcuts are customizable in Settings. Duplicate bindings are rejected, registration failures are reported, and the panic path immediately releases every held key and mouse button.
+By default, `build.sh` creates or updates the real application at:
 
-See `DEVELOPMENT_GUIDE.md` for the durable architecture, storage contracts, concurrency invariants, performance decisions, and release checklist used by future development sessions. See `TRAINING_AUDIT.md` for the reviewed learning pipeline, implemented corrections, reward-design pitfalls, and staged imitation/reinforcement roadmap. See `IN_PLACE_UPDATE_GUIDE.md` for the Run-tab cursor/keyboard permission design, its transactional safety behavior, and the exact permission-preserving macOS in-place update/signing procedure.
+```text
+/Applications/AgentTrainer.app
+```
+
+It keeps that bundle path, verifies the bundle identifier before replacing
+anything, rebuilds its contents, signs it, and produces these release artifacts
+under `outputs/`:
+
+```text
+AgentTrainer-<version>.dmg
+AgentTrainer-Source.zip
+SHA256SUMS.txt
+```
+
+The script first reuses the installed app's signing identity. For a new install
+it automatically uses the only available code-signing identity; if the choice
+is ambiguous, set one explicitly:
+
+```bash
+CODE_SIGN_IDENTITY="Developer ID Application: Example" ./build.sh
+```
+
+Use `CODE_SIGN_KEYCHAIN` when the identity is in a non-default keychain.
+`ALLOW_ADHOC_SIGNING=1` is intended only for disposable builds because every
+ad-hoc rebuild can require new privacy grants. A temporary app path can be used
+without changing the default installation:
+
+```bash
+AGENTTRAINER_APP_PATH=/tmp/AgentTrainer.app ALLOW_ADHOC_SIGNING=1 ./build.sh
+```
+
+Quit AgentTrainer before running the release build. The script refuses to
+replace a running app.
+
+## Storage
+
+The default workspace is:
+
+```text
+~/Library/Application Support/AgentTrainer/
+├── Recordings/
+├── Caches/
+├── Profiles/
+└── recording-folders.json
+```
+
+Training data and models can be relocated independently from Settings. A move
+uses copy, verification, and an atomic location switch; the source is removed
+only after the new library is usable. Never edit a live workspace by hand.
+
+Each published recording is a self-contained `.atrrecord` directory. The
+manifest is written last, so interrupted recordings are not exposed as library
+items. See [RECORDING_FORMAT.md](RECORDING_FORMAT.md) for the portable format.
+
+## Safety and lifecycle rules
+
+- Recording opens its event clock on the first usable encoded video frame.
+- An unexpected screen-capture or input-monitor stop ends the active operation.
+- Recording-library mutations are blocked while recording, importing,
+  training, running, replaying, or relocating storage.
+- Profile brains cannot be reset, deleted, duplicated, or switched while that
+  profile is training or running.
+- The AI runtime disables and releases every held input before waiting for
+  capture or inference teardown.
+- Run-time cursor and keyboard permissions are independent and apply
+  immediately.
+- The panic shortcut stops recording, training, replay, and runtime activity.
+- Imports validate paths, links, filenames, manifest bounds, event bytes,
+  timing, video metadata, and a decodable frame before publishing anything.
+
+## Architecture
+
+The executable is a Swift Package with one test target:
+
+```text
+Sources/AgentTrainer/
+├── App/             app lifecycle and operation coordination
+├── Capture/         ScreenCaptureKit, HEVC writing, and input monitoring
+├── Storage/         workspace transactions and the binary event format
+├── Preprocessing/   bounded Metal/MLX vision preprocessing
+├── Training/        packed caches, policy, optimizer, validation, checkpoints
+├── Agent/           live inference, focus safety, and synthetic input
+├── Replay/          guarded real-input reenactment
+├── Hotkeys/         global record, run, and panic shortcuts
+├── Core/            domain contracts, logging, updates, and process execution
+└── UI/              SwiftUI pages and diagnostics
+```
+
+`AppModel` owns user-visible state on the main actor. File libraries and cache
+builders are actors. Capture, input, inference, and injection services use
+small explicit locks or serial queues around their cross-thread state. Start
+and stop paths use revision tokens so a cancelled launch cannot install a late
+resource.
+
+Dataset cache and exact-resume identity follow training-relevant content:
+source file size/modification time, timeline, geometry, dimensions, and trims.
+Renaming a recording, changing its thumbnail, or moving it between folders does
+not decode the video again or invalidate training. Existing cache/checkpoint
+identities are accepted once and migrated on reuse.
+
+## Development rules
+
+- Keep model, training-data, objective, and recording schemas separate. Change
+  a schema only when its actual compatibility boundary changes.
+- Preserve recordings when model contracts change. Incompatible model
+  artifacts belong in recovery archives, not in destructive migrations.
+- Write large generated files to private temporary directories and publish
+  them with an atomic move.
+- Drain child-process stdout and stderr concurrently.
+- Keep ScreenCaptureKit callbacks small and never invoke external callbacks
+  while holding a lifecycle lock.
+- Add a regression test for every format, migration, concurrency, cache, or
+  safety correction.
+- Run `./test.sh`, `git diff --check`, and a signed-bundle verification before a
+  release.
+
+## Windows recorder status
+
+`WindowsRecorder/` is an experimental capture companion, not a Windows version
+of the trainer. It contains Record, Library, and recorder Settings only; model
+training and AI execution remain on macOS. The recorder is unfinished and is
+not the main development focus.
+
+Its exported `.atrrecord.zip` packages use the same schema and Apple virtual-key
+policy space as native recordings. macOS import remains the authoritative
+validation boundary. See [WindowsRecorder/README.md](WindowsRecorder/README.md)
+for its current requirements and developer workflow.
+
+## Troubleshooting
+
+- **No capture source:** grant Screen Recording permission, quit, and reopen.
+- **No keyboard or pointer capture:** grant Input Monitoring permission and
+  reopen.
+- **AI cannot send input:** grant Accessibility permission and enable the
+  corresponding Run output permission.
+- **Privacy prompts return after rebuilding:** keep the same app path, bundle
+  identifier, and stable signing identity; do not use ad-hoc signing.
+- **Training cache looks stale or damaged:** use Diagnostics → Clear Caches.
+  Recordings, profiles, checkpoints, and saved brains are not deleted.
+- **Storage disk disconnected:** reconnect it or choose another location in
+  Settings; AgentTrainer will not silently create a replacement library.

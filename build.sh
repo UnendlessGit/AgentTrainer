@@ -4,35 +4,76 @@ set -euo pipefail
 ROOT="${0:A:h}"
 CONFIGURATION="${CONFIGURATION:-release}"
 BUILD_ROOT="$ROOT/.build/xcode"
-APP="$ROOT/outputs/AgentTrainer.app"
+APP="${AGENTTRAINER_APP_PATH:-/Applications/AgentTrainer.app}"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT/Resources/Info.plist")"
+EXPECTED_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ROOT/Resources/Info.plist")"
 DMG="$ROOT/outputs/AgentTrainer-$VERSION.dmg"
 SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-}"
 SIGN_KEYCHAIN="${CODE_SIGN_KEYCHAIN:-}"
 
+if [[ "$APP" != /* || "$APP" != *.app || -L "$APP" ]]; then
+  echo "AGENTTRAINER_APP_PATH must be an absolute, non-symlink .app path." >&2
+  exit 1
+fi
+if [[ -e "$APP" && ! -d "$APP" ]]; then
+  echo "$APP exists but is not an application bundle directory." >&2
+  exit 1
+fi
+if [[ -d "$APP" ]]; then
+  EXISTING_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null || true)"
+  if [[ "$EXISTING_BUNDLE_ID" != "$EXPECTED_BUNDLE_ID" ]]; then
+    echo "Refusing to replace $APP because its bundle identifier is not $EXPECTED_BUNDLE_ID." >&2
+    exit 1
+  fi
+  if [[ ! -w "$APP/Contents" ]]; then
+    echo "$APP is not writable. Fix its ownership or choose another path with AGENTTRAINER_APP_PATH." >&2
+    exit 1
+  fi
+fi
+APP_PARENT="${APP:h}"
+mkdir -p "$APP_PARENT"
+if [[ ! -w "$APP_PARENT" ]]; then
+  echo "$APP_PARENT is not writable. Choose a writable .app path with AGENTTRAINER_APP_PATH." >&2
+  exit 1
+fi
+
 # Ad-hoc signing makes the designated requirement equal the binary's CDHash,
 # which changes on every build and forces macOS TCC permissions to be granted
-# again. Prefer this Mac's long-lived local identity so Screen Recording, Input
-# Monitoring, and Accessibility see rebuilt bundles as the same application.
-LOCAL_SIGN_NAME="MimicClone Local Code Signing"
-LOCAL_SIGN_KEYCHAIN="$HOME/Documents/MimicClone/.codesign/MimicClone.keychain-db"
-if [[ -z "$SIGN_IDENTITY" && -f "$LOCAL_SIGN_KEYCHAIN" ]]; then
-  security unlock-keychain -p "" "$LOCAL_SIGN_KEYCHAIN" >/dev/null 2>&1 || true
-  if security find-identity -v -p codesigning "$LOCAL_SIGN_KEYCHAIN" 2>/dev/null | grep -Fq "$LOCAL_SIGN_NAME"; then
-    SIGN_IDENTITY="$LOCAL_SIGN_NAME"
-    SIGN_KEYCHAIN="$LOCAL_SIGN_KEYCHAIN"
+# again. Prefer the installed app's current signer; on a fresh install, use the
+# only available identity when the choice is unambiguous.
+IDENTITY_SEARCH_ARGUMENTS=()
+if [[ -n "$SIGN_KEYCHAIN" ]]; then
+  IDENTITY_SEARCH_ARGUMENTS=("$SIGN_KEYCHAIN")
+fi
+IDENTITY_LIST="$(security find-identity -v -p codesigning "${IDENTITY_SEARCH_ARGUMENTS[@]}" 2>/dev/null || true)"
+if [[ -z "$SIGN_IDENTITY" && -d "$APP" ]]; then
+  EXISTING_AUTHORITY="$(codesign -dvv "$APP" 2>&1 | sed -n 's/^Authority=//p' | head -1)"
+  if [[ -n "$EXISTING_AUTHORITY" ]] && grep -Fq "\"$EXISTING_AUTHORITY\"" <<<"$IDENTITY_LIST"; then
+    SIGN_IDENTITY="$EXISTING_AUTHORITY"
+  fi
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  AVAILABLE_IDENTITIES=("${(@f)$(sed -n 's/.*"\(.*\)"/\1/p' <<<"$IDENTITY_LIST")}")
+  if (( ${#AVAILABLE_IDENTITIES[@]} == 1 )) && [[ -n "${AVAILABLE_IDENTITIES[1]}" ]]; then
+    SIGN_IDENTITY="${AVAILABLE_IDENTITIES[1]}"
   fi
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
   if [[ "${ALLOW_ADHOC_SIGNING:-0}" == "1" ]]; then
     SIGN_IDENTITY="-"
   else
-    echo "No stable code-signing identity was found. Set CODE_SIGN_IDENTITY (and optionally CODE_SIGN_KEYCHAIN), or use ALLOW_ADHOC_SIGNING=1 for a disposable build that will require permissions again." >&2
+    echo "No unambiguous stable code-signing identity was found. Set CODE_SIGN_IDENTITY (and optionally CODE_SIGN_KEYCHAIN), or use ALLOW_ADHOC_SIGNING=1 for a disposable build that will require permissions again." >&2
     exit 1
   fi
 fi
+if [[ "$SIGN_IDENTITY" != "-" && -z "$SIGN_KEYCHAIN" ]]; then
+  SIGN_KEYCHAIN="$(security find-certificate -a -c "$SIGN_IDENTITY" -Z 2>/dev/null | sed -n 's/^keychain: "\(.*\)"/\1/p' | head -1)"
+fi
 SIGN_KEYCHAIN_ARGUMENTS=()
 if [[ -n "$SIGN_KEYCHAIN" ]]; then
+  # Custom local build keychains commonly use an empty password. A nonempty
+  # keychain should be unlocked by the developer before running the build.
+  security unlock-keychain -p "" "$SIGN_KEYCHAIN" >/dev/null 2>&1 || true
   SIGN_KEYCHAIN_ARGUMENTS=(--keychain "$SIGN_KEYCHAIN")
 fi
 
@@ -78,16 +119,19 @@ fi
 
 # Preserve the authorized bundle directory and path when updating an existing
 # app. TCC permission identity depends on the bundle identifier, signer, and the
-# copy the user actually launches. Known bundle contents are replaced in place,
-# then the complete bundle is signed again below.
-if pgrep -x AgentTrainer >/dev/null 2>&1; then
-  echo "AgentTrainer is running. Stop the agent and quit the app before updating its signed bundle." >&2
-  exit 1
-fi
+# copy the user actually launches. Bundle contents are rebuilt in place, then
+# the complete bundle is signed again below.
+for RUNNING_PID in $(pgrep -x AgentTrainer 2>/dev/null || true); do
+  RUNNING_EXECUTABLE="$(ps -p "$RUNNING_PID" -o comm= | xargs)"
+  if [[ "$RUNNING_EXECUTABLE" == "$APP/Contents/MacOS/AgentTrainer" ]]; then
+    echo "AgentTrainer is running from $APP. Stop the agent and quit the app before updating its signed bundle." >&2
+    exit 1
+  fi
+done
 APP_WAS_PRESENT=0
 if [[ -d "$APP" ]]; then APP_WAS_PRESENT=1; fi
+rm -rf "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/_CodeSignature"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-rm -rf "$APP/Contents/_CodeSignature"
 /bin/cp "$BIN" "$APP/Contents/MacOS/AgentTrainer"
 /bin/chmod 755 "$APP/Contents/MacOS/AgentTrainer"
 /bin/cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
@@ -106,11 +150,11 @@ fi
 codesign --force --deep --options runtime --timestamp=none "${SIGN_KEYCHAIN_ARGUMENTS[@]}" --sign "$SIGN_IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
-cp "$ROOT/README.md" "$ROOT/outputs/README.md"
+rm -f "$ROOT/outputs/README.md"
 SOURCE_ARCHIVE="$ROOT/outputs/AgentTrainer-Source.zip"
 rm -f "$SOURCE_ARCHIVE"
 cd "$ROOT"
-/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources WindowsRecorder .github RECORDING_FORMAT.md build.sh test.sh README.md DEVELOPMENT_GUIDE.md IN_PLACE_UPDATE_GUIDE.md TRAINING_AUDIT.md -x '*.DS_Store' '*/bin/*' '*/obj/*' '*/artifacts/*'
+/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources WindowsRecorder .github RECORDING_FORMAT.md build.sh test.sh README.md -x '*.DS_Store' '*/bin/*' '*/obj/*' '*/artifacts/*'
 
 DMG_STAGE="$BUILD_ROOT/DMG"
 DMG_APP="$DMG_STAGE/AgentTrainer.app"
@@ -145,7 +189,7 @@ for old in "$ROOT"/outputs/AgentTrainer-*.dmg(N) "$ROOT"/outputs/AgentTrainer-*.
   if [[ "$old" != "$DMG" ]]; then rm -f "$old"; fi
 done
 
-CHECKSUM_INPUTS=("${DMG:t}" "AgentTrainer.app/Contents/MacOS/AgentTrainer" "AgentTrainer-Source.zip")
+CHECKSUM_INPUTS=("${DMG:t}" "${SOURCE_ARCHIVE:t}")
 (cd "$ROOT/outputs" && shasum -a 256 "${CHECKSUM_INPUTS[@]}" > SHA256SUMS.txt)
 
 echo "$APP"

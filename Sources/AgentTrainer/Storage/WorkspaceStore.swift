@@ -375,9 +375,10 @@ actor WorkspaceStore {
         guard listRecordingFolders().contains(where: { $0.id == folderID }) else {
             throw AgentTrainerError.storage("Choose an existing recording folder before importing.")
         }
-        var extractionRoots: [URL] = []
+        let discovery = try await recordingImportSources(from: selectedURLs)
+        let extractionRoots = discovery.extractionRoots
         defer { for root in extractionRoots { try? FileManager.default.removeItem(at: root) } }
-        let sources = try recordingImportSources(from: selectedURLs, extractionRoots: &extractionRoots)
+        let sources = discovery.sources
         guard !sources.isEmpty else {
             throw AgentTrainerError.storage("Choose one or more .atrrecord.zip files, .atrrecord folders, or a folder that contains recordings.")
         }
@@ -470,7 +471,8 @@ actor WorkspaceStore {
                 manifest.deliveredFPS = manifest.capture.requestedFPS
             }
             let rect = manifest.globalRect
-            if !rect.x.isFinite || !rect.y.isFinite || !rect.width.isFinite || !rect.height.isFinite {
+            if !rect.x.isFinite || !rect.y.isFinite || !rect.width.isFinite || rect.width <= 0
+                || !rect.height.isFinite || rect.height <= 0 {
                 manifest.globalRect = CodableRect(CGRect(x: 0, y: 0, width: max(1, manifest.pixelWidth), height: max(1, manifest.pixelHeight)))
             }
             manifest.pixelWidth = min(32_768, max(1, manifest.pixelWidth))
@@ -504,7 +506,9 @@ actor WorkspaceStore {
 
     func renameRecording(_ item: RecordingItem, to name: String) throws {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanName.isEmpty else { throw AgentTrainerError.invalidConfiguration("Recording names cannot be empty.") }
+        guard !cleanName.isEmpty, cleanName.count <= 200 else {
+            throw AgentTrainerError.invalidConfiguration("Recording names must contain 1 through 200 characters.")
+        }
         var manifest = item.manifest
         manifest.name = cleanName
         try writeRecording(manifest, to: item.directory)
@@ -515,7 +519,12 @@ actor WorkspaceStore {
     }
 
     func saveRecordingFolder(_ folder: RecordingFolder) throws {
-        guard !folder.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw AgentTrainerError.invalidConfiguration("Folder names cannot be empty.") }
+        let cleanName = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty, cleanName.count <= 200 else {
+            throw AgentTrainerError.invalidConfiguration("Folder names must contain 1 through 200 characters.")
+        }
+        var folder = folder
+        folder.name = cleanName
         var folders = listRecordingFolders()
         if let index = folders.firstIndex(where: { $0.id == folder.id }) { folders[index] = folder } else { folders.append(folder) }
         try atomicWrite(try encoder.encode(folders), to: foldersURL)
@@ -558,21 +567,83 @@ actor WorkspaceStore {
     }
 
     func deleteRecordingFolder(_ folder: RecordingFolder, includingRecordings: Bool) throws {
-        var remaining = listRecordingFolders().filter { $0.id != folder.id }
+        let originalFolders = listRecordingFolders()
+        var remaining = originalFolders.filter { $0.id != folder.id }
+        let affected = listRecordings().filter { $0.manifest.folderID == folder.id }
         if includingRecordings {
-            for recording in listRecordings() where recording.manifest.folderID == folder.id {
-                try? FileManager.default.removeItem(at: recording.directory)
+            guard !affected.isEmpty else {
+                try atomicWrite(try encoder.encode(remaining), to: foldersURL)
+                return
+            }
+            let staging = recordingsRoot.appendingPathComponent(
+                ".delete-folder-\(UUID().uuidString)",
+                isDirectory: true
+            )
+            var moved: [(source: URL, staged: URL)] = []
+            do {
+                try FileManager.default.createDirectory(
+                    at: staging,
+                    withIntermediateDirectories: false
+                )
+                for recording in affected {
+                    let staged = staging.appendingPathComponent(
+                        recording.directory.lastPathComponent,
+                        isDirectory: true
+                    )
+                    try FileManager.default.moveItem(at: recording.directory, to: staged)
+                    moved.append((recording.directory, staged))
+                }
+                try atomicWrite(try encoder.encode(remaining), to: foldersURL)
+                try FileManager.default.removeItem(at: staging)
+            } catch {
+                var rollbackFailed = false
+                for item in moved.reversed()
+                where FileManager.default.fileExists(atPath: item.staged.path) {
+                    do {
+                        try FileManager.default.moveItem(at: item.staged, to: item.source)
+                    } catch {
+                        rollbackFailed = true
+                    }
+                }
+                try? atomicWrite(try encoder.encode(originalFolders), to: foldersURL)
+                if rollbackFailed {
+                    AppLog.write(
+                        .error,
+                        category: "Storage",
+                        "Folder deletion rollback retained recovery data",
+                        details: staging.path
+                    )
+                } else {
+                    try? FileManager.default.removeItem(at: staging)
+                }
+                throw AgentTrainerError.storage(
+                    rollbackFailed
+                        ? "The folder could not be deleted safely. Recording data was retained at \(staging.path)."
+                        : "The folder could not be deleted safely: \(error.localizedDescription)"
+                )
             }
         } else {
             if remaining.isEmpty {
                 remaining = [RecordingFolder(id: UUID(), name: "Recordings", createdAt: Date())]
             }
             let destinationID = remaining[0].id
-            for recording in listRecordings() where recording.manifest.folderID == folder.id {
-                try assignRecording(recording, to: destinationID)
+            var reassigned: [RecordingItem] = []
+            do {
+                for recording in affected {
+                    try assignRecording(recording, to: destinationID)
+                    reassigned.append(recording)
+                }
+                try atomicWrite(try encoder.encode(remaining), to: foldersURL)
+            } catch {
+                for recording in reassigned.reversed() {
+                    try? assignRecording(recording, to: folder.id)
+                }
+                try? atomicWrite(try encoder.encode(originalFolders), to: foldersURL)
+                throw AgentTrainerError.storage(
+                    "The folder could not be changed safely: \(error.localizedDescription)"
+                )
             }
         }
-        try atomicWrite(try encoder.encode(remaining), to: foldersURL)
     }
 
     func saveProfile(_ profile: AIProfile) throws {
@@ -935,45 +1006,56 @@ actor WorkspaceStore {
         !value.isEmpty && value != "." && value != ".." && !value.contains("/") && !value.contains("\\") && !value.contains(":") && !value.contains("\0")
     }
 
-    private func recordingImportSources(from selectedURLs: [URL], extractionRoots: inout [URL]) throws -> [URL] {
+    private func recordingImportSources(
+        from selectedURLs: [URL]
+    ) async throws -> (sources: [URL], extractionRoots: [URL]) {
         var result: [URL] = []
-        for selected in selectedURLs {
-            let source = normalized(selected)
-            guard source.isFileURL else { continue }
-            let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
-            guard values.isSymbolicLink != true else {
-                throw AgentTrainerError.storage("Linked files and folders cannot be imported: \(selected.lastPathComponent).")
-            }
-            if values.isDirectory == true,
-               source.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame {
-                result.append(source)
-                continue
-            }
-            if values.isRegularFile == true,
-               source.pathExtension.localizedCaseInsensitiveCompare("zip") == .orderedSame {
-                let extractionRoot = try extractRecordingArchive(source)
-                extractionRoots.append(extractionRoot)
-                let extracted = try importDirectories(in: extractionRoot)
-                guard !extracted.isEmpty else {
-                    throw AgentTrainerError.storage("\(source.lastPathComponent) does not contain an .atrrecord package.")
+        var extractionRoots: [URL] = []
+        do {
+            for selected in selectedURLs {
+                let source = normalized(selected)
+                guard source.isFileURL else { continue }
+                let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isSymbolicLink != true else {
+                    throw AgentTrainerError.storage("Linked files and folders cannot be imported: \(selected.lastPathComponent).")
                 }
-                result.append(contentsOf: extracted)
-                continue
+                if values.isDirectory == true,
+                   source.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame {
+                    result.append(source)
+                    continue
+                }
+                if values.isRegularFile == true,
+                   source.pathExtension.localizedCaseInsensitiveCompare("zip") == .orderedSame {
+                    let extractionRoot = try await extractRecordingArchive(source)
+                    extractionRoots.append(extractionRoot)
+                    let extracted = try importDirectories(in: extractionRoot)
+                    guard !extracted.isEmpty else {
+                        throw AgentTrainerError.storage("\(source.lastPathComponent) does not contain an .atrrecord package.")
+                    }
+                    result.append(contentsOf: extracted)
+                    continue
+                }
+                guard values.isDirectory == true else { continue }
+                let directRecordings = try importDirectories(in: source)
+                if !directRecordings.isEmpty {
+                    result.append(contentsOf: directRecordings)
+                    continue
+                }
+                let libraryRecordings = source.appendingPathComponent("Recordings", isDirectory: true)
+                result.append(contentsOf: try importDirectories(in: libraryRecordings))
             }
-            guard values.isDirectory == true else { continue }
-            let directRecordings = try importDirectories(in: source)
-            if !directRecordings.isEmpty {
-                result.append(contentsOf: directRecordings)
-                continue
-            }
-            let libraryRecordings = source.appendingPathComponent("Recordings", isDirectory: true)
-            result.append(contentsOf: try importDirectories(in: libraryRecordings))
+        } catch {
+            for root in extractionRoots { try? FileManager.default.removeItem(at: root) }
+            throw error
         }
         var seen: Set<String> = []
-        return result.filter { seen.insert(normalized($0).path).inserted }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let sources = result
+            .filter { seen.insert(normalized($0).path).inserted }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return (sources, extractionRoots)
     }
 
-    private func extractRecordingArchive(_ archive: URL) throws -> URL {
+    private func extractRecordingArchive(_ archive: URL) async throws -> URL {
         let values = try archive.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
         guard values.isRegularFile == true, values.isSymbolicLink != true,
               let size = values.fileSize, size > 0 else {
@@ -983,8 +1065,8 @@ actor WorkspaceStore {
         // Preflight every ZIP member before invoking the system extractor. The
         // exported format has one .atrrecord directory at its root; absolute,
         // parent-relative, Windows-style, and NUL-bearing paths are rejected.
-        let listing = try runImportProcess("/usr/bin/unzip", ["-Z1", archive.path])
-        guard let listingText = String(data: listing, encoding: .utf8) else {
+        let listing = try await ProcessRunner.run("/usr/bin/unzip", ["-Z1", archive.path])
+        guard let listingText = String(data: listing.stdout, encoding: .utf8) else {
             throw AgentTrainerError.storage("\(archive.lastPathComponent) has an unreadable ZIP directory.")
         }
         let entries = listingText.split(whereSeparator: \Character.isNewline).map(String.init)
@@ -1005,7 +1087,7 @@ actor WorkspaceStore {
             .appendingPathComponent("AgentTrainer-Recording-Import-\(UUID().uuidString)", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: extractionRoot, withIntermediateDirectories: false)
-            _ = try runImportProcess("/usr/bin/ditto", ["-x", "-k", "--noqtn", archive.path, extractionRoot.path])
+            _ = try await ProcessRunner.run("/usr/bin/ditto", ["-x", "-k", "--noqtn", archive.path, extractionRoot.path])
             try rejectLinkedImportEntries(in: extractionRoot)
             return extractionRoot
         } catch {
@@ -1030,25 +1112,6 @@ actor WorkspaceStore {
                 throw AgentTrainerError.storage("Recording archives may not contain links or paths outside their package.")
             }
         }
-    }
-
-    private func runImportProcess(_ executable: String, _ arguments: [String]) throws -> Data {
-        let process = Process()
-        let output = Pipe()
-        let errors = Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardOutput = output
-        process.standardError = errors
-        try process.run()
-        process.waitUntilExit()
-        let stdout = output.fileHandleForReading.readDataToEndOfFile()
-        let stderr = errors.fileHandleForReading.readDataToEndOfFile()
-        guard process.terminationStatus == 0 else {
-            let detail = String(data: stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw AgentTrainerError.storage(detail?.isEmpty == false ? detail! : "The recording archive tool failed.")
-        }
-        return stdout
     }
 
     private func importDirectories(in directory: URL) throws -> [URL] {

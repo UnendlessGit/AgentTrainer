@@ -214,15 +214,16 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @u
         }
         guard let pixelBuffer = sampleBuffer.imageBuffer else { droppedFrames += 1; return }
         let pts = sampleBuffer.presentationTimeStamp
-        firstFrameLock.lock()
-        if firstFrameHostNanos == 0 {
+        let firstFrame = firstFrameLock.withLock { () -> UInt64? in
+            guard firstFrameHostNanos == 0 else { return nil }
             let hostTime = CMTimeConvertScale(pts, timescale: 1_000_000_000, method: .default)
             if hostTime.isNumeric, hostTime.value > 0 {
                 firstFrameHostNanos = UInt64(hostTime.value)
-                onFirstFrame?(firstFrameHostNanos)
+                return firstFrameHostNanos
             }
+            return nil
         }
-        firstFrameLock.unlock()
+        if let firstFrame { onFirstFrame?(firstFrame) }
         writer?.append(sampleBuffer)
         onFrame?(pixelBuffer, pts)
     }
