@@ -1,8 +1,10 @@
 # AgentTrainer Recorder for Windows
 
-AgentTrainer Recorder is the Windows capture companion for AgentTrainer. It
-contains only **Record**, **Library**, and recorder **Settings**. Training, model management, and AI
-execution remain in the Apple-silicon macOS app.
+AgentTrainer Recorder is the experimental Windows capture companion for
+AgentTrainer. It is unfinished and is not the project's current development
+focus. It contains only **Record**, **Library**, and recorder **Settings**;
+training, model management, and AI execution remain in the Apple-silicon
+macOS app.
 
 Windows and macOS recordings use the same schema-2 `.atrrecord` package and
 the same 72-byte input-event records. Windows physical scan codes are converted
@@ -25,15 +27,16 @@ The UI is per-monitor-DPI-aware. Capture uses physical desktop pixels and raw
 input uses `WM_INPUT`, so mixed-DPI displays and high-polling-rate mice do not
 pass through WPF coordinate or pointer-event coalescing.
 
-The recommended download is the single `AgentTrainer-Recorder-1.8.8-Setup-x64.exe`
-installer—the Windows equivalent of the Mac DMG. It installs the app, required
+When a tested release is available, the recommended download is the versioned
+`AgentTrainer-Recorder-<version>-Setup-x64.exe` installer. It installs the app, required
 Microsoft runtime, Start-menu entry, optional desktop shortcut, and uninstaller,
 then offers to launch the recorder. For the portable app zip, extract the complete folder and launch
 `AgentTrainer Recorder.exe`. On a clean PC, first launch offers to run the
 bundled Microsoft-signed `VC_redist.x64.exe`, then restarts the recorder. Do
 not run the executable from inside the zip.
 Production releases should Authenticode-sign the executable and installer with
-the publisher's Windows signing certificate.
+the publisher's Windows signing certificate. Treat unsigned or development
+artifacts as test builds.
 
 ## Transfer workflow
 

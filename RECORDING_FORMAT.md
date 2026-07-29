@@ -67,6 +67,10 @@ offset  size  type      field
 64      8     Float64   vertical point-scroll delta
 ```
 
+Readers reject non-Boolean `isDown` values, nonzero reserved bytes, mouse
+buttons outside `0...7`, and key/flags codes outside the fixed `0...127` policy
+space.
+
 Timestamps are nanoseconds in any monotonic, per-machine host clock. They must
 be finite in the UInt64 domain and nondecreasing. `hostStartNanos` is the
 timestamp of the first usable encoded screen frame. Events before that boundary

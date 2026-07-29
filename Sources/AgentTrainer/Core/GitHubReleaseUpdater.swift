@@ -444,31 +444,11 @@ struct GitHubReleaseUpdater: Sendable {
     }
 
     static func runProcess(_ executable: String, _ arguments: [String]) async throws -> (stdout: Data, stderr: Data) {
-        try await Task.detached(priority: .utility) {
-            let process = Process()
-            let stdout = Pipe()
-            let stderr = Pipe()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = arguments
-            process.standardOutput = stdout
-            process.standardError = stderr
-            try process.run()
-            // Drain both pipes while the child runs. Waiting first can deadlock
-            // when a future tool invocation writes more than the pipe buffer.
-            async let outputRead = Task.detached(priority: .utility) {
-                stdout.fileHandleForReading.readDataToEndOfFile()
-            }.value
-            async let errorRead = Task.detached(priority: .utility) {
-                stderr.fileHandleForReading.readDataToEndOfFile()
-            }.value
-            process.waitUntilExit()
-            let (output, error) = await (outputRead, errorRead)
-            guard process.terminationStatus == 0 else {
-                let details = String(data: error, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                throw GitHubUpdateError.commandFailed(URL(fileURLWithPath: executable).lastPathComponent, process.terminationStatus, details)
-            }
-            return (output, error)
-        }.value
+        do {
+            return try await ProcessRunner.run(executable, arguments)
+        } catch ProcessExecutionError.commandFailed(let command, let status, let details) {
+            throw GitHubUpdateError.commandFailed(command, status, details)
+        }
     }
 }
 

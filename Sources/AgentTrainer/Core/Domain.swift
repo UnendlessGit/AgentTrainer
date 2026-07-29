@@ -819,9 +819,10 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
         let safeFileNames = [videoFile, eventFile] + (thumbnailFile.map { [$0] } ?? [])
         return (1...2).contains(schemaVersion)
             && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && duration.isFinite && duration >= 0
+            && duration.isFinite && duration > 0
             && capture.requestedFPS.isFinite && capture.requestedFPS > 0 && capture.requestedFPS <= 1_000
-            && rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite
+            && rect.origin.x.isFinite && rect.origin.y.isFinite
+            && rect.width.isFinite && rect.width > 0 && rect.height.isFinite && rect.height > 0
             && pixelWidth > 0 && pixelHeight > 0 && pixelWidth <= 32_768 && pixelHeight <= 32_768
             && deliveredFPS.isFinite && deliveredFPS >= 0 && deliveredFPS <= 1_000
             && eventCount >= 0

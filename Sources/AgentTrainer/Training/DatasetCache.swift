@@ -135,6 +135,77 @@ struct DatasetCacheManifest: Codable, Hashable, Sendable {
     var segments: [CacheSegment]
 }
 
+/// Stable identity for the bytes and timeline that actually affect training.
+/// Library-only metadata (display name, folder, thumbnail, and creation date)
+/// must not force an expensive video decode or invalidate optimizer resume.
+struct RecordingContentIdentity: Codable, Hashable, Sendable {
+    struct FileStamp: Codable, Hashable, Sendable {
+        var byteCount: Int
+        var modifiedNanoseconds: Int64
+    }
+
+    var schemaVersion: Int
+    var id: UUID
+    var hostStartNanos: UInt64
+    var duration: Double
+    var globalRect: CodableRect
+    var pixelWidth: Int
+    var pixelHeight: Int
+    var videoFile: String
+    var eventFile: String
+    var trimStart: Double
+    var trimEnd: Double
+    var video: FileStamp
+    var events: FileStamp
+
+    init(recording: RecordingItem) throws {
+        let manifest = recording.manifest
+        schemaVersion = manifest.schemaVersion
+        id = manifest.id
+        hostStartNanos = manifest.hostStartNanos
+        duration = manifest.duration
+        globalRect = manifest.globalRect
+        pixelWidth = manifest.pixelWidth
+        pixelHeight = manifest.pixelHeight
+        videoFile = manifest.videoFile
+        eventFile = manifest.eventFile
+        trimStart = manifest.trimStart
+        trimEnd = manifest.trimEnd ?? manifest.duration
+        video = try Self.stamp(
+            recording.directory.appendingPathComponent(manifest.videoFile)
+        )
+        events = try Self.stamp(
+            recording.directory.appendingPathComponent(manifest.eventFile)
+        )
+    }
+
+    private static func stamp(_ url: URL) throws -> FileStamp {
+        let values = try url.resourceValues(
+            forKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]
+        )
+        guard values.isRegularFile == true,
+              let byteCount = values.fileSize,
+              byteCount >= 0,
+              let modificationDate = values.contentModificationDate else {
+            throw AgentTrainerError.storage(
+                "\(url.lastPathComponent) is missing or is not a regular recording file."
+            )
+        }
+        let nanoseconds = modificationDate.timeIntervalSince1970 * 1_000_000_000
+        guard nanoseconds.isFinite,
+              nanoseconds >= Double(Int64.min),
+              nanoseconds <= Double(Int64.max) else {
+            throw AgentTrainerError.storage(
+                "\(url.lastPathComponent) has an invalid modification timestamp."
+            )
+        }
+        return FileStamp(
+            byteCount: byteCount,
+            modifiedNanoseconds: Int64(nanoseconds.rounded())
+        )
+    }
+}
+
 /// One CPU-side optimizer batch gathered in a single pass over the mapped
 /// cache. Keeping the outputs separate avoids an extra split/copy when
 /// they become MLX arrays, while one mapped traversal removes repeated locks,
@@ -1051,6 +1122,15 @@ actor DatasetCacheBuilder {
             progress(1, "Reusing lossless sampled-video cache")
             return cached
         }
+        if let migrated = try? migrateLegacyCache(
+            profile: profile,
+            recordings: recordings,
+            stableKey: key,
+            cacheRoot: root
+        ) {
+            progress(1, "Reusing and updating the sampled-video cache")
+            return migrated
+        }
         // Do not compile the Metal kernel or retain its in-flight buffers when
         // the mapped cache already exists.
         if preprocessor == nil { preprocessor = try VisionPreprocessor() }
@@ -1123,16 +1203,78 @@ actor DatasetCacheBuilder {
             let preprocessing: PreprocessingSpec
             let actionFPS: Double
             let perceptionFPS: Double
-            let recordings: [RecordingManifest]
+            let recordings: [RecordingContentIdentity]
         }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]; encoder.dateEncodingStrategy = .iso8601
         // History is derived from immutable cached action rows at batch time.
         // Excluding both history layouts lets users tune action/visual memory
         // or switch either Policy-v9 family without losslessly decoding the
         // same videos again.
-        let identity = Identity(cacheSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, recordings: recordings.map(\.manifest))
+        let identity = Identity(
+            cacheSchema: TrainingDataContract.schemaVersion,
+            preprocessing: profile.preprocessing,
+            actionFPS: profile.training.actionFPS,
+            perceptionFPS: profile.training.perceptionFPS,
+            recordings: try recordings.map { try RecordingContentIdentity(recording: $0) }
+        )
         let digest = SHA256.hash(data: try encoder.encode(identity))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func legacyCacheKey(
+        profile: AIProfile,
+        recordings: [RecordingItem]
+    ) throws -> String {
+        struct Identity: Encodable {
+            let cacheSchema: Int
+            let preprocessing: PreprocessingSpec
+            let actionFPS: Double
+            let perceptionFPS: Double
+            let recordings: [RecordingManifest]
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let identity = Identity(
+            cacheSchema: TrainingDataContract.schemaVersion,
+            preprocessing: profile.preprocessing,
+            actionFPS: profile.training.actionFPS,
+            perceptionFPS: profile.training.perceptionFPS,
+            recordings: recordings.map(\.manifest)
+        )
+        return SHA256.hash(data: try encoder.encode(identity))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private func migrateLegacyCache(
+        profile: AIProfile,
+        recordings: [RecordingItem],
+        stableKey: String,
+        cacheRoot: URL
+    ) throws -> CachedDataset {
+        let legacyKey = try legacyCacheKey(profile: profile, recordings: recordings)
+        guard legacyKey != stableKey else {
+            throw AgentTrainerError.storage("No legacy cache migration is needed.")
+        }
+        let source = cacheRoot.appendingPathComponent("\(legacyKey).atrcache", isDirectory: true)
+        let destination = cacheRoot.appendingPathComponent("\(stableKey).atrcache", isDirectory: true)
+        _ = try CachedDataset(directory: source)
+        try FileManager.default.moveItem(at: source, to: destination)
+
+        let manifestURL = destination.appendingPathComponent("manifest.json")
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var manifest = try decoder.decode(
+            DatasetCacheManifest.self,
+            from: Data(contentsOf: manifestURL)
+        )
+        manifest.key = stableKey
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+        return try CachedDataset(directory: destination)
     }
 
     private func appendRecording(_ recording: RecordingItem, profile: AIProfile, observationBase: Int, observations: BufferedFileWriter, observationIndices: BufferedFileWriter, actions: BufferedFileWriter, progress: (Double) -> Void) async throws -> (samples: Int, observations: Int) {

@@ -265,8 +265,21 @@ enum InputEventReader {
         for index in 0..<count {
             let recordStart = 12 + index * recordSize
             let rawKind = data[recordStart + 8]
-            guard InputEventKind(rawValue: rawKind) != nil else {
+            guard let kind = InputEventKind(rawValue: rawKind) else {
                 throw AgentTrainerError.storage("This AgentTrainer input event file contains an unknown event kind.")
+            }
+            guard data[recordStart + 9] <= 1,
+                  data[recordStart + 11] == 0,
+                  data[recordStart + 14] == 0,
+                  data[recordStart + 15] == 0 else {
+                throw AgentTrainerError.storage("This AgentTrainer input event file contains invalid flags or reserved bytes.")
+            }
+            let button = data[recordStart + 10]
+            var keyCursor = recordStart + 12
+            let keyCode: UInt16 = data.readInteger(at: &keyCursor)
+            guard kind != .mouseButton || button < 8,
+                  ![InputEventKind.key, .flags].contains(kind) || keyCode < 128 else {
+                throw AgentTrainerError.storage("This AgentTrainer input event file contains a control outside the supported policy layout.")
             }
             var cursor = recordStart
             let timestamp: UInt64 = data.readInteger(at: &cursor)

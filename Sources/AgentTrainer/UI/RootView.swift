@@ -104,7 +104,7 @@ struct RootView: View {
                 }
                 .primaryButton(color: ATColor.coral)
                 .help(model.recordingIsActiveOrStarting ? "Stop or cancel recording" : "Start recording")
-                .disabled(model.agentIsActiveOrStarting)
+                .disabled(!model.recordingIsActiveOrStarting && !model.canStartRecording)
 
                 Button {
                     Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() }
@@ -113,7 +113,10 @@ struct RootView: View {
                 }
                 .primaryButton(color: ATColor.violet)
                 .help(model.agentIsActiveOrStarting ? "Stop AI and release inputs" : "Run selected AI")
-                .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil)
+                .disabled(
+                    !model.agentIsActiveOrStarting
+                        && (model.selectedProfile?.activeVersionID == nil || !model.canStartAgent)
+                )
 
                 Button(role: .destructive) { model.panic() } label: {
                     Image(systemName: "hand.raised.fill")

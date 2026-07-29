@@ -7,6 +7,12 @@ let agentTrainerSyntheticTag: Int64 = 0x4154474E_54524E52
 final class InputCaptureService: @unchecked Sendable {
     var onSample: (@Sendable (InputSample) -> Void)?
     var onState: (@Sendable (InputState) -> Void)?
+    private let unexpectedStopLock = NSLock()
+    private var unexpectedStopHandler: (@Sendable () -> Void)?
+    var onUnexpectedStop: (@Sendable () -> Void)? {
+        get { unexpectedStopLock.withLock { unexpectedStopHandler } }
+        set { unexpectedStopLock.withLock { unexpectedStopHandler = newValue } }
+    }
 
     private final class Session: @unchecked Sendable {
         let tap: CFMachPort
@@ -170,6 +176,7 @@ final class InputCaptureService: @unchecked Sendable {
         }
         if endedUnexpectedly {
             AppLog.write(.warning, category: "Input", "Input-monitor run loop exited unexpectedly")
+            onUnexpectedStop?()
         }
     }
 

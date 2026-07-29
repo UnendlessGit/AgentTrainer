@@ -213,6 +213,9 @@ final class AgentRuntime: @unchecked Sendable {
                 guard panic || self.safety.stopOnHumanInput else { return }
                 Task { await self.stop(reason: panic ? "Panic stop" : "Stopped on human input") }
             }
+            safetyMonitor.onUnexpectedStop = { [weak self] in
+                Task { await self?.stop(reason: "Input monitoring stopped unexpectedly") }
+            }
             try safetyMonitor.start()
             let targetPID = await focusTargetIfNeeded(captureSpec)
             guard lock.withLock({ !stopped }) else { throw CancellationError() }
@@ -236,6 +239,7 @@ final class AgentRuntime: @unchecked Sendable {
             // subsequently-started monitor/stream. Clean those late resources
             // again after joining teardown so a cancelled launch can never
             // leave an input tap or capture stream behind.
+            safetyMonitor.onUnexpectedStop = nil
             safetyMonitor.stop()
             safetyMonitor.onSample = nil
             _ = try? await capture.stop()
@@ -298,6 +302,7 @@ final class AgentRuntime: @unchecked Sendable {
         // or leave relative mouse state associated during that wait.
         await drain(queue: actionQueue)
         injector.disableAndReleaseAll()
+        safetyMonitor.onUnexpectedStop = nil
         safetyMonitor.stop()
         safetyMonitor.onSample = nil
         _ = try? await capture.stop()

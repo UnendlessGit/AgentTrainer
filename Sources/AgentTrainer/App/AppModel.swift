@@ -120,6 +120,30 @@ final class AppModel: ObservableObject {
     var selectedProfile: AIProfile? { profiles.first { $0.id == selectedProfileID } }
     var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording }
     var agentIsActiveOrStarting: Bool { isRunning || isStartingAgent }
+    var canStartRecording: Bool {
+        !recordingIsActiveOrStarting && !isImportingRecordings
+            && !isChangingStorageLocation && !agentIsActiveOrStarting && !isReplaying
+    }
+    var canStartAgent: Bool {
+        !recordingIsActiveOrStarting && !agentIsActiveOrStarting && agent == nil
+            && !isImportingRecordings && !isChangingStorageLocation && !isReplaying
+    }
+    var canStartTraining: Bool {
+        !isTraining && !isImportingRecordings && !isChangingStorageLocation
+    }
+    var canImportRecordings: Bool {
+        !isImportingRecordings && !isChangingStorageLocation
+            && !recordingIsActiveOrStarting && !agentIsActiveOrStarting
+            && !isTraining && !isReplaying
+    }
+    var canMutateRecordingLibrary: Bool {
+        !isImportingRecordings && !isChangingStorageLocation
+            && !recordingIsActiveOrStarting && !agentIsActiveOrStarting
+            && !isTraining && !isReplaying
+    }
+    var canClearCaches: Bool {
+        !isTraining && !isImportingRecordings && !isChangingStorageLocation
+    }
     var canChangeStorageLocations: Bool {
         !isChangingStorageLocation && !isImportingRecordings && !recordingIsActiveOrStarting && !isTraining && !agentIsActiveOrStarting && !isReplaying
     }
@@ -305,7 +329,7 @@ final class AppModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !isRecording, !isStartingRecording, !isImportingRecordings, !agentIsActiveOrStarting, !isReplaying else { return }
+        guard canStartRecording else { return }
         guard let source = selectedSource else { present(AgentTrainerError.invalidConfiguration("Select a capture source.")); return }
         guard let destinationFolderID = recordingDestinationFolderID else { present(AgentTrainerError.invalidConfiguration("Create or select a recording folder.")); return }
         isStartingRecording = true
@@ -331,6 +355,14 @@ final class AppModel: ObservableObject {
                 eventClock.update(sample.timestampNanos)
             }
             input.onState = { [weak self] state in Task { @MainActor in self?.hudModel.update(state: state, source: .human) } }
+            input.onUnexpectedStop = { [weak self] in
+                Task { @MainActor in
+                    await self?.handleRecordingSubsystemFailure(
+                        launchToken: launchToken,
+                        message: "Input monitoring stopped unexpectedly."
+                    )
+                }
+            }
             try input.start()
             guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             try await capture.start(spec: spec, recordingURL: directory.appendingPathComponent("capture.mov"), onFirstFrame: { [weak self, weak writer] nanos in
@@ -351,6 +383,13 @@ final class AppModel: ObservableObject {
                 if let initialSample { writer?.append(initialSample); eventClock.update(nanos) }
                 clock.set(nanos)
                 Task { @MainActor [weak self] in self?.recordingHostStart = nanos }
+            }, onUnexpectedStop: { [weak self] error in
+                Task { @MainActor in
+                    await self?.handleRecordingSubsystemFailure(
+                        launchToken: launchToken,
+                        message: "Screen capture stopped unexpectedly: \(error.localizedDescription)"
+                    )
+                }
             })
             guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             hudModel.show(source: .human, vision: false)
@@ -358,7 +397,7 @@ final class AppModel: ObservableObject {
             AppLog.write(category: "Recording", "Recording started", details: "\(spec.kind.rawValue), \(Int(captureRect.width))×\(Int(captureRect.height)) at \(captureFPS.formatted()) FPS")
         } catch {
             _ = try? await capture.stop()
-            input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = try? eventWriter?.finish(); eventWriter = nil
+            input.onUnexpectedStop = nil; input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = try? eventWriter?.finish(); eventWriter = nil
             if let recordingDirectory { try? FileManager.default.removeItem(at: recordingDirectory) }
             self.recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []
             if error is CancellationError { activityStatus = "Recording start cancelled" }
@@ -373,7 +412,8 @@ final class AppModel: ObservableObject {
             return
         }
         guard isRecording, let directory = recordingDirectory, let id = recordingID, let captureSpec = activeRecordingSpec, let captureRect = activeRecordingRect, let destinationFolderID = activeRecordingFolderID else { return }
-        input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
+        recordingLaunchRevision &+= 1
+        input.onUnexpectedStop = nil; input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
         let eventResult = Result { try eventWriter?.finish() ?? 0 }
         eventWriter = nil
         do {
@@ -395,7 +435,27 @@ final class AppModel: ObservableObject {
         isRecording = false; recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []; recordingClock = RecordingClock(); lastEventClock = RecordingClock(); await refreshLibrary()
     }
 
+    private func handleRecordingSubsystemFailure(
+        launchToken: UInt64,
+        message: String
+    ) async {
+        guard launchToken == recordingLaunchRevision, recordingIsActiveOrStarting else { return }
+        if isRecording {
+            await stopRecording()
+            errorMessage = "\(message) AgentTrainer ended the recording immediately to prevent unsynchronized training data."
+        } else {
+            recordingLaunchRevision &+= 1
+            activityStatus = "Recording start failed"
+            errorMessage = message
+        }
+        AppLog.write(.error, category: "Recording", message)
+    }
+
     func deleteRecording(_ item: RecordingItem) async {
+        guard canMutateRecordingLibrary else {
+            present(AgentTrainerError.storage("Stop active work before changing the recording library."))
+            return
+        }
         do {
             let nextSelection = recordings.first(where: { $0.id != item.id })?.id
             try await WorkspaceStore.shared.deleteRecording(item)
@@ -405,7 +465,7 @@ final class AppModel: ObservableObject {
         } catch { present(error) }
     }
     func importRecordings() async {
-        guard !isImportingRecordings, !recordingIsActiveOrStarting, !agentIsActiveOrStarting, !isTraining, !isReplaying else {
+        guard canImportRecordings else {
             present(AgentTrainerError.storage("Stop active work before importing recordings."))
             return
         }
@@ -424,6 +484,10 @@ final class AppModel: ObservableObject {
         panel.resolvesAliases = true
         panel.treatsFilePackagesAsDirectories = true
         guard panel.runModal() == .OK else { return }
+        guard canImportRecordings else {
+            present(AgentTrainerError.storage("Stop active work before importing recordings."))
+            return
+        }
 
         isImportingRecordings = true
         activityStatus = "Validating recordings for import…"
@@ -437,13 +501,26 @@ final class AppModel: ObservableObject {
             AppLog.write(category: "Storage", "Portable recordings imported", details: "\(imported.count) validated portable packages")
         } catch { present(error) }
     }
-    func renameRecording(_ item: RecordingItem, name: String) async { do { try await WorkspaceStore.shared.renameRecording(item, to: name); await refreshLibrary() } catch { present(error) } }
-    func moveRecording(_ item: RecordingItem, to folderID: UUID?) async { do { try await WorkspaceStore.shared.assignRecording(item, to: folderID); await refreshLibrary() } catch { present(error) } }
+    func renameRecording(_ item: RecordingItem, name: String) async {
+        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
+        do { try await WorkspaceStore.shared.renameRecording(item, to: name); await refreshLibrary() } catch { present(error) }
+    }
+    func moveRecording(_ item: RecordingItem, to folderID: UUID?) async {
+        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
+        do { try await WorkspaceStore.shared.assignRecording(item, to: folderID); await refreshLibrary() } catch { present(error) }
+    }
     func createRecordingFolder(name: String = "New Folder") async {
+        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
         do { let folder = RecordingFolder(id: UUID(), name: name, createdAt: Date()); try await WorkspaceStore.shared.saveRecordingFolder(folder); recordingDestinationFolderID = folder.id; await refreshLibrary() } catch { present(error) }
     }
-    func renameRecordingFolder(_ folder: RecordingFolder, name: String) async { do { var changed = folder; changed.name = name; try await WorkspaceStore.shared.saveRecordingFolder(changed); await refreshLibrary() } catch { present(error) } }
-    func deleteRecordingFolder(_ folder: RecordingFolder, includingRecordings: Bool = true) async { do { try await WorkspaceStore.shared.deleteRecordingFolder(folder, includingRecordings: includingRecordings); if recordingDestinationFolderID == folder.id { recordingDestinationFolderID = nil }; await refreshLibrary() } catch { present(error) } }
+    func renameRecordingFolder(_ folder: RecordingFolder, name: String) async {
+        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
+        do { var changed = folder; changed.name = name; try await WorkspaceStore.shared.saveRecordingFolder(changed); await refreshLibrary() } catch { present(error) }
+    }
+    func deleteRecordingFolder(_ folder: RecordingFolder, includingRecordings: Bool = true) async {
+        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
+        do { try await WorkspaceStore.shared.deleteRecordingFolder(folder, includingRecordings: includingRecordings); if recordingDestinationFolderID == folder.id { recordingDestinationFolderID = nil }; await refreshLibrary() } catch { present(error) }
+    }
 
     func createProfile(name: String) {
         Task {
@@ -475,6 +552,10 @@ final class AppModel: ObservableObject {
         }
     }
     func duplicateProfile(_ profile: AIProfile) async {
+        guard !isProfileBusy(profile.id) else {
+            present(AgentTrainerError.model("Stop this AI before duplicating its live training state."))
+            return
+        }
         profileAutosaveTask?.cancel()
         do {
             let copy = try await WorkspaceStore.shared.duplicateProfile(profile)
@@ -488,6 +569,10 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func resetLearningAndSave(_ profile: AIProfile) async -> AIProfile? {
+        guard !isProfileBusy(profile.id) else {
+            present(AgentTrainerError.model("Stop this AI before resetting its learned state."))
+            return nil
+        }
         profileAutosaveTask?.cancel()
         do {
             try validateProfile(profile)
@@ -503,10 +588,21 @@ final class AppModel: ObservableObject {
             return nil
         }
     }
-    func deleteProfile(_ profile: AIProfile) async { profileAutosaveTask?.cancel(); do { try await WorkspaceStore.shared.deleteProfile(profile); selectedProfileID = nil; unloadVersions(); await refreshLibrary() } catch { present(error) } }
+    func deleteProfile(_ profile: AIProfile) async {
+        guard !isProfileBusy(profile.id) else {
+            present(AgentTrainerError.model("Stop this AI before deleting it."))
+            return
+        }
+        profileAutosaveTask?.cancel()
+        do { try await WorkspaceStore.shared.deleteProfile(profile); selectedProfileID = nil; unloadVersions(); await refreshLibrary() } catch { present(error) }
+    }
 
     func activateVersion(_ version: ModelVersionManifest) async {
         guard var profile = selectedProfile else { return }
+        guard !isProfileBusy(profile.id) else {
+            present(AgentTrainerError.model("Stop this AI before changing its active brain."))
+            return
+        }
         profile.activeVersionID = version.id
         do {
             let resumable = try await WorkspaceStore.shared.restoreVersionAsCheckpoint(profileID: profile.id, version: version)
@@ -526,6 +622,10 @@ final class AppModel: ObservableObject {
 
     func deleteVersion(_ version: ModelVersionManifest) async {
         guard var profile = selectedProfile else { return }
+        guard !isProfileBusy(profile.id) else {
+            present(AgentTrainerError.model("Stop this AI before deleting one of its brains."))
+            return
+        }
         do {
             try await WorkspaceStore.shared.deleteVersion(profile: profile, versionID: version.id)
             if profile.activeVersionID == version.id { profile.activeVersionID = nil; try await WorkspaceStore.shared.saveProfile(profile) }
@@ -543,7 +643,7 @@ final class AppModel: ObservableObject {
     func startAutoTraining() { startTraining(automaticallyRepeating: true) }
 
     private func startTraining(automaticallyRepeating: Bool) {
-        guard let profile = selectedProfile, !isTraining else { return }
+        guard let profile = selectedProfile, canStartTraining else { return }
         guard runningProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently running. Select a different AI to train in the background.")); return }
         guard trainingRunSettings.maximumSteps >= 0,
               (1...100_000_000).contains(trainingRunSettings.autosaveSteps) else {
@@ -686,7 +786,7 @@ final class AppModel: ObservableObject {
 
     func startAgent() async {
         guard let profile = selectedProfile, let versionID = profile.activeVersionID,
-              let source = selectedSource, !recordingIsActiveOrStarting, !agentIsActiveOrStarting, agent == nil, !isReplaying else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop recording, replay, or any current AI first.")); return }
+              let source = selectedSource, canStartAgent else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop recording, import, storage changes, replay, or any current AI first.")); return }
         guard trainingProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently training. Select another trained AI to run at the same time.")); return }
         isStartingAgent = true
         runningProfileID = profile.id
@@ -793,15 +893,22 @@ final class AppModel: ObservableObject {
     }
     func startReenactment() {
         guard let recording = selectedRecording else { return }
-        guard !agentIsActiveOrStarting, !recordingIsActiveOrStarting, !isReplaying else {
-            present(AgentTrainerError.invalidConfiguration("Stop the current agent or recording before reenacting real input."))
+        guard !agentIsActiveOrStarting, !recordingIsActiveOrStarting, !isImportingRecordings,
+              !isChangingStorageLocation, !isTraining, !isReplaying else {
+            present(AgentTrainerError.invalidConfiguration("Stop active work before reenacting real input."))
             return
         }
         do { try reenactor.start(recording: recording); isReplaying = true; activityStatus = "Guarded reenactment running"; AppLog.write(category: "Replay", "Reenactment started", details: recording.manifest.name) } catch { present(error) }
     }
     func stopReenactment() { reenactor.stop(); if isReplaying { AppLog.write(category: "Replay", "Reenactment stopped") }; isReplaying = false; activityStatus = "Reenactment stopped" }
     func panic() { AppLog.write(.warning, category: "Safety", "Panic stop requested"); Task { stopReenactment(); await stopAgent(); if recordingIsActiveOrStarting { await stopRecording() }; if isTraining { stopTraining() } } }
-    func clearCaches() async { do { try await WorkspaceStore.shared.clearCaches(); await refreshStorageState(); activityStatus = "Dataset caches cleared"; AppLog.write(category: "Storage", "Dataset caches cleared") } catch { present(error) } }
+    func clearCaches() async {
+        guard canClearCaches else {
+            present(AgentTrainerError.storage("Wait for training, imports, and storage changes to finish before clearing caches."))
+            return
+        }
+        do { try await WorkspaceStore.shared.clearCaches(); await refreshStorageState(); activityStatus = "Dataset caches cleared"; AppLog.write(category: "Storage", "Dataset caches cleared") } catch { present(error) }
+    }
 
     func chooseStorageLocation(_ kind: WorkspaceDataKind) async {
         guard canChangeStorageLocations else {
@@ -843,6 +950,14 @@ final class AppModel: ObservableObject {
     }
 
     private func changeStorageLocation(_ kind: WorkspaceDataKind, to destination: URL) async {
+        guard canChangeStorageLocations else {
+            present(AgentTrainerError.storage("Stop recording, training, running, importing, and replay before changing storage locations."))
+            return
+        }
+        profileAutosaveTask?.cancel()
+        isChangingStorageLocation = true
+        activityStatus = "Inspecting \(kind.rawValue.lowercased()) location…"
+        defer { isChangingStorageLocation = false }
         do {
             let inspection = try await WorkspaceStore.shared.inspectDestination(destination, for: kind)
             if inspection.isCurrentLocation {
@@ -861,8 +976,6 @@ final class AppModel: ObservableObject {
                 useExisting = true
             }
 
-            profileAutosaveTask?.cancel()
-            isChangingStorageLocation = true
             activityStatus = useExisting ? "Switching \(kind.rawValue.lowercased())…" : "Copying and verifying \(kind.rawValue.lowercased())…"
             let result = try await WorkspaceStore.shared.relocate(kind, to: inspection.url, useExisting: useExisting)
             if kind == .trainingData {
@@ -886,9 +999,7 @@ final class AppModel: ObservableObject {
                 AppLog.write(.warning, category: "Storage", "\(kind.rawValue) location changed with an old copy retained", details: result.destination.path)
                 errorMessage = "\(kind.rawValue) is now using the new location, but an old copy could not be removed. Your data is safe; you may delete the old copy manually after verifying the new library."
             }
-            isChangingStorageLocation = false
         } catch {
-            isChangingStorageLocation = false
             await refreshStorageState()
             present(error)
         }

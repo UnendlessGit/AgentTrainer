@@ -810,6 +810,30 @@ final class DomainTests: XCTestCase {
         try unknownKind.write(to: url)
         XCTAssertThrowsError(try InputEventReader.mapped(url: url))
 
+        var invalidBoolean = valid
+        invalidBoolean[12 + 9] = 2
+        try invalidBoolean.write(to: url)
+        XCTAssertThrowsError(try InputEventReader.mapped(url: url))
+
+        for reservedOffset in [11, 14, 15] {
+            var nonzeroReserved = valid
+            nonzeroReserved[12 + reservedOffset] = 1
+            try nonzeroReserved.write(to: url)
+            XCTAssertThrowsError(try InputEventReader.mapped(url: url))
+        }
+
+        var unsupportedButton = valid
+        unsupportedButton[12 + 8] = InputEventKind.mouseButton.rawValue
+        unsupportedButton[12 + 10] = 8
+        try unsupportedButton.write(to: url)
+        XCTAssertThrowsError(try InputEventReader.mapped(url: url))
+
+        var unsupportedKey = valid
+        var keyCode = UInt16(128).littleEndian
+        withUnsafeBytes(of: &keyCode) { unsupportedKey.replaceSubrange((12 + 12)..<(12 + 14), with: $0) }
+        try unsupportedKey.write(to: url)
+        XCTAssertThrowsError(try InputEventReader.mapped(url: url))
+
         var nonFinite = valid
         var nanBits = Double.nan.bitPattern.littleEndian
         withUnsafeBytes(of: &nanBits) { nonFinite.replaceSubrange((12 + 24)..<(12 + 32), with: $0) }
@@ -913,7 +937,7 @@ final class DomainTests: XCTestCase {
         let folder = RecordingFolder(id: UUID(), name: "Game", createdAt: Date())
         try await store.saveRecordingFolder(folder)
         let id = UUID(), directory = try await store.createRecordingDirectory(id: id)
-        let manifest = RecordingManifest(id: id, name: "Example", createdAt: Date(), hostStartNanos: 1, duration: 2, capture: CaptureSpec(), globalRect: CodableRect(.zero), pixelWidth: 16, pixelHeight: 9, deliveredFPS: 60, eventCount: 3, folderID: folder.id)
+        let manifest = RecordingManifest(id: id, name: "Example", createdAt: Date(), hostStartNanos: 1, duration: 2, capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 9)), pixelWidth: 16, pixelHeight: 9, deliveredFPS: 60, eventCount: 3, folderID: folder.id)
         try await store.writeRecording(manifest, to: directory)
         let before = await store.listRecordings()
         XCTAssertEqual(before.first?.manifest.folderID, folder.id)
@@ -1100,7 +1124,7 @@ final class DomainTests: XCTestCase {
         let store = WorkspaceStore(root: root)
         try await store.prepare()
         let id = UUID(), directory = try await store.createRecordingDirectory(id: id)
-        let manifest = RecordingManifest(id: id, name: "Legacy", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(.zero), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0)
+        let manifest = RecordingManifest(id: id, name: "Legacy", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 8, height: 8)), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0)
         try await store.writeRecording(manifest, to: directory)
 
         let folderID = try await store.normalizeRecordingFolders()
@@ -1123,7 +1147,7 @@ final class DomainTests: XCTestCase {
         try await store.saveRecordingFolder(folder)
         let recordingID = UUID()
         let recordingDirectory = try await store.createRecordingDirectory(id: recordingID)
-        let recording = RecordingManifest(id: recordingID, name: "Move me", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(.zero), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0, folderID: folder.id)
+        let recording = RecordingManifest(id: recordingID, name: "Move me", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 8, height: 8)), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0, folderID: folder.id)
         try await store.writeRecording(recording, to: recordingDirectory)
         try Data([1, 2, 3]).write(to: recordingDirectory.appendingPathComponent("capture.mov"))
 
@@ -1180,13 +1204,13 @@ final class DomainTests: XCTestCase {
         let currentID = UUID()
         let currentDirectory = try await current.createRecordingDirectory(id: currentID)
         try await current.writeRecording(
-            RecordingManifest(id: currentID, name: "Current", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(.zero), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0),
+            RecordingManifest(id: currentID, name: "Current", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 8, height: 8)), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0),
             to: currentDirectory
         )
         let existingID = UUID()
         let existingDirectory = try await existing.createRecordingDirectory(id: existingID)
         try await existing.writeRecording(
-            RecordingManifest(id: existingID, name: "Existing", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(.zero), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0),
+            RecordingManifest(id: existingID, name: "Existing", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 8, height: 8)), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0),
             to: existingDirectory
         )
 
@@ -1244,7 +1268,7 @@ final class DomainTests: XCTestCase {
 
         let recordingID = UUID()
         let recordingDirectory = try await store.createRecordingDirectory(id: recordingID)
-        let recording = RecordingManifest(id: recordingID, name: "Keep me", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(.zero), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0)
+        let recording = RecordingManifest(id: recordingID, name: "Keep me", createdAt: Date(), hostStartNanos: 1, duration: 1, capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 8, height: 8)), pixelWidth: 8, pixelHeight: 8, deliveredFPS: 30, eventCount: 0)
         try await store.writeRecording(recording, to: recordingDirectory)
         let compatibleCache = (await store.cacheDirectory())
             .appendingPathComponent("preserved.atrcache", isDirectory: true)
@@ -1902,6 +1926,49 @@ final class DomainTests: XCTestCase {
         manifest.eventFile = "events.atrevents"
         manifest.duration = .infinity
         XCTAssertFalse(manifest.isStructurallyValid)
+    }
+
+    func testRecordingContentIdentityIgnoresLibraryMetadataButTracksPayloadAndTrim() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("content-identity-\(UUID().uuidString).atrrecord", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        try Data("video".utf8).write(to: directory.appendingPathComponent("capture.mov"))
+        try Data("events".utf8).write(to: directory.appendingPathComponent("events.atrevents"))
+
+        var manifest = RecordingManifest(
+            id: UUID(), name: "Original", createdAt: Date(), hostStartNanos: 10,
+            duration: 2, capture: CaptureSpec(),
+            globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 9)),
+            pixelWidth: 16, pixelHeight: 9, deliveredFPS: 60, eventCount: 1,
+            trimStart: 0.1, trimEnd: 1.9, folderID: UUID(), thumbnailFile: "thumbnail.jpg"
+        )
+        let original = try RecordingContentIdentity(
+            recording: RecordingItem(manifest: manifest, directory: directory)
+        )
+
+        manifest.name = "Renamed"
+        manifest.createdAt = Date(timeIntervalSince1970: 0)
+        manifest.folderID = UUID()
+        manifest.thumbnailFile = nil
+        let libraryEdit = try RecordingContentIdentity(
+            recording: RecordingItem(manifest: manifest, directory: directory)
+        )
+        XCTAssertEqual(original, libraryEdit)
+
+        manifest.trimEnd = 1.5
+        let trimmed = try RecordingContentIdentity(
+            recording: RecordingItem(manifest: manifest, directory: directory)
+        )
+        XCTAssertNotEqual(original, trimmed)
+
+        manifest.trimEnd = 1.9
+        try Data("longer video payload".utf8)
+            .write(to: directory.appendingPathComponent("capture.mov"))
+        let changedPayload = try RecordingContentIdentity(
+            recording: RecordingItem(manifest: manifest, directory: directory)
+        )
+        XCTAssertNotEqual(original, changedPayload)
     }
 
     func testSubTickPressesRemainVisibleInKeyboardButtonAndModifierTargets() {

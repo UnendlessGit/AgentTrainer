@@ -104,7 +104,7 @@ struct RecordView: View {
                     Label("The menu bar shows recording status; a compact capture-excluded keyboard shows only keys used in this recording.", systemImage: "keyboard").font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     if model.recordingIsActiveOrStarting { Button(model.isRecording ? "Stop & Save" : "Cancel Start") { Task { await model.stopRecording() } }.primaryButton(color: ATColor.coral) }
-                    else { Button("Record") { Task { await model.startRecording() } }.primaryButton(color: ATColor.coral).disabled(model.agentIsActiveOrStarting || model.isReplaying) }
+                    else { Button("Record") { Task { await model.startRecording() } }.primaryButton(color: ATColor.coral).disabled(!model.canStartRecording) }
                 }
             }.padding(28)
         }
@@ -145,6 +145,7 @@ struct ModelsView: View {
                                     }
                                     .buttonStyle(.borderless)
                                     .foregroundStyle(ATColor.coral)
+                                    .disabled(model.isProfileBusy(profile.id))
                                     .help("Delete this AI and its saved brains")
                                 }
                             }
@@ -518,7 +519,7 @@ private struct NeuralNetworkInputOverview: View {
                         Label(showsTechnicalDetails ? "Hide technical details" : "Show technical details", systemImage: "slider.horizontal.3")
                             .font(.caption.bold()).foregroundStyle(ATColor.cyan)
                         Spacer()
-                        Text("vision, tokens, history, memory, and rates").font(.caption2).foregroundStyle(.secondary)
+                        Text("vision, spatial tokens, visual memory, and rates").font(.caption2).foregroundStyle(.secondary)
                     }
                 }
                 .tint(ATColor.cyan)
@@ -1119,8 +1120,8 @@ struct TrainingView: View {
                     Spacer()
                     if model.isTraining { Button("Pause & Save Current Brain") { model.pauseTraining() }.primaryButton(color: ATColor.amber); Button("Stop") { model.stopTraining() }.primaryButton(color: ATColor.coral) }
                     else {
-                        Button("Start / Exact Resume") { model.startTraining() }.primaryButton(color: ATColor.green)
-                        Button("Auto Train") { model.startAutoTraining() }.primaryButton(color: ATColor.cyan).help("Keep starting another configured epoch block whenever training completes, until paused or stopped.")
+                        Button("Start / Exact Resume") { model.startTraining() }.primaryButton(color: ATColor.green).disabled(!model.canStartTraining)
+                        Button("Auto Train") { model.startAutoTraining() }.primaryButton(color: ATColor.cyan).disabled(!model.canStartTraining).help("Keep starting another configured epoch block whenever training completes, until paused or stopped.")
                     }
                 }
                 OLEDCard {
@@ -1859,7 +1860,7 @@ struct RunView: View {
                             KeyRestrictionGrid(restrictions: Binding(get: { profile.effectiveRestrictions }, set: { value in var changed = profile; changed.restrictions = value; model.saveProfile(changed) }), model: model).disabled(model.agentIsActiveOrStarting)
                         }
                     }
-                    HStack { StatusPill(text: model.isTraining ? "Background training remains active" : "Custom panic shortcut armed", color: model.isTraining ? ATColor.cyan : ATColor.coral); Spacer(); if model.agentIsActiveOrStarting { Button(model.isStartingAgent ? "Cancel AI Start & Release Inputs" : "Stop AI & Disable All Hooks") { Task { await model.stopAgent() } }.primaryButton(color: ATColor.coral) } else { Button("Run AI") { Task { await model.startAgent() } }.primaryButton(color: ATColor.green).disabled(profile.activeVersionID == nil || model.trainingProfileID == profile.id || model.recordingIsActiveOrStarting || model.isReplaying) } }
+                    HStack { StatusPill(text: model.isTraining ? "Background training remains active" : "Custom panic shortcut armed", color: model.isTraining ? ATColor.cyan : ATColor.coral); Spacer(); if model.agentIsActiveOrStarting { Button(model.isStartingAgent ? "Cancel AI Start & Release Inputs" : "Stop AI & Disable All Hooks") { Task { await model.stopAgent() } }.primaryButton(color: ATColor.coral) } else { Button("Run AI") { Task { await model.startAgent() } }.primaryButton(color: ATColor.green).disabled(profile.activeVersionID == nil || model.trainingProfileID == profile.id || !model.canStartAgent) } }
                 } else { ContentUnavailableView("No AI profile selected", systemImage: "cpu") }
             }.padding(28)
         }
@@ -1916,7 +1917,7 @@ struct DiagnosticsView: View {
                 PermissionStrip(model: model)
                 HStack(spacing: 12) { MetricCard(title: "MLX active", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .memory), symbol: "memorychip", color: ATColor.green); MetricCard(title: "MLX peak", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .memory), symbol: "chart.bar.fill", color: ATColor.amber); MetricCard(title: "MLX cache", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.cacheMemory), countStyle: .memory), symbol: "shippingbox", color: ATColor.violet) }
                 OLEDCard { VStack(alignment: .leading, spacing: 10) { LabeledContent("Chip", value: hardwareName()); LabeledContent("MLX device", value: Device.defaultDevice().deviceType == .gpu ? "Apple GPU" : "CPU"); LabeledContent("Physical unified memory", value: ByteCountFormatter.string(fromByteCount: Int64(ProcessInfo.processInfo.physicalMemory), countStyle: .memory)); LabeledContent("Local workspace", value: ByteCountFormatter.string(fromByteCount: model.storageBytes, countStyle: .file)); LabeledContent("Bundle identifier", value: Bundle.main.bundleIdentifier ?? "local.agenttrainer.mac"); LabeledContent("Networking", value: "GitHub Releases update check only") } }
-                OLEDCard { HStack { VStack(alignment: .leading) { HStack { Text("Packed dataset caches").font(.headline); InfoTip("Caches store each perception frame once and map faster action ticks to compact frame indices. Every configured visual-memory lag and action-history row is derived from that index at batch time, so changing either memory layout reuses the same cache. Clearing caches never deletes recordings, profiles, or checkpoints.") }; Text("Delete reusable decoded observations without deleting recordings or models.").foregroundStyle(.secondary) }; Spacer(); Button("Clear Caches") { Task { await model.clearCaches() } }.primaryButton(color: ATColor.amber) } }
+                OLEDCard { HStack { VStack(alignment: .leading) { HStack { Text("Packed dataset caches").font(.headline); InfoTip("Caches store each perception frame once and map faster action ticks to compact frame indices. Visual-memory lags are derived at batch time, so changing memory layout reuses the same decoded video. Renaming or moving a recording also keeps its cache. Clearing caches never deletes recordings, profiles, or checkpoints.") }; Text("Delete reusable decoded observations without deleting recordings or models.").foregroundStyle(.secondary) }; Spacer(); Button("Clear Caches") { Task { await model.clearCaches() } }.primaryButton(color: ATColor.amber).disabled(!model.canClearCaches) } }
                 let crashReports = AppLogStore.crashReports()
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 10) {
@@ -2011,7 +2012,7 @@ struct SettingsView: View {
                 ThemeSettingsView()
                 OLEDCard { HStack { VStack(alignment: .leading, spacing: 4) { Text("Diagnostics and app logs").font(.headline).foregroundStyle(ATColor.cyan); Text("Open the dedicated tab for persistent errors, prints, crash reports, MLX memory, and a copyable support report.").foregroundStyle(.secondary) }; Spacer(); Button("Open Diagnostics") { model.selection = .diagnostics }.primaryButton() } }
                 StorageSettingsView(model: model)
-                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.9.4") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "25"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
+                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.9.4.1") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "26"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
             }.padding(28)
         }
     }

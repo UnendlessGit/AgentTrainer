@@ -114,7 +114,7 @@ struct LibraryView: View {
                 Label(model.isImportingRecordings ? "Importing…" : "Import", systemImage: "square.and.arrow.down")
             }
             .primaryButton(color: ATColor.green)
-            .disabled(model.isImportingRecordings || model.recordingIsActiveOrStarting || model.agentIsActiveOrStarting || model.isTraining || model.isReplaying)
+            .disabled(!model.canImportRecordings)
             .help("Import recordings exported from AgentTrainer on Windows or another Mac")
 
             Button {
@@ -123,6 +123,7 @@ struct LibraryView: View {
                 Image(systemName: "arrow.clockwise")
             }
             .primaryButton()
+            .disabled(model.isChangingStorageLocation)
             .help("Refresh library")
         }
         .fixedSize()
@@ -142,7 +143,7 @@ struct LibraryView: View {
                         let name = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !name.isEmpty else { return }
                         folderName = ""; Task { await model.createRecordingFolder(name: name) }
-                    }.primaryButton()
+                    }.primaryButton().disabled(!model.canMutateRecordingLibrary)
                 }
                 Divider()
                 List {
@@ -170,6 +171,7 @@ struct LibraryView: View {
                                         }
                                         .buttonStyle(.borderless)
                                         .foregroundStyle(ATColor.coral)
+                                        .disabled(!model.canMutateRecordingLibrary)
                                         .help("Delete this recording")
                                     }
                                 }
@@ -185,6 +187,7 @@ struct LibraryView: View {
                                     Button("Rename folder") { folderRenameText = folder.name; folderToRename = folder }
                                     Button("Delete folder and recordings", role: .destructive) { deleteFolder = folder }
                                 } label: { Image(systemName: "ellipsis.circle").foregroundStyle(.secondary) }.menuStyle(.borderlessButton).fixedSize()
+                                    .disabled(!model.canMutateRecordingLibrary)
                             }
                         }
                         .tint(ATColor.cyan)
@@ -212,6 +215,7 @@ struct LibraryView: View {
                             .frame(maxWidth: .infinity, minHeight: 150).background(Color.black).clipShape(RoundedRectangle(cornerRadius: ATCorner.scaled(10), style: .continuous))
                         TextField("Recording name", text: $renameText).font(.title3.bold()).textFieldStyle(.plain)
                             .onSubmit { Task { await model.renameRecording(item, name: renameText) } }
+                            .disabled(!model.canMutateRecordingLibrary)
                         HStack { StatusPill(text: durationString(effectiveDuration(item)), color: ATColor.cyan); StatusPill(text: "\(item.manifest.pixelWidth)×\(item.manifest.pixelHeight)", color: ATColor.violet); StatusPill(text: "\(Int(item.manifest.deliveredFPS.rounded())) FPS", color: ATColor.green) }
                         HStack { Label("\(item.manifest.eventCount) inputs", systemImage: "cursorarrow.click.2"); Spacer(); Label(item.manifest.capture.kind.rawValue, systemImage: "viewfinder") }.font(.caption).foregroundStyle(.secondary)
                         if item.manifest.trimStart > 0 || (item.manifest.trimEnd ?? item.manifest.duration) < item.manifest.duration {
@@ -263,11 +267,12 @@ struct LibraryView: View {
                         }
                         Divider()
                         Picker("Folder", selection: Binding(get: { item.manifest.folderID }, set: { folder in Task { await model.moveRecording(item, to: folder) } })) { ForEach(model.recordingFolders) { Text($0.name).tag(Optional($0.id)) } }
+                            .disabled(!model.canMutateRecordingLibrary)
                         Toggle("Enable real-input reenactment", isOn: $reenactmentArmed).font(.caption)
                         HStack {
                             if model.isReplaying { Button("Stop Replay") { model.stopReenactment() }.primaryButton(color: ATColor.coral) }
-                            else { Button("Reenact") { model.startReenactment() }.primaryButton(color: ATColor.amber).disabled(!reenactmentArmed || model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting) }
-                            Spacer(); Button("Delete", role: .destructive) { deleteRecording = item }.primaryButton(color: ATColor.coral)
+                            else { Button("Reenact") { model.startReenactment() }.primaryButton(color: ATColor.amber).disabled(!reenactmentArmed || model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting || model.isImportingRecordings || model.isChangingStorageLocation || model.isTraining) }
+                            Spacer(); Button("Delete", role: .destructive) { deleteRecording = item }.primaryButton(color: ATColor.coral).disabled(!model.canMutateRecordingLibrary)
                         }
                     }
                     .listRowInsets(EdgeInsets())
