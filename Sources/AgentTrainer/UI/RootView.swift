@@ -104,7 +104,7 @@ struct RootView: View {
                 }
                 .primaryButton(color: ATColor.coral)
                 .help(model.recordingIsActiveOrStarting ? "Stop or cancel recording" : "Start recording")
-                .disabled(!model.recordingIsActiveOrStarting && !model.canStartRecording)
+                .disabled(model.agentIsActiveOrStarting)
 
                 Button {
                     Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() }
@@ -113,10 +113,7 @@ struct RootView: View {
                 }
                 .primaryButton(color: ATColor.violet)
                 .help(model.agentIsActiveOrStarting ? "Stop AI and release inputs" : "Run selected AI")
-                .disabled(
-                    !model.agentIsActiveOrStarting
-                        && (model.selectedProfile?.activeVersionID == nil || !model.canStartAgent)
-                )
+                .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil)
 
                 Button(role: .destructive) { model.panic() } label: {
                     Image(systemName: "hand.raised.fill")
@@ -181,6 +178,7 @@ struct RootView: View {
 
 
     private var activityTitle: String {
+        if model.isStoppingRecording { return "Saving recording" }
         if model.isRecording { return "Recording" }
         if model.agentIsActiveOrStarting && model.isTraining { return model.isStartingAgent ? "Start/stop + train" : "Run + train" }
         if model.isStartingAgent { return "AI starting / stopping" }
@@ -303,7 +301,7 @@ private struct WindowDragHandle: NSViewRepresentable {
 }
 
 /// Full-size, transparent AppKit title chrome leaves the traffic lights native
-/// while the app draws one identical opaque top bar on Sequoia and Tahoe.
+/// while the app draws one identical opaque top bar across supported macOS versions.
 private struct WindowChromeConfigurator: NSViewRepresentable {
     let configuration: UIConfiguration
 

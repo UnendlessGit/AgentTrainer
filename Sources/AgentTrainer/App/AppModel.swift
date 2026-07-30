@@ -27,7 +27,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLoadingVersions = false
     @Published var isRecording = false
     @Published private(set) var isStartingRecording = false
-    @Published private(set) var isImportingRecordings = false
+    @Published private(set) var isStoppingRecording = false
     @Published var isTraining = false
     @Published private(set) var isAutoTraining = false
     @Published var isRunning = false
@@ -118,34 +118,10 @@ final class AppModel: ObservableObject {
     var selectedSource: CaptureSourceOption? { captureSources.first { $0.id == selectedSourceID && sourceMatchesKind($0) } }
     var selectedRecording: RecordingItem? { recordings.first { $0.id == selectedRecordingID } }
     var selectedProfile: AIProfile? { profiles.first { $0.id == selectedProfileID } }
-    var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording }
+    var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording || isStoppingRecording }
     var agentIsActiveOrStarting: Bool { isRunning || isStartingAgent }
-    var canStartRecording: Bool {
-        !recordingIsActiveOrStarting && !isImportingRecordings
-            && !isChangingStorageLocation && !agentIsActiveOrStarting && !isReplaying
-    }
-    var canStartAgent: Bool {
-        !recordingIsActiveOrStarting && !agentIsActiveOrStarting && agent == nil
-            && !isImportingRecordings && !isChangingStorageLocation && !isReplaying
-    }
-    var canStartTraining: Bool {
-        !isTraining && !isImportingRecordings && !isChangingStorageLocation
-    }
-    var canImportRecordings: Bool {
-        !isImportingRecordings && !isChangingStorageLocation
-            && !recordingIsActiveOrStarting && !agentIsActiveOrStarting
-            && !isTraining && !isReplaying
-    }
-    var canMutateRecordingLibrary: Bool {
-        !isImportingRecordings && !isChangingStorageLocation
-            && !recordingIsActiveOrStarting && !agentIsActiveOrStarting
-            && !isTraining && !isReplaying
-    }
-    var canClearCaches: Bool {
-        !isTraining && !isImportingRecordings && !isChangingStorageLocation
-    }
     var canChangeStorageLocations: Bool {
-        !isChangingStorageLocation && !isImportingRecordings && !recordingIsActiveOrStarting && !isTraining && !agentIsActiveOrStarting && !isReplaying
+        !isChangingStorageLocation && !recordingIsActiveOrStarting && !isTraining && !agentIsActiveOrStarting && !isReplaying
     }
 
     init() {
@@ -181,14 +157,12 @@ final class AppModel: ObservableObject {
     func bootstrap() async {
         storageLocations = await WorkspaceStore.shared.locations()
         do {
-            var archivedModelArtifacts = 0
             try await WorkspaceStore.shared.prepare()
             let repairedRecordings = try await WorkspaceStore.shared.repairInvalidRecordingManifests()
             if repairedRecordings > 0 {
                 AppLog.write(.warning, category: "Migration", "Recovered legacy recording manifests", details: "\(repairedRecordings) recording manifests repaired; video and input files were unchanged")
             }
             let archived = try await WorkspaceStore.shared.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
-            archivedModelArtifacts = archived
             if archived > 0 { AppLog.write(.warning, category: "Migration", "Archived incompatible model artifacts", details: "\(archived) model/checkpoint items moved to recovery archives; compatible brains, recordings, and profiles were preserved") }
             let obsoleteCaches = try await WorkspaceStore.shared.removeObsoleteCaches(currentSchema: TrainingDataContract.schemaVersion)
             if obsoleteCaches > 0 { AppLog.write(category: "Migration", "Removed obsolete dataset caches", details: "\(obsoleteCaches) cache directories; recordings and runnable brains were preserved") }
@@ -197,9 +171,6 @@ final class AppModel: ObservableObject {
             await refreshLibrary(); await repairLegacyRecordingClocks(); await refreshSources(); refreshPermissions()
             await ensureRecordingThumbnails()
             if profiles.isEmpty { createProfile(name: "My First Agent") }
-            if archivedModelArtifacts > 0 {
-                activityStatus = "Policy v9 perception-backed model ready • archived \(archivedModelArtifacts) older model artifact\(archivedModelArtifacts == 1 ? "" : "s") • recordings and sampled-video caches preserved"
-            }
             AppLog.write(category: "Lifecycle", "Workspace ready", details: "\(recordings.count) recordings, \(profiles.count) profiles")
         } catch {
             await refreshStorageState()
@@ -329,7 +300,7 @@ final class AppModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard canStartRecording else { return }
+        guard !recordingIsActiveOrStarting, !agentIsActiveOrStarting, !isReplaying else { return }
         guard let source = selectedSource else { present(AgentTrainerError.invalidConfiguration("Select a capture source.")); return }
         guard let destinationFolderID = recordingDestinationFolderID else { present(AgentTrainerError.invalidConfiguration("Create or select a recording folder.")); return }
         isStartingRecording = true
@@ -355,14 +326,6 @@ final class AppModel: ObservableObject {
                 eventClock.update(sample.timestampNanos)
             }
             input.onState = { [weak self] state in Task { @MainActor in self?.hudModel.update(state: state, source: .human) } }
-            input.onUnexpectedStop = { [weak self] in
-                Task { @MainActor in
-                    await self?.handleRecordingSubsystemFailure(
-                        launchToken: launchToken,
-                        message: "Input monitoring stopped unexpectedly."
-                    )
-                }
-            }
             try input.start()
             guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             try await capture.start(spec: spec, recordingURL: directory.appendingPathComponent("capture.mov"), onFirstFrame: { [weak self, weak writer] nanos in
@@ -383,13 +346,6 @@ final class AppModel: ObservableObject {
                 if let initialSample { writer?.append(initialSample); eventClock.update(nanos) }
                 clock.set(nanos)
                 Task { @MainActor [weak self] in self?.recordingHostStart = nanos }
-            }, onUnexpectedStop: { [weak self] error in
-                Task { @MainActor in
-                    await self?.handleRecordingSubsystemFailure(
-                        launchToken: launchToken,
-                        message: "Screen capture stopped unexpectedly: \(error.localizedDescription)"
-                    )
-                }
             })
             guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             hudModel.show(source: .human, vision: false)
@@ -397,7 +353,7 @@ final class AppModel: ObservableObject {
             AppLog.write(category: "Recording", "Recording started", details: "\(spec.kind.rawValue), \(Int(captureRect.width))×\(Int(captureRect.height)) at \(captureFPS.formatted()) FPS")
         } catch {
             _ = try? await capture.stop()
-            input.onUnexpectedStop = nil; input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = try? eventWriter?.finish(); eventWriter = nil
+            input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = try? eventWriter?.finish(); eventWriter = nil
             if let recordingDirectory { try? FileManager.default.removeItem(at: recordingDirectory) }
             self.recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []
             if error is CancellationError { activityStatus = "Recording start cancelled" }
@@ -411,9 +367,14 @@ final class AppModel: ObservableObject {
             activityStatus = "Cancelling recording start…"
             return
         }
-        guard isRecording, let directory = recordingDirectory, let id = recordingID, let captureSpec = activeRecordingSpec, let captureRect = activeRecordingRect, let destinationFolderID = activeRecordingFolderID else { return }
-        recordingLaunchRevision &+= 1
-        input.onUnexpectedStop = nil; input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
+        guard !isStoppingRecording, isRecording,
+              let directory = recordingDirectory, let id = recordingID,
+              let captureSpec = activeRecordingSpec, let captureRect = activeRecordingRect,
+              let destinationFolderID = activeRecordingFolderID else { return }
+        isStoppingRecording = true
+        activityStatus = "Saving recording…"
+        defer { isStoppingRecording = false }
+        input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
         let eventResult = Result { try eventWriter?.finish() ?? 0 }
         eventWriter = nil
         do {
@@ -435,27 +396,7 @@ final class AppModel: ObservableObject {
         isRecording = false; recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []; recordingClock = RecordingClock(); lastEventClock = RecordingClock(); await refreshLibrary()
     }
 
-    private func handleRecordingSubsystemFailure(
-        launchToken: UInt64,
-        message: String
-    ) async {
-        guard launchToken == recordingLaunchRevision, recordingIsActiveOrStarting else { return }
-        if isRecording {
-            await stopRecording()
-            errorMessage = "\(message) AgentTrainer ended the recording immediately to prevent unsynchronized training data."
-        } else {
-            recordingLaunchRevision &+= 1
-            activityStatus = "Recording start failed"
-            errorMessage = message
-        }
-        AppLog.write(.error, category: "Recording", message)
-    }
-
     func deleteRecording(_ item: RecordingItem) async {
-        guard canMutateRecordingLibrary else {
-            present(AgentTrainerError.storage("Stop active work before changing the recording library."))
-            return
-        }
         do {
             let nextSelection = recordings.first(where: { $0.id != item.id })?.id
             try await WorkspaceStore.shared.deleteRecording(item)
@@ -464,63 +405,13 @@ final class AppModel: ObservableObject {
             activityStatus = "Recording deleted"
         } catch { present(error) }
     }
-    func importRecordings() async {
-        guard canImportRecordings else {
-            present(AgentTrainerError.storage("Stop active work before importing recordings."))
-            return
-        }
-        guard let destinationFolderID = recordingDestinationFolderID else {
-            present(AgentTrainerError.storage("Create or select a recording folder before importing."))
-            return
-        }
-        let panel = NSOpenPanel()
-        panel.title = "Import AgentTrainer recordings"
-        panel.message = "Choose .atrrecord.zip files exported on Windows, .atrrecord folders, a Recordings folder, or an AgentTrainer training-data library. Sources are validated and copied; they are never modified."
-        panel.prompt = "Import"
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = true
-        panel.canCreateDirectories = false
-        panel.resolvesAliases = true
-        panel.treatsFilePackagesAsDirectories = true
-        guard panel.runModal() == .OK else { return }
-        guard canImportRecordings else {
-            present(AgentTrainerError.storage("Stop active work before importing recordings."))
-            return
-        }
-
-        isImportingRecordings = true
-        activityStatus = "Validating recordings for import…"
-        defer { isImportingRecordings = false }
-        do {
-            let imported = try await WorkspaceStore.shared.importRecordings(from: panel.urls, into: destinationFolderID)
-            await refreshLibrary()
-            await ensureRecordingThumbnails()
-            if let first = imported.first { selectedRecordingID = first.id }
-            activityStatus = "Imported \(imported.count) recording\(imported.count == 1 ? "" : "s")"
-            AppLog.write(category: "Storage", "Portable recordings imported", details: "\(imported.count) validated portable packages")
-        } catch { present(error) }
-    }
-    func renameRecording(_ item: RecordingItem, name: String) async {
-        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
-        do { try await WorkspaceStore.shared.renameRecording(item, to: name); await refreshLibrary() } catch { present(error) }
-    }
-    func moveRecording(_ item: RecordingItem, to folderID: UUID?) async {
-        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
-        do { try await WorkspaceStore.shared.assignRecording(item, to: folderID); await refreshLibrary() } catch { present(error) }
-    }
+    func renameRecording(_ item: RecordingItem, name: String) async { do { try await WorkspaceStore.shared.renameRecording(item, to: name); await refreshLibrary() } catch { present(error) } }
+    func moveRecording(_ item: RecordingItem, to folderID: UUID?) async { do { try await WorkspaceStore.shared.assignRecording(item, to: folderID); await refreshLibrary() } catch { present(error) } }
     func createRecordingFolder(name: String = "New Folder") async {
-        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
         do { let folder = RecordingFolder(id: UUID(), name: name, createdAt: Date()); try await WorkspaceStore.shared.saveRecordingFolder(folder); recordingDestinationFolderID = folder.id; await refreshLibrary() } catch { present(error) }
     }
-    func renameRecordingFolder(_ folder: RecordingFolder, name: String) async {
-        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
-        do { var changed = folder; changed.name = name; try await WorkspaceStore.shared.saveRecordingFolder(changed); await refreshLibrary() } catch { present(error) }
-    }
-    func deleteRecordingFolder(_ folder: RecordingFolder, includingRecordings: Bool = true) async {
-        guard canMutateRecordingLibrary else { present(AgentTrainerError.storage("Stop active work before changing the recording library.")); return }
-        do { try await WorkspaceStore.shared.deleteRecordingFolder(folder, includingRecordings: includingRecordings); if recordingDestinationFolderID == folder.id { recordingDestinationFolderID = nil }; await refreshLibrary() } catch { present(error) }
-    }
+    func renameRecordingFolder(_ folder: RecordingFolder, name: String) async { do { var changed = folder; changed.name = name; try await WorkspaceStore.shared.saveRecordingFolder(changed); await refreshLibrary() } catch { present(error) } }
+    func deleteRecordingFolder(_ folder: RecordingFolder, includingRecordings: Bool = true) async { do { try await WorkspaceStore.shared.deleteRecordingFolder(folder, includingRecordings: includingRecordings); if recordingDestinationFolderID == folder.id { recordingDestinationFolderID = nil }; await refreshLibrary() } catch { present(error) } }
 
     func createProfile(name: String) {
         Task {
@@ -530,14 +421,10 @@ final class AppModel: ObservableObject {
     }
 
     func saveProfile(_ profile: AIProfile) {
-        var profile = profile
-        profile.training.historyLength = PolicyInputContract.actionHistoryLength
         do { try validateProfile(profile) } catch { present(error); return }
         Task { do { try await WorkspaceStore.shared.saveProfile(profile); await refreshLibrary(); selectedProfileID = profile.id } catch { present(error) } }
     }
     func scheduleProfileAutosave(_ profile: AIProfile) {
-        var profile = profile
-        profile.training.historyLength = PolicyInputContract.actionHistoryLength
         profileAutosaveTask?.cancel()
         if let index = profiles.firstIndex(where: { $0.id == profile.id }) { profiles[index] = profile }
         selectedProfileID = profile.id
@@ -552,10 +439,6 @@ final class AppModel: ObservableObject {
         }
     }
     func duplicateProfile(_ profile: AIProfile) async {
-        guard !isProfileBusy(profile.id) else {
-            present(AgentTrainerError.model("Stop this AI before duplicating its live training state."))
-            return
-        }
         profileAutosaveTask?.cancel()
         do {
             let copy = try await WorkspaceStore.shared.duplicateProfile(profile)
@@ -569,10 +452,6 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func resetLearningAndSave(_ profile: AIProfile) async -> AIProfile? {
-        guard !isProfileBusy(profile.id) else {
-            present(AgentTrainerError.model("Stop this AI before resetting its learned state."))
-            return nil
-        }
         profileAutosaveTask?.cancel()
         do {
             try validateProfile(profile)
@@ -580,61 +459,40 @@ final class AppModel: ObservableObject {
             unloadVersions()
             await refreshLibrary()
             selectedProfileID = reset.id
-            activityStatus = "Architecture changed — incompatible training was archived and this AI is ready for a fresh brain"
-            AppLog.write(.warning, category: "Models", "Learned brain archived after confirmed architecture change", details: reset.name)
+            activityStatus = "Architecture changed — previous training was cleared and this AI is ready for a fresh brain"
+            AppLog.write(.warning, category: "Models", "Learned brain reset after confirmed architecture change", details: reset.name)
             return profiles.first(where: { $0.id == reset.id }) ?? reset
         } catch {
             present(error)
             return nil
         }
     }
-    func deleteProfile(_ profile: AIProfile) async {
-        guard !isProfileBusy(profile.id) else {
-            present(AgentTrainerError.model("Stop this AI before deleting it."))
-            return
-        }
-        profileAutosaveTask?.cancel()
-        do { try await WorkspaceStore.shared.deleteProfile(profile); selectedProfileID = nil; unloadVersions(); await refreshLibrary() } catch { present(error) }
-    }
+    func deleteProfile(_ profile: AIProfile) async { profileAutosaveTask?.cancel(); do { try await WorkspaceStore.shared.deleteProfile(profile); selectedProfileID = nil; unloadVersions(); await refreshLibrary() } catch { present(error) } }
 
-    func activateVersion(_ version: ModelVersionManifest) async {
-        guard var profile = selectedProfile else { return }
-        guard !isProfileBusy(profile.id) else {
-            present(AgentTrainerError.model("Stop this AI before changing its active brain."))
-            return
-        }
-        profile.activeVersionID = version.id
+    @discardableResult
+    func activateVersion(_ version: ModelVersionManifest) async -> Bool {
+        guard let profile = selectedProfile else { return false }
         do {
-            let resumable = try await WorkspaceStore.shared.restoreVersionAsCheckpoint(profileID: profile.id, version: version)
-            let count = await WorkspaceStore.shared.listVersions(profileID: profile.id).count
-            profile.trainingProgress = TrainingProgressSummary(
-                globalStep: version.globalStep,
-                epoch: version.epoch ?? 0,
-                updatedAt: version.createdAt,
-                savedBrainCount: count,
-                trainingDurationSeconds: version.trainingDurationSeconds,
-                experienceDurationSeconds: version.experienceDurationSeconds
-            )
-            try await WorkspaceStore.shared.saveProfile(profile); await refreshLibrary(); selectedProfileID = profile.id
-            activityStatus = resumable ? "Brain reverted to \(version.name); training will resume there" : "Activated \(version.name) for running"
-        } catch { present(error) }
+            let activation = try await WorkspaceStore.shared.activateVersion(profile: profile, versionID: version.id)
+            await refreshLibrary()
+            selectedProfileID = activation.profile.id
+            activityStatus = activation.checkpointIsResumable
+                ? "Brain reverted to \(activation.version.name); training will resume there"
+                : "Activated \(activation.version.name) for running"
+            return true
+        } catch {
+            present(error)
+            return false
+        }
     }
 
     func deleteVersion(_ version: ModelVersionManifest) async {
-        guard var profile = selectedProfile else { return }
-        guard !isProfileBusy(profile.id) else {
-            present(AgentTrainerError.model("Stop this AI before deleting one of its brains."))
-            return
-        }
+        guard let profile = selectedProfile else { return }
         do {
-            try await WorkspaceStore.shared.deleteVersion(profile: profile, versionID: version.id)
-            if profile.activeVersionID == version.id { profile.activeVersionID = nil; try await WorkspaceStore.shared.saveProfile(profile) }
-            if var progress = profile.trainingProgress {
-                progress.savedBrainCount = await WorkspaceStore.shared.listVersions(profileID: profile.id).count
-                profile.trainingProgress = progress
-                try await WorkspaceStore.shared.saveProfile(profile)
-            }
-            await refreshLibrary(); activityStatus = "Model version deleted"
+            let updated = try await WorkspaceStore.shared.deleteVersion(profile: profile, versionID: version.id)
+            await refreshLibrary()
+            selectedProfileID = updated.id
+            activityStatus = "Model version deleted"
         } catch { present(error) }
     }
 
@@ -643,7 +501,7 @@ final class AppModel: ObservableObject {
     func startAutoTraining() { startTraining(automaticallyRepeating: true) }
 
     private func startTraining(automaticallyRepeating: Bool) {
-        guard let profile = selectedProfile, canStartTraining else { return }
+        guard let profile = selectedProfile, !isTraining else { return }
         guard runningProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently running. Select a different AI to train in the background.")); return }
         guard trainingRunSettings.maximumSteps >= 0,
               (1...100_000_000).contains(trainingRunSettings.autosaveSteps) else {
@@ -661,13 +519,8 @@ final class AppModel: ObservableObject {
     }
 
     private func launchTraining(profile: AIProfile, recordings selected: [RecordingItem]) {
-        trainingMetrics = TrainingMetrics()
         isTraining = true; trainingProfileID = profile.id; trainingStatus = "Preparing packed dataset cache for \(profile.name)"; activityStatus = trainingStatus
-        AppLog.write(
-            category: "Training",
-            isAutoTraining ? "Auto training started" : "Training started",
-            details: "\(profile.name), objective v\(TrainingObjectiveContract.schemaVersion), \(selected.count) recordings, batch \(profile.training.batchSize), \(profile.preprocessing.width)×\(profile.preprocessing.height), visual memory \(profile.training.visualMemoryLags)"
-        )
+        AppLog.write(category: "Training", isAutoTraining ? "Auto training started" : "Training started", details: "\(profile.name), \(selected.count) recordings, batch \(profile.training.batchSize), \(profile.preprocessing.width)×\(profile.preprocessing.height)")
         training.start(profile: profile, recordings: selected, runSettings: trainingRunSettings) { [weak self] value, status in
             Task { @MainActor in self?.trainingMetrics = value; self?.trainingStatus = status; self?.activityStatus = self?.isRunning == true ? "AI running • \(status)" : status }
         } completion: { [weak self] result in
@@ -680,19 +533,7 @@ final class AppModel: ObservableObject {
     private func handleTrainingCompletion(_ result: Result<TrainingCompletion, Error>, profileID: UUID) async {
         switch result {
         case .success(let completion):
-            let report = completion.version.validationReport
-            let details = [
-                "step \(completion.version.globalStep)",
-                "objective \(completion.version.trainingLoss)",
-                completion.version.validationLoss.map { "held-out \($0)" },
-                report.map {
-                    "\($0.effectiveEvaluationScope.shortLabel.lowercased()) execution sample \($0.sampleCount)"
-                },
-                report?.lossBreakdown?.mouse.map { "mouse \($0)" },
-                report?.lossBreakdown?.keyboard.map { "keyboard \($0)" },
-                report?.binary.map { "binary F1 \($0.f1)" }
-            ].compactMap { $0 }.joined(separator: ", ")
-            AppLog.write(category: "Training", completion.completed ? "Training block complete" : "Training paused", details: details)
+            AppLog.write(category: "Training", completion.completed ? "Training block complete" : "Training paused", details: "step \(completion.version.globalStep), loss \(completion.version.trainingLoss)")
             await refreshLibrary()
             if completion.completed,
                trainingInterruption == nil,
@@ -722,33 +563,15 @@ final class AppModel: ObservableObject {
 
     private func finishTraining(with completion: TrainingCompletion) {
         let interruption = trainingInterruption
-        // The final published version may intentionally be an earlier
-        // recommended best brain. Pause instead publishes the exact current
-        // tensors. Leave the curves intact, but make the headline and detailed
-        // quality panels describe the version that is now runnable.
-        trainingMetrics.trainingLoss = completion.version.trainingLoss
-        trainingMetrics.epochTrainingLoss = completion.version.trainingLoss
-        trainingMetrics.validationLoss = completion.version.validationLoss
-        trainingMetrics.validationReport = completion.version.validationReport
-        trainingMetrics.balanceReport = completion.version.validationReport?.trainingBalance
-            ?? trainingMetrics.balanceReport
         isTraining = false
         trainingProfileID = nil
         isAutoTraining = false
         autoTrainingProfileID = nil
         trainingInterruption = nil
         switch interruption {
-        case .pause: trainingStatus = "Paused — exact current brain saved and ready to run or resume"
+        case .pause: trainingStatus = "Paused — current brain is ready to run and resume"
         case .stop: trainingStatus = "Training stopped."
-        case nil:
-            if completion.completed,
-               completion.version.validationReport?.effectiveEvaluationScope == .trainingCalibration {
-                trainingStatus = "Training complete — final brain saved with in-sample runtime calibration"
-            } else {
-                trainingStatus = completion.completed
-                    ? "Training complete — recommended brain saved"
-                    : "Paused — exact current brain saved and ready to run or resume"
-            }
+        case nil: trainingStatus = completion.completed ? "Training complete — runnable brain saved" : "Paused — current brain is ready to run and resume"
         }
         activityStatus = trainingStatus
     }
@@ -786,7 +609,7 @@ final class AppModel: ObservableObject {
 
     func startAgent() async {
         guard let profile = selectedProfile, let versionID = profile.activeVersionID,
-              let source = selectedSource, canStartAgent else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop recording, import, storage changes, replay, or any current AI first.")); return }
+              let source = selectedSource, !recordingIsActiveOrStarting, !agentIsActiveOrStarting, agent == nil, !isReplaying else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop recording, replay, or any current AI first.")); return }
         guard trainingProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently training. Select another trained AI to run at the same time.")); return }
         isStartingAgent = true
         runningProfileID = profile.id
@@ -838,7 +661,7 @@ final class AppModel: ObservableObject {
             let previewRate = visionPreviewMatchesPerception ? version.training.perceptionFPS : visionPreviewFPS
             try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: captureSpec(source: source), captureRect: effectiveCaptureRect(source), mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, safety: runtimeSafety, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run])
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
-            if isRunning, agent === runtime { runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue)"; activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus; AppLog.write(category: "Runtime", "Agent started", details: "\(profile.name), \(resolvedMouseMode.rawValue), visual memory \(version.training.visualMemoryLags), \(allowedKeyCodes.count) allowed keys, \(version.validationReport?.calibratedThresholdCount ?? 0) calibrated thresholds, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), policy diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")") }
+            if isRunning, agent === runtime { runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue)"; activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus; AppLog.write(category: "Runtime", "Agent started", details: "\(profile.name), \(resolvedMouseMode.rawValue), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")") }
         } catch is CancellationError {
             await attemptedRuntime?.stop(reason: nil)
             // If an installed runtime already cleared itself, its onStop reason
@@ -893,22 +716,15 @@ final class AppModel: ObservableObject {
     }
     func startReenactment() {
         guard let recording = selectedRecording else { return }
-        guard !agentIsActiveOrStarting, !recordingIsActiveOrStarting, !isImportingRecordings,
-              !isChangingStorageLocation, !isTraining, !isReplaying else {
-            present(AgentTrainerError.invalidConfiguration("Stop active work before reenacting real input."))
+        guard !agentIsActiveOrStarting, !recordingIsActiveOrStarting, !isReplaying else {
+            present(AgentTrainerError.invalidConfiguration("Stop the current agent or recording before reenacting real input."))
             return
         }
         do { try reenactor.start(recording: recording); isReplaying = true; activityStatus = "Guarded reenactment running"; AppLog.write(category: "Replay", "Reenactment started", details: recording.manifest.name) } catch { present(error) }
     }
     func stopReenactment() { reenactor.stop(); if isReplaying { AppLog.write(category: "Replay", "Reenactment stopped") }; isReplaying = false; activityStatus = "Reenactment stopped" }
     func panic() { AppLog.write(.warning, category: "Safety", "Panic stop requested"); Task { stopReenactment(); await stopAgent(); if recordingIsActiveOrStarting { await stopRecording() }; if isTraining { stopTraining() } } }
-    func clearCaches() async {
-        guard canClearCaches else {
-            present(AgentTrainerError.storage("Wait for training, imports, and storage changes to finish before clearing caches."))
-            return
-        }
-        do { try await WorkspaceStore.shared.clearCaches(); await refreshStorageState(); activityStatus = "Dataset caches cleared"; AppLog.write(category: "Storage", "Dataset caches cleared") } catch { present(error) }
-    }
+    func clearCaches() async { do { try await WorkspaceStore.shared.clearCaches(); await refreshStorageState(); activityStatus = "Dataset caches cleared"; AppLog.write(category: "Storage", "Dataset caches cleared") } catch { present(error) } }
 
     func chooseStorageLocation(_ kind: WorkspaceDataKind) async {
         guard canChangeStorageLocations else {
@@ -950,14 +766,6 @@ final class AppModel: ObservableObject {
     }
 
     private func changeStorageLocation(_ kind: WorkspaceDataKind, to destination: URL) async {
-        guard canChangeStorageLocations else {
-            present(AgentTrainerError.storage("Stop recording, training, running, importing, and replay before changing storage locations."))
-            return
-        }
-        profileAutosaveTask?.cancel()
-        isChangingStorageLocation = true
-        activityStatus = "Inspecting \(kind.rawValue.lowercased()) location…"
-        defer { isChangingStorageLocation = false }
         do {
             let inspection = try await WorkspaceStore.shared.inspectDestination(destination, for: kind)
             if inspection.isCurrentLocation {
@@ -976,6 +784,8 @@ final class AppModel: ObservableObject {
                 useExisting = true
             }
 
+            profileAutosaveTask?.cancel()
+            isChangingStorageLocation = true
             activityStatus = useExisting ? "Switching \(kind.rawValue.lowercased())…" : "Copying and verifying \(kind.rawValue.lowercased())…"
             let result = try await WorkspaceStore.shared.relocate(kind, to: inspection.url, useExisting: useExisting)
             if kind == .trainingData {
@@ -999,7 +809,9 @@ final class AppModel: ObservableObject {
                 AppLog.write(.warning, category: "Storage", "\(kind.rawValue) location changed with an old copy retained", details: result.destination.path)
                 errorMessage = "\(kind.rawValue) is now using the new location, but an old copy could not be removed. Your data is safe; you may delete the old copy manually after verifying the new library."
             }
+            isChangingStorageLocation = false
         } catch {
+            isChangingStorageLocation = false
             await refreshStorageState()
             present(error)
         }
@@ -1103,17 +915,14 @@ final class AppModel: ObservableObject {
         let folderIDs = Set(profile.effectiveFolderIDs)
         let selected = recordings.filter { profile.recordingIDs.contains($0.id) || $0.manifest.folderID.map(folderIDs.contains) == true }
         return await Task.detached(priority: .userInitiated) {
-            var evidence = InputEventReader.MouseModeEvidence()
+            var cameraRecordings = 0
+            var cursorRecordings = 0
             for item in selected {
                 let url = item.directory.appendingPathComponent(item.manifest.eventFile)
-                guard let summary = try? InputEventReader.summarize(
-                    url: url,
-                    previewLimit: 0,
-                    globalRect: item.manifest.globalRect.cgRect
-                ) else { continue }
-                evidence.include(summary.mouse)
+                guard let summary = try? InputEventReader.summarize(url: url, previewLimit: 0, globalRect: item.manifest.globalRect.cgRect), summary.mouse.moveEventCount > 0 else { continue }
+                if summary.mouse.isGameCamera { cameraRecordings += 1 } else { cursorRecordings += 1 }
             }
-            return evidence.recommendedMode
+            return cameraRecordings > cursorRecordings ? .relative : .absolute
         }.value
     }
 
@@ -1125,11 +934,11 @@ final class AppModel: ObservableObject {
             let videoDuration = CMTimeGetSeconds(time)
             guard videoDuration.isFinite, videoDuration > 0 else { continue }
             var manifest = item.manifest
-            let events = (try? InputEventReader.read(url: item.directory.appendingPathComponent(item.manifest.eventFile))) ?? []
-            if manifest.hostStartNanos == 0, let first = events.first {
+            let events = try? InputEventReader.mapped(url: item.directory.appendingPathComponent(item.manifest.eventFile))
+            if manifest.hostStartNanos == 0, let first = events?.first {
                 manifest.hostStartNanos = first.timestampNanos
                 manifest.trimStart = 0
-                manifest.trimEnd = events.last.map { min(videoDuration, Double($0.timestampNanos - first.timestampNanos) / 1e9 + 0.25) }
+                manifest.trimEnd = events?.last.map { min(videoDuration, Double($0.timestampNanos - first.timestampNanos) / 1e9 + 0.25) }
             }
             manifest.duration = videoDuration
             if let trimEnd = manifest.trimEnd { manifest.trimEnd = min(videoDuration, trimEnd) }
@@ -1145,25 +954,22 @@ final class AppModel: ObservableObject {
     }
 
     private func validateProfile(_ profile: AIProfile) throws {
+        guard !profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw AgentTrainerError.invalidConfiguration("AI names cannot be empty.")
+        }
         _ = try profile.preprocessing.validated()
         let training = profile.training
         let cycleEpochs = training.cosineCycleEpochs ?? 8
         let plateauPatience = training.plateauPatience ?? 5
         let minimumLearningRateRatio = training.minimumLearningRateRatio ?? 0.05
         let binaryFocalGamma = training.binaryFocalGamma ?? 0
-        let visualMemoryFrames = training.visualMemoryFrames ?? VisualMemoryContract.defaultFrameCount
-        let visualMemoryStride = training.visualMemoryStride ?? VisualMemoryContract.defaultStride
-        let visualMemoryDropout = training.visualMemoryDropout ?? VisualMemoryContract.defaultDropout
         guard training.learningRate.isFinite, training.weightDecay.isFinite,
               training.perceptionFPS.isFinite, training.actionFPS.isFinite,
               training.validationSplit.isFinite, minimumLearningRateRatio.isFinite,
-              binaryFocalGamma.isFinite, visualMemoryDropout.isFinite,
+              binaryFocalGamma.isFinite,
               (1...1_000_000).contains(training.epochs),
               (1...4_096).contains(training.batchSize),
-              training.historyLength == PolicyInputContract.actionHistoryLength,
-              (0...VisualMemoryContract.maximumFrameCount).contains(visualMemoryFrames),
-              (1...VisualMemoryContract.maximumStride).contains(visualMemoryStride),
-              visualMemoryDropout >= 0, visualMemoryDropout <= 0.5,
+              (0...256).contains(training.historyLength),
               (1...10_000).contains(cycleEpochs),
               (1...1_000).contains(plateauPatience),
               training.learningRate >= 0.000_000_1, training.learningRate <= 0.003,
@@ -1174,41 +980,23 @@ final class AppModel: ObservableObject {
               training.validationSplit >= 0, training.validationSplit < 1,
               minimumLearningRateRatio >= 0.001, minimumLearningRateRatio <= 0.5,
               binaryFocalGamma >= 0, binaryFocalGamma <= 4 else {
-            throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, perception-only action input, visual memory 0–\(VisualMemoryContract.maximumFrameCount) frames with spacing 1–\(VisualMemoryContract.maximumStride) and dropout 0–0.5, cosine cycles 1–10,000 epochs, plateau patience 1–1,000, minimum learning-rate ratio 0.001–0.5, focal gamma 0–4, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
+            throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, history 0–256, cosine cycles 1–10,000 epochs, plateau patience 1–1,000, minimum learning-rate ratio 0.001–0.5, focal gamma 0–4, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
         }
         let architecture = training.architecture
-        let tokenWidth = architecture.visualEmbedding
-        let spatialTokens = architecture.spatialTokens ?? architecture.attentionHeads ?? 8
-        let transformerLayers = architecture.transformerLayers ?? 3
-        let transformerHeads = architecture.transformerHeads ?? 8
-        let feedForwardWidth = architecture.transformerFeedForward ?? 768
-        let headWidth = tokenWidth / max(1, transformerHeads)
-        let hybridVisualConfigurationIsValid = architecture.effectiveFamily != .hybrid || (
-            (1...8).contains(architecture.convolutionChannels.count)
-                && architecture.convolutionChannels.allSatisfy({ (1...16_384).contains($0) })
-                && architecture.kernelSizes.count == architecture.convolutionChannels.count
-                && architecture.kernelSizes.allSatisfy({ (1...31).contains($0) })
-                && architecture.strides.count == architecture.convolutionChannels.count
-                && architecture.strides.allSatisfy({ (1...16).contains($0) })
-                && (1...64).contains(spatialTokens)
-        )
-        let pureVisualConfigurationIsValid = architecture.effectiveFamily != .pureTransformer
-            || (8...64).contains(architecture.patchSize ?? 32)
-        let sequenceLength = PolicyTokenGeometry.sequenceLength(profile)
         guard architecture.dropout.isFinite,
-              hybridVisualConfigurationIsValid,
-              pureVisualConfigurationIsValid,
-              (8...16_384).contains(tokenWidth),
+              (1...8).contains(architecture.convolutionChannels.count),
+              architecture.convolutionChannels.allSatisfy({ (1...16_384).contains($0) }),
+              architecture.kernelSizes.count == architecture.convolutionChannels.count,
+              architecture.kernelSizes.allSatisfy({ (1...31).contains($0) }),
+              architecture.strides.count == architecture.convolutionChannels.count,
+              architecture.strides.allSatisfy({ (1...16).contains($0) }),
+              (1...16_384).contains(architecture.visualEmbedding),
+              (1...16_384).contains(architecture.recurrentWidth),
               architecture.fusionWidths.count <= 16,
               architecture.fusionWidths.allSatisfy({ (1...16_384).contains($0) }),
-              (1...8).contains(transformerLayers),
-              (1...32).contains(transformerHeads),
-              tokenWidth.isMultiple(of: transformerHeads),
-              headWidth >= 8,
-              (tokenWidth...min(16_384, tokenWidth * 8)).contains(feedForwardWidth),
-              architecture.dropout >= 0, architecture.dropout <= 0.5,
-              sequenceLength > 0, sequenceLength <= 4_096 else {
-            throw AgentTrainerError.invalidConfiguration("Hybrid requires 1–8 matched convolution/kernel/stride stages and 1–64 spatial tokens. Pure Transformer requires an 8–64 pixel patch size and at most 4,096 total tokens. Both require 1–8 Transformer blocks, 1–32 heads, at least 8 values per head, feed-forward width from 1× through 8× token width, positive bounded fusion widths, and dropout from 0 through 0.5.")
+              (1...64).contains(architecture.attentionHeads ?? 8),
+              architecture.dropout >= 0, architecture.dropout <= 0.5 else {
+            throw AgentTrainerError.invalidConfiguration("Use 1–8 convolution stages with one kernel and stride per stage, positive bounded widths, 1–64 attention keypoints, and dropout from 0 through 0.5.")
         }
         let channels = profile.channels
         guard channels.mouseMovement || channels.buttons || channels.scroll || channels.keyboard || channels.modifiers else { throw AgentTrainerError.invalidConfiguration("Enable at least one control channel before training.") }

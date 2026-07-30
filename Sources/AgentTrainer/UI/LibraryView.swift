@@ -77,56 +77,12 @@ struct LibraryView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center, spacing: 12) {
-                libraryTitle
-                libraryActions
-            }
-            HStack {
-                Spacer(minLength: 0)
-                libraryFilters
-            }
+        HStack(alignment: .center, spacing: 12) {
+            SectionTitle("Library", "Expand folders to browse recordings, inspect captured controls, and replay locally.")
+            TextField("Search recordings", text: $search).textFieldStyle(.roundedBorder).frame(width: 240)
+            Picker("Sort", selection: $sortOrder) { ForEach(SortOrder.allCases) { Text($0.rawValue).tag($0) } }.frame(width: 130)
+            Button { Task { await model.refreshLibrary(); ensureSelection() } } label: { Image(systemName: "arrow.clockwise") }.primaryButton()
         }
-    }
-
-    private var libraryTitle: some View {
-        SectionTitle("Library", "Expand folders to browse recordings, inspect captured controls, and replay locally.")
-            .layoutPriority(1)
-    }
-
-    private var libraryFilters: some View {
-        HStack(spacing: 10) {
-            TextField("Search recordings", text: $search)
-                .textFieldStyle(.roundedBorder)
-                .frame(minWidth: 180, idealWidth: 240, maxWidth: 240)
-            Picker("Sort", selection: $sortOrder) {
-                ForEach(SortOrder.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .frame(width: 130)
-        }
-    }
-
-    private var libraryActions: some View {
-        HStack(spacing: 8) {
-            Button {
-                Task { await model.importRecordings(); ensureSelection() }
-            } label: {
-                Label(model.isImportingRecordings ? "Importing…" : "Import", systemImage: "square.and.arrow.down")
-            }
-            .primaryButton(color: ATColor.green)
-            .disabled(!model.canImportRecordings)
-            .help("Import recordings exported from AgentTrainer on Windows or another Mac")
-
-            Button {
-                Task { await model.refreshLibrary(); ensureSelection() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .primaryButton()
-            .disabled(model.isChangingStorageLocation)
-            .help("Refresh library")
-        }
-        .fixedSize()
     }
 
     private var folderBrowser: some View {
@@ -143,7 +99,7 @@ struct LibraryView: View {
                         let name = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !name.isEmpty else { return }
                         folderName = ""; Task { await model.createRecordingFolder(name: name) }
-                    }.primaryButton().disabled(!model.canMutateRecordingLibrary)
+                    }.primaryButton()
                 }
                 Divider()
                 List {
@@ -171,7 +127,6 @@ struct LibraryView: View {
                                         }
                                         .buttonStyle(.borderless)
                                         .foregroundStyle(ATColor.coral)
-                                        .disabled(!model.canMutateRecordingLibrary)
                                         .help("Delete this recording")
                                     }
                                 }
@@ -187,7 +142,6 @@ struct LibraryView: View {
                                     Button("Rename folder") { folderRenameText = folder.name; folderToRename = folder }
                                     Button("Delete folder and recordings", role: .destructive) { deleteFolder = folder }
                                 } label: { Image(systemName: "ellipsis.circle").foregroundStyle(.secondary) }.menuStyle(.borderlessButton).fixedSize()
-                                    .disabled(!model.canMutateRecordingLibrary)
                             }
                         }
                         .tint(ATColor.cyan)
@@ -215,7 +169,6 @@ struct LibraryView: View {
                             .frame(maxWidth: .infinity, minHeight: 150).background(Color.black).clipShape(RoundedRectangle(cornerRadius: ATCorner.scaled(10), style: .continuous))
                         TextField("Recording name", text: $renameText).font(.title3.bold()).textFieldStyle(.plain)
                             .onSubmit { Task { await model.renameRecording(item, name: renameText) } }
-                            .disabled(!model.canMutateRecordingLibrary)
                         HStack { StatusPill(text: durationString(effectiveDuration(item)), color: ATColor.cyan); StatusPill(text: "\(item.manifest.pixelWidth)×\(item.manifest.pixelHeight)", color: ATColor.violet); StatusPill(text: "\(Int(item.manifest.deliveredFPS.rounded())) FPS", color: ATColor.green) }
                         HStack { Label("\(item.manifest.eventCount) inputs", systemImage: "cursorarrow.click.2"); Spacer(); Label(item.manifest.capture.kind.rawValue, systemImage: "viewfinder") }.font(.caption).foregroundStyle(.secondary)
                         if item.manifest.trimStart > 0 || (item.manifest.trimEnd ?? item.manifest.duration) < item.manifest.duration {
@@ -228,14 +181,7 @@ struct LibraryView: View {
                         HStack { Label("\(summary.keyEventCount) key events", systemImage: "keyboard"); Label("\(summary.mouseEventCount) pointer events", systemImage: "computermouse") }.font(.caption2).foregroundStyle(.secondary)
                         if summary.mouse.moveEventCount > 0 {
                             HStack(spacing: 7) {
-                                switch summary.mouse.controlEvidence {
-                                case .gameCamera:
-                                    StatusPill(text: "Game camera detected", color: ATColor.green)
-                                case .movingCursor:
-                                    StatusPill(text: "Moving cursor detected", color: ATColor.cyan)
-                                case .insufficient:
-                                    StatusPill(text: "Too little motion to classify", color: ATColor.amber)
-                                }
+                                StatusPill(text: summary.mouse.isGameCamera ? "Game camera detected" : "Moving cursor detected", color: summary.mouse.isGameCamera ? ATColor.green : ATColor.cyan)
                                 StatusPill(text: summary.mouse.positionsAreValid ? "Positions valid" : "\(summary.mouse.outOfCaptureBoundsCount) invalid positions", color: summary.mouse.positionsAreValid ? ATColor.green : ATColor.coral)
                             }
                             Text("Raw delta active on \((summary.mouse.nonzeroDeltaFraction * 100).formatted(.number.precision(.fractionLength(1))))% of move samples • mean active |Δ| \(summary.mouse.meanActiveDeltaMagnitude.formatted(.number.precision(.fractionLength(2)))) px • max \(summary.mouse.maximumDeltaMagnitude.formatted(.number.precision(.fractionLength(1)))) px")
@@ -267,12 +213,11 @@ struct LibraryView: View {
                         }
                         Divider()
                         Picker("Folder", selection: Binding(get: { item.manifest.folderID }, set: { folder in Task { await model.moveRecording(item, to: folder) } })) { ForEach(model.recordingFolders) { Text($0.name).tag(Optional($0.id)) } }
-                            .disabled(!model.canMutateRecordingLibrary)
                         Toggle("Enable real-input reenactment", isOn: $reenactmentArmed).font(.caption)
                         HStack {
                             if model.isReplaying { Button("Stop Replay") { model.stopReenactment() }.primaryButton(color: ATColor.coral) }
-                            else { Button("Reenact") { model.startReenactment() }.primaryButton(color: ATColor.amber).disabled(!reenactmentArmed || model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting || model.isImportingRecordings || model.isChangingStorageLocation || model.isTraining) }
-                            Spacer(); Button("Delete", role: .destructive) { deleteRecording = item }.primaryButton(color: ATColor.coral).disabled(!model.canMutateRecordingLibrary)
+                            else { Button("Reenact") { model.startReenactment() }.primaryButton(color: ATColor.amber).disabled(!reenactmentArmed || model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting) }
+                            Spacer(); Button("Delete", role: .destructive) { deleteRecording = item }.primaryButton(color: ATColor.coral)
                         }
                     }
                     .listRowInsets(EdgeInsets())
@@ -280,9 +225,9 @@ struct LibraryView: View {
                     .listRowBackground(Color.clear)
                 }
                 // `ScrollView` currently enters a safe-area/frame feedback
-                // loop with this AVKit-backed inspector on macOS 27. A plain
+                // loop with this AVKit-backed inspector on newer macOS builds. A plain
                 // List uses AppKit's stable table scrolling path while keeping
-                // the inspector scrollable on Sequoia and Tahoe as well.
+                // the inspector scrollable across supported macOS versions.
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
             }.frame(width: 380).frame(maxHeight: .infinity)

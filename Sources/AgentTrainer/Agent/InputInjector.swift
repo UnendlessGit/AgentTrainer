@@ -29,7 +29,18 @@ final class InputInjector: @unchecked Sendable {
     }
 
     func enable(outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions()) {
-        lock.lock(); heldKeys.removeAll(); heldButtons.removeAll(); modifiers = 0
+        lock.lock()
+        // A defensive re-enable must not forget controls that are still down.
+        // Keep release events ordered with `execute` and the new session.
+        let previousKeys = heldKeys
+        let previousButtons = heldButtons
+        let previousPosition = cursor
+        let shouldResetGameCamera = usedGameCamera
+        enabled = false
+        for button in previousButtons { postButton(button, down: false, at: previousPosition) }
+        for key in previousKeys { postKey(key, down: false, flags: []) }
+        if shouldResetGameCamera { postNeutralGameCameraMove(at: previousPosition) }
+        heldKeys.removeAll(); heldButtons.removeAll(); modifiers = 0
         self.outputPermissions = outputPermissions
         cursor = CGEvent(source: hidEventSource)?.location ?? cursor
         // Display discovery crosses into WindowServer. Cache it once per run
@@ -58,29 +69,18 @@ final class InputInjector: @unchecked Sendable {
         if wasEnabled {
             lastStateReportTime = CACurrentMediaTime()
             lastReportedState = state
+            // Release while the execution lock is still held. Otherwise a fast
+            // off/on toggle can post a new key-down before this old key-up.
+            for key in keysToRelease { postKey(key, down: false, flags: []) }
+            if resetGameCamera { postNeutralGameCameraMove(at: position) }
         }
         lock.unlock()
 
         guard wasEnabled else { return }
-        for key in keysToRelease { postKey(key, down: false, flags: []) }
-        if resetGameCamera { postNeutralGameCameraMove(at: position) }
         onState?(state)
     }
 
-    func execute(
-        _ prediction: [Float],
-        profile: AIProfile,
-        allowedKeyCodes: Set<UInt16>,
-        mouseMode: MouseControlMode,
-        captureRect: CGRect,
-        safety: AgentSafetyPolicy,
-        gameCamera: GameCameraSettings = GameCameraSettings(),
-        predictionIsFresh: Bool = true,
-        binaryDecisionThresholds: [Float] = [],
-        gameCameraMinimumPostedMagnitude: CGFloat =
-            GameCameraContract.defaultMinimumPostedMagnitude,
-        shiftUsesKeyboardChannel: Bool = false
-    ) {
+    func execute(_ prediction: [Float], profile: AIProfile, allowedKeyCodes: Set<UInt16>, mouseMode: MouseControlMode, captureRect: CGRect, safety: AgentSafetyPolicy, gameCamera: GameCameraSettings = GameCameraSettings(), predictionIsFresh: Bool = true, shiftUsesKeyboardChannel: Bool = false) {
         guard prediction.count >= ActionLayout.count,
               prediction.prefix(ActionLayout.count).allSatisfy(\.isFinite) else { return }
         lock.lock()
@@ -93,16 +93,10 @@ final class InputInjector: @unchecked Sendable {
         var scrollDelta = CGSize.zero
 
         if predictionIsFresh, outputPermissions.cursorMovement, channels.mouseMovement, mouseMode == .relative {
-            let postedDX = GameCameraContract.postedDelta(
-                forPrediction: prediction[2],
-                sensitivity: gameCamera.sensitivity,
-                minimumMagnitude: gameCameraMinimumPostedMagnitude
-            )
-            let postedDY = GameCameraContract.postedDelta(
-                forPrediction: prediction[3],
-                sensitivity: gameCamera.sensitivity,
-                minimumMagnitude: gameCameraMinimumPostedMagnitude
-            )
+            let dx = GameCameraContract.runtimeDelta(forPrediction: prediction[2], sensitivity: gameCamera.sensitivity)
+            let dy = GameCameraContract.runtimeDelta(forPrediction: prediction[3], sensitivity: gameCamera.sensitivity)
+            let postedDX = Int64(dx.rounded())
+            let postedDY = Int64(dy.rounded())
             // Game-camera mode keeps the system cursor at a stable anchor while
             // emitting raw deltas, so movement never stalls against a screen edge.
             cursor = CGPoint(x: captureRect.midX, y: captureRect.midY).clamped(to: allowed)
@@ -119,13 +113,7 @@ final class InputInjector: @unchecked Sendable {
         }
 
         if channels.buttons {
-            let desired = Set((0..<8).compactMap { button -> UInt8? in
-                let index = ActionLayout.buttons.lowerBound + button
-                return prediction[index] >= BinaryDecisionThresholds.threshold(
-                    for: index,
-                    in: binaryDecisionThresholds
-                ) && restrictions.allowsButton(UInt8(button)) ? UInt8(button) : nil
-            })
+            let desired = Set((0..<8).compactMap { prediction[4 + $0] >= 0.5 && restrictions.allowsButton(UInt8($0)) ? UInt8($0) : nil })
             for button in heldButtons.subtracting(desired) { postButton(button, down: false, at: cursor) }
             for button in desired.subtracting(heldButtons) { postButton(button, down: true, at: cursor) }
             heldButtons = desired
@@ -147,10 +135,7 @@ final class InputInjector: @unchecked Sendable {
         let modifierKeys: [UInt16] = [56, 59, 58, 55]
         if outputPermissions.keyboard {
             for i in 0..<4 where (i == 0 && shiftUsesKeyboardChannel ? channels.keyboard : channels.modifiers)
-                && prediction[142 + i] >= BinaryDecisionThresholds.threshold(
-                    for: 142 + i,
-                    in: binaryDecisionThresholds
-                )
+                && prediction[142 + i] >= 0.5
                 && restrictions.allowsModifier(i)
                 && allowsDemonstratedModifier(i, keys: allowedKeyCodes) {
                 desiredModifiers |= modifierMasks[i].rawValue
@@ -158,11 +143,7 @@ final class InputInjector: @unchecked Sendable {
         }
         let desiredKeys = outputPermissions.keyboard && channels.keyboard ? Set<UInt16>((0..<128).compactMap {
             let code = UInt16($0)
-            let index = ActionLayout.keyboard.lowerBound + $0
-            return prediction[index] >= BinaryDecisionThresholds.threshold(
-                for: index,
-                in: binaryDecisionThresholds
-            )
+            return prediction[14 + $0] >= 0.5
                 && !ActionLayout.commandOptionControlKeyCodeSet.contains(code)
                 && allowedKeyCodes.contains(code)
                 && restrictions.allowsKey(code) ? code : nil
@@ -185,14 +166,18 @@ final class InputInjector: @unchecked Sendable {
     func disableAndReleaseAll() {
         lock.lock()
         let keys = heldKeys, buttons = heldButtons, position = cursor, shouldResetGameCamera = usedGameCamera
-        enabled = false; heldKeys.removeAll(); heldButtons.removeAll(); modifiers = 0; lastReportedState = .empty
-        usedGameCamera = false
-        lock.unlock()
+        enabled = false
+        // Do not allow a new session to start until every release has actually
+        // been posted. This also closes the stop/restart counterpart of the
+        // live-permission race handled above.
         for button in buttons { postButton(button, down: false, at: position) }
         for key in keys { postKey(key, down: false, flags: []) }
         // Return the HID cursor path to a neutral, associated state. Some games
         // retain the final relative delta unless they receive a zero-delta move.
         if shouldResetGameCamera { postNeutralGameCameraMove(at: position) }
+        heldKeys.removeAll(); heldButtons.removeAll(); modifiers = 0; lastReportedState = .empty
+        usedGameCamera = false
+        lock.unlock()
         onState?(.empty)
     }
 

@@ -40,6 +40,12 @@ struct WorkspaceRelocationResult: Equatable, Sendable {
     var sourceCleanupComplete: Bool
 }
 
+struct WorkspaceVersionActivation: Sendable {
+    var profile: AIProfile
+    var version: ModelVersionManifest
+    var checkpointIsResumable: Bool
+}
+
 actor WorkspaceStore {
     static let shared = WorkspaceStore()
 
@@ -218,18 +224,19 @@ actor WorkspaceStore {
 
             for item in versionItems {
                 let manifestURL = item.appendingPathComponent("manifest.json")
-                let manifest = (try? Data(contentsOf: manifestURL))
-                    .flatMap { try? decoder.decode(ModelVersionManifest.self, from: $0) }
-                if let manifest,
+                if let data = try? Data(contentsOf: manifestURL),
+                   let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
                    manifest.schemaVersion == currentSchema,
-                   manifest.id.uuidString.caseInsensitiveCompare(item.lastPathComponent) == .orderedSame {
+                   manifest.id.uuidString.caseInsensitiveCompare(item.lastPathComponent) == .orderedSame,
+                   manifest.artifactFileNamesAreSafe,
+                   FileManager.default.fileExists(atPath: item.appendingPathComponent(manifest.weightsFile).path) {
                     compatibleVersionIDs.insert(manifest.id)
                 } else {
                     try archiveModelArtifact(
                         item,
                         profileRoot: profileRoot,
                         category: "Versions",
-                        storedSchema: manifest?.schemaVersion
+                        storedSchema: storedSchema
                     )
                     archived += 1
                 }
@@ -240,17 +247,21 @@ actor WorkspaceStore {
             if FileManager.default.fileExists(atPath: checkpoint.path) {
                 let checkpointMarker = checkpoint.appendingPathComponent("model-schema.json")
                 let checkpointSchema = (try? Data(contentsOf: checkpointMarker)).flatMap { try? decoder.decode(Int.self, from: $0) }
-                // Policy-v5 checkpoints have carried this marker since the
-                // contract was introduced. A sibling runnable version proves
-                // nothing about an unmarked checkpoint's tensor shapes, so an
-                // uncertain checkpoint is always archived rather than trusted.
                 keepsCheckpoint = checkpointSchema == currentSchema
-                if !keepsCheckpoint {
+                    || (checkpointSchema == nil && (storedSchema == currentSchema || !compatibleVersionIDs.isEmpty))
+                if keepsCheckpoint {
+                    // Checkpoints created before 1.8.2 did not carry their own
+                    // schema marker. Once compatibility is established from a
+                    // current library or version manifest, make it explicit.
+                    if checkpointSchema == nil {
+                        try atomicWrite(try encoder.encode(currentSchema), to: checkpointMarker)
+                    }
+                } else {
                     try archiveModelArtifact(
                         checkpoint,
                         profileRoot: profileRoot,
                         category: "Checkpoints",
-                        storedSchema: checkpointSchema
+                        storedSchema: checkpointSchema ?? storedSchema
                     )
                     archived += 1
                 }
@@ -259,51 +270,14 @@ actor WorkspaceStore {
             let activeIsCompatible = profile.activeVersionID.map(compatibleVersionIDs.contains) ?? false
             if profile.activeVersionID != nil && !activeIsCompatible {
                 profile.activeVersionID = nil
-                if !keepsCheckpoint { profile.trainingProgress = nil }
+                profile.trainingProgress = nil
             }
 
             // A compatible saved brain or checkpoint proves that this profile
             // already uses the current contract. Never rewrite its settings.
             if compatibleVersionIDs.isEmpty && !keepsCheckpoint {
-                // Progress with no compatible version/checkpoint is stale even
-                // when an older profile had already lost its active-version ID.
-                profile.trainingProgress = nil
                 profile.training.architecture = migratedArchitecture(profile.training.architecture)
-                // There is no optimizer/model behavior left to preserve at
-                // this boundary. Fill only absent legacy fields so explicit
-                // user choices survive, while profiles whose older weights were
-                // archived receive the current visual-memory, scheduler, and
-                // sparse-control defaults.
-                let defaults = TrainingConfiguration()
-                if profile.training.visualMemoryFrames == nil {
-                    profile.training.visualMemoryFrames = defaults.visualMemoryFrames
-                }
-                if profile.training.visualMemoryStride == nil {
-                    profile.training.visualMemoryStride = defaults.visualMemoryStride
-                }
-                if profile.training.visualMemoryDropout == nil {
-                    profile.training.visualMemoryDropout = defaults.visualMemoryDropout
-                }
-                if profile.training.learningRateSchedule == nil {
-                    profile.training.learningRateSchedule = defaults.learningRateSchedule
-                }
-                if profile.training.cosineCycleEpochs == nil {
-                    profile.training.cosineCycleEpochs = defaults.cosineCycleEpochs
-                }
-                if profile.training.plateauPatience == nil {
-                    profile.training.plateauPatience = defaults.plateauPatience
-                }
-                if profile.training.minimumLearningRateRatio == nil {
-                    profile.training.minimumLearningRateRatio = defaults.minimumLearningRateRatio
-                }
-                if profile.training.binaryFocalGamma == nil {
-                    profile.training.binaryFocalGamma = defaults.binaryFocalGamma
-                }
-                // Policy v9 deliberately removes teacher-forced actions from
-                // the model. Retain the legacy Codable field for old profile
-                // files, but normalize it so UI, sizing, and saved versions
-                // all describe the perception-only input contract exactly.
-                profile.training.historyLength = PolicyInputContract.actionHistoryLength
+                profile.training.historyLength = min(32, max(0, profile.training.historyLength))
                 if !profile.training.learningRate.isFinite || profile.training.learningRate <= 0 {
                     profile.training.learningRate = 0.0003
                 } else {
@@ -315,9 +289,7 @@ actor WorkspaceStore {
             }
             try saveProfile(profile)
         }
-        // Policy-v9 visual memory is derived from the existing deduplicated
-        // observation index. Model archival therefore does not discard the
-        // lossless sampled-video cache or force an unnecessary video decode.
+        try clearCaches()
         try atomicWrite(try encoder.encode(currentSchema), to: marker)
         try atomicWrite(try encoder.encode(currentSchema), to: auditMarker)
         return archived
@@ -339,19 +311,16 @@ actor WorkspaceStore {
 
     private func migratedArchitecture(_ previous: ArchitectureSpec) -> ArchitectureSpec {
         let widestConvolution = previous.convolutionChannels.max() ?? 0
-        let family = previous.family == nil ? PolicyArchitectureFamily.hybrid : previous.effectiveFamily
-        let scale: Int
+        var architecture: ArchitectureSpec
         if previous.visualEmbedding <= 128, previous.recurrentWidth <= 128, widestConvolution <= 64 {
-            scale = 0
+            architecture = .small
         } else if previous.visualEmbedding >= 384 || previous.recurrentWidth >= 320 || widestConvolution >= 192 {
-            scale = 2
+            architecture = .large
         } else {
-            scale = 1
+            architecture = .balanced
         }
-        // Preserve an explicit Pure Transformer choice across a model-contract
-        // boundary instead of silently turning it into Hybrid. Legacy profiles
-        // with no family remain unambiguously Hybrid.
-        return .preset(family: family, scale: scale)
+        architecture.recurrentKind = previous.recurrentKind
+        return architecture
     }
 
     func createRecordingDirectory(id: UUID) throws -> URL {
@@ -363,74 +332,6 @@ actor WorkspaceStore {
 
     func writeRecording(_ manifest: RecordingManifest, to directory: URL) throws {
         try atomicWrite(try encoder.encode(manifest), to: directory.appendingPathComponent("manifest.json"))
-    }
-
-    /// Imports portable `.atrrecord` directories without trusting their folder
-    /// name, local folder ID, filenames, event count, or video metadata. Every
-    /// source is validated before any destination is published. The source is
-    /// never modified, and a failed batch removes only its private staging/new
-    /// destination directories.
-    func importRecordings(from selectedURLs: [URL], into folderID: UUID) async throws -> [RecordingItem] {
-        try prepare()
-        guard listRecordingFolders().contains(where: { $0.id == folderID }) else {
-            throw AgentTrainerError.storage("Choose an existing recording folder before importing.")
-        }
-        let discovery = try await recordingImportSources(from: selectedURLs)
-        let extractionRoots = discovery.extractionRoots
-        defer { for root in extractionRoots { try? FileManager.default.removeItem(at: root) } }
-        let sources = discovery.sources
-        guard !sources.isEmpty else {
-            throw AgentTrainerError.storage("Choose one or more .atrrecord.zip files, .atrrecord folders, or a folder that contains recordings.")
-        }
-
-        var validated: [(source: URL, manifest: RecordingManifest, hasThumbnail: Bool)] = []
-        validated.reserveCapacity(sources.count)
-        for source in sources {
-            validated.append(try await validateRecordingImport(at: source))
-        }
-
-        var stagingDirectories: [URL] = []
-        var publishedDirectories: [URL] = []
-        do {
-            for item in validated {
-                let newID = UUID()
-                let staging = recordingsRoot.appendingPathComponent(".import-\(newID.uuidString)", isDirectory: true)
-                let destination = recordingsRoot.appendingPathComponent("\(newID.uuidString).atrrecord", isDirectory: true)
-                try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
-                stagingDirectories.append(staging)
-
-                try copyRegularImportFile(
-                    item.source.appendingPathComponent(item.manifest.videoFile),
-                    to: staging.appendingPathComponent(item.manifest.videoFile)
-                )
-                try copyRegularImportFile(
-                    item.source.appendingPathComponent(item.manifest.eventFile),
-                    to: staging.appendingPathComponent(item.manifest.eventFile)
-                )
-
-                var manifest = item.manifest
-                manifest.id = newID
-                manifest.folderID = folderID
-                if let thumbnail = manifest.thumbnailFile, item.hasThumbnail {
-                    try copyRegularImportFile(
-                        item.source.appendingPathComponent(thumbnail),
-                        to: staging.appendingPathComponent(thumbnail)
-                    )
-                } else {
-                    manifest.thumbnailFile = nil
-                }
-                try atomicWrite(try encoder.encode(manifest), to: staging.appendingPathComponent("manifest.json"))
-                try FileManager.default.moveItem(at: staging, to: destination)
-                stagingDirectories.removeAll { $0 == staging }
-                publishedDirectories.append(destination)
-            }
-        } catch {
-            for directory in stagingDirectories + publishedDirectories { try? FileManager.default.removeItem(at: directory) }
-            throw AgentTrainerError.storage("The recordings could not be imported transactionally: \(error.localizedDescription)")
-        }
-
-        let published = Set(publishedDirectories.map { $0.standardizedFileURL })
-        return listRecordings().filter { published.contains($0.directory.standardizedFileURL) }
     }
 
     /// Repairs legacy manifests before the strict library scan runs. Policy
@@ -471,8 +372,7 @@ actor WorkspaceStore {
                 manifest.deliveredFPS = manifest.capture.requestedFPS
             }
             let rect = manifest.globalRect
-            if !rect.x.isFinite || !rect.y.isFinite || !rect.width.isFinite || rect.width <= 0
-                || !rect.height.isFinite || rect.height <= 0 {
+            if !rect.x.isFinite || !rect.y.isFinite || !rect.width.isFinite || !rect.height.isFinite {
                 manifest.globalRect = CodableRect(CGRect(x: 0, y: 0, width: max(1, manifest.pixelWidth), height: max(1, manifest.pixelHeight)))
             }
             manifest.pixelWidth = min(32_768, max(1, manifest.pixelWidth))
@@ -495,7 +395,6 @@ actor WorkspaceStore {
     func listRecordings() -> [RecordingItem] {
         guard let urls = try? FileManager.default.contentsOfDirectory(at: recordingsRoot, includingPropertiesForKeys: nil) else { return [] }
         return urls.compactMap { directory in
-            guard directory.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame else { return nil }
             let manifestURL = directory.appendingPathComponent("manifest.json")
             guard let data = try? Data(contentsOf: manifestURL),
                   let manifest = try? decoder.decode(RecordingManifest.self, from: data),
@@ -506,9 +405,7 @@ actor WorkspaceStore {
 
     func renameRecording(_ item: RecordingItem, to name: String) throws {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanName.isEmpty, cleanName.count <= 200 else {
-            throw AgentTrainerError.invalidConfiguration("Recording names must contain 1 through 200 characters.")
-        }
+        guard !cleanName.isEmpty else { throw AgentTrainerError.invalidConfiguration("Recording names cannot be empty.") }
         var manifest = item.manifest
         manifest.name = cleanName
         try writeRecording(manifest, to: item.directory)
@@ -519,12 +416,9 @@ actor WorkspaceStore {
     }
 
     func saveRecordingFolder(_ folder: RecordingFolder) throws {
-        let cleanName = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanName.isEmpty, cleanName.count <= 200 else {
-            throw AgentTrainerError.invalidConfiguration("Folder names must contain 1 through 200 characters.")
-        }
         var folder = folder
-        folder.name = cleanName
+        folder.name = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !folder.name.isEmpty else { throw AgentTrainerError.invalidConfiguration("Folder names cannot be empty.") }
         var folders = listRecordingFolders()
         if let index = folders.firstIndex(where: { $0.id == folder.id }) { folders[index] = folder } else { folders.append(folder) }
         try atomicWrite(try encoder.encode(folders), to: foldersURL)
@@ -567,88 +461,30 @@ actor WorkspaceStore {
     }
 
     func deleteRecordingFolder(_ folder: RecordingFolder, includingRecordings: Bool) throws {
-        let originalFolders = listRecordingFolders()
-        var remaining = originalFolders.filter { $0.id != folder.id }
-        let affected = listRecordings().filter { $0.manifest.folderID == folder.id }
+        var remaining = listRecordingFolders().filter { $0.id != folder.id }
         if includingRecordings {
-            guard !affected.isEmpty else {
-                try atomicWrite(try encoder.encode(remaining), to: foldersURL)
-                return
-            }
-            let staging = recordingsRoot.appendingPathComponent(
-                ".delete-folder-\(UUID().uuidString)",
-                isDirectory: true
-            )
-            var moved: [(source: URL, staged: URL)] = []
-            do {
-                try FileManager.default.createDirectory(
-                    at: staging,
-                    withIntermediateDirectories: false
-                )
-                for recording in affected {
-                    let staged = staging.appendingPathComponent(
-                        recording.directory.lastPathComponent,
-                        isDirectory: true
-                    )
-                    try FileManager.default.moveItem(at: recording.directory, to: staged)
-                    moved.append((recording.directory, staged))
-                }
-                try atomicWrite(try encoder.encode(remaining), to: foldersURL)
-                try FileManager.default.removeItem(at: staging)
-            } catch {
-                var rollbackFailed = false
-                for item in moved.reversed()
-                where FileManager.default.fileExists(atPath: item.staged.path) {
-                    do {
-                        try FileManager.default.moveItem(at: item.staged, to: item.source)
-                    } catch {
-                        rollbackFailed = true
-                    }
-                }
-                try? atomicWrite(try encoder.encode(originalFolders), to: foldersURL)
-                if rollbackFailed {
-                    AppLog.write(
-                        .error,
-                        category: "Storage",
-                        "Folder deletion rollback retained recovery data",
-                        details: staging.path
-                    )
-                } else {
-                    try? FileManager.default.removeItem(at: staging)
-                }
-                throw AgentTrainerError.storage(
-                    rollbackFailed
-                        ? "The folder could not be deleted safely. Recording data was retained at \(staging.path)."
-                        : "The folder could not be deleted safely: \(error.localizedDescription)"
-                )
+            for recording in listRecordings() where recording.manifest.folderID == folder.id {
+                try FileManager.default.removeItem(at: recording.directory)
             }
         } else {
             if remaining.isEmpty {
                 remaining = [RecordingFolder(id: UUID(), name: "Recordings", createdAt: Date())]
             }
             let destinationID = remaining[0].id
-            var reassigned: [RecordingItem] = []
-            do {
-                for recording in affected {
-                    try assignRecording(recording, to: destinationID)
-                    reassigned.append(recording)
-                }
-                try atomicWrite(try encoder.encode(remaining), to: foldersURL)
-            } catch {
-                for recording in reassigned.reversed() {
-                    try? assignRecording(recording, to: folder.id)
-                }
-                try? atomicWrite(try encoder.encode(originalFolders), to: foldersURL)
-                throw AgentTrainerError.storage(
-                    "The folder could not be changed safely: \(error.localizedDescription)"
-                )
+            for recording in listRecordings() where recording.manifest.folderID == folder.id {
+                try assignRecording(recording, to: destinationID)
             }
         }
+        try atomicWrite(try encoder.encode(remaining), to: foldersURL)
     }
 
     func saveProfile(_ profile: AIProfile) throws {
         try prepare()
         var profile = profile
+        profile.name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !profile.name.isEmpty else {
+            throw AgentTrainerError.invalidConfiguration("AI names cannot be empty.")
+        }
         if profile.isDeletionProtected { profile.deletionProtected = true }
         let directory = profileDirectory(profile.id)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -725,42 +561,48 @@ actor WorkspaceStore {
         }
     }
 
-    /// Detaches learned artifacts after a confirmed brain-incompatible change.
-    /// The old tensors cannot be loaded by the new architecture, but they are
-    /// moved into a recovery archive instead of deleted. Crystal V4 remains
-    /// immutable.
+    /// Explicitly discards learned artifacts after the user confirms a brain-
+    /// incompatible configuration change. Crystal V4 remains immutable.
     func resetLearning(for profile: AIProfile) throws -> AIProfile {
         guard !profile.isDeletionProtected else {
             throw AgentTrainerError.storage("This AI is protected. Duplicate it before changing brain architecture or vision settings.")
         }
         var reset = profile
+        reset.name = reset.name.trimmingCharacters(in: .whitespacesAndNewlines)
         reset.activeVersionID = nil
         reset.trainingProgress = nil
         let root = profileDirectory(profile.id)
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-            .replacingOccurrences(of: ":", with: "-")
-        let archive = root
-            .appendingPathComponent("Archived Model Artifacts", isDirectory: true)
-            .appendingPathComponent("Manual Architecture Changes", isDirectory: true)
-            .appendingPathComponent("\(timestamp)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
+        let profileURL = root.appendingPathComponent("profile.json")
+        let previousProfileData = try Data(contentsOf: profileURL)
+        let staging = root.appendingPathComponent(".LearningReset.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
         var moved: [(from: URL, to: URL)] = []
         do {
+            // Make the persisted profile safe first. A process interruption can
+            // then leave only inactive extra artifacts, never an active profile
+            // whose selected brain has already disappeared.
+            try saveProfile(reset)
             for name in ["Versions", "Checkpoint"] {
                 let source = root.appendingPathComponent(name, isDirectory: true)
                 guard FileManager.default.fileExists(atPath: source.path) else { continue }
-                let destination = archive.appendingPathComponent(name, isDirectory: true)
+                let destination = staging.appendingPathComponent(name, isDirectory: true)
                 try FileManager.default.moveItem(at: source, to: destination)
                 moved.append((source, destination))
             }
-            try saveProfile(reset)
-            if moved.isEmpty { try? FileManager.default.removeItem(at: archive) }
+            try FileManager.default.removeItem(at: staging)
             return reset
         } catch {
+            var rollbackError: Error?
             for item in moved.reversed() where FileManager.default.fileExists(atPath: item.to.path) {
-                try? FileManager.default.moveItem(at: item.to, to: item.from)
+                do { try FileManager.default.moveItem(at: item.to, to: item.from) }
+                catch { rollbackError = rollbackError ?? error }
             }
-            try? FileManager.default.removeItem(at: archive)
+            do { try atomicWrite(previousProfileData, to: profileURL) }
+            catch { rollbackError = rollbackError ?? error }
+            try? FileManager.default.removeItem(at: staging)
+            if let rollbackError {
+                throw AgentTrainerError.storage("Learning reset failed and its rollback was incomplete: \(rollbackError.localizedDescription)")
+            }
             throw error
         }
     }
@@ -778,6 +620,11 @@ actor WorkspaceStore {
     }
 
     func saveVersionManifest(_ manifest: ModelVersionManifest, profileID: UUID) throws {
+        var manifest = manifest
+        manifest.name = manifest.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !manifest.name.isEmpty, manifest.artifactFileNamesAreSafe else {
+            throw AgentTrainerError.storage("The model version manifest contains an invalid name or artifact filename.")
+        }
         let directory = versionDirectory(profileID: profileID, versionID: manifest.id)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try atomicWrite(try encoder.encode(manifest), to: directory.appendingPathComponent("manifest.json"))
@@ -787,22 +634,58 @@ actor WorkspaceStore {
         let versions = profileDirectory(profileID).appendingPathComponent("Versions", isDirectory: true)
         guard let urls = try? FileManager.default.contentsOfDirectory(at: versions, includingPropertiesForKeys: nil) else { return [] }
         return urls.compactMap { url in
-            guard let data = try? Data(contentsOf: url.appendingPathComponent("manifest.json")) else { return nil }
-            return try? decoder.decode(ModelVersionManifest.self, from: data)
+            guard let data = try? Data(contentsOf: url.appendingPathComponent("manifest.json")),
+                  let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
+                  manifest.schemaVersion == ModelContract.schemaVersion,
+                  manifest.artifactFileNamesAreSafe,
+                  manifest.id.uuidString.caseInsensitiveCompare(url.lastPathComponent) == .orderedSame else { return nil }
+            return manifest
         }.sorted { $0.createdAt > $1.createdAt }
     }
 
     func version(profileID: UUID, versionID: UUID) -> ModelVersionManifest? {
         let url = versionDirectory(profileID: profileID, versionID: versionID).appendingPathComponent("manifest.json")
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? decoder.decode(ModelVersionManifest.self, from: data)
+        guard let data = try? Data(contentsOf: url),
+              let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
+              manifest.id == versionID,
+              manifest.schemaVersion == ModelContract.schemaVersion,
+              manifest.artifactFileNamesAreSafe else { return nil }
+        return manifest
     }
 
-    func deleteVersion(profile: AIProfile, versionID: UUID) throws {
+    @discardableResult
+    func deleteVersion(profile: AIProfile, versionID: UUID) throws -> AIProfile {
         guard !profile.isDeletionProtected else {
             throw AgentTrainerError.storage("This protected AI's runnable brain cannot be deleted.")
         }
-        try FileManager.default.removeItem(at: versionDirectory(profileID: profile.id, versionID: versionID))
+        let source = versionDirectory(profileID: profile.id, versionID: versionID)
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            throw AgentTrainerError.storage("The selected model version no longer exists.")
+        }
+        let backup = source.deletingLastPathComponent().appendingPathComponent(".VersionDeletion.\(versionID.uuidString).\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: source, to: backup)
+        do {
+            var updated = profile
+            if updated.activeVersionID == versionID { updated.activeVersionID = nil }
+            if var progress = updated.trainingProgress {
+                progress.savedBrainCount = listVersions(profileID: profile.id).count
+                updated.trainingProgress = progress
+            }
+            try saveProfile(updated)
+            do { try FileManager.default.removeItem(at: backup) }
+            catch {
+                AppLog.write(.warning, category: "Storage", "A deleted model version remains in a hidden cleanup folder", details: error.localizedDescription)
+            }
+            return updated
+        } catch {
+            if !FileManager.default.fileExists(atPath: source.path) {
+                do { try FileManager.default.moveItem(at: backup, to: source) }
+                catch {
+                    throw AgentTrainerError.storage("Model deletion failed and its rollback was incomplete: \(error.localizedDescription)")
+                }
+            }
+            throw error
+        }
     }
 
     /// Keeps the newest periodic autosaves bounded. Completed/manual brains are
@@ -830,31 +713,113 @@ actor WorkspaceStore {
         return removed
     }
 
-    func restoreVersionAsCheckpoint(profileID: UUID, version: ModelVersionManifest) throws -> Bool {
-        let destination = checkpointDirectory(profileID: profileID)
-        guard let optimizerFile = version.optimizerFile, let stateFile = version.trainingStateFile else {
-            // Explicitly activating a weights-only/best brain means future
-            // training should fine-tune that brain with a fresh optimizer, not
-            // silently resume an unrelated newer checkpoint left on disk.
-            if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-            return false
+    /// Activates the immutable version and its exact checkpoint as one logical
+    /// transaction. If profile persistence fails, the previous checkpoint is
+    /// restored so the next training session can never resume the wrong brain.
+    func activateVersion(profile: AIProfile, versionID: UUID) throws -> WorkspaceVersionActivation {
+        guard let version = version(profileID: profile.id, versionID: versionID) else {
+            throw AgentTrainerError.storage("The selected model version is missing or has an invalid manifest.")
         }
-        let source = versionDirectory(profileID: profileID, versionID: version.id)
-        let temporary = destination.deletingLastPathComponent().appendingPathComponent(".Checkpoint.restore.\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
-        do {
-            try FileManager.default.copyItem(at: source.appendingPathComponent(version.weightsFile), to: temporary.appendingPathComponent("weights.safetensors"))
-            try FileManager.default.copyItem(at: source.appendingPathComponent(optimizerFile), to: temporary.appendingPathComponent("optimizer.safetensors"))
-            try FileManager.default.copyItem(at: source.appendingPathComponent(stateFile), to: temporary.appendingPathComponent("state.json"))
-            try encoder.encode(version.schemaVersion).write(to: temporary.appendingPathComponent("model-schema.json"), options: .atomic)
-            if let randomStateFile = version.randomStateFile {
-                try FileManager.default.copyItem(at: source.appendingPathComponent(randomStateFile), to: temporary.appendingPathComponent("random.safetensors"))
+        let source = versionDirectory(profileID: profile.id, versionID: version.id)
+        let sourceWeights = source.appendingPathComponent(version.weightsFile)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: sourceWeights.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw AgentTrainerError.storage("The selected model version is missing its weights.")
+        }
+
+        let checkpointMetadata = (version.optimizerFile, version.trainingStateFile, version.randomStateFile)
+        let resumable: Bool
+        switch checkpointMetadata {
+        case (nil, nil, nil):
+            resumable = false
+        case (.some, .some, _):
+            resumable = true
+        default:
+            throw AgentTrainerError.storage("The selected model version has an incomplete training checkpoint.")
+        }
+
+        let destination = checkpointDirectory(profileID: profile.id)
+        let parent = destination.deletingLastPathComponent()
+        var temporary: URL?
+        if resumable, let optimizerFile = version.optimizerFile, let stateFile = version.trainingStateFile {
+            let candidate = parent.appendingPathComponent(".Checkpoint.restore.\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
+            do {
+                try FileManager.default.copyItem(at: sourceWeights, to: candidate.appendingPathComponent("weights.safetensors"))
+                try FileManager.default.copyItem(at: source.appendingPathComponent(optimizerFile), to: candidate.appendingPathComponent("optimizer.safetensors"))
+                try FileManager.default.copyItem(at: source.appendingPathComponent(stateFile), to: candidate.appendingPathComponent("state.json"))
+                try encoder.encode(version.schemaVersion).write(to: candidate.appendingPathComponent("model-schema.json"), options: .atomic)
+                if let randomStateFile = version.randomStateFile {
+                    try FileManager.default.copyItem(at: source.appendingPathComponent(randomStateFile), to: candidate.appendingPathComponent("random.safetensors"))
+                }
+                temporary = candidate
+            } catch {
+                try? FileManager.default.removeItem(at: candidate)
+                throw error
             }
-            if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-            try FileManager.default.moveItem(at: temporary, to: destination)
-            return true
+        }
+
+        let checkpointExisted = FileManager.default.fileExists(atPath: destination.path)
+        let backupName = ".Checkpoint.activation-backup.\(UUID().uuidString)"
+        let backup = parent.appendingPathComponent(backupName, isDirectory: true)
+        var backupWasCreated = false
+        do {
+            if checkpointExisted {
+                if let temporary {
+                    _ = try FileManager.default.replaceItemAt(
+                        destination,
+                        withItemAt: temporary,
+                        backupItemName: backupName,
+                        options: .usingNewMetadataOnly
+                    )
+                } else {
+                    try FileManager.default.moveItem(at: destination, to: backup)
+                }
+                backupWasCreated = FileManager.default.fileExists(atPath: backup.path)
+            } else if let temporary {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+
+            var updated = profile
+            updated.name = updated.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            updated.activeVersionID = version.id
+            updated.trainingProgress = TrainingProgressSummary(
+                globalStep: version.globalStep,
+                epoch: version.epoch ?? 0,
+                updatedAt: version.createdAt,
+                savedBrainCount: listVersions(profileID: profile.id).count,
+                trainingDurationSeconds: version.trainingDurationSeconds,
+                experienceDurationSeconds: version.experienceDurationSeconds
+            )
+            try saveProfile(updated)
+            if backupWasCreated {
+                do { try FileManager.default.removeItem(at: backup) }
+                catch {
+                    AppLog.write(.warning, category: "Storage", "An old checkpoint remains in a hidden cleanup folder", details: error.localizedDescription)
+                }
+            }
+            return WorkspaceVersionActivation(profile: updated, version: version, checkpointIsResumable: resumable)
         } catch {
-            try? FileManager.default.removeItem(at: temporary)
+            var rollbackError: Error?
+            if backupWasCreated, FileManager.default.fileExists(atPath: backup.path) {
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    do { try FileManager.default.removeItem(at: destination) }
+                    catch { rollbackError = rollbackError ?? error }
+                }
+                if !FileManager.default.fileExists(atPath: destination.path) {
+                    do { try FileManager.default.moveItem(at: backup, to: destination) }
+                    catch { rollbackError = rollbackError ?? error }
+                }
+            } else if !checkpointExisted, FileManager.default.fileExists(atPath: destination.path) {
+                do { try FileManager.default.removeItem(at: destination) }
+                catch { rollbackError = rollbackError ?? error }
+            }
+            if let temporary, FileManager.default.fileExists(atPath: temporary.path) {
+                try? FileManager.default.removeItem(at: temporary)
+            }
+            if let rollbackError {
+                throw AgentTrainerError.storage("Model activation failed and its checkpoint rollback was incomplete: \(rollbackError.localizedDescription)")
+            }
             throw error
         }
     }
@@ -919,7 +884,7 @@ actor WorkspaceStore {
                 return manifest["schemaVersion"] as? Int
             }
             guard schema != currentSchema else { continue }
-            try? FileManager.default.removeItem(at: directory)
+            try FileManager.default.removeItem(at: directory)
             removed += 1
         }
         return removed
@@ -935,8 +900,7 @@ actor WorkspaceStore {
     }
 
     private func versionDirectoryCount(profileID: UUID) -> Int {
-        let versions = profileDirectory(profileID).appendingPathComponent("Versions", isDirectory: true)
-        return (try? FileManager.default.contentsOfDirectory(at: versions, includingPropertiesForKeys: nil).count) ?? 0
+        listVersions(profileID: profileID).count
     }
 
     private func checkpointTiming(profileID: UUID) -> (training: Double?, experience: Double?) {
@@ -1003,233 +967,7 @@ actor WorkspaceStore {
     }
 
     private static func isSafeLeafName(_ value: String) -> Bool {
-        !value.isEmpty && value != "." && value != ".." && !value.contains("/") && !value.contains("\\") && !value.contains(":") && !value.contains("\0")
-    }
-
-    private func recordingImportSources(
-        from selectedURLs: [URL]
-    ) async throws -> (sources: [URL], extractionRoots: [URL]) {
-        var result: [URL] = []
-        var extractionRoots: [URL] = []
-        do {
-            for selected in selectedURLs {
-                let source = normalized(selected)
-                guard source.isFileURL else { continue }
-                let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
-                guard values.isSymbolicLink != true else {
-                    throw AgentTrainerError.storage("Linked files and folders cannot be imported: \(selected.lastPathComponent).")
-                }
-                if values.isDirectory == true,
-                   source.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame {
-                    result.append(source)
-                    continue
-                }
-                if values.isRegularFile == true,
-                   source.pathExtension.localizedCaseInsensitiveCompare("zip") == .orderedSame {
-                    let extractionRoot = try await extractRecordingArchive(source)
-                    extractionRoots.append(extractionRoot)
-                    let extracted = try importDirectories(in: extractionRoot)
-                    guard !extracted.isEmpty else {
-                        throw AgentTrainerError.storage("\(source.lastPathComponent) does not contain an .atrrecord package.")
-                    }
-                    result.append(contentsOf: extracted)
-                    continue
-                }
-                guard values.isDirectory == true else { continue }
-                let directRecordings = try importDirectories(in: source)
-                if !directRecordings.isEmpty {
-                    result.append(contentsOf: directRecordings)
-                    continue
-                }
-                let libraryRecordings = source.appendingPathComponent("Recordings", isDirectory: true)
-                result.append(contentsOf: try importDirectories(in: libraryRecordings))
-            }
-        } catch {
-            for root in extractionRoots { try? FileManager.default.removeItem(at: root) }
-            throw error
-        }
-        var seen: Set<String> = []
-        let sources = result
-            .filter { seen.insert(normalized($0).path).inserted }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        return (sources, extractionRoots)
-    }
-
-    private func extractRecordingArchive(_ archive: URL) async throws -> URL {
-        let values = try archive.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
-        guard values.isRegularFile == true, values.isSymbolicLink != true,
-              let size = values.fileSize, size > 0 else {
-            throw AgentTrainerError.storage("\(archive.lastPathComponent) is not a regular recording archive.")
-        }
-
-        // Preflight every ZIP member before invoking the system extractor. The
-        // exported format has one .atrrecord directory at its root; absolute,
-        // parent-relative, Windows-style, and NUL-bearing paths are rejected.
-        let listing = try await ProcessRunner.run("/usr/bin/unzip", ["-Z1", archive.path])
-        guard let listingText = String(data: listing.stdout, encoding: .utf8) else {
-            throw AgentTrainerError.storage("\(archive.lastPathComponent) has an unreadable ZIP directory.")
-        }
-        let entries = listingText.split(whereSeparator: \Character.isNewline).map(String.init)
-        guard !entries.isEmpty, entries.count <= 128 else {
-            throw AgentTrainerError.storage("\(archive.lastPathComponent) has an empty or unreasonably large ZIP directory.")
-        }
-        for entry in entries {
-            let normalizedEntry = entry.replacingOccurrences(of: "\\", with: "/")
-            let components = normalizedEntry.split(separator: "/", omittingEmptySubsequences: false)
-            guard !normalizedEntry.hasPrefix("/"), !normalizedEntry.contains("\0"), !entry.contains("\\"),
-                  !components.contains(where: { $0 == ".." }),
-                  components.first.map({ !$0.contains(":") }) ?? false else {
-                throw AgentTrainerError.storage("\(archive.lastPathComponent) contains an unsafe ZIP path.")
-            }
-        }
-
-        let extractionRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("AgentTrainer-Recording-Import-\(UUID().uuidString)", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: extractionRoot, withIntermediateDirectories: false)
-            _ = try await ProcessRunner.run("/usr/bin/ditto", ["-x", "-k", "--noqtn", archive.path, extractionRoot.path])
-            try rejectLinkedImportEntries(in: extractionRoot)
-            return extractionRoot
-        } catch {
-            try? FileManager.default.removeItem(at: extractionRoot)
-            if let error = error as? AgentTrainerError { throw error }
-            throw AgentTrainerError.storage("\(archive.lastPathComponent) could not be safely extracted: \(error.localizedDescription)")
-        }
-    }
-
-    private func rejectLinkedImportEntries(in root: URL) throws {
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            throw AgentTrainerError.storage("The recording archive could not be inspected after extraction.")
-        }
-        let rootPath = root.standardizedFileURL.path + "/"
-        for case let entry as URL in enumerator {
-            guard entry.standardizedFileURL.path.hasPrefix(rootPath),
-                  try entry.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
-                throw AgentTrainerError.storage("Recording archives may not contain links or paths outside their package.")
-            }
-        }
-    }
-
-    private func importDirectories(in directory: URL) throws -> [URL] {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else { return [] }
-        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles])
-            .filter { url in
-                guard url.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame,
-                      let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return false }
-                return values.isDirectory == true && values.isSymbolicLink != true
-            }
-    }
-
-    private func validateRecordingImport(at requestedSource: URL) async throws -> (source: URL, manifest: RecordingManifest, hasThumbnail: Bool) {
-        let source = normalized(requestedSource)
-        guard !isSameOrDescendant(source, of: recordingsRoot) else {
-            throw AgentTrainerError.storage("\(requestedSource.lastPathComponent) is already inside the active AgentTrainer library.")
-        }
-        let sourceValues = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        guard source.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame,
-              sourceValues.isDirectory == true, sourceValues.isSymbolicLink != true else {
-            throw AgentTrainerError.storage("\(requestedSource.lastPathComponent) is not a regular .atrrecord directory.")
-        }
-
-        let manifestURL = source.appendingPathComponent("manifest.json")
-        try requireRegularImportFile(manifestURL)
-        let manifestSize = try manifestURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        guard manifestSize > 0, manifestSize <= 1_048_576 else {
-            throw AgentTrainerError.storage("\(source.lastPathComponent) has an empty or unreasonably large manifest.")
-        }
-        let manifest: RecordingManifest
-        do { manifest = try decoder.decode(RecordingManifest.self, from: Data(contentsOf: manifestURL)) }
-        catch { throw AgentTrainerError.storage("\(source.lastPathComponent) has an unreadable AgentTrainer manifest.") }
-        guard manifest.isStructurallyValid, manifest.hostStartNanos > 0,
-              Self.isSafeLeafName(manifest.videoFile), Self.isSafeLeafName(manifest.eventFile),
-              manifest.thumbnailFile.map(Self.isSafeLeafName) ?? true else {
-            throw AgentTrainerError.storage("\(manifest.name) has an invalid or unsafe recording manifest.")
-        }
-        let payloadNames = [manifest.videoFile, manifest.eventFile] + (manifest.thumbnailFile.map { [$0] } ?? [])
-        guard Set(payloadNames.map { $0.lowercased() }).count == payloadNames.count,
-              payloadNames.allSatisfy({ $0.caseInsensitiveCompare("manifest.json") != .orderedSame }) else {
-            throw AgentTrainerError.storage("\(manifest.name) uses duplicate or reserved recording filenames.")
-        }
-
-        let eventURL = source.appendingPathComponent(manifest.eventFile)
-        let videoURL = source.appendingPathComponent(manifest.videoFile)
-        try requireRegularImportFile(eventURL)
-        try requireRegularImportFile(videoURL)
-        let events: InputEventReader.MappedEvents
-        do { events = try InputEventReader.mapped(url: eventURL) }
-        catch { throw AgentTrainerError.storage("\(manifest.name) has an invalid input stream: \(error.localizedDescription)") }
-        guard events.count == manifest.eventCount else {
-            throw AgentTrainerError.storage("\(manifest.name) declares \(manifest.eventCount) inputs but contains \(events.count).")
-        }
-        if let first = events.first, first.timestampNanos < manifest.hostStartNanos {
-            throw AgentTrainerError.storage("\(manifest.name) contains input from before its first video frame.")
-        }
-        let inputDuration = events.last.flatMap { event -> Double? in
-            guard event.timestampNanos >= manifest.hostStartNanos else { return nil }
-            return Double(event.timestampNanos - manifest.hostStartNanos) / 1_000_000_000
-        } ?? 0
-        guard inputDuration <= manifest.duration + 0.001 else {
-            throw AgentTrainerError.storage("\(manifest.name) has input timestamps beyond its declared duration.")
-        }
-
-        let asset = AVURLAsset(url: videoURL)
-        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
-            throw AgentTrainerError.storage("\(manifest.name) has no readable video track.")
-        }
-        let time = try await asset.load(.duration)
-        let videoDuration = CMTimeGetSeconds(time)
-        guard videoDuration.isFinite, videoDuration > 0 else {
-            throw AgentTrainerError.storage("\(manifest.name) has an invalid video duration.")
-        }
-        let naturalSize = try await track.load(.naturalSize)
-        let transform = try await track.load(.preferredTransform)
-        let transformed = CGRect(origin: .zero, size: naturalSize).applying(transform).standardized
-        let actualWidth = Int(abs(transformed.width).rounded())
-        let actualHeight = Int(abs(transformed.height).rounded())
-        guard abs(actualWidth - manifest.pixelWidth) <= 2, abs(actualHeight - manifest.pixelHeight) <= 2 else {
-            throw AgentTrainerError.storage("\(manifest.name) video dimensions do not match its manifest.")
-        }
-        let expectedDuration = max(videoDuration, inputDuration)
-        let durationTolerance = max(1, 2 / max(1, manifest.capture.requestedFPS))
-        guard abs(manifest.duration - expectedDuration) <= durationTolerance else {
-            throw AgentTrainerError.storage("\(manifest.name) video/input duration does not match its manifest.")
-        }
-
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        ])
-        output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else { throw AgentTrainerError.storage("\(manifest.name) cannot be decoded for training.") }
-        reader.add(output)
-        guard reader.startReading(), output.copyNextSampleBuffer() != nil else {
-            throw reader.error ?? AgentTrainerError.storage("\(manifest.name) cannot be decoded for training.")
-        }
-        reader.cancelReading()
-
-        let hasThumbnail: Bool
-        if let thumbnail = manifest.thumbnailFile {
-            let url = source.appendingPathComponent(thumbnail)
-            hasThumbnail = (try? requireRegularImportFile(url)) != nil
-        } else { hasThumbnail = false }
-        return (source, manifest, hasThumbnail)
-    }
-
-    private func requireRegularImportFile(_ url: URL) throws {
-        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-        guard values.isRegularFile == true, values.isSymbolicLink != true else {
-            throw AgentTrainerError.storage("The import contains a missing, non-regular, or linked file: \(url.lastPathComponent).")
-        }
-    }
-
-    private func copyRegularImportFile(_ source: URL, to destination: URL) throws {
-        try requireRegularImportFile(source)
-        try FileManager.default.copyItem(at: source, to: destination)
+        !value.isEmpty && value != "." && value != ".." && !value.contains("/") && !value.contains("\0")
     }
 
     private func ensureLocationIsAvailable(_ location: URL, name: String) throws {

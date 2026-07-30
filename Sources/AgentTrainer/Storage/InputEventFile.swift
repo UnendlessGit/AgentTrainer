@@ -85,14 +85,16 @@ enum InputEventReader {
         let endIndex: Int
 
         fileprivate init(data: Data) throws {
-            try InputEventReader.validate(data)
+            endIndex = try InputEventReader.validate(data)
             self.data = data
-            endIndex = (data.count - 12) / InputEventReader.recordSize
         }
 
         subscript(position: Int) -> InputSample {
             precondition(indices.contains(position))
-            return InputEventReader.decodeRecord(in: data, index: position)
+            guard let event = InputEventReader.decodeRecord(in: data, index: position) else {
+                preconditionFailure("Mapped input events were mutated after validation.")
+            }
+            return event
         }
     }
 
@@ -107,54 +109,10 @@ enum InputEventReader {
         var nonzeroDeltaFraction: Double { Double(nonzeroDeltaCount) / Double(max(1, moveEventCount)) }
         var absolutePositionChangeFraction: Double { Double(absolutePositionChangeCount) / Double(max(1, moveEventCount - 1)) }
         var meanActiveDeltaMagnitude: Double { accumulatedDeltaMagnitude / Double(max(1, nonzeroDeltaCount)) }
-        var controlEvidence: MouseControlEvidence {
-            guard moveEventCount >= 20 else { return .insufficient }
-            if nonzeroDeltaCount > 0, absolutePositionChangeFraction < 0.05 {
-                return .gameCamera
-            }
-            if absolutePositionChangeCount > 0, absolutePositionChangeFraction >= 0.05 {
-                return .movingCursor
-            }
-            return .insufficient
+        var isGameCamera: Bool {
+            moveEventCount >= 20 && nonzeroDeltaCount > 0 && absolutePositionChangeFraction < 0.05
         }
-        var isGameCamera: Bool { controlEvidence == .gameCamera }
         var positionsAreValid: Bool { outOfCaptureBoundsCount == 0 }
-    }
-
-    enum MouseControlEvidence: Sendable, Equatable {
-        case gameCamera
-        case movingCursor
-        case insufficient
-    }
-
-    /// Aggregates only recordings that contain classifiable movement. Long
-    /// recordings with a stationary pointer previously counted as Absolute
-    /// Cursor and could outvote hundreds of short, genuine camera captures.
-    struct MouseModeEvidence: Sendable, Equatable {
-        private(set) var gameCameraRecordings = 0
-        private(set) var movingCursorRecordings = 0
-        private(set) var gameCameraMoveEvents = 0
-        private(set) var movingCursorMoveEvents = 0
-
-        mutating func include(_ diagnostics: MouseDiagnostics) {
-            switch diagnostics.controlEvidence {
-            case .gameCamera:
-                gameCameraRecordings += 1
-                gameCameraMoveEvents += diagnostics.moveEventCount
-            case .movingCursor:
-                movingCursorRecordings += 1
-                movingCursorMoveEvents += diagnostics.moveEventCount
-            case .insufficient:
-                break
-            }
-        }
-
-        var recommendedMode: MouseControlMode {
-            if gameCameraRecordings != movingCursorRecordings {
-                return gameCameraRecordings > movingCursorRecordings ? .relative : .absolute
-            }
-            return gameCameraMoveEvents > movingCursorMoveEvents ? .relative : .absolute
-        }
     }
 
     struct Summary: Sendable {
@@ -166,10 +124,11 @@ enum InputEventReader {
     }
 
     static func read(url: URL) throws -> [InputSample] {
-        let mapped = try mapped(url: url)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         var result: [InputSample] = []
-        result.reserveCapacity(mapped.count)
-        result.append(contentsOf: mapped)
+        let count = try validatedRecordCount(in: data)
+        result.reserveCapacity(count)
+        try forEachValidated(in: data, count: count) { result.append($0) }
         return result
     }
 
@@ -253,48 +212,41 @@ enum InputEventReader {
         return Set(mappings.compactMap { flags & $0.0.rawValue != 0 ? $0.1 : nil })
     }
 
-    private static func validate(_ data: Data) throws {
+    private static func validatedRecordCount(in data: Data) throws -> Int {
         guard data.count >= 12, String(data: data.prefix(8), encoding: .utf8) == "ATREVT01" else { throw AgentTrainerError.storage("Invalid AgentTrainer input event file.") }
         var headerCursor = 8
         let version: UInt32 = data.readInteger(at: &headerCursor)
         guard version == 1, (data.count - 12).isMultiple(of: recordSize) else {
             throw AgentTrainerError.storage("This AgentTrainer input event file is unsupported or incomplete.")
         }
-        let count = (data.count - 12) / recordSize
+        return (data.count - 12) / recordSize
+    }
+
+    @discardableResult
+    private static func validate(_ data: Data) throws -> Int {
+        let count = try validatedRecordCount(in: data)
+        try forEachValidated(in: data, count: count) { _ in }
+        return count
+    }
+
+    private static func forEachValidated(in data: Data, count: Int, _ body: (InputSample) -> Void) throws {
         var previousTimestamp: UInt64?
         for index in 0..<count {
-            let recordStart = 12 + index * recordSize
-            let rawKind = data[recordStart + 8]
-            guard let kind = InputEventKind(rawValue: rawKind) else {
+            guard let event = decodeRecord(in: data, index: index) else {
                 throw AgentTrainerError.storage("This AgentTrainer input event file contains an unknown event kind.")
             }
-            guard data[recordStart + 9] <= 1,
-                  data[recordStart + 11] == 0,
-                  data[recordStart + 14] == 0,
-                  data[recordStart + 15] == 0 else {
-                throw AgentTrainerError.storage("This AgentTrainer input event file contains invalid flags or reserved bytes.")
-            }
-            let button = data[recordStart + 10]
-            var keyCursor = recordStart + 12
-            let keyCode: UInt16 = data.readInteger(at: &keyCursor)
-            guard kind != .mouseButton || button < 8,
-                  ![InputEventKind.key, .flags].contains(kind) || keyCode < 128 else {
-                throw AgentTrainerError.storage("This AgentTrainer input event file contains a control outside the supported policy layout.")
-            }
-            var cursor = recordStart
-            let timestamp: UInt64 = data.readInteger(at: &cursor)
-            if let previousTimestamp, timestamp < previousTimestamp {
+            if let previousTimestamp, event.timestampNanos < previousTimestamp {
                 throw AgentTrainerError.storage("This AgentTrainer input event file is not ordered by capture time.")
             }
-            previousTimestamp = timestamp
-            let event = decodeRecord(in: data, index: index)
+            previousTimestamp = event.timestampNanos
             guard [event.x, event.y, event.deltaX, event.deltaY, event.scrollX, event.scrollY].allSatisfy(\.isFinite) else {
                 throw AgentTrainerError.storage("This AgentTrainer input event file contains a non-finite control value.")
             }
+            body(event)
         }
     }
 
-    private static func decodeRecord(in data: Data, index: Int) -> InputSample {
+    private static func decodeRecord(in data: Data, index: Int) -> InputSample? {
         var cursor = 12 + index * recordSize
         let timestamp: UInt64 = data.readInteger(at: &cursor)
         let kindRaw = data[cursor]; cursor += 1
@@ -305,17 +257,13 @@ enum InputEventReader {
         let x = data.readDouble(at: &cursor), y = data.readDouble(at: &cursor)
         let dx = data.readDouble(at: &cursor), dy = data.readDouble(at: &cursor)
         let sx = data.readDouble(at: &cursor), sy = data.readDouble(at: &cursor)
-        // Validation above guarantees the closed version-1 event kind set.
-        let kind = InputEventKind(rawValue: kindRaw)!
+        guard let kind = InputEventKind(rawValue: kindRaw) else { return nil }
         return InputSample(timestampNanos: timestamp, kind: kind, x: x, y: y, deltaX: dx, deltaY: dy, button: button, scrollX: sx, scrollY: sy, keyCode: keyCode, modifiers: modifiers, isDown: isDown)
     }
 
     private static func forEach(in data: Data, _ body: (InputSample) -> Void) throws {
-        try validate(data)
-        let count = (data.count - 12) / recordSize
-        for index in 0..<count {
-            body(decodeRecord(in: data, index: index))
-        }
+        let count = try validatedRecordCount(in: data)
+        try forEachValidated(in: data, count: count, body)
     }
 }
 

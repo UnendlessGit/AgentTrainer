@@ -48,15 +48,13 @@ enum CNNVisualizationImageRenderer {
         guard let tensor = frame.tensors.first,
               tensor.width > 0, tensor.height > 0, tensor.channels > 0,
               tensor.values.count == tensor.width * tensor.height * tensor.channels else {
-            return CNNVisualizationRender(image: nil, detail: "Waiting for a valid policy tensor")
+            return CNNVisualizationRender(image: nil, detail: "Waiting for a valid CNN tensor")
         }
         switch frame.settings.mode {
         case .activationOverlay:
             return overlay(frame: frame, tensor: tensor, kind: "combined activation")
         case .featureChannels:
             return featureGrid(frame: frame, tensor: tensor)
-        case .spatialTokens:
-            return spatialTokenGrid(frame: frame, tensor: tensor)
         case .actionSaliency:
             return overlay(frame: frame, tensor: tensor, kind: "\(frame.settings.actionFocus.rawValue) influence")
         }
@@ -122,28 +120,6 @@ enum CNNVisualizationImageRenderer {
     private static func featureGrid(frame: CNNVisualizationFrame, tensor: CNNFeatureTensor) -> CNNVisualizationRender {
         let selected = strongestChannels(in: tensor, count: frame.settings.featureChannelCount)
         guard !selected.isEmpty else { return CNNVisualizationRender(image: nil, detail: "No active feature channels") }
-        return mapGrid(
-            tensor: tensor,
-            selected: selected,
-            detail: "\(stageLabel(tensor)) • stride ×\(tensor.effectiveStride) • field \(tensor.receptiveField)×\(tensor.receptiveField) • top \(selected.count) feature maps"
-        )
-    }
-
-    private static func spatialTokenGrid(frame: CNNVisualizationFrame, tensor: CNNFeatureTensor) -> CNNVisualizationRender {
-        let count = min(tensor.channels, max(1, frame.settings.featureChannelCount))
-        let selected = Array(0..<count)
-        let isPatchProjection = tensor.convolutionLayer < 0 && tensor.kernelSize > 1
-        guard !selected.isEmpty else { return CNNVisualizationRender(image: nil, detail: isPatchProjection ? "No patch-token map" : "No spatial-token routing maps") }
-        return mapGrid(
-            tensor: tensor,
-            selected: selected,
-            detail: isPatchProjection
-                ? "Direct patch-token strength • normalized over the full ViT patch grid"
-                : "\(selected.count) learned spatial-token routing maps • normalized over the final CNN grid"
-        )
-    }
-
-    private static func mapGrid(tensor: CNNFeatureTensor, selected: [Int], detail: String) -> CNNVisualizationRender {
         let columns = max(1, Int(ceil(sqrt(Double(selected.count)))))
         let rows = Int(ceil(Double(selected.count) / Double(columns)))
         let width = 600, height = 360, gutter = 3
@@ -181,13 +157,12 @@ enum CNNVisualizationImageRenderer {
         }
         return CNNVisualizationRender(
             image: image(width: width, height: height, rgba: rgba),
-            detail: detail
+            detail: "\(stageLabel(tensor)) • stride ×\(tensor.effectiveStride) • field \(tensor.receptiveField)×\(tensor.receptiveField) • top \(selected.count) maps"
         )
     }
 
     private static func stageLabel(_ tensor: CNNFeatureTensor) -> String {
-        if tensor.convolutionLayer >= 0 { return "Conv \(tensor.convolutionLayer + 1)" }
-        return tensor.kernelSize > 1 ? "Patch projection" : "Vision input"
+        tensor.convolutionLayer >= 0 ? "Conv \(tensor.convolutionLayer + 1)" : "Vision input"
     }
 
     private static func boundedSize(width: Int, height: Int) -> (width: Int, height: Int) {

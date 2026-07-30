@@ -5,7 +5,3 @@ outputs/
 work/
 *.xcuserstate
 xcuserdata/
-WindowsRecorder/**/bin/
-WindowsRecorder/**/obj/
-WindowsRecorder/artifacts/
-WindowsRecorder/.vs/
