@@ -496,23 +496,75 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
 
     func load(from url: URL) throws {
         let loaded = try MLX.loadArraysAndMetadata(url: url)
-        firstMoments = Dictionary(uniqueKeysWithValues: loaded.0.compactMap { key, value in key.hasPrefix("m.") ? (String(key.dropFirst(2)), value) : nil })
-        secondMoments = Dictionary(uniqueKeysWithValues: loaded.0.compactMap { key, value in key.hasPrefix("v.") ? (String(key.dropFirst(2)), value) : nil })
-        parameterNames = firstMoments.keys.sorted()
-        stepArray = MLXArray(Float(Int(loaded.1["step"] ?? "0") ?? 0), dtype: .float32)
-        learningRate = Float(loaded.1["learningRate"] ?? "") ?? learningRate
-        weightDecay = Float(loaded.1["weightDecay"] ?? "") ?? weightDecay
+        let restoredFirst = Dictionary(uniqueKeysWithValues: loaded.0.compactMap { key, value in key.hasPrefix("m.") ? (String(key.dropFirst(2)), value) : nil })
+        let restoredSecond = Dictionary(uniqueKeysWithValues: loaded.0.compactMap { key, value in key.hasPrefix("v.") ? (String(key.dropFirst(2)), value) : nil })
+        let restoredNames = Set(restoredFirst.keys)
+        let expectedNames = Set(parameterNames)
+        let expectedShapes = firstMoments.mapValues(\.shape)
+        guard !restoredNames.isEmpty,
+              restoredNames == Set(restoredSecond.keys),
+              expectedNames.isEmpty || restoredNames == expectedNames,
+              restoredNames.allSatisfy({
+                  restoredFirst[$0]?.shape == restoredSecond[$0]?.shape
+                      && (expectedShapes[$0] == nil || restoredFirst[$0]?.shape == expectedShapes[$0])
+              }) else {
+            throw AgentTrainerError.model("The optimizer checkpoint is incomplete or does not match this model.")
+        }
+        firstMoments = restoredFirst
+        secondMoments = restoredSecond
+        parameterNames = restoredNames.sorted()
+        guard let restoredStep = loaded.1["step"].flatMap(Int.init), restoredStep >= 0,
+              let restoredLearningRate = loaded.1["learningRate"].flatMap(Float.init),
+              restoredLearningRate.isFinite, restoredLearningRate > 0,
+              let restoredWeightDecay = loaded.1["weightDecay"].flatMap(Float.init),
+              restoredWeightDecay.isFinite, restoredWeightDecay >= 0 else {
+            throw AgentTrainerError.model("The optimizer checkpoint contains invalid core metadata.")
+        }
+        stepArray = MLXArray(Float(restoredStep), dtype: .float32)
+        learningRate = restoredLearningRate
+        weightDecay = restoredWeightDecay
         // Checkpoints from the fixed-schedule trainer did not save this field;
         // retaining 500 preserves their exact continuation behavior.
-        warmupSteps = max(1, Int(loaded.1["warmupSteps"] ?? "500") ?? 500)
-        if let rawSchedule = loaded.1["schedule"], let restoredSchedule = LearningRateSchedule(rawValue: rawSchedule) {
+        if let rawWarmup = loaded.1["warmupSteps"] {
+            guard let restoredWarmup = Int(rawWarmup), restoredWarmup > 0 else {
+                throw AgentTrainerError.model("The optimizer checkpoint contains an invalid warmup length.")
+            }
+            warmupSteps = restoredWarmup
+        } else {
+            warmupSteps = 500
+        }
+        if let rawSchedule = loaded.1["schedule"] {
+            guard let restoredSchedule = LearningRateSchedule(rawValue: rawSchedule) else {
+                throw AgentTrainerError.model("The optimizer checkpoint contains an unknown learning-rate schedule.")
+            }
             schedule = restoredSchedule
         } else {
             schedule = .legacyInverseSquareRoot
         }
-        cycleSteps = max(1, Int(loaded.1["cycleSteps"] ?? "4000") ?? 4_000)
-        minimumLearningRateRatio = min(0.5, max(0.001, Float(loaded.1["minimumLearningRateRatio"] ?? "0.05") ?? 0.05))
-        let restoredScale = min(1, max(minimumLearningRateRatio, Float(loaded.1["learningRateScale"] ?? "1") ?? 1))
-        learningRateScaleArray = MLXArray(restoredScale, dtype: .float32)
+        if let rawCycle = loaded.1["cycleSteps"] {
+            guard let restoredCycle = Int(rawCycle), restoredCycle > 0 else {
+                throw AgentTrainerError.model("The optimizer checkpoint contains an invalid cosine cycle.")
+            }
+            cycleSteps = restoredCycle
+        } else {
+            cycleSteps = 4_000
+        }
+        if let rawRatio = loaded.1["minimumLearningRateRatio"] {
+            guard let restoredRatio = Float(rawRatio), restoredRatio.isFinite, (0.001...0.5).contains(restoredRatio) else {
+                throw AgentTrainerError.model("The optimizer checkpoint contains an invalid minimum learning-rate ratio.")
+            }
+            minimumLearningRateRatio = restoredRatio
+        } else {
+            minimumLearningRateRatio = 0.05
+        }
+        if let rawScale = loaded.1["learningRateScale"] {
+            guard let restoredScale = Float(rawScale), restoredScale.isFinite,
+                  (minimumLearningRateRatio...1).contains(restoredScale) else {
+                throw AgentTrainerError.model("The optimizer checkpoint contains an invalid learning-rate scale.")
+            }
+            learningRateScaleArray = MLXArray(restoredScale, dtype: .float32)
+        } else {
+            learningRateScaleArray = MLXArray(1, dtype: .float32)
+        }
     }
 }

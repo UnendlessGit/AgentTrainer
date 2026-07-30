@@ -13,12 +13,19 @@ struct TrainingCompletion: Sendable {
 
 enum TrainingRandomState {
     static func save(_ randomState: MLXRandom.RandomState = MLXRandom.globalState, to url: URL) throws {
-        guard let state = randomState.innerState().first else { return }
+        guard let state = randomState.innerState().first else {
+            throw AgentTrainerError.model("MLX random state is unavailable, so an exact checkpoint cannot be saved.")
+        }
         MLX.eval(state); try MLX.save(arrays: ["state": state], url: url)
     }
 
     static func load(_ randomState: MLXRandom.RandomState = MLXRandom.globalState, from url: URL) throws {
-        guard let restored = try MLX.loadArrays(url: url)["state"], let current = randomState.innerState().first else { return }
+        guard let restored = try MLX.loadArrays(url: url)["state"] else {
+            throw AgentTrainerError.model("The checkpoint does not contain its saved MLX random state.")
+        }
+        guard let current = randomState.innerState().first else {
+            throw AgentTrainerError.model("MLX random state is unavailable, so the checkpoint cannot resume exactly.")
+        }
         current._updateInternal(restored)
         MLX.eval(current)
     }

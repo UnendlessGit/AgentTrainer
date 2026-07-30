@@ -271,7 +271,11 @@ private struct ProfileEditor: View {
                             ForEach(model.versions) { version in
                                 HStack {
                                     VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
-                                    Spacer(); Button(version.optimizerFile == nil ? "Run this" : "Revert & Resume") { Task { await model.activateVersion(version); draft.activeVersionID = version.id } }.primaryButton(color: ATColor.violet)
+                                    Spacer(); Button(version.optimizerFile == nil ? "Run this" : "Revert & Resume") {
+                                        Task {
+                                            if await model.activateVersion(version) { draft.activeVersionID = version.id }
+                                        }
+                                    }.primaryButton(color: ATColor.violet)
                                     if !draft.isDeletionProtected { Button("Delete") { Task { await model.deleteVersion(version) } }.primaryButton(color: ATColor.coral) }
                                 }.padding(.vertical, 4)
                             }
@@ -398,7 +402,7 @@ private struct NeuralNetworkInputOverview: View {
                 NeuralInputMetric(
                     title: "First convolution",
                     value: input.firstConvolutionValues.formatted(),
-                    detail: "\(profile.preprocessing.width) × \(profile.preprocessing.height) × \(profile.preprocessing.channelCount + 2)",
+                    detail: "\(profile.preprocessing.width) × \(profile.preprocessing.height) × \(profile.preprocessing.channelCount * 2 + 2)",
                     color: ATColor.violet
                 )
                 NeuralInputMetric(
@@ -1451,7 +1455,7 @@ struct DiagnosticsView: View {
             }.padding(28)
         }
     }
-    private var appState: String { "recording=\(model.isRecording), recordingStarting=\(model.isStartingRecording), training=\(model.isTraining), running=\(model.isRunning), agentStarting=\(model.isStartingAgent), replaying=\(model.isReplaying), activity=\(model.activityStatus)" }
+    private var appState: String { "recording=\(model.isRecording), recordingStarting=\(model.isStartingRecording), recordingStopping=\(model.isStoppingRecording), training=\(model.isTraining), running=\(model.isRunning), agentStarting=\(model.isStartingAgent), replaying=\(model.isReplaying), activity=\(model.activityStatus)" }
     private func hardwareName() -> String { var size = 0; sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0); var value = [CChar](repeating: 0, count: max(1, size)); sysctlbyname("machdep.cpu.brand_string", &value, &size, nil, 0); return String(decoding: value.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self) }
 }
 
@@ -1497,7 +1501,7 @@ struct SettingsView: View {
                 ThemeSettingsView()
                 OLEDCard { HStack { VStack(alignment: .leading, spacing: 4) { Text("Diagnostics and app logs").font(.headline).foregroundStyle(ATColor.cyan); Text("Open the dedicated tab for persistent errors, prints, crash reports, MLX memory, and a copyable support report.").foregroundStyle(.secondary) }; Spacer(); Button("Open Diagnostics") { model.selection = .diagnostics }.primaryButton() } }
                 StorageSettingsView(model: model)
-                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.8") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "19"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
+                HStack { Spacer(); Text("AgentTrainer v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unversioned"))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary) }
             }.padding(28)
         }
     }
@@ -1702,7 +1706,7 @@ private struct ThemeSettingsView: View {
                 .padding(11)
                 .raisedGlassSurface(cornerRadius: 11, tint: appearance.motionEnabled ? ATColor.cyan : nil)
 
-                Label("The top bar and sidebar use solid, theme-matched surfaces on macOS Sequoia, Tahoe, and macOS 27, avoiding version-specific glass and inactive-window gray states.", systemImage: "macwindow")
+                Label("The top bar and sidebar use solid, theme-matched surfaces on macOS 15 and later, avoiding version-specific glass and inactive-window gray states.", systemImage: "macwindow")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

@@ -42,17 +42,17 @@ private struct AgentTrainerMenuBarView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Image(nsImage: NSApplication.shared.applicationIconImage).resizable().frame(width: 25, height: 25).clipShape(RoundedRectangle(cornerRadius: ATCorner.scaled(6), style: .continuous))
-                VStack(alignment: .leading, spacing: 1) { Text(appearance.configuration.appName).font(.headline); Text(model.isRecording ? "Recording" : appearance.configuration.appSubtitle).font(.caption).foregroundStyle(model.isRecording ? Color.red : Color.secondary) }
+                VStack(alignment: .leading, spacing: 1) { Text(appearance.configuration.appName).font(.headline); Text(model.isStoppingRecording ? "Saving recording" : model.isRecording ? "Recording" : appearance.configuration.appSubtitle).font(.caption).foregroundStyle(model.isRecording ? Color.red : Color.secondary) }
                 Spacer()
                 if model.isRecording { Circle().fill(.red).frame(width: 9, height: 9) }
             }
             Divider()
-            status("Recording", model.isRecording ? "Active" : "Idle", model.isRecording ? .red : .secondary)
+            status("Recording", model.isStoppingRecording ? "Saving" : model.isRecording ? "Active" : model.isStartingRecording ? "Starting" : "Idle", model.recordingIsActiveOrStarting ? .red : .secondary)
             status("Training", model.isTraining ? model.profiles.first(where: { $0.id == model.trainingProfileID })?.name ?? "Active" : "Idle", model.isTraining ? ATColor.cyan : .secondary)
             status("Agent", model.isStartingAgent ? "Starting / stopping" : model.isRunning ? model.profiles.first(where: { $0.id == model.runningProfileID })?.name ?? "Running" : "Idle", model.agentIsActiveOrStarting ? ATColor.violet : .secondary)
             Divider()
-            Button(model.recordingIsActiveOrStarting ? (model.isRecording ? "Stop & Save Recording" : "Cancel Recording Start") : "Start Recording") { Task { model.recordingIsActiveOrStarting ? await model.stopRecording() : await model.startRecording() } }
-                .disabled(model.agentIsActiveOrStarting)
+            Button(model.recordingIsActiveOrStarting ? (model.isStoppingRecording ? "Saving Recording…" : model.isRecording ? "Stop & Save Recording" : "Cancel Recording Start") : "Start Recording") { Task { model.recordingIsActiveOrStarting ? await model.stopRecording() : await model.startRecording() } }
+                .disabled(model.agentIsActiveOrStarting || model.isStoppingRecording)
             Button(model.agentIsActiveOrStarting ? "Stop Agent & Release Inputs" : "Start Selected Agent") { Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() } }
                 .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil)
             Button("Panic — Stop Everything", role: .destructive) { model.panic() }

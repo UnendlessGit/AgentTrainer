@@ -27,6 +27,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLoadingVersions = false
     @Published var isRecording = false
     @Published private(set) var isStartingRecording = false
+    @Published private(set) var isStoppingRecording = false
     @Published var isTraining = false
     @Published private(set) var isAutoTraining = false
     @Published var isRunning = false
@@ -117,7 +118,7 @@ final class AppModel: ObservableObject {
     var selectedSource: CaptureSourceOption? { captureSources.first { $0.id == selectedSourceID && sourceMatchesKind($0) } }
     var selectedRecording: RecordingItem? { recordings.first { $0.id == selectedRecordingID } }
     var selectedProfile: AIProfile? { profiles.first { $0.id == selectedProfileID } }
-    var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording }
+    var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording || isStoppingRecording }
     var agentIsActiveOrStarting: Bool { isRunning || isStartingAgent }
     var canChangeStorageLocations: Bool {
         !isChangingStorageLocation && !recordingIsActiveOrStarting && !isTraining && !agentIsActiveOrStarting && !isReplaying
@@ -299,7 +300,7 @@ final class AppModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !isRecording, !isStartingRecording, !agentIsActiveOrStarting, !isReplaying else { return }
+        guard !recordingIsActiveOrStarting, !agentIsActiveOrStarting, !isReplaying else { return }
         guard let source = selectedSource else { present(AgentTrainerError.invalidConfiguration("Select a capture source.")); return }
         guard let destinationFolderID = recordingDestinationFolderID else { present(AgentTrainerError.invalidConfiguration("Create or select a recording folder.")); return }
         isStartingRecording = true
@@ -366,7 +367,13 @@ final class AppModel: ObservableObject {
             activityStatus = "Cancelling recording start…"
             return
         }
-        guard isRecording, let directory = recordingDirectory, let id = recordingID, let captureSpec = activeRecordingSpec, let captureRect = activeRecordingRect, let destinationFolderID = activeRecordingFolderID else { return }
+        guard !isStoppingRecording, isRecording,
+              let directory = recordingDirectory, let id = recordingID,
+              let captureSpec = activeRecordingSpec, let captureRect = activeRecordingRect,
+              let destinationFolderID = activeRecordingFolderID else { return }
+        isStoppingRecording = true
+        activityStatus = "Saving recording…"
+        defer { isStoppingRecording = false }
         input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
         let eventResult = Result { try eventWriter?.finish() ?? 0 }
         eventWriter = nil
@@ -462,36 +469,30 @@ final class AppModel: ObservableObject {
     }
     func deleteProfile(_ profile: AIProfile) async { profileAutosaveTask?.cancel(); do { try await WorkspaceStore.shared.deleteProfile(profile); selectedProfileID = nil; unloadVersions(); await refreshLibrary() } catch { present(error) } }
 
-    func activateVersion(_ version: ModelVersionManifest) async {
-        guard var profile = selectedProfile else { return }
-        profile.activeVersionID = version.id
+    @discardableResult
+    func activateVersion(_ version: ModelVersionManifest) async -> Bool {
+        guard let profile = selectedProfile else { return false }
         do {
-            let resumable = try await WorkspaceStore.shared.restoreVersionAsCheckpoint(profileID: profile.id, version: version)
-            let count = await WorkspaceStore.shared.listVersions(profileID: profile.id).count
-            profile.trainingProgress = TrainingProgressSummary(
-                globalStep: version.globalStep,
-                epoch: version.epoch ?? 0,
-                updatedAt: version.createdAt,
-                savedBrainCount: count,
-                trainingDurationSeconds: version.trainingDurationSeconds,
-                experienceDurationSeconds: version.experienceDurationSeconds
-            )
-            try await WorkspaceStore.shared.saveProfile(profile); await refreshLibrary(); selectedProfileID = profile.id
-            activityStatus = resumable ? "Brain reverted to \(version.name); training will resume there" : "Activated \(version.name) for running"
-        } catch { present(error) }
+            let activation = try await WorkspaceStore.shared.activateVersion(profile: profile, versionID: version.id)
+            await refreshLibrary()
+            selectedProfileID = activation.profile.id
+            activityStatus = activation.checkpointIsResumable
+                ? "Brain reverted to \(activation.version.name); training will resume there"
+                : "Activated \(activation.version.name) for running"
+            return true
+        } catch {
+            present(error)
+            return false
+        }
     }
 
     func deleteVersion(_ version: ModelVersionManifest) async {
-        guard var profile = selectedProfile else { return }
+        guard let profile = selectedProfile else { return }
         do {
-            try await WorkspaceStore.shared.deleteVersion(profile: profile, versionID: version.id)
-            if profile.activeVersionID == version.id { profile.activeVersionID = nil; try await WorkspaceStore.shared.saveProfile(profile) }
-            if var progress = profile.trainingProgress {
-                progress.savedBrainCount = await WorkspaceStore.shared.listVersions(profileID: profile.id).count
-                profile.trainingProgress = progress
-                try await WorkspaceStore.shared.saveProfile(profile)
-            }
-            await refreshLibrary(); activityStatus = "Model version deleted"
+            let updated = try await WorkspaceStore.shared.deleteVersion(profile: profile, versionID: version.id)
+            await refreshLibrary()
+            selectedProfileID = updated.id
+            activityStatus = "Model version deleted"
         } catch { present(error) }
     }
 
@@ -933,11 +934,11 @@ final class AppModel: ObservableObject {
             let videoDuration = CMTimeGetSeconds(time)
             guard videoDuration.isFinite, videoDuration > 0 else { continue }
             var manifest = item.manifest
-            let events = (try? InputEventReader.read(url: item.directory.appendingPathComponent(item.manifest.eventFile))) ?? []
-            if manifest.hostStartNanos == 0, let first = events.first {
+            let events = try? InputEventReader.mapped(url: item.directory.appendingPathComponent(item.manifest.eventFile))
+            if manifest.hostStartNanos == 0, let first = events?.first {
                 manifest.hostStartNanos = first.timestampNanos
                 manifest.trimStart = 0
-                manifest.trimEnd = events.last.map { min(videoDuration, Double($0.timestampNanos - first.timestampNanos) / 1e9 + 0.25) }
+                manifest.trimEnd = events?.last.map { min(videoDuration, Double($0.timestampNanos - first.timestampNanos) / 1e9 + 0.25) }
             }
             manifest.duration = videoDuration
             if let trimEnd = manifest.trimEnd { manifest.trimEnd = min(videoDuration, trimEnd) }
@@ -953,6 +954,9 @@ final class AppModel: ObservableObject {
     }
 
     private func validateProfile(_ profile: AIProfile) throws {
+        guard !profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw AgentTrainerError.invalidConfiguration("AI names cannot be empty.")
+        }
         _ = try profile.preprocessing.validated()
         let training = profile.training
         let cycleEpochs = training.cosineCycleEpochs ?? 8

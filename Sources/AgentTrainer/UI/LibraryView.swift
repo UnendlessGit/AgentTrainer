@@ -225,9 +225,9 @@ struct LibraryView: View {
                     .listRowBackground(Color.clear)
                 }
                 // `ScrollView` currently enters a safe-area/frame feedback
-                // loop with this AVKit-backed inspector on macOS 27. A plain
+                // loop with this AVKit-backed inspector on newer macOS builds. A plain
                 // List uses AppKit's stable table scrolling path while keeping
-                // the inspector scrollable on Sequoia and Tahoe as well.
+                // the inspector scrollable across supported macOS versions.
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
             }.frame(width: 380).frame(maxHeight: .infinity)

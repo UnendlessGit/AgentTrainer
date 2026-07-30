@@ -8,15 +8,23 @@ struct AppSemanticVersion: Comparable, CustomStringConvertible, Sendable {
     init?(_ value: String) {
         var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if normalized.first == "v" || normalized.first == "V" { normalized.removeFirst() }
-        normalized = normalized.split(separator: "+", maxSplits: 1).first.map(String.init) ?? normalized
+        let buildPieces = normalized.split(separator: "+", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let numericAndPrerelease = buildPieces.first, !numericAndPrerelease.isEmpty else { return nil }
+        if buildPieces.count == 2, !Self.identifiersAreValid(buildPieces[1]) { return nil }
+        normalized = String(numericAndPrerelease)
         let pieces = normalized.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
         let numericPieces = pieces[0].split(separator: ".", omittingEmptySubsequences: false)
         guard !numericPieces.isEmpty,
-              numericPieces.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }),
+              numericPieces.allSatisfy({ !$0.isEmpty && $0.unicodeScalars.allSatisfy { (48...57).contains($0.value) } }),
               numericPieces.count <= 4 else { return nil }
         components = numericPieces.compactMap { Int($0) }
         guard components.count == numericPieces.count else { return nil }
-        prerelease = pieces.count == 2 ? pieces[1].split(separator: ".").map(String.init) : []
+        if pieces.count == 2 {
+            guard Self.identifiersAreValid(pieces[1]) else { return nil }
+            prerelease = pieces[1].split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        } else {
+            prerelease = []
+        }
     }
 
     var description: String {
@@ -50,9 +58,20 @@ struct AppSemanticVersion: Comparable, CustomStringConvertible, Sendable {
             if let leftNumber = Int(left), let rightNumber = Int(right) { return leftNumber < rightNumber }
             if Int(left) != nil { return true }
             if Int(right) != nil { return false }
-            return left.localizedStandardCompare(right) == .orderedAscending
+            return left < right
         }
         return false
+    }
+
+    private static func identifiersAreValid(_ value: Substring) -> Bool {
+        !value.isEmpty && value.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { identifier in
+            !identifier.isEmpty && identifier.unicodeScalars.allSatisfy {
+                (48...57).contains($0.value)
+                    || (65...90).contains($0.value)
+                    || (97...122).contains($0.value)
+                    || $0.value == 45
+            }
+        }
     }
 }
 
@@ -191,9 +210,19 @@ enum GitHubUpdateError: LocalizedError {
 
 private final class UpdateDownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let progress: @Sendable (Double) -> Void
+    private let maximumBytes: Int64
+    private let lock = NSLock()
+    private var exceededMaximum = false
 
-    init(progress: @escaping @Sendable (Double) -> Void) {
+    init(maximumBytes: Int, progress: @escaping @Sendable (Double) -> Void) {
+        self.maximumBytes = Int64(maximumBytes)
         self.progress = progress
+    }
+
+    var didExceedMaximum: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return exceededMaximum
     }
 
     func urlSession(
@@ -203,6 +232,13 @@ private final class UpdateDownloadProgressDelegate: NSObject, URLSessionDownload
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
+        if totalBytesWritten > maximumBytes || totalBytesExpectedToWrite > maximumBytes {
+            lock.lock()
+            exceededMaximum = true
+            lock.unlock()
+            downloadTask.cancel()
+            return
+        }
         guard totalBytesExpectedToWrite > 0 else { return }
         progress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
     }
@@ -321,9 +357,9 @@ struct GitHubReleaseUpdater: Sendable {
         guard let text = String(data: data, encoding: .utf8) else { return nil }
         for line in text.split(whereSeparator: \.isNewline) {
             let fields = line.split(whereSeparator: \.isWhitespace)
-            guard fields.count >= 2 else { continue }
+            guard fields.count >= 2, let listedField = fields.last else { continue }
             let hash = String(fields[0])
-            let listedName = String(fields.last!).trimmingCharacters(in: CharacterSet(charactersIn: "*"))
+            let listedName = String(listedField).trimmingCharacters(in: CharacterSet(charactersIn: "*"))
             if listedName == filename, hash.count == 64, hash.allSatisfy(\.isHexDigit) { return hash.lowercased() }
         }
         return nil
@@ -361,8 +397,15 @@ struct GitHubReleaseUpdater: Sendable {
         request.timeoutInterval = 180
         request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
         request.setValue("AgentTrainer/\(configuration.currentVersion)", forHTTPHeaderField: "User-Agent")
-        let delegate = UpdateDownloadProgressDelegate(progress: progress)
-        let (temporary, response) = try await session.download(for: request, delegate: delegate)
+        let delegate = UpdateDownloadProgressDelegate(maximumBytes: maximumBytes, progress: progress)
+        let download: (URL, URLResponse)
+        do {
+            download = try await session.download(for: request, delegate: delegate)
+        } catch {
+            if delegate.didExceedMaximum { throw GitHubUpdateError.downloadTooLarge }
+            throw error
+        }
+        let (temporary, response) = download
         try Self.validate(response: response, dataSize: nil, maximumBytes: maximumBytes, permittedInitialHosts: ["github.com"], request: request)
         let fileSize = try temporary.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard fileSize > 0, fileSize <= maximumBytes else { throw GitHubUpdateError.downloadTooLarge }
@@ -390,7 +433,8 @@ struct GitHubReleaseUpdater: Sendable {
         guard let http = response as? HTTPURLResponse else { throw GitHubUpdateError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else { throw GitHubUpdateError.requestFailed(http.statusCode) }
         if let dataSize, dataSize > maximumBytes { throw GitHubUpdateError.downloadTooLarge }
-        guard let finalHost = http.url?.host?.lowercased(),
+        guard http.url?.scheme?.lowercased() == "https",
+              let finalHost = http.url?.host?.lowercased(),
               finalHost == "github.com" || finalHost == "api.github.com" || finalHost.hasSuffix(".githubusercontent.com") else {
             throw GitHubUpdateError.unsafeDownloadURL
         }
@@ -550,10 +594,20 @@ struct SelfUpdateInstaller: Sendable {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()
-        for _ in 0..<100 {
+        for _ in 0..<250 {
             if FileManager.default.fileExists(atPath: readinessURL.path) { return }
             if !process.isRunning { throw GitHubUpdateError.installerHelperFailed }
             try await Task.sleep(for: .milliseconds(20))
+        }
+        // Never leave an unacknowledged helper waiting to replace the app
+        // later. If readiness was not observed, cancel it before reporting the
+        // failed launch.
+        if process.isRunning {
+            process.terminate()
+            for _ in 0..<50 where process.isRunning {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            if process.isRunning { process.interrupt() }
         }
         throw GitHubUpdateError.installerHelperFailed
     }

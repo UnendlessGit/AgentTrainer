@@ -632,6 +632,15 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Optional keeps existing manifests decodable. New brains retain the
     /// per-head held-out report that justified best-brain selection.
     var validationReport: ValidationReport? = nil
+
+    /// Manifest filenames are treated as leaf names, never paths. A damaged or
+    /// hand-edited manifest must not escape its immutable version directory.
+    var artifactFileNamesAreSafe: Bool {
+        let names = [weightsFile] + [optimizerFile, trainingStateFile, randomStateFile].compactMap { $0 }
+        return names.allSatisfy {
+            !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0")
+        }
+    }
 }
 
 struct TrainingProgressSummary: Codable, Hashable, Sendable {

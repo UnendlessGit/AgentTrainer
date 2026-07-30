@@ -178,6 +178,7 @@ struct RootView: View {
 
 
     private var activityTitle: String {
+        if model.isStoppingRecording { return "Saving recording" }
         if model.isRecording { return "Recording" }
         if model.agentIsActiveOrStarting && model.isTraining { return model.isStartingAgent ? "Start/stop + train" : "Run + train" }
         if model.isStartingAgent { return "AI starting / stopping" }
@@ -300,7 +301,7 @@ private struct WindowDragHandle: NSViewRepresentable {
 }
 
 /// Full-size, transparent AppKit title chrome leaves the traffic lights native
-/// while the app draws one identical opaque top bar on Sequoia and Tahoe.
+/// while the app draws one identical opaque top bar across supported macOS versions.
 private struct WindowChromeConfigurator: NSViewRepresentable {
     let configuration: UIConfiguration
 

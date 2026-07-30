@@ -40,7 +40,7 @@ enum ATCorner {
     }
 }
 
-/// The fast surface used throughout the backup build: one fill, one border,
+/// The fast surface used throughout the app: one fill, one border,
 /// and no per-card blur, gradient, shadow, or compositing group.
 struct OLEDCard<Content: View>: View {
     var padding: CGFloat = 18

@@ -7,6 +7,17 @@ import MLXOptimizers
 @preconcurrency import ScreenCaptureKit
 @testable import AgentTrainer
 
+private func XCTAssertThrowsErrorAsync<T>(
+    _ operation: () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await operation()
+        XCTFail("Expected operation to throw an error.", file: file, line: line)
+    } catch {}
+}
+
 final class DomainTests: XCTestCase {
     private final class EventCollector: @unchecked Sendable {
         private let lock = NSLock()
@@ -17,12 +28,27 @@ final class DomainTests: XCTestCase {
         var events: [(CGEventType, Int64, Int64, Int64)] { lock.lock(); defer { lock.unlock() }; return stored }
         var warps: [CGPoint] { lock.lock(); defer { lock.unlock() }; return storedWarps }
     }
+    private final class OneShotGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var used = false
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !used else { return false }
+            used = true
+            return true
+        }
+    }
     func testUpdateVersionsUseSemanticOrdering() throws {
         XCTAssertLessThan(try XCTUnwrap(AppSemanticVersion("v1.3.9")), try XCTUnwrap(AppSemanticVersion("1.4.0")))
         XCTAssertLessThan(try XCTUnwrap(AppSemanticVersion("1.9")), try XCTUnwrap(AppSemanticVersion("1.10")))
         XCTAssertEqual(try XCTUnwrap(AppSemanticVersion("1.3")), try XCTUnwrap(AppSemanticVersion("1.3.0")))
         XCTAssertLessThan(try XCTUnwrap(AppSemanticVersion("2.0.0-beta.2")), try XCTUnwrap(AppSemanticVersion("2.0.0")))
         XCTAssertNil(AppSemanticVersion("release-next"))
+        XCTAssertNil(AppSemanticVersion("1.0-"))
+        XCTAssertNil(AppSemanticVersion("1.0-alpha..1"))
+        XCTAssertNil(AppSemanticVersion("1.0+"))
+        XCTAssertNil(AppSemanticVersion("1.0+build+other"))
     }
 
     func testReleaseChecksumParserRequiresExactFilenameAndSHA256() {
@@ -998,23 +1024,69 @@ final class DomainTests: XCTestCase {
         let store = WorkspaceStore(root: root)
         try await store.prepare()
         let profile = AIProfile.fresh(), versionID = UUID()
+        try await store.saveProfile(profile)
         let directory = await store.versionDirectory(profileID: profile.id, versionID: versionID)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try Data("brain".utf8).write(to: directory.appendingPathComponent("weights.safetensors"))
         try Data("optimizer".utf8).write(to: directory.appendingPathComponent("optimizer.safetensors"))
         try Data("state".utf8).write(to: directory.appendingPathComponent("state.json"))
         let version = ModelVersionManifest(id: versionID, name: "Epoch 120", createdAt: Date(), globalStep: 240, trainingLoss: 0.2, validationLoss: nil, preprocessing: profile.preprocessing, channels: profile.channels, training: profile.training, optimizerFile: "optimizer.safetensors", trainingStateFile: "state.json", epoch: 120, isAutosave: true)
-        let restored = try await store.restoreVersionAsCheckpoint(profileID: profile.id, version: version)
-        XCTAssertTrue(restored)
+        try await store.saveVersionManifest(version, profileID: profile.id)
+        let restored = try await store.activateVersion(profile: profile, versionID: version.id)
+        XCTAssertTrue(restored.checkpointIsResumable)
+        XCTAssertEqual(restored.profile.activeVersionID, version.id)
+        XCTAssertEqual(restored.profile.trainingProgress?.globalStep, 240)
         let checkpoint = await store.checkpointDirectory(profileID: profile.id)
         XCTAssertEqual(try Data(contentsOf: checkpoint.appendingPathComponent("weights.safetensors")), Data("brain".utf8))
         XCTAssertEqual(try Data(contentsOf: checkpoint.appendingPathComponent("optimizer.safetensors")), Data("optimizer".utf8))
         XCTAssertEqual(try Data(contentsOf: checkpoint.appendingPathComponent("state.json")), Data("state".utf8))
 
         let best = ModelVersionManifest(id: UUID(), name: "Best", createdAt: Date(), globalStep: 120, trainingLoss: 0.1, validationLoss: 0.1, preprocessing: profile.preprocessing, channels: profile.channels, training: profile.training)
-        let staleRestored = try await store.restoreVersionAsCheckpoint(profileID: profile.id, version: best)
-        XCTAssertFalse(staleRestored)
+        try await store.saveVersionManifest(best, profileID: profile.id)
+        let bestDirectory = await store.versionDirectory(profileID: profile.id, versionID: best.id)
+        try Data("best-brain".utf8).write(to: bestDirectory.appendingPathComponent(best.weightsFile))
+        let staleRestored = try await store.activateVersion(profile: restored.profile, versionID: best.id)
+        XCTAssertFalse(staleRestored.checkpointIsResumable)
+        XCTAssertEqual(staleRestored.profile.activeVersionID, best.id)
         XCTAssertFalse(FileManager.default.fileExists(atPath: checkpoint.path), "A stale newer checkpoint must not override an explicitly activated weights-only brain")
+    }
+
+    func testModelVersionManifestsCannotEscapeTheirVersionDirectory() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("unsafe-version-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let profile = AIProfile.fresh()
+        var version = ModelVersionManifest(id: UUID(), name: "Unsafe", createdAt: Date(), globalStep: 1, trainingLoss: 0.1, preprocessing: profile.preprocessing, channels: profile.channels, training: profile.training)
+        XCTAssertTrue(version.artifactFileNamesAreSafe)
+        version.weightsFile = "../outside.safetensors"
+        XCTAssertFalse(version.artifactFileNamesAreSafe)
+        await XCTAssertThrowsErrorAsync {
+            try await store.saveVersionManifest(version, profileID: profile.id)
+        }
+    }
+
+    func testProfileAndFolderNamesAreTrimmedAndCannotBeEmpty() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("names-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+
+        var profile = AIProfile.fresh(name: "  Polished AI  ")
+        try await store.saveProfile(profile)
+        let storedProfiles = await store.listProfiles()
+        XCTAssertEqual(storedProfiles.first?.name, "Polished AI")
+        profile.id = UUID()
+        profile.name = "   "
+        await XCTAssertThrowsErrorAsync { try await store.saveProfile(profile) }
+
+        let folder = RecordingFolder(id: UUID(), name: "  Sessions  ", createdAt: Date())
+        try await store.saveRecordingFolder(folder)
+        let storedFolders = await store.listRecordingFolders()
+        XCTAssertEqual(storedFolders.first?.name, "Sessions")
+        await XCTAssertThrowsErrorAsync {
+            try await store.saveRecordingFolder(RecordingFolder(id: UUID(), name: "\n\t", createdAt: Date()))
+        }
     }
 
     func testConfiguredHotkeyIsRemovedFromCapturedInput() {
@@ -1402,6 +1474,53 @@ final class DomainTests: XCTestCase {
         injector.disableAndReleaseAll()
     }
 
+    func testKeyboardDisableAndReenableCannotOvertakeTheReleaseEvent() {
+        let collector = EventCollector()
+        let releaseEntered = DispatchSemaphore(value: 0)
+        let allowRelease = DispatchSemaphore(value: 0)
+        let disableFinished = DispatchSemaphore(value: 0)
+        let repressFinished = DispatchSemaphore(value: 0)
+        let gate = OneShotGate()
+        let injector = InputInjector(eventSink: { event in
+            if event.type == .keyUp, event.getIntegerValueField(.keyboardEventKeycode) == 13 {
+                if gate.claim() {
+                    releaseEntered.signal()
+                    _ = allowRelease.wait(timeout: .now() + 5)
+                }
+            }
+            collector.append(event)
+        })
+        var profile = AIProfile.fresh()
+        profile.channels.mouseMovement = false
+        profile.channels.buttons = false
+        profile.channels.scroll = false
+        profile.channels.modifiers = false
+        var prediction = [Float](repeating: 0, count: ActionLayout.count)
+        prediction[14 + 13] = 1
+        let runtimeProfile = profile
+        let action = prediction
+        let captureRect = CGRect(x: 0, y: 0, width: 100, height: 100)
+
+        injector.enable()
+        injector.execute(action, profile: runtimeProfile, allowedKeyCodes: [13], mouseMode: .absolute, captureRect: captureRect, safety: AgentSafetyPolicy())
+        DispatchQueue.global().async {
+            injector.updateOutputPermissions(RuntimeOutputPermissions(cursorMovement: true, keyboard: false))
+            disableFinished.signal()
+        }
+        XCTAssertEqual(releaseEntered.wait(timeout: .now() + 2), .success)
+        DispatchQueue.global().async {
+            injector.updateOutputPermissions(RuntimeOutputPermissions(cursorMovement: true, keyboard: true))
+            injector.execute(action, profile: runtimeProfile, allowedKeyCodes: [13], mouseMode: .absolute, captureRect: captureRect, safety: AgentSafetyPolicy())
+            repressFinished.signal()
+        }
+        XCTAssertEqual(repressFinished.wait(timeout: .now() + 0.1), .timedOut, "A new key-down overtook the in-flight release")
+        allowRelease.signal()
+        XCTAssertEqual(disableFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(repressFinished.wait(timeout: .now() + 2), .success)
+        let keyEvents = collector.events.filter { ($0.0 == .keyDown || $0.0 == .keyUp) && $0.1 == 13 }.map(\.0)
+        XCTAssertEqual(keyEvents, [.keyDown, .keyUp, .keyDown])
+    }
+
     func testShiftFollowsKeyboardWhileCommandOptionControlFollowModifierChannel() {
         var profile = AIProfile.fresh()
         profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: false, keyboard: true, modifiers: false)
@@ -1701,7 +1820,7 @@ final class DomainTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("legacy-optimizer-\(UUID().uuidString).safetensors")
         defer { try? FileManager.default.removeItem(at: url) }
         try MLX.save(
-            arrays: ["m.placeholder": MLXArray.zeros([1])],
+            arrays: ["m.placeholder": MLXArray.zeros([1]), "v.placeholder": MLXArray.zeros([1])],
             metadata: [
                 "step": "2000",
                 "learningRate": "0.0003",
@@ -1714,6 +1833,24 @@ final class DomainTests: XCTestCase {
         try restored.load(from: url)
         XCTAssertEqual(restored.schedule, .legacyInverseSquareRoot)
         XCTAssertEqual(restored.effectiveLearningRate(), 0.00015, accuracy: 0.000_001)
+    }
+
+    func testOptimizerCheckpointRejectsMissingMomentPairs() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("incomplete-optimizer-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try MLX.save(arrays: ["m.placeholder": MLXArray.zeros([1])], metadata: ["step": "1"], url: url)
+        XCTAssertThrowsError(try ResumableAdamW(learningRate: 0.001, weightDecay: 0.01).load(from: url))
+    }
+
+    func testOptimizerCheckpointRejectsMalformedMetadata() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("invalid-optimizer-metadata-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try MLX.save(
+            arrays: ["m.placeholder": MLXArray.zeros([1]), "v.placeholder": MLXArray.zeros([1])],
+            metadata: ["step": "not-a-step", "learningRate": "nan", "weightDecay": "0.01"],
+            url: url
+        )
+        XCTAssertThrowsError(try ResumableAdamW(learningRate: 0.001, weightDecay: 0.01).load(from: url))
     }
 
     func testCompiledTrainingStepMatchesUncompiledAdamW() throws {
@@ -1823,6 +1960,13 @@ final class DomainTests: XCTestCase {
         let restored = withRandomState(trainingState) { MLXRandom.uniform(low: 0, high: 1, [32]) }
         MLX.eval(restored)
         XCTAssertEqual(expected.asArray(Float.self), restored.asArray(Float.self))
+    }
+
+    func testTrainingRandomStateRejectsAFileWithoutTheStateTensor() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("invalid-random-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try MLX.save(arrays: ["other": MLXArray.zeros([1])], url: url)
+        XCTAssertThrowsError(try TrainingRandomState.load(from: url))
     }
 
     func testPackedActionBatchesPreserveHistoryExactly() throws {

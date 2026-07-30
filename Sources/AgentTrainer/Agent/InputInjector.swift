@@ -29,7 +29,18 @@ final class InputInjector: @unchecked Sendable {
     }
 
     func enable(outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions()) {
-        lock.lock(); heldKeys.removeAll(); heldButtons.removeAll(); modifiers = 0
+        lock.lock()
+        // A defensive re-enable must not forget controls that are still down.
+        // Keep release events ordered with `execute` and the new session.
+        let previousKeys = heldKeys
+        let previousButtons = heldButtons
+        let previousPosition = cursor
+        let shouldResetGameCamera = usedGameCamera
+        enabled = false
+        for button in previousButtons { postButton(button, down: false, at: previousPosition) }
+        for key in previousKeys { postKey(key, down: false, flags: []) }
+        if shouldResetGameCamera { postNeutralGameCameraMove(at: previousPosition) }
+        heldKeys.removeAll(); heldButtons.removeAll(); modifiers = 0
         self.outputPermissions = outputPermissions
         cursor = CGEvent(source: hidEventSource)?.location ?? cursor
         // Display discovery crosses into WindowServer. Cache it once per run
@@ -58,12 +69,14 @@ final class InputInjector: @unchecked Sendable {
         if wasEnabled {
             lastStateReportTime = CACurrentMediaTime()
             lastReportedState = state
+            // Release while the execution lock is still held. Otherwise a fast
+            // off/on toggle can post a new key-down before this old key-up.
+            for key in keysToRelease { postKey(key, down: false, flags: []) }
+            if resetGameCamera { postNeutralGameCameraMove(at: position) }
         }
         lock.unlock()
 
         guard wasEnabled else { return }
-        for key in keysToRelease { postKey(key, down: false, flags: []) }
-        if resetGameCamera { postNeutralGameCameraMove(at: position) }
         onState?(state)
     }
 
@@ -153,14 +166,18 @@ final class InputInjector: @unchecked Sendable {
     func disableAndReleaseAll() {
         lock.lock()
         let keys = heldKeys, buttons = heldButtons, position = cursor, shouldResetGameCamera = usedGameCamera
-        enabled = false; heldKeys.removeAll(); heldButtons.removeAll(); modifiers = 0; lastReportedState = .empty
-        usedGameCamera = false
-        lock.unlock()
+        enabled = false
+        // Do not allow a new session to start until every release has actually
+        // been posted. This also closes the stop/restart counterpart of the
+        // live-permission race handled above.
         for button in buttons { postButton(button, down: false, at: position) }
         for key in keys { postKey(key, down: false, flags: []) }
         // Return the HID cursor path to a neutral, associated state. Some games
         // retain the final relative delta unless they receive a zero-delta move.
         if shouldResetGameCamera { postNeutralGameCameraMove(at: position) }
+        heldKeys.removeAll(); heldButtons.removeAll(); modifiers = 0; lastReportedState = .empty
+        usedGameCamera = false
+        lock.unlock()
         onState?(.empty)
     }
 

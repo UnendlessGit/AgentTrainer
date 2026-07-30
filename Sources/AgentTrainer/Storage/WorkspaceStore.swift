@@ -40,6 +40,12 @@ struct WorkspaceRelocationResult: Equatable, Sendable {
     var sourceCleanupComplete: Bool
 }
 
+struct WorkspaceVersionActivation: Sendable {
+    var profile: AIProfile
+    var version: ModelVersionManifest
+    var checkpointIsResumable: Bool
+}
+
 actor WorkspaceStore {
     static let shared = WorkspaceStore()
 
@@ -221,7 +227,9 @@ actor WorkspaceStore {
                 if let data = try? Data(contentsOf: manifestURL),
                    let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
                    manifest.schemaVersion == currentSchema,
-                   manifest.id.uuidString.caseInsensitiveCompare(item.lastPathComponent) == .orderedSame {
+                   manifest.id.uuidString.caseInsensitiveCompare(item.lastPathComponent) == .orderedSame,
+                   manifest.artifactFileNamesAreSafe,
+                   FileManager.default.fileExists(atPath: item.appendingPathComponent(manifest.weightsFile).path) {
                     compatibleVersionIDs.insert(manifest.id)
                 } else {
                     try archiveModelArtifact(
@@ -408,7 +416,9 @@ actor WorkspaceStore {
     }
 
     func saveRecordingFolder(_ folder: RecordingFolder) throws {
-        guard !folder.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw AgentTrainerError.invalidConfiguration("Folder names cannot be empty.") }
+        var folder = folder
+        folder.name = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !folder.name.isEmpty else { throw AgentTrainerError.invalidConfiguration("Folder names cannot be empty.") }
         var folders = listRecordingFolders()
         if let index = folders.firstIndex(where: { $0.id == folder.id }) { folders[index] = folder } else { folders.append(folder) }
         try atomicWrite(try encoder.encode(folders), to: foldersURL)
@@ -454,7 +464,7 @@ actor WorkspaceStore {
         var remaining = listRecordingFolders().filter { $0.id != folder.id }
         if includingRecordings {
             for recording in listRecordings() where recording.manifest.folderID == folder.id {
-                try? FileManager.default.removeItem(at: recording.directory)
+                try FileManager.default.removeItem(at: recording.directory)
             }
         } else {
             if remaining.isEmpty {
@@ -471,6 +481,10 @@ actor WorkspaceStore {
     func saveProfile(_ profile: AIProfile) throws {
         try prepare()
         var profile = profile
+        profile.name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !profile.name.isEmpty else {
+            throw AgentTrainerError.invalidConfiguration("AI names cannot be empty.")
+        }
         if profile.isDeletionProtected { profile.deletionProtected = true }
         let directory = profileDirectory(profile.id)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -554,13 +568,20 @@ actor WorkspaceStore {
             throw AgentTrainerError.storage("This AI is protected. Duplicate it before changing brain architecture or vision settings.")
         }
         var reset = profile
+        reset.name = reset.name.trimmingCharacters(in: .whitespacesAndNewlines)
         reset.activeVersionID = nil
         reset.trainingProgress = nil
         let root = profileDirectory(profile.id)
+        let profileURL = root.appendingPathComponent("profile.json")
+        let previousProfileData = try Data(contentsOf: profileURL)
         let staging = root.appendingPathComponent(".LearningReset.\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
         var moved: [(from: URL, to: URL)] = []
         do {
+            // Make the persisted profile safe first. A process interruption can
+            // then leave only inactive extra artifacts, never an active profile
+            // whose selected brain has already disappeared.
+            try saveProfile(reset)
             for name in ["Versions", "Checkpoint"] {
                 let source = root.appendingPathComponent(name, isDirectory: true)
                 guard FileManager.default.fileExists(atPath: source.path) else { continue }
@@ -568,14 +589,20 @@ actor WorkspaceStore {
                 try FileManager.default.moveItem(at: source, to: destination)
                 moved.append((source, destination))
             }
-            try saveProfile(reset)
             try FileManager.default.removeItem(at: staging)
             return reset
         } catch {
+            var rollbackError: Error?
             for item in moved.reversed() where FileManager.default.fileExists(atPath: item.to.path) {
-                try? FileManager.default.moveItem(at: item.to, to: item.from)
+                do { try FileManager.default.moveItem(at: item.to, to: item.from) }
+                catch { rollbackError = rollbackError ?? error }
             }
+            do { try atomicWrite(previousProfileData, to: profileURL) }
+            catch { rollbackError = rollbackError ?? error }
             try? FileManager.default.removeItem(at: staging)
+            if let rollbackError {
+                throw AgentTrainerError.storage("Learning reset failed and its rollback was incomplete: \(rollbackError.localizedDescription)")
+            }
             throw error
         }
     }
@@ -593,6 +620,11 @@ actor WorkspaceStore {
     }
 
     func saveVersionManifest(_ manifest: ModelVersionManifest, profileID: UUID) throws {
+        var manifest = manifest
+        manifest.name = manifest.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !manifest.name.isEmpty, manifest.artifactFileNamesAreSafe else {
+            throw AgentTrainerError.storage("The model version manifest contains an invalid name or artifact filename.")
+        }
         let directory = versionDirectory(profileID: profileID, versionID: manifest.id)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try atomicWrite(try encoder.encode(manifest), to: directory.appendingPathComponent("manifest.json"))
@@ -602,22 +634,58 @@ actor WorkspaceStore {
         let versions = profileDirectory(profileID).appendingPathComponent("Versions", isDirectory: true)
         guard let urls = try? FileManager.default.contentsOfDirectory(at: versions, includingPropertiesForKeys: nil) else { return [] }
         return urls.compactMap { url in
-            guard let data = try? Data(contentsOf: url.appendingPathComponent("manifest.json")) else { return nil }
-            return try? decoder.decode(ModelVersionManifest.self, from: data)
+            guard let data = try? Data(contentsOf: url.appendingPathComponent("manifest.json")),
+                  let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
+                  manifest.schemaVersion == ModelContract.schemaVersion,
+                  manifest.artifactFileNamesAreSafe,
+                  manifest.id.uuidString.caseInsensitiveCompare(url.lastPathComponent) == .orderedSame else { return nil }
+            return manifest
         }.sorted { $0.createdAt > $1.createdAt }
     }
 
     func version(profileID: UUID, versionID: UUID) -> ModelVersionManifest? {
         let url = versionDirectory(profileID: profileID, versionID: versionID).appendingPathComponent("manifest.json")
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? decoder.decode(ModelVersionManifest.self, from: data)
+        guard let data = try? Data(contentsOf: url),
+              let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
+              manifest.id == versionID,
+              manifest.schemaVersion == ModelContract.schemaVersion,
+              manifest.artifactFileNamesAreSafe else { return nil }
+        return manifest
     }
 
-    func deleteVersion(profile: AIProfile, versionID: UUID) throws {
+    @discardableResult
+    func deleteVersion(profile: AIProfile, versionID: UUID) throws -> AIProfile {
         guard !profile.isDeletionProtected else {
             throw AgentTrainerError.storage("This protected AI's runnable brain cannot be deleted.")
         }
-        try FileManager.default.removeItem(at: versionDirectory(profileID: profile.id, versionID: versionID))
+        let source = versionDirectory(profileID: profile.id, versionID: versionID)
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            throw AgentTrainerError.storage("The selected model version no longer exists.")
+        }
+        let backup = source.deletingLastPathComponent().appendingPathComponent(".VersionDeletion.\(versionID.uuidString).\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.moveItem(at: source, to: backup)
+        do {
+            var updated = profile
+            if updated.activeVersionID == versionID { updated.activeVersionID = nil }
+            if var progress = updated.trainingProgress {
+                progress.savedBrainCount = listVersions(profileID: profile.id).count
+                updated.trainingProgress = progress
+            }
+            try saveProfile(updated)
+            do { try FileManager.default.removeItem(at: backup) }
+            catch {
+                AppLog.write(.warning, category: "Storage", "A deleted model version remains in a hidden cleanup folder", details: error.localizedDescription)
+            }
+            return updated
+        } catch {
+            if !FileManager.default.fileExists(atPath: source.path) {
+                do { try FileManager.default.moveItem(at: backup, to: source) }
+                catch {
+                    throw AgentTrainerError.storage("Model deletion failed and its rollback was incomplete: \(error.localizedDescription)")
+                }
+            }
+            throw error
+        }
     }
 
     /// Keeps the newest periodic autosaves bounded. Completed/manual brains are
@@ -645,31 +713,113 @@ actor WorkspaceStore {
         return removed
     }
 
-    func restoreVersionAsCheckpoint(profileID: UUID, version: ModelVersionManifest) throws -> Bool {
-        let destination = checkpointDirectory(profileID: profileID)
-        guard let optimizerFile = version.optimizerFile, let stateFile = version.trainingStateFile else {
-            // Explicitly activating a weights-only/best brain means future
-            // training should fine-tune that brain with a fresh optimizer, not
-            // silently resume an unrelated newer checkpoint left on disk.
-            if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-            return false
+    /// Activates the immutable version and its exact checkpoint as one logical
+    /// transaction. If profile persistence fails, the previous checkpoint is
+    /// restored so the next training session can never resume the wrong brain.
+    func activateVersion(profile: AIProfile, versionID: UUID) throws -> WorkspaceVersionActivation {
+        guard let version = version(profileID: profile.id, versionID: versionID) else {
+            throw AgentTrainerError.storage("The selected model version is missing or has an invalid manifest.")
         }
-        let source = versionDirectory(profileID: profileID, versionID: version.id)
-        let temporary = destination.deletingLastPathComponent().appendingPathComponent(".Checkpoint.restore.\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
-        do {
-            try FileManager.default.copyItem(at: source.appendingPathComponent(version.weightsFile), to: temporary.appendingPathComponent("weights.safetensors"))
-            try FileManager.default.copyItem(at: source.appendingPathComponent(optimizerFile), to: temporary.appendingPathComponent("optimizer.safetensors"))
-            try FileManager.default.copyItem(at: source.appendingPathComponent(stateFile), to: temporary.appendingPathComponent("state.json"))
-            try encoder.encode(version.schemaVersion).write(to: temporary.appendingPathComponent("model-schema.json"), options: .atomic)
-            if let randomStateFile = version.randomStateFile {
-                try FileManager.default.copyItem(at: source.appendingPathComponent(randomStateFile), to: temporary.appendingPathComponent("random.safetensors"))
+        let source = versionDirectory(profileID: profile.id, versionID: version.id)
+        let sourceWeights = source.appendingPathComponent(version.weightsFile)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: sourceWeights.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw AgentTrainerError.storage("The selected model version is missing its weights.")
+        }
+
+        let checkpointMetadata = (version.optimizerFile, version.trainingStateFile, version.randomStateFile)
+        let resumable: Bool
+        switch checkpointMetadata {
+        case (nil, nil, nil):
+            resumable = false
+        case (.some, .some, _):
+            resumable = true
+        default:
+            throw AgentTrainerError.storage("The selected model version has an incomplete training checkpoint.")
+        }
+
+        let destination = checkpointDirectory(profileID: profile.id)
+        let parent = destination.deletingLastPathComponent()
+        var temporary: URL?
+        if resumable, let optimizerFile = version.optimizerFile, let stateFile = version.trainingStateFile {
+            let candidate = parent.appendingPathComponent(".Checkpoint.restore.\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
+            do {
+                try FileManager.default.copyItem(at: sourceWeights, to: candidate.appendingPathComponent("weights.safetensors"))
+                try FileManager.default.copyItem(at: source.appendingPathComponent(optimizerFile), to: candidate.appendingPathComponent("optimizer.safetensors"))
+                try FileManager.default.copyItem(at: source.appendingPathComponent(stateFile), to: candidate.appendingPathComponent("state.json"))
+                try encoder.encode(version.schemaVersion).write(to: candidate.appendingPathComponent("model-schema.json"), options: .atomic)
+                if let randomStateFile = version.randomStateFile {
+                    try FileManager.default.copyItem(at: source.appendingPathComponent(randomStateFile), to: candidate.appendingPathComponent("random.safetensors"))
+                }
+                temporary = candidate
+            } catch {
+                try? FileManager.default.removeItem(at: candidate)
+                throw error
             }
-            if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-            try FileManager.default.moveItem(at: temporary, to: destination)
-            return true
+        }
+
+        let checkpointExisted = FileManager.default.fileExists(atPath: destination.path)
+        let backupName = ".Checkpoint.activation-backup.\(UUID().uuidString)"
+        let backup = parent.appendingPathComponent(backupName, isDirectory: true)
+        var backupWasCreated = false
+        do {
+            if checkpointExisted {
+                if let temporary {
+                    _ = try FileManager.default.replaceItemAt(
+                        destination,
+                        withItemAt: temporary,
+                        backupItemName: backupName,
+                        options: .usingNewMetadataOnly
+                    )
+                } else {
+                    try FileManager.default.moveItem(at: destination, to: backup)
+                }
+                backupWasCreated = FileManager.default.fileExists(atPath: backup.path)
+            } else if let temporary {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+
+            var updated = profile
+            updated.name = updated.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            updated.activeVersionID = version.id
+            updated.trainingProgress = TrainingProgressSummary(
+                globalStep: version.globalStep,
+                epoch: version.epoch ?? 0,
+                updatedAt: version.createdAt,
+                savedBrainCount: listVersions(profileID: profile.id).count,
+                trainingDurationSeconds: version.trainingDurationSeconds,
+                experienceDurationSeconds: version.experienceDurationSeconds
+            )
+            try saveProfile(updated)
+            if backupWasCreated {
+                do { try FileManager.default.removeItem(at: backup) }
+                catch {
+                    AppLog.write(.warning, category: "Storage", "An old checkpoint remains in a hidden cleanup folder", details: error.localizedDescription)
+                }
+            }
+            return WorkspaceVersionActivation(profile: updated, version: version, checkpointIsResumable: resumable)
         } catch {
-            try? FileManager.default.removeItem(at: temporary)
+            var rollbackError: Error?
+            if backupWasCreated, FileManager.default.fileExists(atPath: backup.path) {
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    do { try FileManager.default.removeItem(at: destination) }
+                    catch { rollbackError = rollbackError ?? error }
+                }
+                if !FileManager.default.fileExists(atPath: destination.path) {
+                    do { try FileManager.default.moveItem(at: backup, to: destination) }
+                    catch { rollbackError = rollbackError ?? error }
+                }
+            } else if !checkpointExisted, FileManager.default.fileExists(atPath: destination.path) {
+                do { try FileManager.default.removeItem(at: destination) }
+                catch { rollbackError = rollbackError ?? error }
+            }
+            if let temporary, FileManager.default.fileExists(atPath: temporary.path) {
+                try? FileManager.default.removeItem(at: temporary)
+            }
+            if let rollbackError {
+                throw AgentTrainerError.storage("Model activation failed and its checkpoint rollback was incomplete: \(rollbackError.localizedDescription)")
+            }
             throw error
         }
     }
@@ -734,7 +884,7 @@ actor WorkspaceStore {
                 return manifest["schemaVersion"] as? Int
             }
             guard schema != currentSchema else { continue }
-            try? FileManager.default.removeItem(at: directory)
+            try FileManager.default.removeItem(at: directory)
             removed += 1
         }
         return removed
@@ -750,8 +900,7 @@ actor WorkspaceStore {
     }
 
     private func versionDirectoryCount(profileID: UUID) -> Int {
-        let versions = profileDirectory(profileID).appendingPathComponent("Versions", isDirectory: true)
-        return (try? FileManager.default.contentsOfDirectory(at: versions, includingPropertiesForKeys: nil).count) ?? 0
+        listVersions(profileID: profileID).count
     }
 
     private func checkpointTiming(profileID: UUID) -> (training: Double?, experience: Double?) {

@@ -1,40 +1,96 @@
-# AgentTrainer
+# AgentTrainer 1.9.5
 
-AgentTrainer 1.8.8 is a privacy-first Apple-silicon app for macOS Sequoia 15, macOS Tahoe 26, and macOS 27. It records screen content and synchronized human input, trains imitation policies with MLX, and runs those policies as guarded OS-wide agents. On launch, its only network feature checks the public `UnendlessGit/AgentTrainer` GitHub Releases feed for a newer version; recordings, models, diagnostics, and usage data are never uploaded. A pre-library recovery pass repairs malformed-but-decodable legacy duration/trim metadata before strict validation can hide it, retaining a backup of the original manifest and never modifying the source video or input stream.
+AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
-Recordings live in real library folders that expand in place and can be selected as whole training datasets. The AI Models recording picker mirrors that folder hierarchy, while every Library row offers direct, confirmed deletion. Legacy unfiled recordings are migrated into a `Recordings` folder. Recording-time key blacklists remove selected keys and modifier state before they reach disk, redundant macOS key-repeat events are discarded, and presses shorter than one action tick are preserved as learnable targets. Independent start/end trims are non-destructive and are honored by replay and dataset generation; replay reconstructs the held keys, buttons, modifiers, and pointer state at a trim boundary. Every periodic autosave and manual pause publishes an immediately runnable, exactly resumable brain with optimizer, epoch, batch offset, timing, loss history, isolated MLX random state, and demonstrated-key capability. Completed training activates the lowest held-out validation-loss brain while retaining the latest exact optimizer checkpoint for continued training. Autosaves are capped at the newest ten per AI; completed brains are retained. A one-time 1.8.2 audit reads every saved brain's own model manifest: compatible versions and checkpoints remain byte-for-byte intact even when the library marker is missing or stale, while genuinely incompatible or unreadable artifacts move into a per-profile recovery archive instead of being deleted.
+Recordings, models, settings, and diagnostics stay on the Mac. The only built-in network operation is a check of the public AgentTrainer GitHub Releases feed; the app does not upload training data or telemetry.
 
-Settings can place **Training data** and **AI models** in separate folders on internal or mounted external disks. Training data includes recordings and rebuildable dataset caches; the model library includes profiles, runnable brains, exact checkpoints, optimizer state, and saved versions. Moving to an empty folder uses copy-then-verify semantics and switches locations only after every managed item is present. Selecting an existing AgentTrainer library switches to it without merging or deleting the current library. Storage changes are locked while recording, training, running, or replaying, and persistent diagnostic logs stay in Application Support so a missing external disk remains diagnosable.
+## Requirements
 
-Live inference consumes the same packed UInt8 vision format used for training at the model's exact width and height. Policy v4 supplies the current frame, its signed difference from the preceding perception frame, and explicit X/Y coordinates to a four-stage GroupNorm/SiLU spatial encoder. The final spatial grid is projected without global averaging, preserving object location and screen layout while exposing motion directly. The optional capture-excluded PIP renders that exact processed frame at a bounded display size and appears only while running AI. A separate, fully disableable CNN inspector can render a selectable-layer activation overlay, the strongest final-layer feature channels, or action-head Grad-CAM saliency above that PIP. Its mode, rate, layer, channel count, action focus, and overlay strength are run-only controls that can change live. Diagnostic tensors remain on the GPU until reduced, spatial and channel transfer is bounded, renderer work coalesces off the inference queue, and disabling the inspector restores the standard prediction-only graph. Recording and running both show a compact capture-excluded keyboard whose unused keys and empty rows are omitted. Per-profile output restrictions can permanently block individual keys and mouse buttons during both training and running; the runtime additionally refuses every key absent from that brain's training split. Run-only cursor-movement and keyboard toggles can be changed during an active session without editing or retraining the AI; disabling keyboard output immediately releases every AI-held key and modifier.
+- Apple silicon
+- macOS 15 or later
+- Screen Recording and Input Monitoring permission for recording
+- Accessibility permission only when running an AI or reenacting input
+- Xcode with the macOS SDK to build from source
 
-The AI Models editor shows a simple live **Input size check** for the current settings. It compares the total values used for each decision with the selected network's learned parameter count and labels the match Comfortable, Balanced, High, or Too high, with a direct recommendation when settings should be reduced or the architecture enlarged. The exact packed vision, dense vision, generated coordinates, action history, rates, and nominal payload remain available under a collapsed technical-details disclosure.
+The package pins MLX Swift exactly in `Package.resolved`.
 
-Training uses a compiled MLX forward/backward/AdamW graph on a dedicated Apple-GPU stream, packed memory-mapped UInt8 caches, bounded graph history, Metal preprocessing, and Apple-silicon unified memory. New brains use learned spatial-attention keypoints that retain exact X/Y and local visual features plus global mean/max context. Unlike the legacy flattened grid, the visual projection's parameter count is nearly independent of resolution, substantially reducing optimizer memory and dense-layer work without discarding location. Existing brains keep their exact flattened architecture until explicitly changed. Perception frames are stored once and action-rate rows use compact current/previous frame indices, eliminating duplicated images when Action FPS exceeds Perception FPS. Recorded H.264/HEVC stays in VideoToolbox's native bi-planar YUV decode path instead of expanding every full-resolution source frame to BGRA; the shared Metal preprocessor applies the tagged Rec.709/601/2020 matrix, resize, chroma mode, and quantization directly. Buffered sequential cache writes consume the completed shared Metal buffer without an intermediate frame allocation, while mapped event traversal removes per-tick filesystem overhead. CPU batch gathering is pipelined behind asynchronous Metal execution without changing gradient order, precision, sample order, or exact checkpoints. A deterministic, compute-neutral curriculum spreads control transitions and active mouse/scroll rows across batches while still consuming every training row exactly once per epoch. A process-wide MLX policy retains a macOS memory reserve, caps reusable allocator cache even in inference-only launches, and clears unused buffers after every run or training boundary so repeated sessions cannot accumulate unified memory until quit. One AI may train while a different AI runs.
+## Workflow
 
-The loss is designed for sparse controls instead of rewarding “do nothing”: keyboard, button, and modifier positives are class-balanced from the training split; configurable focal weighting concentrates updates on mistakes; unseen or blocked dimensions contribute no easy-zero loss; brief transitions and active mouse/scroll deltas receive extra weight; and gradients are globally clipped. Transition loss receives the real preceding cached action even when recurrent history is disabled, so a long held input is no longer falsely treated as a fresh press on every frame. Shift belongs to the Keyboard channel, while the separate Modifiers channel controls only Command, Option, and Control. macOS reports those three modifiers as both flags and ordinary key codes, so AgentTrainer removes the duplicate key-code path from targets, action history, loss, visualization, and runtime output; disabling Modifiers is therefore a hard block for new and existing brains. Whole-recording validation targets the requested sample fraction, never removes the only training example of a control, covers every held-out recording when budget permits, and evaluates up to 8,192 representative rare positives, transitions, active deltas, and timeline anchors. It publishes per-head precision/recall/F1, continuous MAE, and idle false-action rate. Best-brain selection minimizes comparable held-out loss but refuses a candidate with a well-supported, severe binary-head regression, so aggregate improvement cannot silently erase a control capability. A lone recording uses an embargo until both recurrent history and current/previous perception frames are disjoint; if honest held-out context is impossible, all rows train and no misleading validation score is published. Fine-tuning re-scores the selected brain on the current held-out set instead of comparing against a stale score from different data. New brains use one-epoch warmup followed by bounded cosine restarts and plateau-driven envelope reductions; a configurable global floor prevents learning rate from asymptotically collapsing to zero. The scheduler, envelope, and monitor state are exactly checkpointed. Older profiles and checkpoints retain inverse-square-root behavior until Adaptive Cosine + Plateau is selected explicitly. Every training sample independently masks the complete ground-truth action-history branch with 50% probability, regardless of ordinary Dropout, and kept histories retain inference-time magnitude rather than being doubled.
+1. Open AgentTrainer and grant the permissions needed for the operation you want.
+2. Create a recording folder, choose a display, window, or region, then record a demonstration.
+3. Create an AI profile, select recording folders, and configure its vision, controls, and network.
+4. Train the profile. Pause publishes a runnable brain and retains an exact checkpoint.
+5. In Run, choose cursor mode and output permissions, then start the AI.
+6. Use the configured panic shortcut at any time to stop hooks and release held controls.
 
-Mouse demonstrations always train both position and delta representations. Each captured frame is paired with the control interval immediately after it, so training learns the action to perform next instead of an action already visible in the frame. Trimmed lead-in movement is used to establish state but is never collapsed into the first target. Run defaults to **Auto** and uses the mode derived from the immutable recordings that produced the selected brain, so later profile edits cannot silently change execution semantics. Game Camera uses a fixed 80-pixel raw-HID learning scale instead of dividing by capture resolution, then reverses that scale at runtime with bounded configurable sensitivity and optional before/after recentering. Held keyboard/button state remains active between perception updates, while additive Game Camera and scroll outputs are consumed exactly once per newly published prediction. Recurrent runtime history is built from thresholded, permitted actions that could actually execute—not raw probabilities, blocked keys, duplicate modifier paths, or outputs disabled by the live firewall—so inference sees the same action semantics used during training. Raw camera movement always posts as `mouseMoved`, independently of button edges, and rounded zero deltas are suppressed. ScreenCaptureKit's unchanged-screen `idle` status reuses the last safe surface for a fresh perception instead of being mistaken for stalled inference; blank, suspended, and stopped frames remain unsafe. A real stale-prediction watchdog releases all outputs if inference stops producing fresh results. Stop first blocks new actions, drains the action queue, and releases physical input before waiting for ScreenCaptureKit or an in-flight MLX evaluation, while the UI remains in Starting/Stopping state until all teardown callers have joined. Policy v4 cannot run older tensor shapes or visual semantics; 1.8.2 preserves compatible artifacts in place and archives older/uncertain weights and optimizer state for recovery, while profile settings and every source recording remain preserved.
+Training and another already-trained AI may run at the same time when they use different profiles.
 
-The AI Models list is newest-first and shows steps, epochs, actual training time, and equivalent demonstration experience without loading every version manifest. Counters stay in hours until a full day, then switch to days. **Duplicate** performs a deep copy of the active brain, saved versions, timing/progress summary, and exact resumable checkpoint; the copy can be fine-tuned independently. Its saved-brain/autosave list is opened only with **Load Saved Brains**, keeping the page responsive after long runs. Run and Training each provide their own direct AI picker. Changing exact vision or any architecture parameter on a trained AI shows a destructive warning and, only after confirmation, clears incompatible training while retaining recordings. Protected AIs must be duplicated first.
+## Safety
 
-Epochs are configured as repeatable blocks: pausing or stopping midway preserves the current goal, while pressing Train after completing a block adds another block of the configured size. **Auto Train**, beside the normal Train button, starts the next configured epoch block whenever one completes and continues until Pause or Stop is pressed. Maximum Steps is a per-session budget, so a high global step count never prevents a later training session from continuing.
+Runtime output is constrained in several independent layers:
 
-Diagnostics is a dedicated tab with cache controls and macOS crash reports above the persistent searchable application log, plus a copyable support report. Info buttons use larger click targets, plain-English technical popovers, and native hover help. The top bar and sidebar are explicit opaque app surfaces instead of system sidebar/toolbar materials, keeping their color, focus, and contrast consistent on Sequoia, Tahoe, and macOS 27 without depending on version-specific glass behavior. Global shortcuts use native hotkey registration when that framework is present, with an AppKit-monitor fallback guarded for a future SDK that removes it. The draggable top bar keeps native traffic lights, live status, and quick safety controls above every page. Settings offers four deliberately balanced palettes—Midnight, Daylight, Graphite, and Ember—plus bounded global controls for corner radius, surface separation, accent fill, and sidebar width. The controls update cards, rows, HUDs, buttons, status treatments, and navigation as one coherent system and can be reset independently of the chosen palette. Lightweight hover, press, page, and chart-reveal animations can be disabled globally, honor Reduce Motion, and stop when the app is inactive. Batch loss, epoch-average loss, validation loss, and effective-learning-rate curves use bounded, extrema-preserving sampling and smooth Canvas paths; live cards expose held-out F1 and the complete report. Curves observe changing bounded snapshots rather than only their length, so long training sessions continue updating in real time. Each incoming snapshot morphs for 160 ms, with no continuous animation between updates. Hidden tabs are not mounted and inactive charts stop accepting new render data.
+- A physical-input monitor can stop the AI as soon as the user intervenes.
+- The panic action stops capture and action queues before releasing every held key and button.
+- A model can emit only keys represented in its training data.
+- Per-profile restrictions and live cursor/keyboard permissions are applied again at execution.
+- Full-Mac control is opt-in; otherwise output stays inside the configured control region.
+- Locked-camera movement is transient and is never replayed from a stale prediction.
 
-Recording timestamps begin on the first usable ScreenCaptureKit frame (`started` or `complete`). Global record, run, and panic shortcuts are filtered out of both recording data and the human-input safety monitor, including their modifier transitions and trailing key releases. Agent startup is single-flight and revision-tokened, and recording, live agent output, and real-input reenactment are mutually exclusive so two OS-input producers cannot overlap behind one UI state.
+These are safeguards, not a security boundary. Supervise new brains in a low-risk environment.
+
+## Build and test
+
+Run the complete test suite:
 
 ```sh
-chmod +x build.sh
-./build.sh
-open outputs/AgentTrainer.app
 ./test.sh
 ```
 
-`build.sh` produces the native arm64 app, a source archive, and exactly one versioned DMG. The staged DMG copy strips link/debug symbols and omits only the duplicate Resources copy of `mlx.metallib`; it retains the executable-adjacent Metal library, optimized release code, and model quality. The build fails if that single DMG reaches 10,000,000 bytes. The script verifies the executable and plist both target macOS 15.0, preserves an existing authorized app bundle in place, refuses to modify a running copy, removes superseded DMGs, and validates the app signature and disk image before returning. Xcode builds MLX's Metal shaders; SwiftPM separately builds the shipped optimized executable so Xcode's generated package-scheme coverage counters never enter the hot inference or training paths. On this Mac the script automatically uses the installed long-lived `MimicClone Local Code Signing` identity, retaining the same designated requirement across rebuilt binaries so macOS permission grants survive updates. The first stable-signed build replaces the old ad-hoc identity and therefore needs one final permission grant; subsequent builds using the same bundle identifier, signer, and install path do not. Set `CODE_SIGN_IDENTITY` and optionally `CODE_SIGN_KEYCHAIN` to override the local identity for Developer ID distribution. If no stable identity exists, the build stops instead of silently breaking TCC identity; `ALLOW_ADHOC_SIGNING=1` is available only for disposable builds.
+Build, sign, package, and install:
 
-The app requires Screen Recording and Input Monitoring to record, plus Accessibility to replay or run an agent. It has no accounts, telemetry, or Python runtime. Update checks use GitHub Releases only. Accepting a prompt shows live download/install progress, verifies the DMG checksum and the embedded app's exact code-signing identity, stages a transactional replacement at the current app path, then restarts automatically. A failed verification or staging step leaves the running app unchanged.
+```sh
+./build.sh
+```
 
-Global panic, record, and run shortcuts are customizable in Settings. Duplicate bindings are rejected, registration failures are reported, and the panic path immediately releases every held key and mouse button.
+The default installed application is:
 
-See `DEVELOPMENT_GUIDE.md` for the durable architecture, storage contracts, concurrency invariants, performance decisions, and release checklist used by future development sessions. See `TRAINING_AUDIT.md` for the reviewed learning pipeline, implemented corrections, reward-design pitfalls, and staged imitation/reinforcement roadmap. See `IN_PLACE_UPDATE_GUIDE.md` for the Run-tab cursor/keyboard permission design, its transactional safety behavior, and the exact permission-preserving macOS in-place update/signing procedure.
+```text
+/Applications/AgentTrainer.app
+```
+
+The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
+
+- `AgentTrainer-1.9.5.dmg`
+- `AgentTrainer-Source.zip`
+- `SHA256SUMS.txt`
+
+The build reuses the installed app's signing identity when available. You can select one explicitly:
+
+```sh
+CODE_SIGN_IDENTITY="Developer ID Application: Example" ./build.sh
+```
+
+Set `CODE_SIGN_KEYCHAIN` when the identity is outside the normal keychain search list. Use `APP_PATH` to install into another Applications folder. `ALLOW_ADHOC_SIGNING=1` is intended only for disposable development builds because an ad-hoc identity changes between builds and macOS permissions may need to be granted again.
+
+## Data and privacy
+
+The default support root is:
+
+```text
+~/Library/Application Support/AgentTrainer
+```
+
+It contains:
+
+- `Recordings` — HEVC video, synchronized binary input, thumbnails, and manifests
+- `Caches` — rebuildable packed datasets
+- `Profiles` — profile metadata, immutable runnable versions, and exact checkpoints
+- `Logs` — bounded local diagnostics
+
+Settings can relocate training data and models independently. Moves use copy, verification, switch, and cleanup steps; selecting an existing AgentTrainer library switches to it without merging. Do not manually edit manifests or move only part of a managed library.
+
+## Updates
+
+The updater accepts only a newer stable semantic version from the configured GitHub repository. It requires HTTPS, bounded downloads, an exact SHA-256 entry, a valid disk image, the same bundle identifier, the expected version, and the same designated signing requirement as the installed app. Installation keeps a rollback copy until the replacement verifies.
+
+Engineering contracts and release checks are in [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md).
