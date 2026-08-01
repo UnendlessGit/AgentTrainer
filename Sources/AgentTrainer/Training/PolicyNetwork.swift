@@ -113,30 +113,133 @@ final class AgentPolicy: Module, @unchecked Sendable {
         [8, 4, 2].first(where: { channels.isMultiple(of: $0) }) ?? 1
     }
 
-    /// Returns every normalized post-SiLU spatial stage without changing the normal policy
-    /// graph or its saved parameters. Runtime diagnostics consume these tensors
-    /// only when explicitly enabled.
+    /// Returns every normalized post-SiLU spatial stage without changing the
+    /// normal policy graph or its saved parameters. Runtime diagnostics consume
+    /// these tensors only when explicitly enabled.
     func visualActivations(images: MLXArray) -> [MLXArray] {
+        visualActivations(
+            images: images,
+            acceleratedOperators: Self.usesAcceleratedVisionPath(
+                batch: images.dim(0),
+                width: profile.preprocessing.width,
+                height: profile.preprocessing.height
+            )
+        )
+    }
+
+    /// Fused normalization and the split coordinate stem have a fixed launch
+    /// cost. Below this measured crossover the original kernels are faster;
+    /// larger batches/frames recover substantially more repeated GPU work.
+    static func usesAcceleratedVisionPath(batch: Int, width: Int, height: Int) -> Bool {
+        let pixels = max(0, width).multipliedReportingOverflow(by: max(0, height))
+        guard !pixels.overflow else { return true }
+        let spatialSamples = max(0, batch).multipliedReportingOverflow(by: pixels.partialValue)
+        return spatialSamples.overflow || spatialSamples.partialValue >= 200_000
+    }
+
+    /// The switch is internal solely so the opt-in hardware benchmark can time
+    /// the pre-optimization graph against the adaptive production graph with
+    /// identical weights.
+    func visualActivations(images: MLXArray, acceleratedOperators: Bool) -> [MLXArray] {
         var vision = images.asType(dtype)
-        let coordinates = broadcast(_coordinateGrid, to: [images.dim(0), profile.preprocessing.height, profile.preprocessing.width, 2])
-        vision = concatenated([vision, coordinates], axis: -1)
         var activations: [MLXArray] = []
         activations.reserveCapacity(max(1, convolutions.count))
         for (index, convolution) in convolutions.enumerated() {
-            vision = convolution(vision)
+            // Splitting the coordinate contribution only removes repeated work
+            // when a batch has multiple samples. Batch-one inference retains
+            // the original single convolution while still using fused GroupNorm.
+            if index == 0, acceleratedOperators, images.dim(0) > 1 {
+                vision = Self.sharedCoordinateConvolution(
+                    vision,
+                    coordinates: _coordinateGrid,
+                    convolution: convolution
+                )
+            } else {
+                if index == 0 {
+                    let coordinates = broadcast(
+                        _coordinateGrid,
+                        to: [images.dim(0), profile.preprocessing.height, profile.preprocessing.width, 2]
+                    )
+                    vision = concatenated([vision, coordinates], axis: -1)
+                }
+                vision = convolution(vision)
+            }
             if convolutionNormalizations.indices.contains(index) {
-                vision = convolutionNormalizations[index](vision)
+                let normalization = convolutionNormalizations[index]
+                vision = acceleratedOperators
+                    ? Self.acceleratedGroupNorm(vision, normalization: normalization)
+                    : normalization(vision)
             }
             vision = silu(vision)
             activations.append(vision)
         }
         // A convolution-free custom architecture is still a valid tensor graph.
         // Treat its coordinate-aware input as the only visual stage.
-        if activations.isEmpty { activations.append(vision) }
+        if activations.isEmpty {
+            let coordinates = broadcast(
+                _coordinateGrid,
+                to: [images.dim(0), profile.preprocessing.height, profile.preprocessing.width, 2]
+            )
+            activations.append(concatenated([vision, coordinates], axis: -1))
+        }
         return activations
     }
 
-    func logits(visualFeatures: MLXArray, history: MLXArray) -> MLXArray {
+    /// The coordinate grid is identical for every item in a batch and the stem
+    /// convolution is linear. Convolving its two positional channels once and
+    /// broadcasting the result avoids repeating that work for every sample,
+    /// while slicing the existing weight preserves the model/checkpoint shape.
+    static func sharedCoordinateConvolution(
+        _ input: MLXArray,
+        coordinates: MLXArray,
+        convolution: Conv2d
+    ) -> MLXArray {
+        let contentChannels = input.dim(-1)
+        let contentWeight = convolution.weight[.ellipsis, 0..<contentChannels]
+        let coordinateWeight = convolution.weight[.ellipsis, contentChannels..<(contentChannels + 2)]
+        var output = conv2d(
+            input,
+            contentWeight,
+            stride: .init(convolution.stride),
+            padding: .init(convolution.padding),
+            dilation: .init(convolution.dilation),
+            groups: convolution.groups
+        ) + conv2d(
+            coordinates,
+            coordinateWeight,
+            stride: .init(convolution.stride),
+            padding: .init(convolution.padding),
+            dilation: .init(convolution.dilation),
+            groups: convolution.groups
+        )
+        if let bias = convolution.bias { output = output + bias }
+        return output
+    }
+
+    /// MLX's general GroupNorm spells this layout as separate mean, variance,
+    /// normalize, scale, and bias operations. The policy's established
+    /// interleaved grouping is equivalent to layer normalization after a view
+    /// transpose, which lets MLX use its fused Metal kernel without changing
+    /// grouping, epsilon, learned parameters, or the saved model contract.
+    static func acceleratedGroupNorm(_ input: MLXArray, normalization: GroupNorm) -> MLXArray {
+        let batch = input.dim(0)
+        let shape = input.shape
+        var grouped = input
+            .reshaped(batch, -1, normalization.groupCount)
+            .transposed(0, 2, 1)
+        grouped = MLXFast.layerNorm(
+            grouped,
+            weight: nil,
+            bias: nil,
+            eps: normalization.eps
+        )
+        var output = grouped.transposed(0, 2, 1).reshaped(shape)
+        if let weight = normalization.weight { output = weight * output }
+        if let bias = normalization.bias { output = output + bias }
+        return output
+    }
+
+    func visualEmbedding(visualFeatures: MLXArray) -> MLXArray {
         let batch = visualFeatures.dim(0)
         var vision: MLXArray
         if let spatialAttention, let poolCoordinates = _poolCoordinates {
@@ -144,8 +247,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
             // Softmax over locations makes each learned head an interpretable
             // spatial keypoint. Pooling exact coordinates retains layout while
             // global mean/max features preserve scene-wide context.
-            let attention = softmax(spatialAttention(spatial), axis: 1, precise: true)
             let coordinates = broadcast(poolCoordinates, to: [batch, spatial.dim(1), 2])
+            let attention = softmax(spatialAttention(spatial), axis: 1, precise: true)
             let attended = attention.transposed(0, 2, 1)
                 .matmul(concatenated([spatial, coordinates], axis: -1))
                 .reshaped([batch, -1])
@@ -157,7 +260,18 @@ final class AgentPolicy: Module, @unchecked Sendable {
         } else {
             vision = visualFeatures.reshaped([batch, -1])
         }
-        vision = silu(visualNormalization(visualProjection(vision)))
+        return silu(visualNormalization(visualProjection(vision)))
+    }
+
+    func logits(visualFeatures: MLXArray, history: MLXArray) -> MLXArray {
+        logits(
+            visualEmbedding: visualEmbedding(visualFeatures: visualFeatures),
+            history: history
+        )
+    }
+
+    func logits(visualEmbedding vision: MLXArray, history: MLXArray) -> MLXArray {
+        let batch = vision.dim(0)
 
         var history = history.asType(dtype)
         // Ground-truth action history is an exceptionally tempting shortcut:
@@ -181,7 +295,10 @@ final class AgentPolicy: Module, @unchecked Sendable {
         } else if let lstm {
             recurrent = lstm(history).0[.ellipsis, -1, 0...]
         } else {
-            recurrent = MLXArray.zeros([visualFeatures.dim(0), profile.training.architecture.recurrentWidth], dtype: dtype)
+            recurrent = MLXArray.zeros(
+                [batch, profile.training.architecture.recurrentWidth],
+                dtype: dtype
+            )
         }
         var fused = concatenated([vision, recurrent], axis: -1)
         for (index, layer) in fusion.enumerated() {
@@ -245,6 +362,25 @@ final class AgentPolicy: Module, @unchecked Sendable {
         previousTargets: MLXArray? = nil
     ) -> MLXArray {
         let logits = callAsFunction(images: images, history: history)
+        return loss(
+            logits: logits,
+            history: history,
+            targets: targets,
+            positiveWeights: positiveWeights,
+            previousTargets: previousTargets
+        )
+    }
+
+    /// Computes the training objective from an existing forward pass. Validation
+    /// uses this overload so loss and per-head metrics share exactly one policy
+    /// evaluation instead of running the convolutional/recurrent stack twice.
+    func loss(
+        logits: MLXArray,
+        history: MLXArray,
+        targets: MLXArray,
+        positiveWeights: MLXArray? = nil,
+        previousTargets: MLXArray? = nil
+    ) -> MLXArray {
         let targets = targets.asType(dtype)
         // Training passes the actual preceding cached action explicitly. This
         // remains correct when model history is disabled; using the mandatory
@@ -269,42 +405,43 @@ final class AgentPolicy: Module, @unchecked Sendable {
     }
 
     private func binaryControlLoss(logits: MLXArray, targets: MLXArray, previous: MLXArray, positiveWeights: MLXArray?, range: Range<Int>) -> MLXArray {
-        let selectedLogits = logits[.ellipsis, range]
-        let selectedTargets = targets[.ellipsis, range]
-        let selectedPrevious = previous[.ellipsis, range]
-        let raw = binaryCrossEntropy(logits: selectedLogits, targets: selectedTargets, reduction: .none)
-        let classWeights: MLXArray
-        if let positiveWeights {
-            let positives = positiveWeights[range]
-            let learnedOutput = (positives .> 0).asType(dtype)
-            classWeights = (1 + selectedTargets * (positives - 1)) * learnedOutput
-        } else {
-            classWeights = MLXArray.ones(like: selectedTargets)
-        }
-        // Press/release boundaries matter far more than another frame in the
-        // middle of a long hold. Upweighting transitions prevents a policy from
-        // learning only action persistence.
-        let transitionWeights = 1 + 3 * abs(selectedTargets - selectedPrevious)
-        let weights = classWeights * transitionWeights * binaryFocalWeights(logits: selectedLogits, targets: selectedTargets)
-        return (raw * weights).sum() / (weights.sum() + 1e-6)
+        binaryControlLoss(
+            logits: logits[.ellipsis, range],
+            targets: targets[.ellipsis, range],
+            previous: previous[.ellipsis, range],
+            positiveWeights: positiveWeights.map { $0[range] }
+        )
     }
 
     private func binaryControlLoss(logits: MLXArray, targets: MLXArray, previous: MLXArray, positiveWeights: MLXArray?, indices: [Int]) -> MLXArray {
         let selection = MLXArray(indices)
-        let selectedLogits = logits[.ellipsis, selection]
-        let selectedTargets = targets[.ellipsis, selection]
-        let selectedPrevious = previous[.ellipsis, selection]
-        let raw = binaryCrossEntropy(logits: selectedLogits, targets: selectedTargets, reduction: .none)
+        return binaryControlLoss(
+            logits: logits[.ellipsis, selection],
+            targets: targets[.ellipsis, selection],
+            previous: previous[.ellipsis, selection],
+            positiveWeights: positiveWeights.map { $0[selection] }
+        )
+    }
+
+    private func binaryControlLoss(
+        logits: MLXArray,
+        targets: MLXArray,
+        previous: MLXArray,
+        positiveWeights: MLXArray?
+    ) -> MLXArray {
+        let raw = binaryCrossEntropy(logits: logits, targets: targets, reduction: .none)
         let classWeights: MLXArray
         if let positiveWeights {
-            let positives = positiveWeights[selection]
-            let learnedOutput = (positives .> 0).asType(dtype)
-            classWeights = (1 + selectedTargets * (positives - 1)) * learnedOutput
+            let learnedOutput = (positiveWeights .> 0).asType(dtype)
+            classWeights = (1 + targets * (positiveWeights - 1)) * learnedOutput
         } else {
-            classWeights = MLXArray.ones(like: selectedTargets)
+            classWeights = MLXArray.ones(like: targets)
         }
-        let transitionWeights = 1 + 3 * abs(selectedTargets - selectedPrevious)
-        let weights = classWeights * transitionWeights * binaryFocalWeights(logits: selectedLogits, targets: selectedTargets)
+        // Press/release boundaries matter far more than another frame in the
+        // middle of a long hold. Upweighting transitions prevents a policy from
+        // learning only action persistence.
+        let transitionWeights = 1 + 3 * abs(targets - previous)
+        let weights = classWeights * transitionWeights * binaryFocalWeights(logits: logits, targets: targets)
         return (raw * weights).sum() / (weights.sum() + 1e-6)
     }
 
@@ -383,7 +520,13 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         }
     }
 
-    func update(model: Module, gradients: ModuleParameters, targetType: DType) {
+    func update(
+        model: Module,
+        gradients: ModuleParameters,
+        targetType: DType,
+        gradientNorm: MLXArray? = nil,
+        maxGradientNorm: Float? = nil
+    ) {
         initialize(model: model)
         stepArray = stepArray + 1
         // Both schedules depend only on persisted optimizer state. New training
@@ -411,22 +554,44 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
             scheduleScale = warmupScale * maximum(floor, cycleScale)
         }
         let scheduledLearningRate = learningRate * scheduleScale
+        // These scalars are shared by every parameter. Hoisting them keeps one
+        // bias-correction/decay subgraph instead of tracing identical pow and
+        // multiply nodes for each tensor in the model.
+        let correction1 = 1 - pow(beta1, stepArray)
+        let correction2 = 1 - pow(beta2, stepArray)
+        let decayScale = 1 - scheduledLearningRate * weightDecay
         let gradientMap = Dictionary(uniqueKeysWithValues: gradients.flattened())
+        let clipping: (condition: MLXArray, normalizer: MLXArray)?
+        if let gradientNorm, let maxGradientNorm {
+            clipping = (
+                gradientNorm .< maxGradientNorm,
+                maxGradientNorm / (gradientNorm + 1e-6)
+            )
+        } else {
+            clipping = nil
+        }
         var updated: [(String, MLXArray)] = []
         for (name, parameter) in model.parameters().flattened() {
             guard let gradient = gradientMap[name] else { updated.append((name, parameter)); continue }
             let p = parameter.asType(.float32)
-            let g = gradient.asType(.float32)
+            let clipped = clipping.map {
+                which($0.condition, gradient, gradient * $0.normalizer)
+            } ?? gradient
+            let g = clipped.asType(.float32)
             let m = beta1 * (firstMoments[name] ?? MLXArray.zeros(like: p)) + (1 - beta1) * g
             let v = beta2 * (secondMoments[name] ?? MLXArray.zeros(like: p)) + (1 - beta2) * square(g)
             firstMoments[name] = m
             secondMoments[name] = v
-            let correction1 = 1 - pow(beta1, stepArray)
-            let correction2 = 1 - pow(beta2, stepArray)
             let update = (m / correction1) / (sqrt(v / correction2) + epsilon)
-            updated.append((name, (p * (1 - scheduledLearningRate * weightDecay) - scheduledLearningRate * update).asType(targetType)))
+            updated.append((name, (p * decayScale - scheduledLearningRate * update).asType(targetType)))
         }
         model.update(parameters: ModuleParameters.unflattened(updated))
+    }
+
+    /// Mirrors MLXOptimizers' canonical global norm calculation, but returns
+    /// only its shared scalar, avoiding a temporary clipped parameter tree.
+    static func globalGradientNorm(_ gradients: ModuleParameters) -> MLXArray {
+        sqrt(gradients.reduce(MLXArray(0)) { $0 + $1.square().sum() })
     }
 
     func save(to url: URL) throws {

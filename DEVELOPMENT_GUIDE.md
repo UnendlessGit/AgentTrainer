@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 1.9.5. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 1.9.6. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -23,12 +23,14 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Training/DatasetCache.swift` — causal frame/action pairing and memory-mapped datasets
 - `Training/PolicyNetwork.swift` — Policy v4 and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
+- `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
 - `Agent/AgentRuntime.swift` — capture, inference scheduling, prediction latching, and teardown
 - `Agent/InputInjector.swift` — final output firewall and synthetic HID events
 - `Replay/InputReenactor.swift` — guarded demonstration replay
 - `Core/GitHubReleaseUpdater.swift` — release discovery, verification, staging, and rollback installer
 - `UI/` — views, themes, HUD, diagnostics, and CNN visualization
 - `Tests/AgentTrainerTests/DomainTests.swift` — contract, corruption, concurrency, storage, MLX, and rendering coverage
+- `Tests/AgentTrainerTests/TrainingPerformanceTests.swift` — opt-in release hardware benchmark and trajectory checks
 
 ## Concurrency ownership
 
@@ -103,6 +105,19 @@ Current Policy v4 combines:
 
 Training uses class/transition weighting, focal binary loss, anti-shortcut history masking, deterministic salience-balanced order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Do not change those semantics without updating tests and the relevant schema.
 
+The performance path preserves those semantics:
+
+- VideoToolbox decode, Metal resize/color packing, and cache writes overlap through a bounded ordered pipeline.
+- Dataset files are required memory mappings with random-access VM advice. A batch gathers both causal frames and all action rows once into pooled Metal shared memory; MLX expands `UInt8` temporal vision inside the compiled graph.
+- When action sampling reuses perception pairs above the measured crossover, epoch ordering colocates those rows and evaluates each distinct visual encoder input once per batch. The resulting embedding is gathered back to every independent history/target row; no label is removed, duplicated, averaged, or reused as another label.
+- Above the measured workload crossover, the coordinate contribution to the first convolution is evaluated once per batch and the established GroupNorm layout uses MLX's fused Metal layer-normalization kernel. Small tensors retain the lower-overhead kernels.
+- Validation adaptively shares repeated visual inputs, expands packed input, runs one compiled policy forward, then derives both loss and predictions from the shared logits.
+- CPU gathering of the next batch overlaps the current Metal graph. Every optimizer step still evaluates the complete model, AdamW moments, scheduler, and MLX random state before advancing the checkpoint cursor.
+
+Do not queue stateful optimizer steps merely to improve a benchmark. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
+
+Performance work may change graph operation order, grouped sample order, and low-bit numerical trajectories. “No quality loss” is evaluated by matched-update training loss, held-out validation loss, and per-head validation behavior—not byte-identical weights or predictions. The hardware benchmark gates relative validation-loss drift at 1%, while focused tests compare the optimized objective and gradients to the reference graph. Never obtain speed by silently reducing vision resolution, precision, model capacity, labels, loss terms, or update count.
+
 An exact checkpoint contains weights, both AdamW moment sets, optimizer metadata, scheduler state, training state, model schema, and MLX random state. Missing or mismatched moment pairs/random state are corruption, not a silent fresh start.
 
 Checkpoint and version activation are transactions. A profile must never point at one brain while its checkpoint resumes another. Weights-only activation intentionally removes an unrelated resumable checkpoint so later training begins a fresh optimizer from the selected brain.
@@ -171,12 +186,13 @@ User-facing technical values must be derived from shared contract helpers such a
 Before release:
 
 1. Run `./test.sh`.
-2. Run `git diff --check`.
-3. Confirm `CFBundleShortVersionString` and `CFBundleVersion`.
-4. Quit AgentTrainer and run `./build.sh`.
-5. Verify `/Applications/AgentTrainer.app` launches and reports the intended version.
-6. Exercise permission refresh, recording start/stop, training pause/resume, agent panic, and updater UI.
-7. Verify the DMG and `SHA256SUMS.txt` in `outputs`.
-8. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
+2. Run `./benchmark.sh` and compare original/optimized throughput plus matched-update training and validation loss on the same idle Mac.
+3. Run `git diff --check`.
+4. Confirm `CFBundleShortVersionString` and `CFBundleVersion`.
+5. Quit AgentTrainer and run `./build.sh`.
+6. Verify `/Applications/AgentTrainer.app` launches and reports the intended version.
+7. Exercise permission refresh, recording start/stop, training pause/resume, agent panic, and updater UI.
+8. Verify the DMG and `SHA256SUMS.txt` in `outputs`.
+9. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
 
 `build.sh` creates a fully signed staging bundle, transactionally installs it into `/Applications/AgentTrainer.app` by default, and then packages the DMG/source/checksums. Override the install path with `APP_PATH`; override signing with `CODE_SIGN_IDENTITY` and optionally `CODE_SIGN_KEYCHAIN`.

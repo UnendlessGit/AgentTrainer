@@ -9,8 +9,66 @@ final class VisionPreprocessor: @unchecked Sendable {
     private let queue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
-    private var reusableOutput: MTLBuffer?
+    private let maximumReusableOutputBytes = 64 * 1_024 * 1_024
+    private var reusableOutputs: [MTLBuffer] = []
+    private var reusableOutputBytes = 0
     private let lock = NSLock()
+
+    final class PendingPackedFrame: @unchecked Sendable {
+        private let owner: VisionPreprocessor
+        private let command: any MTLCommandBuffer
+        private let output: any MTLBuffer
+        private let byteCount: Int
+        // Keep the IOSurface and its CVMetalTexture wrappers alive until Metal
+        // has finished reading them.
+        private let _retainedPixelBuffer: CVPixelBuffer
+        private let _retainedTextures: [CVMetalTexture]
+        private let lock = NSLock()
+        private var consumed = false
+
+        fileprivate init(
+            owner: VisionPreprocessor,
+            command: any MTLCommandBuffer,
+            output: any MTLBuffer,
+            byteCount: Int,
+            pixelBuffer: CVPixelBuffer,
+            textures: [CVMetalTexture]
+        ) {
+            self.owner = owner
+            self.command = command
+            self.output = output
+            self.byteCount = byteCount
+            _retainedPixelBuffer = pixelBuffer
+            _retainedTextures = textures
+        }
+
+        func withPackedBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) throws -> R {
+            let accepted = lock.withLock { () -> Bool in
+                guard !consumed else { return false }
+                consumed = true
+                return true
+            }
+            guard accepted else {
+                throw AgentTrainerError.model("A pipelined vision frame was consumed more than once.")
+            }
+            command.waitUntilCompleted()
+            defer { owner.recycle(output) }
+            if let error = command.error { throw error }
+            return try body(UnsafeRawBufferPointer(start: output.contents(), count: byteCount))
+        }
+
+        deinit {
+            let shouldDiscard = lock.withLock { () -> Bool in
+                guard !consumed else { return false }
+                consumed = true
+                return true
+            }
+            if shouldDiscard {
+                command.waitUntilCompleted()
+                owner.recycle(output)
+            }
+        }
+    }
 
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
@@ -32,6 +90,13 @@ final class VisionPreprocessor: @unchecked Sendable {
     /// callback. Cache construction can copy it directly into its large output
     /// buffer instead of allocating and copying an intermediate Data per frame.
     func withPackedBytes<R>(_ pixelBuffer: CVPixelBuffer, spec: PreprocessingSpec, _ body: (UnsafeRawBufferPointer) throws -> R) throws -> R {
+        try submit(pixelBuffer, spec: spec).withPackedBytes(body)
+    }
+
+    /// Encodes preprocessing without waiting. Dataset construction keeps a
+    /// small ordered queue of these jobs so VideoToolbox decoding, Metal resize
+    /// and color packing, and sequential file writes overlap safely.
+    func submit(_ pixelBuffer: CVPixelBuffer, spec: PreprocessingSpec) throws -> PendingPackedFrame {
         let spec = try spec.validated()
         lock.lock()
         defer { lock.unlock() }
@@ -61,8 +126,17 @@ final class VisionPreprocessor: @unchecked Sendable {
         let chromaTexture = cvChroma.flatMap(CVMetalTextureGetTexture)
         if sourceFormat != 0, chromaTexture == nil { throw AgentTrainerError.model("The decoded video chroma texture is unavailable.") }
 
-        if reusableOutput?.length ?? 0 < spec.sampleByteCount { reusableOutput = device.makeBuffer(length: spec.sampleByteCount, options: .storageModeShared) }
-        guard let output = reusableOutput, let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else {
+        let output: any MTLBuffer
+        if let index = reusableOutputs.firstIndex(where: { $0.length >= spec.sampleByteCount }) {
+            output = reusableOutputs.remove(at: index)
+            reusableOutputBytes -= output.length
+        } else if let allocated = device.makeBuffer(length: spec.sampleByteCount, options: .storageModeShared) {
+            output = allocated
+        } else {
+            throw AgentTrainerError.model("Metal could not allocate the preprocessing output buffer.")
+        }
+        guard let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else {
+            storeReusableOutput(output)
             throw AgentTrainerError.model("Metal could not allocate the preprocessing workload.")
         }
 
@@ -83,9 +157,25 @@ final class VisionPreprocessor: @unchecked Sendable {
         encoder.dispatchThreads(MTLSize(width: spec.width, height: spec.height, depth: 1), threadsPerThreadgroup: threads)
         encoder.endEncoding()
         command.commit()
-        command.waitUntilCompleted()
-        if let error = command.error { throw error }
-        return try body(UnsafeRawBufferPointer(start: output.contents(), count: spec.sampleByteCount))
+        return PendingPackedFrame(
+            owner: self,
+            command: command,
+            output: output,
+            byteCount: spec.sampleByteCount,
+            pixelBuffer: pixelBuffer,
+            textures: [cvLuma, cvChroma].compactMap { $0 }
+        )
+    }
+
+    private func recycle(_ output: any MTLBuffer) {
+        lock.withLock { storeReusableOutput(output) }
+    }
+
+    private func storeReusableOutput(_ output: any MTLBuffer) {
+        guard output.length <= maximumReusableOutputBytes,
+              reusableOutputBytes <= maximumReusableOutputBytes - output.length else { return }
+        reusableOutputs.append(output)
+        reusableOutputBytes += output.length
     }
 
     private static func sourceMatrix(for pixelBuffer: CVPixelBuffer) -> UInt32 {
@@ -123,7 +213,22 @@ final class VisionPreprocessor: @unchecked Sendable {
     /// expansion and normalization stay in MLX instead of allocating millions of
     /// Swift Float values for every batch.
     static func mlxTensor(_ packed: Data, batch: Int, spec: PreprocessingSpec) -> MLXArray {
-        let raw = MLXArray(packed, [batch, spec.sampleByteCount], dtype: .uint8).asType(.float32) / 255
+        mlxTensor(
+            MLXArray(packed, [batch, spec.sampleByteCount], dtype: .uint8),
+            spec: spec
+        )
+    }
+
+    /// Array-input form used by compiled training graphs. Keeping UInt8
+    /// expansion inside the compiled function lets MLX fuse normalization,
+    /// chroma expansion, and temporal differencing with the policy graph.
+    static func mlxTensor(_ packed: MLXArray, spec: PreprocessingSpec) -> MLXArray {
+        precondition(
+            packed.ndim == 2 && packed.dim(1) == spec.sampleByteCount,
+            "Packed vision must have shape [batch, sampleByteCount]."
+        )
+        let batch = packed.dim(0)
+        let raw = packed.asType(.float32) / 255
         let width = spec.width, height = spec.height
         let lumaCount = width * height
         let y = raw[0..., 0..<lumaCount].reshaped([batch, height, width, 1])
@@ -153,6 +258,20 @@ final class VisionPreprocessor: @unchecked Sendable {
         let currentTensor = mlxTensor(current, batch: batch, spec: spec)
         let previousTensor = previous.map { mlxTensor($0, batch: batch, spec: spec) } ?? currentTensor
         return temporalTensor(current: currentTensor, previous: previousTensor)
+    }
+
+    /// Expands a compact `[batch, 2, sampleByteCount]` UInt8 tensor, where slot
+    /// zero is current perception and slot one is its causal predecessor.
+    static func mlxTemporalTensor(_ packedPair: MLXArray, spec: PreprocessingSpec) -> MLXArray {
+        precondition(
+            packedPair.ndim == 3
+                && packedPair.dim(1) == 2
+                && packedPair.dim(2) == spec.sampleByteCount,
+            "Packed temporal vision must have shape [batch, 2, sampleByteCount]."
+        )
+        let current = mlxTensor(packedPair[0..., 0, 0...], spec: spec)
+        let previous = mlxTensor(packedPair[0..., 1, 0...], spec: spec)
+        return temporalTensor(current: current, previous: previous)
     }
 
     static func temporalTensor(current: MLXArray, previous: MLXArray) -> MLXArray {

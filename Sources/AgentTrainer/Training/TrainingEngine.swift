@@ -2,7 +2,6 @@ import CryptoKit
 import Foundation
 import MLX
 import MLXNN
-import MLXOptimizers
 import QuartzCore
 
 struct TrainingCompletion: Sendable {
@@ -39,6 +38,9 @@ private enum TrainingSamplingContract {
     /// Versioned independently from the dataset bytes so an older checkpoint
     /// paused midway through an epoch can finish with its original exact order.
     static let salienceBalanced = 1
+    /// Keeps every label exactly once while colocating rows that share a causal
+    /// perception pair. The visual encoder evaluates each unique pair once.
+    static let groupedVision = 2
 }
 
 private enum TrainingValidationContract {
@@ -50,6 +52,7 @@ private enum TrainingValidationContract {
 }
 
 final class TrainingEngine: @unchecked Sendable {
+    private static let minimumVisionReuseRatio = 1.20
     typealias MetricsHandler = @Sendable (TrainingMetrics, String) -> Void
     typealias CompletionHandler = @Sendable (Result<TrainingCompletion, Error>) -> Void
 
@@ -112,6 +115,7 @@ final class TrainingEngine: @unchecked Sendable {
             metrics(value, "\(status) • \(Int((progress * 100).rounded()))%")
         }
         guard dataset.count > 0 else { throw AgentTrainerError.noData }
+        let inputBufferPool = try MetalArrayBufferPool()
         let split = splitIndices(
             dataset: dataset,
             fraction: profile.training.validationSplit,
@@ -122,6 +126,23 @@ final class TrainingEngine: @unchecked Sendable {
         guard !split.train.isEmpty else { throw AgentTrainerError.noData }
         let batchSize = max(1, profile.training.batchSize)
         let stepsPerEpoch = Int(ceil(Double(split.train.count) / Double(batchSize)))
+        let (observationReuseRatio, groupedTrainingObservations): (Double, [[Int]]) = {
+            let plan = dataset.visionBatchPlan(at: split.train)
+            // A gather has a small fixed cost. Require enough duplicate visual
+            // work to recover it even on compact networks; common 60/30 FPS
+            // datasets are close to 2x and comfortably exceed this crossover.
+            guard plan.reuseRatio >= Self.minimumVisionReuseRatio else {
+                return (plan.reuseRatio, [])
+            }
+            return (
+                plan.reuseRatio,
+                dataset.observationGroups(at: split.train, using: plan)
+            )
+        }()
+        let reusesVisionFeatures = !groupedTrainingObservations.isEmpty
+        let desiredSamplingStrategy = reusesVisionFeatures
+            ? TrainingSamplingContract.groupedVision
+            : TrainingSamplingContract.salienceBalanced
         // Salience depends only on immutable cached targets and profile output
         // policy. Scan it once per run rather than repeating the CPU pass at
         // every epoch boundary.
@@ -144,12 +165,25 @@ final class TrainingEngine: @unchecked Sendable {
             batchSize: profile.training.batchSize,
             segmentCount: dataset.segmentCount(at: split.validation)
         )
-        let validationEvaluationIndices = dataset.representativeValidationIndices(
+        let representativeValidationIndices = dataset.representativeValidationIndices(
             from: split.validation,
             limit: validationSampleLimit,
             channels: profile.channels,
             restrictions: profile.effectiveRestrictions
         )
+        let (reusesValidationVisionFeatures, validationEvaluationIndices): (Bool, [Int]) = {
+            let plan = dataset.visionBatchPlan(at: representativeValidationIndices)
+            guard plan.reuseRatio >= Self.minimumVisionReuseRatio else {
+                return (false, representativeValidationIndices)
+            }
+            return (
+                true,
+                dataset.observationGroups(
+                    at: representativeValidationIndices,
+                    using: plan
+                ).flatMap { $0 }
+            )
+        }()
 
         let model = AgentPolicy(profile: profile)
         model.train(true)
@@ -190,7 +224,7 @@ final class TrainingEngine: @unchecked Sendable {
             demonstratedKeyCodes: demonstratedKeys,
             experienceSeconds: 0,
             recordingOrder: recordingOrder,
-            samplingStrategy: TrainingSamplingContract.salienceBalanced,
+            samplingStrategy: desiredSamplingStrategy,
             validationStrategy: TrainingValidationContract.disjointContext
         )
         let restore = try await restoreCheckpointIfPresent(
@@ -203,14 +237,46 @@ final class TrainingEngine: @unchecked Sendable {
             randomState: randomState,
             state: &state
         )
+        let validationStep = compile(inputs: [model]) { (arrays: [MLXArray]) -> [MLXArray] in
+            // Keep packed-frame expansion, the shared forward pass, loss, and activation
+            // inside one Metal graph. The class weights are immutable for this
+            // run and become a trace-time constant.
+            let classWeights = MLXArray(positiveClassWeightValues, [ActionLayout.count])
+            let batch = Self.expandBatch(
+                arrays,
+                profile: profile,
+                reusesVisionFeatures: reusesValidationVisionFeatures
+            )
+            let visualFeatures = model.visualActivations(images: batch.images).last!
+            let visualEmbedding = model.visualEmbedding(visualFeatures: visualFeatures)
+            let expandedVisualEmbedding = batch.sampleToVision.map {
+                visualEmbedding.take($0, axis: 0)
+            } ?? visualEmbedding
+            let logits = model.logits(
+                visualEmbedding: expandedVisualEmbedding,
+                history: batch.history
+            )
+            return [
+                model.loss(
+                    logits: logits,
+                    history: batch.history,
+                    targets: batch.targets,
+                    positiveWeights: classWeights,
+                    previousTargets: batch.previousTargets
+                ),
+                model.activatedPredictions(logits: logits),
+                batch.targets
+            ]
+        }
         // The raw event stream is authoritative, including taps shorter than one
         // action interval. Refresh after restoring an older checkpoint.
         state.demonstratedKeyCodes = demonstratedKeys
         // Legacy checkpoints did not persist sample-to-recording order. Preserve
         // their current epoch order, then make every subsequent save enforce it.
         if state.recordingOrder == nil { state.recordingOrder = recordingOrder }
-        if state.samplingStrategy == nil, state.batchOffset == 0 {
-            state.samplingStrategy = TrainingSamplingContract.salienceBalanced
+        if state.batchOffset == 0,
+           state.samplingStrategy != desiredSamplingStrategy {
+            state.samplingStrategy = desiredSamplingStrategy
         }
         state.recommendedMouseMode = recommendedMouseMode
         let cursorDurations = recordings.reduce(into: (shown: 0.0, total: 0.0)) { result, recording in
@@ -246,12 +312,15 @@ final class TrainingEngine: @unchecked Sendable {
         // Re-score those exact selected weights on this run's held-out examples
         // before comparing any fine-tuned epoch against them.
         if restore.captureValidationBaseline, !split.validation.isEmpty {
-            let baseline = evaluate(
+            let baseline = try evaluate(
                 model: model,
                 dataset: dataset,
                 indices: validationEvaluationIndices,
                 profile: profile,
-                positiveClassWeightValues: positiveClassWeightValues
+                positiveClassWeightValues: positiveClassWeightValues,
+                inputBufferPool: inputBufferPool,
+                validationStep: validationStep,
+                reusesVisionFeatures: reusesValidationVisionFeatures
             )
             let baselineValidationLoss = baseline.loss
             guard baselineValidationLoss.isFinite else {
@@ -274,17 +343,46 @@ final class TrainingEngine: @unchecked Sendable {
             // Capture the Sendable Swift values and materialize the constant while
             // MLX traces the graph. MLXArray itself is intentionally non-Sendable.
             let classWeights = MLXArray(positiveClassWeightValues, [ActionLayout.count])
+            let batch = Self.expandBatch(
+                arrays,
+                profile: profile,
+                reusesVisionFeatures: reusesVisionFeatures
+            )
+            let gradientInputs = [
+                batch.images,
+                batch.history,
+                batch.targets,
+                batch.previousTargets
+            ]
+            // The row map is integer metadata, not a differentiable input.
+            // Capture it in the compiled graph instead of asking valueAndGrad
+            // to construct a meaningless gradient for it.
+            let sampleToVision = batch.sampleToVision
             let result = valueAndGrad(model: model) { model, arrays in
-                [model.loss(
-                    images: arrays[0],
+                let visualFeatures = model.visualActivations(images: arrays[0]).last!
+                let visualEmbedding = model.visualEmbedding(visualFeatures: visualFeatures)
+                let expandedVisualEmbedding = sampleToVision.map {
+                    visualEmbedding.take($0, axis: 0)
+                } ?? visualEmbedding
+                let logits = model.logits(
+                    visualEmbedding: expandedVisualEmbedding,
+                    history: arrays[1]
+                )
+                return [model.loss(
+                    logits: logits,
                     history: arrays[1],
                     targets: arrays[2],
                     positiveWeights: classWeights,
                     previousTargets: arrays[3]
                 )]
-            }(model, arrays)
-            let clipped = clipGradNorm(gradients: result.1, maxNorm: 1).0
-            optimizer.update(model: model, gradients: clipped, targetType: model.dtype)
+            }(model, gradientInputs)
+            optimizer.update(
+                model: model,
+                gradients: result.1,
+                targetType: model.dtype,
+                gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
+                maxGradientNorm: 1
+            )
             return [result.0[0]]
         }
         let started = ContinuousClock.now
@@ -368,8 +466,18 @@ final class TrainingEngine: @unchecked Sendable {
 
         trainingLoop: for epoch in state.epoch..<targetEpoch {
             let epochSeed = profile.training.seed &+ UInt64(epoch) &* 0x9E3779B97F4A7C15
-            let order = state.samplingStrategy == TrainingSamplingContract.salienceBalanced
-                ? trainingOrder(
+            let order: [Int]
+            if state.samplingStrategy == TrainingSamplingContract.groupedVision,
+               reusesVisionFeatures {
+                order = groupedVisionTrainingOrder(
+                    groups: groupedTrainingObservations,
+                    batchSize: batchSize,
+                    seed: epochSeed,
+                    salientIndices: salientTrainingIndices
+                )
+            } else if state.samplingStrategy == TrainingSamplingContract.salienceBalanced
+                        || state.samplingStrategy == TrainingSamplingContract.groupedVision {
+                order = trainingOrder(
                     dataset: dataset,
                     indices: split.train,
                     batchSize: batchSize,
@@ -377,41 +485,57 @@ final class TrainingEngine: @unchecked Sendable {
                     profile: profile,
                     precomputedSalientIndices: salientTrainingIndices
                 )
-                : shuffled(split.train, seed: epochSeed)
+            } else {
+                order = shuffled(split.train, seed: epochSeed)
+            }
             var offset = epoch == state.epoch ? state.batchOffset : 0
             var epochWeightedLoss = offset > 0 ? state.currentEpochWeightedLoss ?? 0 : 0
             var epochSampleCount = offset > 0 ? state.currentEpochSampleCount ?? 0 : 0
-            var prefetchedBatch: PreparedBatch?
+            var prefetchedArrays: [MLXArray]?
             while offset < order.count {
                 try Task.checkCancellation()
                 if lock.withLock({ stopRequested }) { throw CancellationError() }
                 let end = min(order.count, offset + batchSize)
                 let batch = Array(order[offset..<end])
-                let prepared = prefetchedBatch ?? prepareBatch(dataset: dataset, indices: batch, profile: profile)
-                prefetchedBatch = nil
-                let result: (loss: Double, next: PreparedBatch?) = autoreleasepool {
-                    let arrays = materializeBatch(prepared, profile: profile)
+                let arrays = try prefetchedArrays ?? makeBatch(
+                    dataset: dataset,
+                    indices: batch,
+                    profile: profile,
+                    inputBufferPool: inputBufferPool,
+                    reusesVisionFeatures: reusesVisionFeatures
+                )
+                prefetchedArrays = nil
+                let result: (loss: Double, next: [MLXArray]?) = try autoreleasepool {
                     let lossArray = trainingStep(arrays)[0]
-                    // Start Metal immediately, then gather the next mapped batch
-                    // while the current optimizer graph is executing. The final
-                    // eval still waits for every model and optimizer output, so
-                    // numerical order and exact-resume semantics are unchanged.
-                    MLX.asyncEval(lossArray, model.parameters(), optimizer.stateArrays())
-                    let next: PreparedBatch?
+                    let modelState = model.parameters()
+                    let optimizerState = optimizer.stateArrays()
+                    // Start Metal immediately, then gather and materialize the
+                    // next mapped batch while the current optimizer graph is
+                    // executing. The final eval still waits for every model and
+                    // optimizer output, so numerical order and exact-resume
+                    // semantics are unchanged.
+                    MLX.asyncEval(lossArray, modelState, optimizerState)
+                    let next: [MLXArray]?
                     if end < order.count {
                         let nextEnd = min(order.count, end + batchSize)
-                        next = prepareBatch(dataset: dataset, indices: Array(order[end..<nextEnd]), profile: profile)
+                        next = try makeBatch(
+                            dataset: dataset,
+                            indices: Array(order[end..<nextEnd]),
+                            profile: profile,
+                            inputBufferPool: inputBufferPool,
+                            reusesVisionFeatures: reusesVisionFeatures
+                        )
                     } else {
                         next = nil
                     }
-                    MLX.eval(lossArray, model.parameters(), optimizer.stateArrays())
+                    MLX.eval(lossArray, modelState, optimizerState)
                     return (Double(lossArray.item(Float.self)), next)
                 }
                 let loss = result.loss
                 guard loss.isFinite else {
                     throw AgentTrainerError.model("Training became numerically unstable before this step could be saved. Lower the learning rate or reset this brain's learning state.")
                 }
-                prefetchedBatch = result.next
+                prefetchedArrays = result.next
                 guard state.globalStep < Int.max else {
                     throw AgentTrainerError.model("The restored optimizer step counter is invalid and cannot be advanced safely.")
                 }
@@ -465,7 +589,10 @@ final class TrainingEngine: @unchecked Sendable {
                         mlxPeakMemory: memory.peakMemory
                     )
                     samplesSinceRate = 0
-                    metrics(report, "Pipelined training on Apple-silicon GPU")
+                    let visionStatus = reusesVisionFeatures
+                        ? " • shared visual work \(observationReuseRatio.formatted(.number.precision(.fractionLength(2))))×"
+                        : ""
+                    metrics(report, "Pipelined training on Apple-silicon GPU\(visionStatus)")
                 }
 
                 let shouldCheckpoint = state.globalStep >= nextAutosaveStep
@@ -488,10 +615,10 @@ final class TrainingEngine: @unchecked Sendable {
             }
             state.batchOffset = 0
             state.epoch = epoch + 1
-            // A legacy checkpoint paused inside this epoch used the historical
-            // uniform order above. Upgrade only after that exact epoch finishes.
-            if state.samplingStrategy == nil {
-                state.samplingStrategy = TrainingSamplingContract.salienceBalanced
+            // A checkpoint paused inside this epoch keeps its versioned order.
+            // Adopt the best current strategy only after that epoch finishes.
+            if state.samplingStrategy != desiredSamplingStrategy {
+                state.samplingStrategy = desiredSamplingStrategy
             }
             let epochTrainingLoss = epochWeightedLoss / Double(max(1, epochSampleCount))
             state.currentEpochWeightedLoss = nil
@@ -504,12 +631,15 @@ final class TrainingEngine: @unchecked Sendable {
             var validationSelectionStatus: String?
             var monitorMetric = epochTrainingLoss
             if !split.validation.isEmpty {
-                let validation = evaluate(
+                let validation = try evaluate(
                     model: model,
                     dataset: dataset,
                     indices: validationEvaluationIndices,
                     profile: profile,
-                    positiveClassWeightValues: positiveClassWeightValues
+                    positiveClassWeightValues: positiveClassWeightValues,
+                    inputBufferPool: inputBufferPool,
+                    validationStep: validationStep,
+                    reusesVisionFeatures: reusesValidationVisionFeatures
                 )
                 let validationLoss = validation.loss
                 guard validationLoss.isFinite else {
@@ -587,50 +717,69 @@ final class TrainingEngine: @unchecked Sendable {
         return final
     }
 
-    private func prepareBatch(dataset: CachedDataset, indices: [Int], profile: AIProfile) -> PreparedBatch {
-        let b = indices.count
-        var targetData = dataset.actionBatch(at: indices)
-        var previousTargetData = dataset.previousActionBatch(at: indices)
-        let restrictions = profile.effectiveRestrictions
-        targetData.withUnsafeMutableBytes { raw in
-            let values = raw.bindMemory(to: Float.self)
-            ActionLayout.sanitizeTrainingRows(values, rowCount: b, channels: profile.channels, restrictions: restrictions)
+    private func makeBatch(
+        dataset: CachedDataset,
+        indices: [Int],
+        profile: AIProfile,
+        inputBufferPool: MetalArrayBufferPool,
+        reusesVisionFeatures: Bool
+    ) throws -> [MLXArray] {
+        let historyLength = max(1, profile.training.historyLength)
+        let count = indices.count
+        let visionPlan = reusesVisionFeatures ? dataset.visionBatchPlan(at: indices) : nil
+        let visionCount = visionPlan?.uniquePairs.count ?? count
+        var descriptors: [MetalArrayBufferPool.Descriptor] = [
+            .init([visionCount, 2, profile.preprocessing.sampleByteCount], dtype: .uint8)
+        ]
+        if reusesVisionFeatures {
+            descriptors.append(.init([count], dtype: .int32))
         }
-        var historyData = dataset.historyBatch(at: indices)
-        historyData.withUnsafeMutableBytes { raw in
-            let values = raw.bindMemory(to: Float.self)
+        descriptors.append(
+            .init([count, historyLength + 2, ActionLayout.count], dtype: .float32)
+        )
+        return try inputBufferPool.makeArrays(descriptors) { destinations in
+            let actionDestination = destinations[reusesVisionFeatures ? 2 : 1]
+            if let visionPlan {
+                dataset.populateTrainingBatch(
+                    at: indices,
+                    observationPairs: visionPlan.uniquePairs,
+                    packedObservationPairs: destinations[0],
+                    actionRows: actionDestination
+                )
+                visionPlan.sampleToVision.withUnsafeBytes {
+                    destinations[1].copyMemory(from: $0)
+                }
+            } else {
+                dataset.populateTrainingBatch(
+                    at: indices,
+                    packedObservationPairs: destinations[0],
+                    actionRows: actionDestination
+                )
+            }
+            let values = actionDestination.bindMemory(to: Float.self)
             ActionLayout.sanitizeTrainingRows(
                 values,
-                rowCount: b * max(1, profile.training.historyLength),
+                rowCount: count * (historyLength + 2),
                 channels: profile.channels,
-                restrictions: restrictions
+                restrictions: profile.effectiveRestrictions
             )
         }
-        previousTargetData.withUnsafeMutableBytes { raw in
-            let values = raw.bindMemory(to: Float.self)
-            ActionLayout.sanitizeTrainingRows(values, rowCount: b, channels: profile.channels, restrictions: restrictions)
-        }
-        return PreparedBatch(
-            count: b,
-            packedObservations: dataset.packedObservations(at: indices),
-            precedingPackedObservations: dataset.precedingPackedObservations(at: indices),
-            history: historyData,
-            targets: targetData,
-            previousTargets: previousTargetData
+    }
+
+    private static func expandBatch(
+        _ arrays: [MLXArray],
+        profile: AIProfile,
+        reusesVisionFeatures: Bool
+    ) -> ExpandedTrainingBatch {
+        let historyLength = max(1, profile.training.historyLength)
+        let actions = arrays[reusesVisionFeatures ? 2 : 1]
+        return ExpandedTrainingBatch(
+            images: VisionPreprocessor.mlxTemporalTensor(arrays[0], spec: profile.preprocessing),
+            sampleToVision: reusesVisionFeatures ? arrays[1] : nil,
+            history: actions[0..., 0..<historyLength, 0...],
+            targets: actions[0..., historyLength, 0...],
+            previousTargets: actions[0..., historyLength + 1, 0...]
         )
-    }
-
-    private func materializeBatch(_ batch: PreparedBatch, profile: AIProfile) -> [MLXArray] {
-        return [
-            VisionPreprocessor.mlxTemporalTensor(current: batch.packedObservations, previous: batch.precedingPackedObservations, batch: batch.count, spec: profile.preprocessing),
-            MLXArray(batch.history, [batch.count, max(1, profile.training.historyLength), ActionLayout.count], type: Float.self),
-            MLXArray(batch.targets, [batch.count, ActionLayout.count], type: Float.self),
-            MLXArray(batch.previousTargets, [batch.count, ActionLayout.count], type: Float.self)
-        ]
-    }
-
-    private func makeBatch(dataset: CachedDataset, indices: [Int], profile: AIProfile) -> [MLXArray] {
-        materializeBatch(prepareBatch(dataset: dataset, indices: indices, profile: profile), profile: profile)
     }
 
     private func evaluate(
@@ -638,8 +787,11 @@ final class TrainingEngine: @unchecked Sendable {
         dataset: CachedDataset,
         indices: [Int],
         profile: AIProfile,
-        positiveClassWeightValues: [Float]
-    ) -> ValidationEvaluation {
+        positiveClassWeightValues: [Float],
+        inputBufferPool: MetalArrayBufferPool,
+        validationStep: @Sendable ([MLXArray]) -> [MLXArray],
+        reusesVisionFeatures: Bool
+    ) throws -> ValidationEvaluation {
         model.train(false)
         defer { model.train(true) }
         var weightedLoss = 0.0
@@ -651,26 +803,40 @@ final class TrainingEngine: @unchecked Sendable {
                 restrictions: profile.effectiveRestrictions
             ).filter { positiveClassWeightValues.indices.contains($0) && positiveClassWeightValues[$0] > 0 })
         )
-        let positiveClassWeights = MLXArray(positiveClassWeightValues, [ActionLayout.count])
         let batchSize = max(1, profile.training.batchSize)
+        var prefetchedArrays: [MLXArray]?
         for start in Swift.stride(from: 0, to: indices.count, by: batchSize) {
             let end = min(indices.count, start + batchSize)
             let batch = Array(indices[start..<end])
-            let arrays = makeBatch(dataset: dataset, indices: batch, profile: profile)
-            let loss = model.loss(
-                images: arrays[0],
-                history: arrays[1],
-                targets: arrays[2],
-                positiveWeights: positiveClassWeights,
-                previousTargets: arrays[3]
+            let arrays = try prefetchedArrays ?? makeBatch(
+                dataset: dataset,
+                indices: batch,
+                profile: profile,
+                inputBufferPool: inputBufferPool,
+                reusesVisionFeatures: reusesVisionFeatures
             )
-            let predictions = model.predictions(images: arrays[0], history: arrays[1])
-            MLX.eval(loss, predictions, arrays[2])
+            prefetchedArrays = nil
+            let result = validationStep(arrays)
+            let loss = result[0]
+            let predictions = result[1]
+            let targets = result[2]
+            MLX.asyncEval(loss, predictions, targets)
+            if end < indices.count {
+                let nextEnd = min(indices.count, end + batchSize)
+                prefetchedArrays = try makeBatch(
+                    dataset: dataset,
+                    indices: Array(indices[end..<nextEnd]),
+                    profile: profile,
+                    inputBufferPool: inputBufferPool,
+                    reusesVisionFeatures: reusesVisionFeatures
+                )
+            }
+            MLX.eval(loss, predictions, targets)
             weightedLoss += Double(loss.item(Float.self)) * Double(batch.count)
             evaluated += batch.count
             report.consume(
                 predictions: predictions.asArray(Float.self),
-                targets: arrays[2].asArray(Float.self),
+                targets: targets.asArray(Float.self),
                 rowCount: batch.count
             )
         }
@@ -766,6 +932,47 @@ final class TrainingEngine: @unchecked Sendable {
             channels: profile.channels,
             restrictions: profile.effectiveRestrictions
         )
+        return salienceBalancedOrder(
+            randomized: randomized,
+            batchSize: batchSize,
+            seed: seed,
+            salient: salient
+        )
+    }
+
+    func groupedVisionTrainingOrder(
+        groups: [[Int]],
+        batchSize rawBatchSize: Int,
+        seed: UInt64,
+        salientIndices: Set<Int>
+    ) -> [Int] {
+        guard !groups.isEmpty else { return [] }
+        let groupIndices = Array(groups.indices)
+        let randomized = shuffled(groupIndices, seed: seed)
+        let salientGroups = Set(groupIndices.filter { group in
+            groups[group].contains(where: salientIndices.contains)
+        })
+        let averageGroupSize = Double(groups.reduce(0) { $0 + $1.count })
+            / Double(max(1, groups.count))
+        let groupsPerBatch = max(
+            1,
+            Int((Double(max(1, rawBatchSize)) / max(1, averageGroupSize)).rounded())
+        )
+        let orderedGroups = salienceBalancedOrder(
+            randomized: randomized,
+            batchSize: groupsPerBatch,
+            seed: seed,
+            salient: salientGroups
+        )
+        return orderedGroups.flatMap { groups[$0] }
+    }
+
+    private func salienceBalancedOrder(
+        randomized: [Int],
+        batchSize: Int,
+        seed: UInt64,
+        salient: Set<Int>
+    ) -> [Int] {
         guard !salient.isEmpty, salient.count < randomized.count else { return randomized }
 
         let priority = randomized.filter(salient.contains)
@@ -1065,6 +1272,7 @@ final class TrainingEngine: @unchecked Sendable {
             let recordingOrderMatches = restored.recordingOrder.map { $0 == expectedRecordingOrder } ?? true
             let samplingStrategyIsKnown = restored.samplingStrategy == nil
                 || restored.samplingStrategy == TrainingSamplingContract.salienceBalanced
+                || restored.samplingStrategy == TrainingSamplingContract.groupedVision
             if restored.profileSignature == expectedSignature,
                recordingOrderMatches,
                samplingStrategyIsKnown {
@@ -1128,13 +1336,12 @@ private struct CheckpointRestore {
     var captureValidationBaseline: Bool
 }
 
-private struct PreparedBatch {
-    let count: Int
-    let packedObservations: Data
-    let precedingPackedObservations: Data
-    let history: Data
-    let targets: Data
-    let previousTargets: Data
+private struct ExpandedTrainingBatch {
+    let images: MLXArray
+    let sampleToVision: MLXArray?
+    let history: MLXArray
+    let targets: MLXArray
+    let previousTargets: MLXArray
 }
 
 private struct ValidationEvaluation {

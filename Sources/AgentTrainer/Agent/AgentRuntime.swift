@@ -24,6 +24,7 @@ final class AgentRuntime: @unchecked Sendable {
 
     private let capture = CaptureService()
     private let preprocessor: VisionPreprocessor
+    private let inferenceInputBuffers: MetalArrayBufferPool
     private let injector = InputInjector()
     private let safetyMonitor = InputCaptureService()
     private let inferenceQueue = DispatchQueue(label: "AgentTrainer.Inference", qos: .userInteractive)
@@ -74,6 +75,7 @@ final class AgentRuntime: @unchecked Sendable {
     init() throws {
         MLXMemoryLifecycle.configure()
         preprocessor = try VisionPreprocessor()
+        inferenceInputBuffers = try MetalArrayBufferPool(maximumCachedBytes: 32 * 1_024 * 1_024)
         injector.onState = { [weak self] state in self?.onState?(state) }
     }
 
@@ -116,25 +118,33 @@ final class AgentRuntime: @unchecked Sendable {
         let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
         model.train(false)
-        let predictionFunction = compile(inputs: [model]) { images, history in model.predictions(images: images, history: history) }
+        let predictionFunction = compile(inputs: [model]) { packedVision, history in
+            model.predictions(
+                images: VisionPreprocessor.mlxTemporalTensor(packedVision, spec: runtimeProfile.preprocessing),
+                history: history
+            )
+        }
         // Diagnostic graphs are lazy: creating these closures does not execute
         // or materialize an extra tensor. The selected graph first compiles only
         // when its view is enabled and reaches its independently capped rate.
         let activationVisualizationFunctions: [VisualizationFunction] = (0..<max(1, model.convolutions.count)).map { selectedLayer in
             compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-                let layers = model.visualActivations(images: inputs[0])
+                let images = VisionPreprocessor.mlxTemporalTensor(inputs[0], spec: runtimeProfile.preprocessing)
+                let layers = model.visualActivations(images: images)
                 let logits = model.logits(visualFeatures: layers.last!, history: inputs[1])
                 let map = model.sampledForVisualization(layers[selectedLayer]).mean(axis: -1, keepDims: true)
                 return [model.activatedPredictions(logits: logits), map]
             }
         }
         let channelVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            let layers = model.visualActivations(images: inputs[0])
+            let images = VisionPreprocessor.mlxTemporalTensor(inputs[0], spec: runtimeProfile.preprocessing)
+            let layers = model.visualActivations(images: images)
             let logits = model.logits(visualFeatures: layers.last!, history: inputs[1])
             return [model.activatedPredictions(logits: logits), model.strongestChannelsForVisualization(layers.last!)]
         }
         let saliencyVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            let layers = model.visualActivations(images: inputs[0])
+            let images = VisionPreprocessor.mlxTemporalTensor(inputs[0], spec: runtimeProfile.preprocessing)
+            let layers = model.visualActivations(images: images)
             let logits = model.logits(visualFeatures: layers.last!, history: inputs[1])
             // Keep the exact final tensor on GPU for the post-CNN gradient.
             // This graph intentionally omits the channel ranking used by the
@@ -368,23 +378,37 @@ final class AgentRuntime: @unchecked Sendable {
                 previousPackedVision = packed
                 return previous
             }
-            let image = VisionPreprocessor.mlxTemporalTensor(current: packed, previous: previousPacked, batch: 1, spec: profile.preprocessing)
+            let predecessor = previousPacked ?? packed
+            let packedVision = try inferenceInputBuffers.makeArrays([
+                .init([1, 2, profile.preprocessing.sampleByteCount], dtype: .uint8)
+            ]) { destinations in
+                packed.withUnsafeBytes { source in
+                    UnsafeMutableRawBufferPointer(
+                        rebasing: destinations[0][..<profile.preprocessing.sampleByteCount]
+                    ).copyMemory(from: source)
+                }
+                predecessor.withUnsafeBytes { source in
+                    UnsafeMutableRawBufferPointer(
+                        rebasing: destinations[0][profile.preprocessing.sampleByteCount...]
+                    ).copyMemory(from: source)
+                }
+            }[0]
             let historyArray = MLXArray(history, [1, max(1, profile.training.historyLength), ActionLayout.count])
             let result: [MLXArray] = Device.withDefaultDevice(.gpu) {
-                guard visualizationDue else { return [predictionFunction(image, historyArray)] }
+                guard visualizationDue else { return [predictionFunction(packedVision, historyArray)] }
                 switch settings.mode {
                 case .activationOverlay:
                     let selectedLayer = max(0, settings.convolutionLayer)
-                    guard activationVisualizationFunctions.indices.contains(selectedLayer) else { return [predictionFunction(image, historyArray)] }
-                    return activationVisualizationFunctions[selectedLayer]([image, historyArray])
+                    guard activationVisualizationFunctions.indices.contains(selectedLayer) else { return [predictionFunction(packedVision, historyArray)] }
+                    return activationVisualizationFunctions[selectedLayer]([packedVision, historyArray])
                 case .featureChannels:
-                    guard let forward = channelVisualizationFunction?([image, historyArray]), forward.count >= 2 else { return [predictionFunction(image, historyArray)] }
+                    guard let forward = channelVisualizationFunction?([packedVision, historyArray]), forward.count >= 2 else { return [predictionFunction(packedVision, historyArray)] }
                     return forward
                 case .actionSaliency:
                     let selector = Self.actionSelector(focus: settings.actionFocus, mouseMode: mouseMode)
-                    guard let saliencyVisualizationFunction, let saliencyGradientFunction else { return [predictionFunction(image, historyArray)] }
-                    let forward = saliencyVisualizationFunction([image, historyArray])
-                    guard forward.count >= 2 else { return [predictionFunction(image, historyArray)] }
+                    guard let saliencyVisualizationFunction, let saliencyGradientFunction else { return [predictionFunction(packedVision, historyArray)] }
+                    let forward = saliencyVisualizationFunction([packedVision, historyArray])
+                    guard forward.count >= 2 else { return [predictionFunction(packedVision, historyArray)] }
                     let gradients = saliencyGradientFunction([forward[1], historyArray, selector])
                     let weights = gradients.mean(axes: [1, 2], keepDims: true)
                     let saliency = relu((forward[1] * weights).sum(axis: -1, keepDims: true))

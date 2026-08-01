@@ -1,4 +1,4 @@
-# AgentTrainer 1.9.5
+# AgentTrainer 1.9.6
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -46,6 +46,14 @@ Run the complete test suite:
 ./test.sh
 ```
 
+Run the opt-in release benchmark for a compact fixture and the default vision/model/batch hardware profile (with stochastic layers disabled for repeatability):
+
+```sh
+./benchmark.sh
+```
+
+The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. It compares training and validation loss after matched update counts; low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
+
 Build, sign, package, and install:
 
 ```sh
@@ -60,7 +68,7 @@ The default installed application is:
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-1.9.5.dmg`
+- `AgentTrainer-1.9.6.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 
