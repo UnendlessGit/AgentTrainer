@@ -1043,6 +1043,12 @@ struct TrainingView: View {
                     MetricCard(title: "Optimizer steps", value: displayedSteps.formatted(), symbol: "arrow.triangle.2.circlepath", color: ATColor.green)
                 }
                 HStack(spacing: 12) {
+                    MetricCard(title: "Pipelined step", value: "\(model.trainingMetrics.trainingStepMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms", symbol: "timer", color: ATColor.cyan)
+                    MetricCard(title: "Mapped input gather", value: "\(model.trainingMetrics.batchPreparationMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms", symbol: "externaldrive.fill", color: ATColor.violet)
+                    MetricCard(title: "Throughput retained", value: "\((100 * model.trainingMetrics.throughputRetention).formatted(.number.precision(.fractionLength(0))))%", symbol: "chart.line.uptrend.xyaxis", color: model.trainingMetrics.throughputRetention < 0.8 ? ATColor.coral : ATColor.green)
+                    MetricCard(title: "Thermal pressure", value: model.trainingMetrics.thermalState.rawValue, symbol: "thermometer.medium", color: model.trainingMetrics.thermalState == .nominal ? ATColor.green : ATColor.coral)
+                }
+                HStack(spacing: 12) {
                     MetricCard(title: "MLX active unified", value: ByteCountFormatter.string(fromByteCount: Int64(model.trainingMetrics.mlxActiveMemory), countStyle: .memory), symbol: "memorychip", color: ATColor.green)
                     MetricCard(title: "MLX reusable cache", value: ByteCountFormatter.string(fromByteCount: Int64(model.trainingMetrics.mlxCacheMemory), countStyle: .memory), symbol: "internaldrive", color: ATColor.violet)
                     MetricCard(title: "MLX peak active", value: ByteCountFormatter.string(fromByteCount: Int64(model.trainingMetrics.mlxPeakMemory), countStyle: .memory), symbol: "chart.bar.fill", color: ATColor.amber)

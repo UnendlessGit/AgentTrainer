@@ -122,20 +122,23 @@ Current Policy v5 combines:
 
 Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. Past control rows are masked for half of training samples while past images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
 
-Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Do not change those semantics without updating tests and the relevant schema.
+Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced locality order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Do not change those semantics without updating tests and the relevant schema.
 
 The performance path preserves those semantics:
 
 - VideoToolbox decode, Metal resize/color packing, and cache writes overlap through a bounded ordered pipeline.
-- Dataset files are required memory mappings with random-access VM advice. A batch gathers current images, native-size past images, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
-- When action sampling reuses a temporal frame sequence, epoch ordering colocates those rows and evaluates each distinct current/past/control feature once per batch. The resulting temporal feature is gathered back to every independent target row; no label is removed, duplicated, averaged, or reused as another label.
+- Dataset files are required memory mappings with adaptive VM advice. Epochs randomize small collections of temporally local lanes rather than every row globally, so each optimizer batch remains diverse while macOS can read ahead the contiguous mapped pages inside each lane. A batch gathers packed vision, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
+- Current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those deterministic embeddings to their exact frame slots. Training gathers visual embeddings back to action-row shape *before* control masking, the recurrent network, and dropout, preserving one independent stochastic path per label. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
 - Above the measured workload crossover, the coordinate contribution to the first convolution is evaluated once per batch and the established GroupNorm layout uses MLX's fused Metal layer-normalization kernel. Small tensors retain the lower-overhead kernels.
-- Validation adaptively shares repeated temporal inputs, expands packed input, runs one compiled policy forward, then derives both loss and predictions from the shared logits.
+- Validation shares deterministic temporal work and head logits before gathering them back to every held-out label, then derives loss and predictions from that one compiled forward graph.
 - CPU gathering of the next batch overlaps the current Metal graph. Every optimizer step still evaluates the complete model, AdamW moments, scheduler, and MLX random state before advancing the checkpoint cursor.
+- Live diagnostics publish a rolling pipelined-step time, mapped-input time, peak-throughput retention, MLX active/cache/peak memory, and macOS thermal pressure. Metrics are rate-limited and chart histories are presentation-bounded so observing a run does not grow UI work with optimizer-step count.
 
 Do not queue stateful optimizer steps merely to improve a benchmark. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
 
 Performance work may change graph operation order, grouped sample order, and low-bit numerical trajectories. “No quality loss” is evaluated by matched-update training loss, held-out validation loss, and per-head validation behavior—not byte-identical weights or predictions. The hardware benchmark gates relative validation-loss drift at 1%, while focused tests compare the optimized objective and gradients to the reference graph. Never obtain speed by silently reducing vision resolution, precision, model capacity, labels, loss terms, or update count.
+
+For a longer power/thermal comparison of the optimized and reference 16-frame paths, run `AGENTTRAINER_BENCHMARK_STRESS_STEPS=2048 AGENTTRAINER_BENCHMARK_STRESS_BASELINE_STEPS=1024 ./benchmark.sh`. Compare first/last-window retention as well as thermal state and cache memory; a coarse nominal macOS thermal state does not prove that sustained GPU clocks remained at their initial boost level.
 
 An exact checkpoint contains weights, both AdamW moment sets, optimizer metadata, scheduler state, training state, model schema, and MLX random state. Missing or mismatched moment pairs/random state are corruption, not a silent fresh start.
 
@@ -207,7 +210,7 @@ User-facing technical values must be derived from shared contract helpers such a
 Before release:
 
 1. Run `./test.sh`.
-2. Run `./benchmark.sh` and compare original/optimized throughput plus matched-update training and validation loss on the same idle Mac.
+2. Run `./benchmark.sh` and compare original/optimized throughput plus matched-update training and validation loss on the same idle Mac. Check every sustained window for stable throughput, bounded MLX cache, and nominal thermal pressure.
 3. Run `git diff --check`.
 4. Confirm `CFBundleShortVersionString` and `CFBundleVersion`.
 5. Quit AgentTrainer and run `./build.sh`.

@@ -818,6 +818,23 @@ struct LearnedBrainContract: Hashable, Sendable {
     var architecture: ArchitectureSpec
 }
 
+enum TrainingThermalState: String, Sendable {
+    case nominal = "Nominal"
+    case fair = "Fair"
+    case serious = "Serious"
+    case critical = "Critical"
+
+    static var current: Self {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: .nominal
+        case .fair: .fair
+        case .serious: .serious
+        case .critical: .critical
+        @unknown default: .fair
+        }
+    }
+}
+
 struct TrainingMetrics: Sendable {
     var epoch = 0
     var totalEpochs = 0
@@ -834,6 +851,15 @@ struct TrainingMetrics: Sendable {
     var effectiveLearningRate = 0.0
     var learningRateScale = 1.0
     var samplesPerSecond = 0.0
+    /// End-to-end time for one pipelined optimizer update, including any input
+    /// preparation that could not be hidden behind Metal execution.
+    var trainingStepMilliseconds = 0.0
+    /// CPU time spent gathering one mapped batch into shared Metal buffers.
+    var batchPreparationMilliseconds = 0.0
+    /// Rolling throughput divided by the best stable throughput observed in
+    /// this run. Values below one make sustained degradation visible.
+    var throughputRetention = 1.0
+    var thermalState = TrainingThermalState.nominal
     var elapsed = 0.0
     var experienceElapsed = 0.0
     var lossHistory: [Double] = []

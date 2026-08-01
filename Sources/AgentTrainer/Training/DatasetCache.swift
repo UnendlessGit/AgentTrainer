@@ -145,10 +145,32 @@ struct CachedObservationSequence: Hashable, Sendable {
 /// expensive temporal frame sequence while retaining independent targets.
 struct CachedVisionBatchPlan: Sendable {
     let uniqueSequences: [CachedObservationSequence]
+    /// Distinct reduced-resolution observations referenced by every past slot
+    /// in `uniqueSequences`. Segment-leading padding resolves to that
+    /// sequence's current observation, exactly as it does in the canonical
+    /// batch path.
+    let uniquePastObservations: [UInt32]
+    /// Row-major [unique sequence, past slot] map into
+    /// `uniquePastObservations`. Keeping this as Int32 lets MLX gather the
+    /// already-encoded frame embeddings without another host conversion.
+    let visionToPast: [Int32]
     let sampleToVision: [Int32]
 
     var reuseRatio: Double {
         Double(sampleToVision.count) / Double(max(1, uniqueSequences.count))
+    }
+
+    var pastFrameReuseRatio: Double {
+        Double(visionToPast.count) / Double(max(1, uniquePastObservations.count))
+    }
+
+    func encoderWorkReuseRatio(currentPixels: Int, pastPixels: Int) -> Double {
+        let pastFrameCount = uniqueSequences.first.map { max(0, $0.indices.count - 1) } ?? 0
+        let reference = Double(sampleToVision.count)
+            * Double(max(0, currentPixels) + pastFrameCount * max(0, pastPixels))
+        let shared = Double(uniqueSequences.count) * Double(max(0, currentPixels))
+            + Double(uniquePastObservations.count) * Double(max(0, pastPixels))
+        return reference / max(1, shared)
     }
 }
 
@@ -260,11 +282,11 @@ final class CachedDataset: @unchecked Sendable {
             return true
         }
         guard mappingsAreValid else { throw AgentTrainerError.storage("The dataset cache contains an invalid frame index.") }
-        Self.adviseRandomAccess(loadedCurrentObservations)
-        Self.adviseRandomAccess(loadedPastObservations)
-        Self.adviseRandomAccess(loadedObservationIndices)
-        Self.adviseRandomAccess(loadedFrameActions)
-        Self.adviseRandomAccess(loadedActions)
+        Self.adviseAdaptiveAccess(loadedCurrentObservations)
+        Self.adviseAdaptiveAccess(loadedPastObservations)
+        Self.adviseAdaptiveAccess(loadedObservationIndices)
+        Self.adviseAdaptiveAccess(loadedFrameActions)
+        Self.adviseAdaptiveAccess(loadedActions)
         manifest = decoded
         currentObservations = loadedCurrentObservations
         pastObservations = loadedPastObservations
@@ -275,16 +297,18 @@ final class CachedDataset: @unchecked Sendable {
 
     var count: Int { manifest.sampleCount }
 
-    private static func adviseRandomAccess(_ data: Data) {
+    private static func adviseAdaptiveAccess(_ data: Data) {
         data.withUnsafeBytes { bytes in
             guard let baseAddress = bytes.baseAddress, !bytes.isEmpty else { return }
-            // Epoch orders are deliberately shuffled. Telling the VM subsystem
-            // avoids spending I/O bandwidth on sequential read-ahead pages that
-            // the next batch is unlikely to consume.
+            // Training randomizes locality batches rather than individual
+            // observations. Normal advice lets macOS detect and read ahead the
+            // contiguous mapped pages inside each batch. MADV_RANDOM disabled
+            // that useful behavior and made page-fault stalls more likely once
+            // macOS began reclaiming otherwise warm file-backed pages.
             _ = madvise(
                 UnsafeMutableRawPointer(mutating: baseAddress),
                 bytes.count,
-                MADV_RANDOM
+                MADV_NORMAL
             )
         }
     }
@@ -367,7 +391,12 @@ final class CachedDataset: @unchecked Sendable {
 
     func visionBatchPlan(at indices: [Int]) -> CachedVisionBatchPlan {
         guard !indices.isEmpty else {
-            return CachedVisionBatchPlan(uniqueSequences: [], sampleToVision: [])
+            return CachedVisionBatchPlan(
+                uniqueSequences: [],
+                uniquePastObservations: [],
+                visionToPast: [],
+                sampleToVision: []
+            )
         }
         var uniqueSequences: [CachedObservationSequence] = []
         uniqueSequences.reserveCapacity(indices.count)
@@ -387,8 +416,37 @@ final class CachedDataset: @unchecked Sendable {
                 sampleToVision.append(index)
             }
         }
+        let pastFrameCount = manifest.temporalVision.pastFrameCount
+        var uniquePastObservations: [UInt32] = []
+        uniquePastObservations.reserveCapacity(uniqueSequences.count * pastFrameCount)
+        var pastObservationToIndex: [UInt32: Int32] = [:]
+        pastObservationToIndex.reserveCapacity(uniqueSequences.count * pastFrameCount)
+        var visionToPast: [Int32] = []
+        visionToPast.reserveCapacity(uniqueSequences.count * pastFrameCount)
+        for sequence in uniqueSequences {
+            precondition(sequence.indices.count == pastFrameCount + 1)
+            let current = sequence.indices[0]
+            for frame in 0..<pastFrameCount {
+                let mapped = sequence.indices[frame + 1]
+                let observation = mapped == UInt32.max ? current : mapped
+                if let existing = pastObservationToIndex[observation] {
+                    visionToPast.append(existing)
+                } else {
+                    precondition(
+                        uniquePastObservations.count < Int(Int32.max),
+                        "A vision batch has too many distinct past frames."
+                    )
+                    let index = Int32(uniquePastObservations.count)
+                    uniquePastObservations.append(observation)
+                    pastObservationToIndex[observation] = index
+                    visionToPast.append(index)
+                }
+            }
+        }
         return CachedVisionBatchPlan(
             uniqueSequences: uniqueSequences,
+            uniquePastObservations: uniquePastObservations,
+            visionToPast: visionToPast,
             sampleToVision: sampleToVision
         )
     }
@@ -426,9 +484,11 @@ final class CachedDataset: @unchecked Sendable {
         pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
         actionRows actionDestination: UnsafeMutableRawBufferPointer
     ) {
+        let sequences = indices.map(observationSequence(at:))
         populateTrainingBatch(
             at: indices,
-            observationSequences: indices.map(observationSequence(at:)),
+            observationSequences: sequences,
+            pastObservationIndices: expandedPastObservationIndices(for: sequences),
             packedCurrentObservations: currentDestination,
             packedPastObservations: pastDestination,
             pastControlRows: controlDestination,
@@ -444,13 +504,79 @@ final class CachedDataset: @unchecked Sendable {
         pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
         actionRows actionDestination: UnsafeMutableRawBufferPointer
     ) {
+        populateTrainingBatch(
+            at: indices,
+            observationSequences: observationSequences,
+            pastObservationIndices: expandedPastObservationIndices(for: observationSequences),
+            packedCurrentObservations: currentDestination,
+            packedPastObservations: pastDestination,
+            pastControlRows: controlDestination,
+            actionRows: actionDestination
+        )
+    }
+
+    /// Writes a deduplicated visual batch. Current images remain one per unique
+    /// temporal sequence, while each reduced-resolution past observation is
+    /// copied and encoded only once even when overlapping causal windows refer
+    /// to it repeatedly. Controls intentionally remain sequence-shaped because
+    /// padding slots and real slots can share an image but never share meaning.
+    func populateTrainingBatch(
+        at indices: [Int],
+        visionPlan: CachedVisionBatchPlan,
+        packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
+        packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
+        pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
+        actionRows actionDestination: UnsafeMutableRawBufferPointer
+    ) {
+        precondition(visionPlan.sampleToVision.count == indices.count)
+        precondition(
+            visionPlan.visionToPast.count
+                == visionPlan.uniqueSequences.count * manifest.temporalVision.pastFrameCount
+        )
+        populateTrainingBatch(
+            at: indices,
+            observationSequences: visionPlan.uniqueSequences,
+            pastObservationIndices: visionPlan.uniquePastObservations,
+            packedCurrentObservations: currentDestination,
+            packedPastObservations: pastDestination,
+            pastControlRows: controlDestination,
+            actionRows: actionDestination
+        )
+    }
+
+    private func expandedPastObservationIndices(
+        for observationSequences: [CachedObservationSequence]
+    ) -> [UInt32] {
+        let pastFrameCount = manifest.temporalVision.pastFrameCount
+        var result: [UInt32] = []
+        result.reserveCapacity(observationSequences.count * pastFrameCount)
+        for sequence in observationSequences {
+            precondition(sequence.indices.count == pastFrameCount + 1)
+            let current = sequence.indices[0]
+            for frame in 0..<pastFrameCount {
+                let mapped = sequence.indices[frame + 1]
+                result.append(mapped == UInt32.max ? current : mapped)
+            }
+        }
+        return result
+    }
+
+    private func populateTrainingBatch(
+        at indices: [Int],
+        observationSequences: [CachedObservationSequence],
+        pastObservationIndices: [UInt32],
+        packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
+        packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
+        pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
+        actionRows actionDestination: UnsafeMutableRawBufferPointer
+    ) {
         let batchCount = indices.count
         let pastFrameCount = manifest.temporalVision.pastFrameCount
         let currentBytes = manifest.currentObservationBytesPerSample
         let pastBytes = manifest.pastObservationBytesPerSample
         let actionRowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
         precondition(currentDestination.count == observationSequences.count * currentBytes)
-        precondition(pastDestination.count == observationSequences.count * pastFrameCount * pastBytes)
+        precondition(pastDestination.count == pastObservationIndices.count * pastBytes)
         precondition(controlDestination.count == observationSequences.count * pastFrameCount * actionRowBytes)
         precondition(actionDestination.count == batchCount * 2 * actionRowBytes)
         if let controlBase = controlDestination.baseAddress {
@@ -479,12 +605,6 @@ final class CachedDataset: @unchecked Sendable {
                         )
                         for frame in 0..<pastFrameCount {
                             let mapped = sequence.indices[frame + 1]
-                            let sourceObservation = mapped == UInt32.max ? current : Int(mapped)
-                            memcpy(
-                                pastDestinationBase.advanced(by: (visionRow * pastFrameCount + frame) * pastBytes),
-                                pastSourceBase.advanced(by: sourceObservation * pastBytes),
-                                pastBytes
-                            )
                             // Padding frames intentionally carry no controls, so
                             // duplicating the current low-resolution image at a
                             // segment boundary can never leak its target action.
@@ -496,6 +616,13 @@ final class CachedDataset: @unchecked Sendable {
                                 )
                             }
                         }
+                    }
+                    for (pastRow, observation) in pastObservationIndices.enumerated() {
+                        memcpy(
+                            pastDestinationBase.advanced(by: pastRow * pastBytes),
+                            pastSourceBase.advanced(by: Int(observation) * pastBytes),
+                            pastBytes
+                        )
                     }
                 }
             }

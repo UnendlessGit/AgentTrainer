@@ -2224,6 +2224,9 @@ final class DomainTests: XCTestCase {
         )
         XCTAssertEqual(plan.sampleToVision, [0, 1, 1, 0, 2, 2])
         XCTAssertEqual(fixture.dataset.observationReuseRatio(at: indices), 2, accuracy: 0.000_001)
+        XCTAssertEqual(plan.uniquePastObservations, [0, 1])
+        XCTAssertEqual(plan.visionToPast, [0, 0, 1])
+        XCTAssertEqual(plan.pastFrameReuseRatio, 1.5, accuracy: 0.000_001)
 
         let rowBytes = ActionLayout.count * MemoryLayout<Float>.size
         var current = Data(count: plan.uniqueSequences.count)
@@ -2262,6 +2265,34 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(expandedCurrent, canonical.packedCurrentObservations)
         XCTAssertEqual(expandedPast, canonical.packedPastObservations)
         XCTAssertEqual(expandedControls, canonical.pastControlRows)
+
+        var deduplicatedPast = Data(count: plan.uniquePastObservations.count)
+        var deduplicatedCurrent = Data(count: plan.uniqueSequences.count)
+        var deduplicatedControls = Data(count: plan.uniqueSequences.count * rowBytes)
+        var deduplicatedActions = Data(count: indices.count * 2 * rowBytes)
+        deduplicatedCurrent.withUnsafeMutableBytes { currentDestination in
+            deduplicatedPast.withUnsafeMutableBytes { pastDestination in
+                deduplicatedControls.withUnsafeMutableBytes { controlDestination in
+                    deduplicatedActions.withUnsafeMutableBytes { actionDestination in
+                        fixture.dataset.populateTrainingBatch(
+                            at: indices,
+                            visionPlan: plan,
+                            packedCurrentObservations: currentDestination,
+                            packedPastObservations: pastDestination,
+                            pastControlRows: controlDestination,
+                            actionRows: actionDestination
+                        )
+                    }
+                }
+            }
+        }
+        let restoredPast = plan.visionToPast.reduce(into: Data()) { output, pastIndex in
+            output.append(deduplicatedPast[Int(pastIndex)])
+        }
+        XCTAssertEqual(deduplicatedCurrent, current)
+        XCTAssertEqual(restoredPast, past)
+        XCTAssertEqual(deduplicatedControls, controls)
+        XCTAssertEqual(deduplicatedActions, actions)
     }
 
     func testGroupedVisionOrderPreservesRowsAndKeepsPairsInsideBatches() {
@@ -2283,6 +2314,55 @@ final class DomainTests: XCTestCase {
         for start in stride(from: 0, to: order.count, by: 8) {
             let batch = order[start..<min(order.count, start + 8)]
             XCTAssertTrue(batch.contains(where: salient.contains))
+        }
+    }
+
+    func testLocalityGroupedVisionOrderRandomizesBatchesWithoutLosingLocalityOrSalience() {
+        let groups = (0..<12).map { group in [group * 2, group * 2 + 1] }
+        let salient = Set([0, 6, 12, 18])
+        let order = TrainingEngine().localityGroupedVisionTrainingOrder(
+            groups: groups,
+            batchSize: 8,
+            seed: 91,
+            salientIndices: salient
+        )
+
+        XCTAssertEqual(order.sorted(), Array(0..<24))
+        for group in groups {
+            let positions = group.compactMap(order.firstIndex)
+            XCTAssertEqual(positions.count, 2)
+            XCTAssertEqual(positions[0] / 8, positions[1] / 8)
+        }
+        for start in stride(from: 0, to: order.count, by: 8) {
+            let batch = Array(order[start..<min(order.count, start + 8)])
+            let groupIndices = batch.map { $0 / 2 }
+            XCTAssertLessThanOrEqual(
+                (groupIndices.max() ?? 0) - (groupIndices.min() ?? 0),
+                3
+            )
+            XCTAssertTrue(batch.contains(where: salient.contains))
+        }
+        XCTAssertNotEqual(order, Array(0..<24))
+    }
+
+    func testLargeLocalityBatchesMixSeveralBoundedTemporalLanes() {
+        let groups = (0..<256).map { [$0] }
+        let order = TrainingEngine().localityGroupedVisionTrainingOrder(
+            groups: groups,
+            batchSize: 128,
+            seed: 92,
+            salientIndices: []
+        )
+
+        XCTAssertEqual(order.sorted(), Array(0..<256))
+        XCTAssertNotEqual(order, Array(0..<256))
+        for start in stride(from: 0, to: order.count, by: 128) {
+            let sortedBatch = order[start..<min(order.count, start + 128)].sorted()
+            let runCount = zip(sortedBatch, sortedBatch.dropFirst()).count { pair in
+                pair.1 != pair.0 + 1
+            } + 1
+            XCTAssertLessThanOrEqual(runCount, 4)
+            XCTAssertEqual(sortedBatch.count, 128)
         }
     }
 
@@ -2708,7 +2788,7 @@ final class DomainTests: XCTestCase {
         XCTAssertLessThanOrEqual(gradientDelta, 0.000_1)
     }
 
-    func testReusedVisualFeaturesPreserveBatchLossAndGradient() {
+    func testDeduplicatedTemporalVisionPreservesBatchLossAndGradient() {
         MLXRandom.seed(88_204)
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(
@@ -2716,18 +2796,28 @@ final class DomainTests: XCTestCase {
             height: 24,
             colorMode: .grayscale
         )
-        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
-        profile.training.architecture.dropout = 0
+        profile.training.architecture.dropout = 0.15
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
-        model.train(false)
+        model.train(true)
         let uniqueInputs = temporalModelInputs(profile: profile, batch: 2, value: 0.25)
         let uniqueImages = uniqueInputs.current + MLXRandom.uniform(low: -0.1, high: 0.1, uniqueInputs.current.shape)
-        let uniquePast = uniqueInputs.past + MLXRandom.uniform(low: -0.1, high: 0.1, uniqueInputs.past.shape)
+        let generatedPast = uniqueInputs.past
+            + MLXRandom.uniform(low: -0.1, high: 0.1, uniqueInputs.past.shape)
+        let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+        let flattenedPast = generatedPast.reshaped([
+            4, pastSpec.height, pastSpec.width, pastSpec.channelCount
+        ])
+        let uniquePast = flattenedPast.take(MLXArray([Int32(0), 1, 3]), axis: 0)
+        let visionToPast = MLXArray([Int32(0), 1, 1, 2], [2, 2])
+        let sequencePast = uniquePast.take(visionToPast.flattened(), axis: 0).reshaped([
+            2, 2, pastSpec.height, pastSpec.width, pastSpec.channelCount
+        ])
         let mapping = MLXArray([Int32(0), 0, 1, 1])
         let fullImages = uniqueImages.take(mapping, axis: 0)
-        let fullPast = uniquePast.take(mapping, axis: 0)
+        let fullPast = sequencePast.take(mapping, axis: 0)
         let fullControls = uniqueInputs.controls.take(mapping, axis: 0)
         var targetValues = [Float](repeating: 0, count: 4 * ActionLayout.count)
         for row in 0..<4 {
@@ -2738,30 +2828,38 @@ final class DomainTests: XCTestCase {
         let previousTargets = MLXArray.zeros(like: targets)
         let classWeights = MLXArray.ones([ActionLayout.count])
 
-        let full = valueAndGrad(model: model) { candidate, arrays in
-            [candidate.loss(
-                currentImages: arrays[0],
-                pastImages: arrays[1],
-                pastControls: arrays[2],
-                targets: arrays[3],
-                positiveWeights: classWeights,
-                previousTargets: arrays[4]
-            )]
-        }(model, [fullImages, fullPast, fullControls, targets, previousTargets])
-        let reused = valueAndGrad(model: model) { candidate, arrays in
-            let uniqueTemporal = candidate.temporalFeatures(
-                currentImages: arrays[0],
-                pastImages: arrays[1],
-                pastControls: arrays[2]
-            )
-            let logits = candidate.logits(temporalFeatures: uniqueTemporal.take(mapping, axis: 0))
-            return [candidate.loss(
-                logits: logits,
-                targets: arrays[3],
-                positiveWeights: classWeights,
-                previousTargets: arrays[4]
-            )]
-        }(model, [uniqueImages, uniquePast, uniqueInputs.controls, targets, previousTargets])
+        let fullRandomState = MLXRandom.RandomState(seed: 90_001)
+        let full = withRandomState(fullRandomState) {
+            valueAndGrad(model: model) { candidate, arrays in
+                [candidate.loss(
+                    currentImages: arrays[0],
+                    pastImages: arrays[1],
+                    pastControls: arrays[2],
+                    targets: arrays[3],
+                    positiveWeights: classWeights,
+                    previousTargets: arrays[4]
+                )]
+            }(model, [fullImages, fullPast, fullControls, targets, previousTargets])
+        }
+        let reusedRandomState = MLXRandom.RandomState(seed: 90_001)
+        let reused = withRandomState(reusedRandomState) {
+            valueAndGrad(model: model) { candidate, arrays in
+                let uniqueTemporal = candidate.temporalFeatures(
+                    currentImages: arrays[0],
+                    pastImages: arrays[1],
+                    pastControls: arrays[2],
+                    visionToPast: visionToPast,
+                    sampleToVision: mapping
+                )
+                let logits = candidate.logits(temporalFeatures: uniqueTemporal)
+                return [candidate.loss(
+                    logits: logits,
+                    targets: arrays[3],
+                    positiveWeights: classWeights,
+                    previousTargets: arrays[4]
+                )]
+            }(model, [uniqueImages, uniquePast, uniqueInputs.controls, targets, previousTargets])
+        }
         MLX.eval(full.0, full.1, reused.0, reused.1)
 
         XCTAssertEqual(full.0[0].item(Float.self), reused.0[0].item(Float.self), accuracy: 0.000_01)

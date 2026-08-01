@@ -346,63 +346,126 @@ final class AgentPolicy: Module, @unchecked Sendable {
     func temporalFeatures(
         currentImages: MLXArray,
         pastImages: MLXArray,
-        pastControls: MLXArray
+        pastControls: MLXArray,
+        visionToPast: MLXArray? = nil,
+        sampleToVision: MLXArray? = nil
     ) -> MLXArray {
         temporalFeatures(
             currentVisualFeatures: visualActivations(images: currentImages).last!,
             pastImages: pastImages,
-            pastControls: pastControls
+            pastControls: pastControls,
+            visionToPast: visionToPast,
+            sampleToVision: sampleToVision
         )
     }
 
     func temporalFeatures(
         currentVisualFeatures: MLXArray,
         pastImages: MLXArray,
-        pastControls: MLXArray
+        pastControls: MLXArray,
+        visionToPast: MLXArray? = nil,
+        sampleToVision: MLXArray? = nil
     ) -> MLXArray {
         temporalFeatures(
             currentVisualEmbedding: visualEmbedding(visualFeatures: currentVisualFeatures),
             pastImages: pastImages,
-            pastControls: pastControls
+            pastControls: pastControls,
+            visionToPast: visionToPast,
+            sampleToVision: sampleToVision
         )
     }
 
     func temporalFeatures(
         currentVisualEmbedding: MLXArray,
         pastImages: MLXArray,
-        pastControls: MLXArray
+        pastControls: MLXArray,
+        visionToPast: MLXArray? = nil,
+        sampleToVision: MLXArray? = nil
     ) -> MLXArray {
-        precondition(pastImages.ndim == 5, "Past images must have shape [batch, frames, height, width, channels].")
         precondition(pastControls.ndim == 3, "Past controls must have shape [batch, frames, controls].")
-        let batch = currentVisualEmbedding.dim(0)
-        let frameCount = pastImages.dim(1)
+        var currentVisualEmbedding = currentVisualEmbedding
+        var controls = pastControls.asType(dtype)
+        let visionCount = currentVisualEmbedding.dim(0)
+        let frameCount = pastControls.dim(1)
         let temporal = profile.training.effectiveTemporalVision
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         precondition(
             frameCount == temporal.pastFrameCount
-                && pastImages.dim(0) == batch
-                && pastImages.dim(2) == pastSpec.height
-                && pastImages.dim(3) == pastSpec.width
-                && pastImages.dim(4) == pastSpec.channelCount,
-            "Past images do not match this brain's immutable temporal-vision contract."
-        )
-        precondition(
-            pastControls.dim(0) == batch
+                && pastControls.dim(0) == visionCount
                 && pastControls.dim(1) == frameCount
                 && pastControls.dim(2) == ActionLayout.count,
             "Past controls must pair one complete control row with every past image."
         )
-        let flattenedPast = pastImages.reshaped([
-            batch * frameCount,
-            pastImages.dim(2),
-            pastImages.dim(3),
-            pastImages.dim(4)
-        ])
-        let pastEmbedding = pastVisualEmbedding(
-            visualFeatures: pastVisualActivations(images: flattenedPast).last!
-        ).reshaped([batch, frameCount, profile.training.architecture.visualEmbedding])
+        var pastEmbedding: MLXArray
+        if let visionToPast {
+            precondition(
+                pastImages.ndim == 4
+                    && pastImages.dim(1) == pastSpec.height
+                    && pastImages.dim(2) == pastSpec.width
+                    && pastImages.dim(3) == pastSpec.channelCount,
+                "Deduplicated past images must have shape [unique frames, height, width, channels]."
+            )
+            precondition(
+                visionToPast.ndim == 2
+                    && visionToPast.dim(0) == visionCount
+                    && visionToPast.dim(1) == frameCount,
+                "The past-frame map must have shape [vision rows, past frames]."
+            )
+            let uniquePastEmbedding = pastVisualEmbedding(
+                visualFeatures: pastVisualActivations(images: pastImages).last!
+            )
+            let mappedPastEmbedding = uniquePastEmbedding.dim(0) == visionCount * frameCount
+                ? uniquePastEmbedding
+                : uniquePastEmbedding.take(visionToPast.flattened(), axis: 0)
+            pastEmbedding = mappedPastEmbedding.reshaped([
+                visionCount,
+                frameCount,
+                profile.training.architecture.visualEmbedding
+            ])
+        } else {
+            precondition(
+                pastImages.ndim == 5
+                    && pastImages.dim(0) == visionCount
+                    && pastImages.dim(1) == frameCount
+                    && pastImages.dim(2) == pastSpec.height
+                    && pastImages.dim(3) == pastSpec.width
+                    && pastImages.dim(4) == pastSpec.channelCount,
+                "Past images do not match this brain's immutable temporal-vision contract."
+            )
+            let flattenedPast = pastImages.reshaped([
+                visionCount * frameCount,
+                pastImages.dim(2),
+                pastImages.dim(3),
+                pastImages.dim(4)
+            ])
+            pastEmbedding = pastVisualEmbedding(
+                visualFeatures: pastVisualActivations(images: flattenedPast).last!
+            ).reshaped([
+                visionCount,
+                frameCount,
+                profile.training.architecture.visualEmbedding
+            ])
+        }
 
-        var controls = pastControls.asType(dtype)
+        // CNN features are deterministic and safe to share. During training we
+        // gather them back to action-row shape before control masking and the
+        // recurrent/fusion stack. This retains one independent mask and one
+        // dropout path per label, matching the canonical stochastic objective.
+        if let sampleToVision {
+            precondition(
+                sampleToVision.ndim == 1,
+                "The sample-to-vision map must contain one index per action row."
+            )
+            // The cache assigns unique rows in first-use order, so an equal
+            // row count proves this map is the identity and avoids three
+            // otherwise redundant Metal gathers at equal action/perception FPS.
+            if sampleToVision.dim(0) != visionCount {
+                currentVisualEmbedding = currentVisualEmbedding.take(sampleToVision, axis: 0)
+                pastEmbedding = pastEmbedding.take(sampleToVision, axis: 0)
+                controls = controls.take(sampleToVision, axis: 0)
+            }
+        }
+        let batch = currentVisualEmbedding.dim(0)
         // Complete frame-aligned controls are useful temporal evidence, but
         // held keys and buttons are still an easy shortcut. Mask only the
         // control half for half of training samples; past vision always remains

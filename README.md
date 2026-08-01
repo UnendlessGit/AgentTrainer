@@ -57,13 +57,13 @@ Run the complete test suite:
 ./test.sh
 ```
 
-Run the opt-in release benchmark for a compact fixture and the default vision/model/batch hardware profile (with stochastic layers disabled for repeatability):
+Run the opt-in release benchmark for a compact fixture, the default vision/model/batch hardware profile, and a large 16-frame Float32 temporal stress profile (with stochastic layers disabled for repeatability):
 
 ```sh
 ./benchmark.sh
 ```
 
-The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. It compares training and validation loss after matched update counts; low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
+The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. Default and temporal-stress runs also report sustained throughput windows, MLX memory, and thermal pressure. It compares training and validation loss after matched update counts; low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
 
 Build, sign, package, and install:
 

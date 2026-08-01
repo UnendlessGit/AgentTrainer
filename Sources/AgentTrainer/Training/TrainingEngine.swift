@@ -41,6 +41,10 @@ private enum TrainingSamplingContract {
     /// Keeps every label exactly once while colocating rows that share a causal
     /// perception pair. The visual encoder evaluates each unique pair once.
     static let groupedVision = 2
+    /// Keeps nearby causal windows together, then randomizes the order of those
+    /// local batches. Overlapping windows can share individual past-frame CNN
+    /// embeddings and mapped dataset reads retain useful page locality.
+    static let localityGroupedVision = 3
 }
 
 private enum TrainingValidationContract {
@@ -53,6 +57,8 @@ private enum TrainingValidationContract {
 
 final class TrainingEngine: @unchecked Sendable {
     private static let minimumVisionReuseRatio = 1.20
+    private static let metricsPublishInterval = 0.5
+    private static let publishedLossHistoryLimit = 2_048
     typealias MetricsHandler = @Sendable (TrainingMetrics, String) -> Void
     typealias CompletionHandler = @Sendable (Result<TrainingCompletion, Error>) -> Void
 
@@ -128,20 +134,34 @@ final class TrainingEngine: @unchecked Sendable {
         let stepsPerEpoch = Int(ceil(Double(split.train.count) / Double(batchSize)))
         let (observationReuseRatio, groupedTrainingObservations): (Double, [[Int]]) = {
             let plan = dataset.visionBatchPlan(at: split.train)
-            // A gather has a small fixed cost. Require enough duplicate temporal
-            // work to recover it even on compact networks; common 60/30 FPS
-            // datasets are close to 2x and comfortably exceed this crossover.
-            guard plan.reuseRatio >= Self.minimumVisionReuseRatio else {
-                return (plan.reuseRatio, [])
-            }
-            return (
-                plan.reuseRatio,
-                dataset.observationGroups(at: split.train, using: plan)
+            let groups = dataset.observationGroups(at: split.train, using: plan)
+            let probeRows = Array(localityGroupedVisionTrainingOrder(
+                groups: groups,
+                batchSize: batchSize,
+                seed: profile.training.seed,
+                salientIndices: []
+            ).prefix(batchSize))
+            let probe = dataset.visionBatchPlan(at: probeRows)
+            let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(
+                from: profile.preprocessing
             )
+            let currentPixels = profile.preprocessing.width * profile.preprocessing.height
+            let pastPixels = pastSpec.width * pastSpec.height
+            let encoderReuse = probe.encoderWorkReuseRatio(
+                currentPixels: currentPixels,
+                pastPixels: pastPixels
+            )
+            // Integer gathers have a small fixed cost. Require enough measured
+            // CNN work reuse in a locality-shaped batch to recover it even on a
+            // compact network.
+            guard encoderReuse >= Self.minimumVisionReuseRatio else {
+                return (encoderReuse, [])
+            }
+            return (encoderReuse, groups)
         }()
         let reusesVisionFeatures = !groupedTrainingObservations.isEmpty
         let desiredSamplingStrategy = reusesVisionFeatures
-            ? TrainingSamplingContract.groupedVision
+            ? TrainingSamplingContract.localityGroupedVision
             : TrainingSamplingContract.salienceBalanced
         // Salience depends only on immutable cached targets and profile output
         // policy. Scan it once per run rather than repeating the CPU pass at
@@ -250,12 +270,17 @@ final class TrainingEngine: @unchecked Sendable {
             let temporalFeatures = model.temporalFeatures(
                 currentImages: batch.currentImages,
                 pastImages: batch.pastImages,
-                pastControls: batch.pastControls
+                pastControls: batch.pastControls,
+                visionToPast: batch.visionToPast
             )
-            let expandedTemporalFeatures = batch.sampleToVision.map {
-                temporalFeatures.take($0, axis: 0)
-            } ?? temporalFeatures
-            let logits = model.logits(temporalFeatures: expandedTemporalFeatures)
+            let uniqueLogits = model.logits(temporalFeatures: temporalFeatures)
+            let logits: MLXArray
+            if let sampleToVision = batch.sampleToVision,
+               sampleToVision.dim(0) != uniqueLogits.dim(0) {
+                logits = uniqueLogits.take(sampleToVision, axis: 0)
+            } else {
+                logits = uniqueLogits
+            }
             return [
                 model.loss(
                     logits: logits,
@@ -358,16 +383,16 @@ final class TrainingEngine: @unchecked Sendable {
             // Capture it in the compiled graph instead of asking valueAndGrad
             // to construct a meaningless gradient for it.
             let sampleToVision = batch.sampleToVision
+            let visionToPast = batch.visionToPast
             let result = valueAndGrad(model: model) { model, arrays in
                 let temporalFeatures = model.temporalFeatures(
                     currentImages: arrays[0],
                     pastImages: arrays[1],
-                    pastControls: arrays[2]
+                    pastControls: arrays[2],
+                    visionToPast: visionToPast,
+                    sampleToVision: sampleToVision
                 )
-                let expandedTemporalFeatures = sampleToVision.map {
-                    temporalFeatures.take($0, axis: 0)
-                } ?? temporalFeatures
-                let logits = model.logits(temporalFeatures: expandedTemporalFeatures)
+                let logits = model.logits(temporalFeatures: temporalFeatures)
                 return [model.loss(
                     logits: logits,
                     targets: arrays[3],
@@ -450,7 +475,7 @@ final class TrainingEngine: @unchecked Sendable {
             samplesPerSecond: 0,
             elapsed: state.elapsed,
             experienceElapsed: state.experienceSeconds ?? 0,
-            lossHistory: Array(state.lossHistory.suffix(4_096)),
+            lossHistory: Array(state.lossHistory.suffix(Self.publishedLossHistoryLimit)),
             epochLossHistory: Array((state.epochLossHistory ?? []).suffix(1_024)),
             validationHistory: Array(state.validationHistory.suffix(1_024)),
             learningRateHistory: Array((state.learningRateHistory ?? []).suffix(1_024)),
@@ -460,13 +485,21 @@ final class TrainingEngine: @unchecked Sendable {
         ), "\(restore.status) • continuing to epoch \(targetEpoch)")
 
         var lastMetricsPublish = CACurrentMediaTime() - 1
-        var lastRateTime = CACurrentMediaTime()
-        var samplesSinceRate = 0
+        var performance = TrainingPerformanceWindow()
+        var lastPerformanceLimit: String?
 
         trainingLoop: for epoch in state.epoch..<targetEpoch {
             let epochSeed = profile.training.seed &+ UInt64(epoch) &* 0x9E3779B97F4A7C15
             let order: [Int]
-            if state.samplingStrategy == TrainingSamplingContract.groupedVision,
+            if state.samplingStrategy == TrainingSamplingContract.localityGroupedVision,
+               reusesVisionFeatures {
+                order = localityGroupedVisionTrainingOrder(
+                    groups: groupedTrainingObservations,
+                    batchSize: batchSize,
+                    seed: epochSeed,
+                    salientIndices: salientTrainingIndices
+                )
+            } else if state.samplingStrategy == TrainingSamplingContract.groupedVision,
                reusesVisionFeatures {
                 order = groupedVisionTrainingOrder(
                     groups: groupedTrainingObservations,
@@ -475,7 +508,8 @@ final class TrainingEngine: @unchecked Sendable {
                     salientIndices: salientTrainingIndices
                 )
             } else if state.samplingStrategy == TrainingSamplingContract.salienceBalanced
-                        || state.samplingStrategy == TrainingSamplingContract.groupedVision {
+                        || state.samplingStrategy == TrainingSamplingContract.groupedVision
+                        || state.samplingStrategy == TrainingSamplingContract.localityGroupedVision {
                 order = trainingOrder(
                     dataset: dataset,
                     indices: split.train,
@@ -490,21 +524,35 @@ final class TrainingEngine: @unchecked Sendable {
             var offset = epoch == state.epoch ? state.batchOffset : 0
             var epochWeightedLoss = offset > 0 ? state.currentEpochWeightedLoss ?? 0 : 0
             var epochSampleCount = offset > 0 ? state.currentEpochSampleCount ?? 0 : 0
-            var prefetchedArrays: [MLXArray]?
+            var prefetchedBatch: (arrays: [MLXArray], preparation: Double)?
             while offset < order.count {
                 try Task.checkCancellation()
                 if lock.withLock({ stopRequested }) { throw CancellationError() }
                 let end = min(order.count, offset + batchSize)
                 let batch = Array(order[offset..<end])
-                let arrays = try prefetchedArrays ?? makeBatch(
-                    dataset: dataset,
-                    indices: batch,
-                    profile: profile,
-                    inputBufferPool: inputBufferPool,
-                    reusesVisionFeatures: reusesVisionFeatures
-                )
-                prefetchedArrays = nil
-                let result: (loss: Double, next: [MLXArray]?) = try autoreleasepool {
+                let prepared: (arrays: [MLXArray], preparation: Double)
+                if let prefetchedBatch {
+                    prepared = prefetchedBatch
+                } else {
+                    let preparationStarted = CACurrentMediaTime()
+                    prepared = (
+                        try makeBatch(
+                            dataset: dataset,
+                            indices: batch,
+                            profile: profile,
+                            inputBufferPool: inputBufferPool,
+                            reusesVisionFeatures: reusesVisionFeatures
+                        ),
+                        CACurrentMediaTime() - preparationStarted
+                    )
+                }
+                prefetchedBatch = nil
+                let stepStarted = CACurrentMediaTime()
+                let result: (
+                    loss: Double,
+                    next: (arrays: [MLXArray], preparation: Double)?
+                ) = try autoreleasepool {
+                    let arrays = prepared.arrays
                     let lossArray = trainingStep(arrays)[0]
                     let modelState = model.parameters()
                     let optimizerState = optimizer.stateArrays()
@@ -514,16 +562,18 @@ final class TrainingEngine: @unchecked Sendable {
                     // optimizer output, so numerical order and exact-resume
                     // semantics are unchanged.
                     MLX.asyncEval(lossArray, modelState, optimizerState)
-                    let next: [MLXArray]?
+                    let next: (arrays: [MLXArray], preparation: Double)?
                     if end < order.count {
                         let nextEnd = min(order.count, end + batchSize)
-                        next = try makeBatch(
+                        let preparationStarted = CACurrentMediaTime()
+                        let arrays = try makeBatch(
                             dataset: dataset,
                             indices: Array(order[end..<nextEnd]),
                             profile: profile,
                             inputBufferPool: inputBufferPool,
                             reusesVisionFeatures: reusesVisionFeatures
                         )
+                        next = (arrays, CACurrentMediaTime() - preparationStarted)
                     } else {
                         next = nil
                     }
@@ -534,12 +584,17 @@ final class TrainingEngine: @unchecked Sendable {
                 guard loss.isFinite else {
                     throw AgentTrainerError.model("Training became numerically unstable before this step could be saved. Lower the learning rate or reset this brain's learning state.")
                 }
-                prefetchedArrays = result.next
+                prefetchedBatch = result.next
+                let stepSeconds = max(0.000_001, CACurrentMediaTime() - stepStarted)
+                performance.record(
+                    samples: batch.count,
+                    stepSeconds: stepSeconds,
+                    preparationSeconds: prepared.preparation
+                )
                 guard state.globalStep < Int.max else {
                     throw AgentTrainerError.model("The restored optimizer step counter is invalid and cannot be advanced safely.")
                 }
                 state.globalStep += 1
-                samplesSinceRate += batch.count
                 state.experienceSeconds = (state.experienceSeconds ?? 0) + Double(batch.count) / max(0.0001, dataset.manifest.actionFPS)
                 offset = end
                 state.epoch = epoch
@@ -552,12 +607,11 @@ final class TrainingEngine: @unchecked Sendable {
                 state.currentEpochSampleCount = epochSampleCount
 
                 let now = CACurrentMediaTime()
-                if now - lastMetricsPublish >= 0.25 || offset == order.count {
+                if now - lastMetricsPublish >= Self.metricsPublishInterval || offset == order.count {
                     lastMetricsPublish = now
                     let elapsed = baseElapsed + started.duration(to: .now).seconds
-                    let recentSeconds = max(0.001, now - lastRateTime)
-                    lastRateTime = now
                     let memory = Memory.snapshot()
+                    let thermalState = TrainingThermalState.current
                     // Publish detached suffixes so Swift array copy-on-write does
                     // not force the optimizer loop to copy its full checkpoint
                     // history on the next append while SwiftUI still retains it.
@@ -576,10 +630,14 @@ final class TrainingEngine: @unchecked Sendable {
                         validationReport: state.currentValidationReport,
                         effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
                         learningRateScale: Double(optimizer.learningRateScale),
-                        samplesPerSecond: Double(samplesSinceRate) / recentSeconds,
+                        samplesPerSecond: performance.samplesPerSecond,
+                        trainingStepMilliseconds: performance.stepMilliseconds,
+                        batchPreparationMilliseconds: performance.preparationMilliseconds,
+                        throughputRetention: performance.throughputRetention,
+                        thermalState: thermalState,
                         elapsed: elapsed,
                         experienceElapsed: state.experienceSeconds ?? 0,
-                        lossHistory: Array(state.lossHistory.suffix(4_096)),
+                        lossHistory: Array(state.lossHistory.suffix(Self.publishedLossHistoryLimit)),
                         epochLossHistory: Array((state.epochLossHistory ?? []).suffix(1_024)),
                         validationHistory: Array(state.validationHistory.suffix(1_024)),
                         learningRateHistory: Array((state.learningRateHistory ?? []).suffix(1_024)),
@@ -587,11 +645,31 @@ final class TrainingEngine: @unchecked Sendable {
                         mlxCacheMemory: memory.cacheMemory,
                         mlxPeakMemory: memory.peakMemory
                     )
-                    samplesSinceRate = 0
                     let visionStatus = reusesVisionFeatures
                         ? " • shared temporal work \(observationReuseRatio.formatted(.number.precision(.fractionLength(2))))×"
                         : ""
-                    metrics(report, "Pipelined training on Apple-silicon GPU\(visionStatus)")
+                    let performanceLimit = performance.limitingStatus(
+                        memory: memory,
+                        thermalState: thermalState
+                    )
+                    if performanceLimit != lastPerformanceLimit {
+                        lastPerformanceLimit = performanceLimit
+                        if let performanceLimit {
+                            AppLog.write(
+                                .warning,
+                                category: "Training",
+                                performanceLimit,
+                                details: "throughput retention \((100 * performance.throughputRetention).formatted(.number.precision(.fractionLength(1))))%; "
+                                    + "step \(performance.stepMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms; "
+                                    + "input \(performance.preparationMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms; "
+                                    + "thermal \(thermalState.rawValue)"
+                            )
+                        }
+                    }
+                    metrics(
+                        report,
+                        performanceLimit ?? "Pipelined training on Apple-silicon GPU\(visionStatus)"
+                    )
                 }
 
                 let shouldCheckpoint = state.globalStep >= nextAutosaveStep
@@ -693,10 +771,14 @@ final class TrainingEngine: @unchecked Sendable {
                 validationReport: state.currentValidationReport,
                 effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
                 learningRateScale: Double(optimizer.learningRateScale),
-                samplesPerSecond: 0,
+                samplesPerSecond: performance.samplesPerSecond,
+                trainingStepMilliseconds: performance.stepMilliseconds,
+                batchPreparationMilliseconds: performance.preparationMilliseconds,
+                throughputRetention: performance.throughputRetention,
+                thermalState: TrainingThermalState.current,
                 elapsed: state.elapsed,
                 experienceElapsed: state.experienceSeconds ?? 0,
-                lossHistory: Array(state.lossHistory.suffix(4_096)),
+                lossHistory: Array(state.lossHistory.suffix(Self.publishedLossHistoryLimit)),
                 epochLossHistory: Array(epochLossHistory.suffix(1_024)),
                 validationHistory: Array(state.validationHistory.suffix(1_024)),
                 learningRateHistory: Array(learningRateHistory.suffix(1_024)),
@@ -728,30 +810,38 @@ final class TrainingEngine: @unchecked Sendable {
         let count = indices.count
         let visionPlan = reusesVisionFeatures ? dataset.visionBatchPlan(at: indices) : nil
         let visionCount = visionPlan?.uniqueSequences.count ?? count
+        let pastVisionCount = visionPlan?.uniquePastObservations.count
+            ?? visionCount * temporal.pastFrameCount
         var descriptors: [MetalArrayBufferPool.Descriptor] = [
             .init([visionCount, profile.preprocessing.sampleByteCount], dtype: .uint8),
-            .init([visionCount, temporal.pastFrameCount, pastSpec.sampleByteCount], dtype: .uint8),
+            reusesVisionFeatures
+                ? .init([pastVisionCount, pastSpec.sampleByteCount], dtype: .uint8)
+                : .init([visionCount, temporal.pastFrameCount, pastSpec.sampleByteCount], dtype: .uint8),
             .init([visionCount, temporal.pastFrameCount, ActionLayout.count], dtype: .float32)
         ]
         if reusesVisionFeatures {
+            descriptors.append(.init([visionCount, temporal.pastFrameCount], dtype: .int32))
             descriptors.append(.init([count], dtype: .int32))
         }
         descriptors.append(
             .init([count, 2, ActionLayout.count], dtype: .float32)
         )
         return try inputBufferPool.makeArrays(descriptors) { destinations in
-            let actionDestination = destinations[reusesVisionFeatures ? 4 : 3]
+            let actionDestination = destinations[reusesVisionFeatures ? 5 : 3]
             if let visionPlan {
                 dataset.populateTrainingBatch(
                     at: indices,
-                    observationSequences: visionPlan.uniqueSequences,
+                    visionPlan: visionPlan,
                     packedCurrentObservations: destinations[0],
                     packedPastObservations: destinations[1],
                     pastControlRows: destinations[2],
                     actionRows: actionDestination
                 )
-                visionPlan.sampleToVision.withUnsafeBytes {
+                visionPlan.visionToPast.withUnsafeBytes {
                     destinations[3].copyMemory(from: $0)
+                }
+                visionPlan.sampleToVision.withUnsafeBytes {
+                    destinations[4].copyMemory(from: $0)
                 }
             } else {
                 dataset.populateTrainingBatch(
@@ -783,12 +873,15 @@ final class TrainingEngine: @unchecked Sendable {
         reusesVisionFeatures: Bool
     ) -> ExpandedTrainingBatch {
         let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
-        let actions = arrays[reusesVisionFeatures ? 4 : 3]
+        let actions = arrays[reusesVisionFeatures ? 5 : 3]
         return ExpandedTrainingBatch(
             currentImages: VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
-            pastImages: VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec),
+            pastImages: reusesVisionFeatures
+                ? VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec)
+                : VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec),
             pastControls: arrays[2],
-            sampleToVision: reusesVisionFeatures ? arrays[3] : nil,
+            visionToPast: reusesVisionFeatures ? arrays[3] : nil,
+            sampleToVision: reusesVisionFeatures ? arrays[4] : nil,
             targets: actions[0..., 0, 0...],
             previousTargets: actions[0..., 1, 0...]
         )
@@ -977,6 +1070,81 @@ final class TrainingEngine: @unchecked Sendable {
             salient: salientGroups
         )
         return orderedGroups.flatMap { groups[$0] }
+    }
+
+    /// Builds temporally local batches, then shuffles the batches and their
+    /// internal row groups deterministically. The optimizer still sees every
+    /// row exactly once in a randomized epoch, while adjacent causal windows
+    /// share mapped pages and individual past-frame CNN embeddings.
+    func localityGroupedVisionTrainingOrder(
+        groups: [[Int]],
+        batchSize rawBatchSize: Int,
+        seed: UInt64,
+        salientIndices: Set<Int>
+    ) -> [Int] {
+        guard !groups.isEmpty else { return [] }
+        let batchSize = max(1, rawBatchSize)
+        let averageGroupSize = Double(groups.reduce(0) { $0 + $1.count })
+            / Double(max(1, groups.count))
+        let groupsPerBatch = max(
+            1,
+            Int((Double(batchSize) / max(1, averageGroupSize)).rounded())
+        )
+        let laneCount = groupsPerBatch >= 64 ? 4 : groupsPerBatch >= 16 ? 2 : 1
+        let groupsPerLane = max(1, Int(ceil(Double(groupsPerBatch) / Double(laneCount))))
+        let localityRuns: [[Int]] = stride(
+            from: 0,
+            to: groups.count,
+            by: groupsPerLane
+        ).map { start in
+            Array(start..<min(groups.count, start + groupsPerLane))
+        }
+        // Combine a few independently selected local runs in each optimizer
+        // batch. This keeps gradient diversity close to a global shuffle while
+        // retaining long enough contiguous lanes for frame and page reuse.
+        let randomizedRuns = shuffled(Array(localityRuns.indices), seed: seed)
+        var localityBatches: [[Int]] = stride(
+            from: 0,
+            to: randomizedRuns.count,
+            by: laneCount
+        ).map { start in
+            randomizedRuns[start..<min(randomizedRuns.count, start + laneCount)]
+                .flatMap { localityRuns[$0] }
+        }
+        let salientGroups = Set(groups.indices.filter { group in
+            groups[group].contains(where: salientIndices.contains)
+        })
+
+        // Preserve the existing high-signal coverage contract with minimal
+        // damage to locality: only batches without a salient group receive one,
+        // and it is swapped from a batch that has more than one.
+        if salientGroups.count >= localityBatches.count {
+            func salientCount(in batch: [Int]) -> Int {
+                batch.count(where: salientGroups.contains)
+            }
+            for receiver in localityBatches.indices
+            where salientCount(in: localityBatches[receiver]) == 0 {
+                guard let donor = localityBatches.indices.first(where: {
+                    $0 != receiver && salientCount(in: localityBatches[$0]) > 1
+                }),
+                let donorPosition = localityBatches[donor].firstIndex(where: salientGroups.contains),
+                let receiverPosition = localityBatches[receiver].firstIndex(where: {
+                    !salientGroups.contains($0)
+                }) else { continue }
+                let salientGroup = localityBatches[donor][donorPosition]
+                localityBatches[donor][donorPosition] = localityBatches[receiver][receiverPosition]
+                localityBatches[receiver][receiverPosition] = salientGroup
+            }
+        }
+
+        let randomizedBatches = shuffled(Array(localityBatches.indices), seed: seed)
+        return randomizedBatches.flatMap { batchIndex in
+            let groupOrder = shuffled(
+                localityBatches[batchIndex],
+                seed: seed ^ (UInt64(batchIndex) &* 0xD1B54A32D192ED03)
+            )
+            return groupOrder.flatMap { groups[$0] }
+        }
     }
 
     private func salienceBalancedOrder(
@@ -1285,6 +1453,7 @@ final class TrainingEngine: @unchecked Sendable {
             let samplingStrategyIsKnown = restored.samplingStrategy == nil
                 || restored.samplingStrategy == TrainingSamplingContract.salienceBalanced
                 || restored.samplingStrategy == TrainingSamplingContract.groupedVision
+                || restored.samplingStrategy == TrainingSamplingContract.localityGroupedVision
             if restored.profileSignature == expectedSignature,
                recordingOrderMatches,
                samplingStrategyIsKnown {
@@ -1348,10 +1517,71 @@ private struct CheckpointRestore {
     var captureValidationBaseline: Bool
 }
 
+private struct TrainingPerformanceWindow {
+    private static let capacity = 32
+    private static let minimumStableSamples = 8
+
+    private var measurements: [(samples: Int, seconds: Double, preparation: Double)] = []
+    private var bestStableSamplesPerSecond = 0.0
+    private(set) var samplesPerSecond = 0.0
+    private(set) var stepMilliseconds = 0.0
+    private(set) var preparationMilliseconds = 0.0
+    private(set) var throughputRetention = 1.0
+
+    init() {
+        measurements.reserveCapacity(Self.capacity)
+    }
+
+    mutating func record(samples: Int, stepSeconds: Double, preparationSeconds: Double) {
+        measurements.append((
+            max(0, samples),
+            max(0.000_001, stepSeconds),
+            max(0, preparationSeconds)
+        ))
+        if measurements.count > Self.capacity {
+            measurements.removeFirst(measurements.count - Self.capacity)
+        }
+        let sampleCount = measurements.reduce(0) { $0 + $1.samples }
+        let seconds = measurements.reduce(0.0) { $0 + $1.seconds }
+        samplesPerSecond = Double(sampleCount) / max(0.000_001, seconds)
+        stepMilliseconds = 1_000 * seconds / Double(max(1, measurements.count))
+        preparationMilliseconds = 1_000
+            * measurements.reduce(0.0) { $0 + $1.preparation }
+            / Double(max(1, measurements.count))
+        if measurements.count >= Self.minimumStableSamples {
+            bestStableSamplesPerSecond = max(bestStableSamplesPerSecond, samplesPerSecond)
+        }
+        throughputRetention = bestStableSamplesPerSecond > 0
+            ? min(1, samplesPerSecond / bestStableSamplesPerSecond)
+            : 1
+    }
+
+    func limitingStatus(
+        memory: Memory.Snapshot,
+        thermalState: TrainingThermalState,
+        physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory
+    ) -> String? {
+        guard measurements.count == Self.capacity,
+              throughputRetention < 0.80 else { return nil }
+        if thermalState == .serious || thermalState == .critical {
+            return "Thermal pressure is throttling Metal"
+        }
+        if preparationMilliseconds >= stepMilliseconds * 0.65 {
+            return "Mapped-data paging is limiting the GPU input pipeline"
+        }
+        let usedUnifiedMemory = Double(memory.activeMemory) + Double(memory.cacheMemory)
+        if usedUnifiedMemory > Double(physicalMemory) * 0.70 {
+            return "Unified-memory pressure is limiting Metal"
+        }
+        return "Metal step time is below its warm-run peak"
+    }
+}
+
 private struct ExpandedTrainingBatch {
     let currentImages: MLXArray
     let pastImages: MLXArray
     let pastControls: MLXArray
+    let visionToPast: MLXArray?
     let sampleToVision: MLXArray?
     let targets: MLXArray
     let previousTargets: MLXArray
