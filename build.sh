@@ -188,7 +188,7 @@ rm -rf "$OUTPUTS/AgentTrainer.app"
 SOURCE_ARCHIVE="$OUTPUTS/AgentTrainer-Source.zip"
 rm -f "$SOURCE_ARCHIVE"
 cd "$ROOT"
-/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources build.sh test.sh README.md DEVELOPMENT_GUIDE.md -x '*.DS_Store'
+/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources build.sh test.sh benchmark.sh README.md DEVELOPMENT_GUIDE.md -x '*.DS_Store'
 
 DMG_STAGE="$BUILD_ROOT/DMG"
 DMG_APP="$DMG_STAGE/AgentTrainer.app"

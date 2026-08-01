@@ -484,6 +484,49 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(packed.allSatisfy { [0, 85, 170, 255].contains($0) })
     }
 
+    func testPipelinedMetalPreprocessingPreservesSynchronousBytesAndOrder() throws {
+        let attributes = [
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ] as CFDictionary
+        let buffers: [CVPixelBuffer] = try [19, 67, 113, 181, 239].map { value in
+            var pixelBuffer: CVPixelBuffer?
+            XCTAssertEqual(
+                CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    32,
+                    24,
+                    kCVPixelFormatType_32BGRA,
+                    attributes,
+                    &pixelBuffer
+                ),
+                kCVReturnSuccess
+            )
+            let buffer = try XCTUnwrap(pixelBuffer)
+            CVPixelBufferLockBaseAddress(buffer, [])
+            memset(CVPixelBufferGetBaseAddress(buffer), Int32(value), CVPixelBufferGetDataSize(buffer))
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            return buffer
+        }
+        let spec = PreprocessingSpec(
+            width: 23,
+            height: 13,
+            colorMode: .color,
+            bitDepth: 8,
+            chroma: .yuv420,
+            resizePolicy: .fit
+        )
+        let synchronous = try VisionPreprocessor()
+        let expected = try buffers.map { try synchronous.process($0, spec: spec) }
+        let pipelined = try VisionPreprocessor()
+        let pending = try buffers.map { try pipelined.submit($0, spec: spec) }
+        let actual = try pending.map { frame in
+            try frame.withPackedBytes { Data($0) }
+        }
+
+        XCTAssertEqual(actual, expected)
+    }
+
     func testNativeVideoRangePreprocessingMatchesBGRAWithoutQualityLoss() throws {
         let attributes = [
             kCVPixelBufferMetalCompatibilityKey: true,
@@ -1674,9 +1717,27 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(values[2], 0, accuracy: 0.000_001)
         XCTAssertEqual(values[3], -1, accuracy: 0.000_001)
 
+        let packedPair = VisionPreprocessor.mlxTemporalTensor(
+            MLXArray(Data([255, 0, 0, 255]), [1, 2, spec.sampleByteCount], dtype: .uint8),
+            spec: spec
+        )
+        MLX.eval(packedPair)
+        XCTAssertEqual(packedPair.asArray(Float.self), values)
+
         let firstFrame = VisionPreprocessor.mlxTemporalTensor(current: Data([255, 0]), previous: nil, batch: 1, spec: spec)
         MLX.eval(firstFrame)
         XCTAssertEqual(firstFrame.asArray(Float.self), [1, 0, 0, 0])
+    }
+
+    func testMetalSharedInputBufferHandsExactBytesToMLX() throws {
+        let pool = try MetalArrayBufferPool(maximumCachedBytes: 1 << 20)
+        let expected = (0..<4096).map { UInt8(truncatingIfNeeded: $0 &* 31) }
+        let array = try pool.makeArrays([.init([16, 256], dtype: .uint8)]) { destinations in
+            expected.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
+        }[0]
+        MLX.eval(array)
+
+        XCTAssertEqual(array.asArray(UInt8.self), expected)
     }
 
     func testCNNVisualizationSettingsAreStrictlyBounded() {
@@ -1853,6 +1914,62 @@ final class DomainTests: XCTestCase {
         XCTAssertThrowsError(try ResumableAdamW(learningRate: 0.001, weightDecay: 0.01).load(from: url))
     }
 
+    func testIntegratedGlobalGradientClipExactlyMatchesCanonicalClipping() throws {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 16, height: 12, colorMode: .grayscale)
+        profile.training.architecture = .small
+        profile.training.precision = .bfloat16
+        let canonicalModel = AgentPolicy(profile: profile)
+        let integratedModel = AgentPolicy(profile: profile)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("integrated-clip-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try canonicalModel.saveWeights(to: url)
+        try integratedModel.loadWeights(from: url)
+        let canonicalOptimizer = ResumableAdamW(learningRate: 0.0003, weightDecay: 0.01)
+        let integratedOptimizer = ResumableAdamW(learningRate: 0.0003, weightDecay: 0.01)
+        canonicalOptimizer.initialize(model: canonicalModel)
+        integratedOptimizer.initialize(model: integratedModel)
+        let canonicalGradients = canonicalModel.mapParameters {
+            MLXArray.ones($0.shape) * 0.03125
+        }
+        let integratedGradients = integratedModel.mapParameters {
+            MLXArray.ones($0.shape) * 0.03125
+        }
+
+        for _ in 0..<4 {
+            let clipped = clipGradNorm(gradients: canonicalGradients, maxNorm: 0.1).0
+            canonicalOptimizer.update(
+                model: canonicalModel,
+                gradients: clipped,
+                targetType: canonicalModel.dtype
+            )
+            integratedOptimizer.update(
+                model: integratedModel,
+                gradients: integratedGradients,
+                targetType: integratedModel.dtype,
+                gradientNorm: ResumableAdamW.globalGradientNorm(integratedGradients),
+                maxGradientNorm: 0.1
+            )
+            MLX.eval(
+                canonicalModel.parameters(),
+                integratedModel.parameters(),
+                canonicalOptimizer.stateArrays(),
+                integratedOptimizer.stateArrays()
+            )
+        }
+
+        let expectedParameters = canonicalModel.parameters().flattened().sorted { $0.0 < $1.0 }
+        let actualParameters = integratedModel.parameters().flattened().sorted { $0.0 < $1.0 }
+        XCTAssertEqual(expectedParameters.map(\.0), actualParameters.map(\.0))
+        for (expected, actual) in zip(expectedParameters, actualParameters) {
+            XCTAssertEqual(expected.1.asArray(Float.self), actual.1.asArray(Float.self), expected.0)
+        }
+        XCTAssertEqual(canonicalOptimizer.stateArrays().count, integratedOptimizer.stateArrays().count)
+        for (expected, actual) in zip(canonicalOptimizer.stateArrays(), integratedOptimizer.stateArrays()) {
+            XCTAssertEqual(expected.asArray(Float.self), actual.asArray(Float.self))
+        }
+    }
+
     func testCompiledTrainingStepMatchesUncompiledAdamW() throws {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 16, height: 12, colorMode: .grayscale, bitDepth: 8)
@@ -1996,6 +2113,130 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(previous[2 * ActionLayout.count], 1)
         let history = MLXArray(dataset.historyBatch(at: [2]), [1, 2, ActionLayout.count], type: Float.self).asArray(Float.self)
         XCTAssertEqual(history[0], 1); XCTAssertEqual(history[ActionLayout.count], 2)
+    }
+
+    func testFusedTrainingBatchMatchesCanonicalCacheReadsAcrossSegments() throws {
+        func verify(historyLength: Int) throws {
+            let mappings: [(UInt32, UInt32)] = [
+                (0, 0), (1, 0), (2, 1),
+                (3, 3), (4, 3), (5, 4)
+            ]
+            let rows = (0..<mappings.count).map { row -> [Float] in
+                var values = [Float](repeating: 0, count: ActionLayout.count)
+                values[0] = Float(row + 1)
+                values[ActionLayout.keyboard.lowerBound + row] = 1
+                return values
+            }
+            let fixture = try makeSyntheticDataset(
+                name: "fused-training-batch-\(historyLength)",
+                historyLength: historyLength,
+                mappings: mappings,
+                actionRows: rows,
+                segments: [
+                    CacheSegment(recordingID: UUID(), start: 0, count: 3),
+                    CacheSegment(recordingID: UUID(), start: 3, count: 3)
+                ]
+            )
+            defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+            let indices = [5, 0, 3, 2, 4, 1]
+            let fused = fixture.dataset.trainingBatch(at: indices)
+            var expectedObservationPairs = Data()
+            var expectedActionRows = Data()
+            for index in indices {
+                expectedObservationPairs.append(fixture.dataset.packedObservations(at: [index]))
+                expectedObservationPairs.append(fixture.dataset.precedingPackedObservations(at: [index]))
+                expectedActionRows.append(fixture.dataset.historyBatch(at: [index]))
+                expectedActionRows.append(fixture.dataset.actionBatch(at: [index]))
+                expectedActionRows.append(fixture.dataset.previousActionBatch(at: [index]))
+            }
+
+            XCTAssertEqual(fused.count, indices.count)
+            XCTAssertEqual(fused.packedObservationPairs, expectedObservationPairs)
+            XCTAssertEqual(fused.actionRows, expectedActionRows)
+        }
+
+        try verify(historyLength: 2)
+        try verify(historyLength: 0)
+    }
+
+    func testVisionBatchPlanDeduplicatesPairsWithoutChangingActionOrder() throws {
+        let mappings: [(UInt32, UInt32)] = [
+            (0, 0), (0, 0), (1, 0), (1, 0), (2, 1), (2, 1)
+        ]
+        let rows = mappings.indices.map { row -> [Float] in
+            var values = [Float](repeating: 0, count: ActionLayout.count)
+            values[0] = Float(row)
+            return values
+        }
+        let fixture = try makeSyntheticDataset(
+            name: "deduplicated-vision-plan",
+            historyLength: 1,
+            mappings: mappings,
+            actionRows: rows,
+            segments: [CacheSegment(recordingID: UUID(), start: 0, count: mappings.count)]
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        let indices = [3, 0, 1, 2, 5, 4]
+        let plan = fixture.dataset.visionBatchPlan(at: indices)
+        XCTAssertEqual(
+            plan.uniquePairs,
+            [
+                CachedObservationPair(current: 1, previous: 0),
+                CachedObservationPair(current: 0, previous: 0),
+                CachedObservationPair(current: 2, previous: 1)
+            ]
+        )
+        XCTAssertEqual(plan.sampleToVision, [0, 1, 1, 0, 2, 2])
+        XCTAssertEqual(fixture.dataset.observationReuseRatio(at: indices), 2, accuracy: 0.000_001)
+
+        let sampleBytes = fixture.dataset.manifest.observationBytesPerSample
+        let historyRows = max(1, fixture.dataset.manifest.historyLength) + 2
+        var packed = Data(count: plan.uniquePairs.count * 2 * sampleBytes)
+        var actions = Data(
+            count: indices.count * historyRows * ActionLayout.count * MemoryLayout<Float>.size
+        )
+        packed.withUnsafeMutableBytes { packedDestination in
+            actions.withUnsafeMutableBytes { actionDestination in
+                fixture.dataset.populateTrainingBatch(
+                    at: indices,
+                    observationPairs: plan.uniquePairs,
+                    packedObservationPairs: packedDestination,
+                    actionRows: actionDestination
+                )
+            }
+        }
+        let canonical = fixture.dataset.trainingBatch(at: indices)
+        XCTAssertEqual(actions, canonical.actionRows)
+
+        let expandedPacked = plan.sampleToVision.reduce(into: Data()) { output, visionIndex in
+            let offset = Int(visionIndex) * 2 * sampleBytes
+            output.append(packed[offset..<(offset + 2 * sampleBytes)])
+        }
+        XCTAssertEqual(expandedPacked, canonical.packedObservationPairs)
+    }
+
+    func testGroupedVisionOrderPreservesRowsAndKeepsPairsInsideBatches() {
+        let groups = (0..<12).map { group in [group * 2, group * 2 + 1] }
+        let salient = Set([0, 6, 12, 18])
+        let order = TrainingEngine().groupedVisionTrainingOrder(
+            groups: groups,
+            batchSize: 8,
+            seed: 91,
+            salientIndices: salient
+        )
+
+        XCTAssertEqual(order.sorted(), Array(0..<24))
+        for group in groups {
+            let positions = group.compactMap(order.firstIndex)
+            XCTAssertEqual(positions.count, 2)
+            XCTAssertEqual(positions[0] / 8, positions[1] / 8)
+        }
+        for start in stride(from: 0, to: order.count, by: 8) {
+            let batch = order[start..<min(order.count, start + 8)]
+            XCTAssertTrue(batch.contains(where: salient.contains))
+        }
     }
 
     func testRealVideoCacheDeduplicatesPerceptionFramesAndPreservesSubTickControls() async throws {
@@ -2248,6 +2489,272 @@ final class DomainTests: XCTestCase {
         MLX.eval(result.0, result.1)
         XCTAssertEqual(model.predictions(images: images, history: history).shape, [2, ActionLayout.count])
         XCTAssertTrue(result.0[0].item(Float.self).isFinite)
+    }
+
+    func testSharedValidationForwardPreservesLossAndPredictions() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 32, height: 24, colorMode: .grayscale, bitDepth: 8)
+        profile.training.historyLength = 2
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+        let images = grayscaleTemporalTensor(batch: 2, width: 32, height: 24, value: 0.375)
+        let history = MLXArray([Float](repeating: 0, count: 2 * 2 * ActionLayout.count), [2, 2, ActionLayout.count])
+        var targetValues = [Float](repeating: 0, count: 2 * ActionLayout.count)
+        targetValues[ActionLayout.keyboard.lowerBound + 13] = 1
+        targetValues[ActionLayout.count + ActionLayout.buttons.lowerBound] = 1
+        let targets = MLXArray(targetValues, [2, ActionLayout.count])
+        let weights = MLXArray.ones([ActionLayout.count])
+
+        let expectedLoss = model.loss(images: images, history: history, targets: targets, positiveWeights: weights)
+        let expectedPredictions = model.predictions(images: images, history: history)
+        let logits = model.callAsFunction(images: images, history: history)
+        let sharedLoss = model.loss(logits: logits, history: history, targets: targets, positiveWeights: weights)
+        let sharedPredictions = model.activatedPredictions(logits: logits)
+        MLX.eval(expectedLoss, expectedPredictions, sharedLoss, sharedPredictions)
+
+        XCTAssertEqual(sharedLoss.item(Float.self), expectedLoss.item(Float.self))
+        XCTAssertEqual(sharedPredictions.asArray(Float.self), expectedPredictions.asArray(Float.self))
+    }
+
+    func testAcceleratedGroupNormMatchesEstablishedGroupingAndGradient() {
+        MLXRandom.seed(88_201)
+        let normalization = GroupNorm(groupCount: 8, dimensions: 32)
+        let input = MLXRandom.uniform(low: -2, high: 2, [2, 9, 13, 32])
+        let selector = MLXRandom.uniform(low: -1, high: 1, input.shape)
+        let expected = normalization(input)
+        let accelerated = AgentPolicy.acceleratedGroupNorm(input, normalization: normalization)
+        let expectedGradient = grad { value in (normalization(value) * selector).sum() }(input)
+        let acceleratedGradient = grad {
+            value in (AgentPolicy.acceleratedGroupNorm(value, normalization: normalization) * selector).sum()
+        }(input)
+        MLX.eval(expected, accelerated, expectedGradient, acceleratedGradient)
+
+        let outputDelta = zip(expected.asArray(Float.self), accelerated.asArray(Float.self))
+            .reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        let gradientDelta = zip(expectedGradient.asArray(Float.self), acceleratedGradient.asArray(Float.self))
+            .reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        XCTAssertLessThanOrEqual(outputDelta, 0.000_002)
+        XCTAssertLessThanOrEqual(gradientDelta, 0.000_002)
+    }
+
+    func testVisionAccelerationUsesTheMeasuredWorkloadCrossover() {
+        XCTAssertFalse(AgentPolicy.usesAcceleratedVisionPath(batch: 16, width: 128, height: 72))
+        XCTAssertTrue(AgentPolicy.usesAcceleratedVisionPath(batch: 1, width: 640, height: 360))
+        XCTAssertTrue(AgentPolicy.usesAcceleratedVisionPath(batch: 32, width: 640, height: 360))
+    }
+
+    func testSharedCoordinateStemMatchesBatchedConvolutionAndWeightGradient() {
+        MLXRandom.seed(88_203)
+        let batch = 4, height = 31, width = 47, contentChannels = 6, outputChannels = 32
+        let input = MLXRandom.uniform(low: -1, high: 1, [batch, height, width, contentChannels])
+        let coordinates = MLXRandom.uniform(low: -1, high: 1, [1, height, width, 2])
+        let convolution = Conv2d(
+            inputChannels: contentChannels + 2,
+            outputChannels: outputChannels,
+            kernelSize: 7,
+            stride: 4,
+            padding: 3,
+            bias: false
+        )
+        let expected = convolution(concatenated([
+            input,
+            broadcast(coordinates, to: [batch, height, width, 2])
+        ], axis: -1))
+        let actual = AgentPolicy.sharedCoordinateConvolution(
+            input,
+            coordinates: coordinates,
+            convolution: convolution
+        )
+        let selector = MLXRandom.uniform(low: -1, high: 1, expected.shape)
+        let expectedValueAndGradient = valueAndGrad(model: convolution) { model, arrays in
+            let batchedCoordinates = broadcast(coordinates, to: [batch, height, width, 2])
+            return [(model(concatenated([arrays[0], batchedCoordinates], axis: -1)) * selector).sum()]
+        }(convolution, [input])
+        let actualValueAndGradient = valueAndGrad(model: convolution) { model, arrays in
+            [(
+                AgentPolicy.sharedCoordinateConvolution(
+                    arrays[0],
+                    coordinates: coordinates,
+                    convolution: model
+                ) * selector
+            ).sum()]
+        }(convolution, [input])
+        MLX.eval(
+            expected,
+            actual,
+            expectedValueAndGradient.0,
+            expectedValueAndGradient.1,
+            actualValueAndGradient.0,
+            actualValueAndGradient.1
+        )
+
+        let outputDelta = zip(expected.asArray(Float.self), actual.asArray(Float.self))
+            .reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        let expectedGradients = expectedValueAndGradient.1.flattened().map(\.1)
+        let actualGradients = actualValueAndGradient.1.flattened().map(\.1)
+        let gradientDelta = zip(expectedGradients, actualGradients).reduce(Float(0)) { maximum, pair in
+            let delta = zip(pair.0.asArray(Float.self), pair.1.asArray(Float.self))
+                .reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+            return max(maximum, delta)
+        }
+        XCTAssertLessThanOrEqual(outputDelta, 0.000_01)
+        XCTAssertLessThanOrEqual(gradientDelta, 0.000_1)
+    }
+
+    func testReusedVisualFeaturesPreserveBatchLossAndGradient() {
+        MLXRandom.seed(88_204)
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(
+            width: 32,
+            height: 24,
+            colorMode: .grayscale
+        )
+        profile.training.historyLength = 0
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+        let uniqueImages = MLXRandom.uniform(low: -1, high: 1, [2, 24, 32, 2])
+        let mapping = MLXArray([Int32(0), 0, 1, 1])
+        let fullImages = uniqueImages.take(mapping, axis: 0)
+        let history = MLXArray.zeros([4, 1, ActionLayout.count])
+        var targetValues = [Float](repeating: 0, count: 4 * ActionLayout.count)
+        for row in 0..<4 {
+            targetValues[row * ActionLayout.count] = Float(row) / 3
+            targetValues[row * ActionLayout.count + ActionLayout.keyboard.lowerBound + row] = 1
+        }
+        let targets = MLXArray(targetValues, [4, ActionLayout.count])
+        let previousTargets = MLXArray.zeros(like: targets)
+        let classWeights = MLXArray.ones([ActionLayout.count])
+
+        let full = valueAndGrad(model: model) { candidate, arrays in
+            [candidate.loss(
+                images: arrays[0],
+                history: arrays[1],
+                targets: arrays[2],
+                positiveWeights: classWeights,
+                previousTargets: arrays[3]
+            )]
+        }(model, [fullImages, history, targets, previousTargets])
+        let reused = valueAndGrad(model: model) { candidate, arrays in
+            let uniqueVisual = candidate.visualActivations(images: arrays[0]).last!
+            let uniqueEmbedding = candidate.visualEmbedding(visualFeatures: uniqueVisual)
+            let logits = candidate.logits(
+                visualEmbedding: uniqueEmbedding.take(mapping, axis: 0),
+                history: arrays[1]
+            )
+            return [candidate.loss(
+                logits: logits,
+                history: arrays[1],
+                targets: arrays[2],
+                positiveWeights: classWeights,
+                previousTargets: arrays[3]
+            )]
+        }(model, [uniqueImages, history, targets, previousTargets])
+        MLX.eval(full.0, full.1, reused.0, reused.1)
+
+        XCTAssertEqual(full.0[0].item(Float.self), reused.0[0].item(Float.self), accuracy: 0.000_01)
+        let fullGradients = Dictionary(uniqueKeysWithValues: full.1.flattened())
+        let reusedGradients = Dictionary(uniqueKeysWithValues: reused.1.flattened())
+        var squaredDifference = 0.0
+        var squaredReference = 0.0
+        for (name, expected) in fullGradients {
+            let actual = reusedGradients[name]!
+            for (lhs, rhs) in zip(expected.asArray(Float.self), actual.asArray(Float.self)) {
+                squaredDifference += Double(lhs - rhs) * Double(lhs - rhs)
+                squaredReference += Double(lhs) * Double(lhs)
+            }
+        }
+        XCTAssertLessThanOrEqual(sqrt(squaredDifference / squaredReference), 0.000_1)
+    }
+
+    func testAcceleratedBFloat16PolicyPathStaysWithinStoragePrecision() {
+        MLXRandom.seed(88_205)
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 32, height: 24, colorMode: .grayscale)
+        profile.training.historyLength = 0
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.precision = .bfloat16
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+        let images = MLXRandom.uniform(low: -1, high: 1, [3, 24, 32, 2]).asType(.bfloat16)
+        let history = MLXArray.zeros([3, 1, ActionLayout.count], dtype: .bfloat16)
+        let selector = MLXRandom.uniform(low: -1, high: 1, [3, ActionLayout.count]).asType(.bfloat16)
+
+        func selectedLogits(_ model: AgentPolicy, _ arrays: [MLXArray], accelerated: Bool) -> MLXArray {
+            let visual = model.visualActivations(
+                images: arrays[0],
+                acceleratedOperators: accelerated
+            ).last!
+            return (
+                model.logits(
+                    visualFeatures: visual,
+                    history: arrays[1]
+                ) * arrays[2]
+            ).sum()
+        }
+        let legacyLogits = model.logits(
+            visualFeatures: model.visualActivations(images: images, acceleratedOperators: false).last!,
+            history: history
+        )
+        let acceleratedLogits = model.logits(
+            visualFeatures: model.visualActivations(images: images, acceleratedOperators: true).last!,
+            history: history
+        )
+        let legacyGradient = valueAndGrad(model: model) { candidate, arrays in
+            [selectedLogits(candidate, arrays, accelerated: false)]
+        }(model, [images, history, selector]).1
+        let acceleratedGradient = valueAndGrad(model: model) { candidate, arrays in
+            [selectedLogits(candidate, arrays, accelerated: true)]
+        }(model, [images, history, selector]).1
+        let legacyPredictions = model.activatedPredictions(logits: legacyLogits)
+        let acceleratedPredictions = model.activatedPredictions(logits: acceleratedLogits)
+        MLX.eval(
+            legacyLogits,
+            acceleratedLogits,
+            legacyPredictions,
+            acceleratedPredictions,
+            legacyGradient,
+            acceleratedGradient
+        )
+
+        let outputDelta = zip(legacyLogits.asArray(Float.self), acceleratedLogits.asArray(Float.self))
+            .reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        let predictionDelta = zip(
+            legacyPredictions.asArray(Float.self),
+            acceleratedPredictions.asArray(Float.self)
+        ).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        let legacyGradients = Dictionary(uniqueKeysWithValues: legacyGradient.flattened())
+        let acceleratedGradients = Dictionary(uniqueKeysWithValues: acceleratedGradient.flattened())
+        var squaredDifference: Double = 0
+        var squaredLegacy: Double = 0
+        var dotProduct: Double = 0
+        var squaredAccelerated: Double = 0
+        for entry in legacyGradients {
+            guard let accelerated = acceleratedGradients[entry.key] else {
+                XCTFail("Accelerated policy omitted gradient \(entry.key)")
+                return
+            }
+            let legacyValues = entry.value.asArray(Float.self)
+            let acceleratedValues = accelerated.asArray(Float.self)
+            for (legacy, actual) in zip(legacyValues, acceleratedValues) {
+                squaredDifference += Double(legacy - actual) * Double(legacy - actual)
+                squaredLegacy += Double(legacy) * Double(legacy)
+                dotProduct += Double(legacy) * Double(actual)
+                squaredAccelerated += Double(actual) * Double(actual)
+            }
+        }
+        let relativeGradientError = sqrt(squaredDifference / squaredLegacy)
+        let gradientCosine = dotProduct / sqrt(squaredLegacy * squaredAccelerated)
+        XCTAssertLessThanOrEqual(outputDelta, 0.03125)
+        XCTAssertLessThanOrEqual(predictionDelta, 0.02)
+        XCTAssertLessThanOrEqual(relativeGradientError, 0.03)
+        XCTAssertGreaterThanOrEqual(gradientCosine, 0.999)
     }
 
     func testHistoryShortcutMaskStillAppliesWhenFeatureDropoutIsZero() {
