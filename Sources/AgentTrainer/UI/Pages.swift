@@ -206,8 +206,33 @@ private struct ProfileEditor: View {
                 }
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 12) {
-                        HStack { Text("Training configuration").font(.headline).foregroundStyle(ATColor.green); InfoTip("Maximum Steps and Autosave Steps are universal run controls in the Training tab, so they do not change a model's learning identity. Architecture and exact vision changes require a fresh brain, and the app asks before clearing training.") }
-                        HStack { IntField("Epochs per block", value: $draft.training.epochs, help: "How many complete dataset passes to add. If a block is paused, Train finishes it first; after a completed block, Train adds another block of this size."); IntField("Batch", value: $draft.training.batchSize, help: "Samples evaluated together. Larger batches use more unified memory."); IntField("History", value: $draft.training.historyLength, help: "Earlier actions supplied to the recurrent encoder. Keep this short: motion comes directly from consecutive screen frames, and training masks history on half the samples so the policy cannot succeed by copying it.") }
+                        HStack { Text("Training configuration").font(.headline).foregroundStyle(ATColor.green); InfoTip("Maximum Steps and Autosave Steps are universal run controls in the Training tab, so they do not change a model's learning identity. Architecture, exact vision, and temporal-context changes require a fresh brain, and the app asks before clearing training.") }
+                        HStack { IntField("Epochs per block", value: $draft.training.epochs, help: "How many complete dataset passes to add. If a block is paused, Train finishes it first; after a completed block, Train adds another block of this size."); IntField("Batch", value: $draft.training.batchSize, help: "Samples evaluated together. Larger batches use more unified memory."); Spacer() }
+                        VStack(alignment: .leading, spacing: 9) {
+                            HStack {
+                                Text("Temporal frame context").font(.subheadline.bold()).foregroundStyle(ATColor.cyan)
+                                InfoTip("Each decision uses the full-resolution current frame plus real lower-resolution past frames. Every past frame is paired with all controls demonstrated during its perception interval: cursor position and movement, mouse buttons, scroll, keyboard, Shift, Control, Option, and Command. No motion-difference image is generated.")
+                                Spacer()
+                            }
+                            HStack {
+                                IntField("Past frames", value: temporalIntBinding(\.pastFrameCount), help: "Number of causal screen frames supplied before the current frame (1–\(TemporalVisionConfiguration.maximumPastFrameCount)).")
+                                IntField("Frames apart", value: temporalIntBinding(\.frameSpacing), help: "Distance between selected frames in Perception FPS intervals (1–\(TemporalVisionConfiguration.maximumFrameSpacing)). 1 means consecutive perceptions.")
+                                IntField("Past downscale", value: temporalIntBinding(\.downsampleFactor), help: "Linear resolution reduction for every past frame (1×–\(TemporalVisionConfiguration.maximumDownsampleFactor)×). 2 means half width and half height while preserving aspect, color mode, chroma, and bit detail.")
+                            }
+                            let temporal = draft.training.effectiveTemporalVision
+                            let pastSpec = temporal.pastFrameSpec(from: draft.preprocessing)
+                            HStack(spacing: 10) {
+                                StatusPill(text: "Current \(draft.preprocessing.width) × \(draft.preprocessing.height)", color: ATColor.green)
+                                StatusPill(text: "Past \(pastSpec.width) × \(pastSpec.height)", color: ATColor.cyan)
+                                Text("nominally every \(temporal.spacingSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.precision(.fractionLength(3))))s • \(temporal.lookbackSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.precision(.fractionLength(3))))s total lookback")
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                            Text(temporalFormatDetail)
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .padding(11)
+                        .raisedGlassSurface(cornerRadius: 11, tint: ATColor.cyan)
                         HStack { DoubleField("Learning rate", value: $draft.training.learningRate, help: "Peak AdamW update size. Adaptive scheduling warms up, uses bounded cosine restarts so updates never decay silently to zero, and reduces its envelope only after a measured plateau."); DoubleField("Weight decay", value: $draft.training.weightDecay, help: "Regularization applied by AdamW."); DoubleField("Validation", value: $draft.training.validationSplit, help: "Fraction of whole recordings held out. Splits target sample count, keep rare controls in training, purge shared context, and score diverse examples from every held-out recording.") }
                         HStack {
                             Picker("Learning-rate schedule", selection: Binding(get: { draft.training.effectiveLearningRateSchedule }, set: { draft.training.learningRateSchedule = $0 })) { ForEach(LearningRateSchedule.allCases) { Text($0.rawValue).tag($0) } }
@@ -220,9 +245,9 @@ private struct ProfileEditor: View {
                             Spacer()
                             InfoTip("Changing scheduler or loss settings keeps the active brain weights but safely starts a new optimizer sequence. Older profiles remain on their exact legacy schedule until you explicitly select Adaptive Cosine + Plateau.")
                         }
-                        HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives a new screen frame and signed motion difference. It cannot exceed Action FPS."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the AI may update mouse, keyboard, button, and scroll output."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
+                        HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives and records a new screen perception. Temporal spacing is measured in these frame intervals. It cannot exceed Action FPS."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the AI may update mouse, keyboard, button, and scroll output."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
                         HStack { Text("Architecture preset").foregroundStyle(.secondary); Button("Small") { draft.training.architecture = .small }.primaryButton(); Button("Balanced") { draft.training.architecture = .balanced }.primaryButton(); Button("Large") { draft.training.architecture = .large }.primaryButton() }
-                        HStack { IntField("Visual width", value: $draft.training.architecture.visualEmbedding, help: "How much visual information is kept after the convolution layers."); IntField("Recurrent width", value: $draft.training.architecture.recurrentWidth, help: "How much capacity is used to remember the recent action history."); Picker("History encoder", selection: $draft.training.architecture.recurrentKind) { ForEach(RecurrentKind.allCases) { Text($0.rawValue).tag($0) } } }
+                        HStack { IntField("Visual width", value: $draft.training.architecture.visualEmbedding, help: "How much visual information is kept after the shared current/past convolution layers."); IntField("Recurrent width", value: $draft.training.architecture.recurrentWidth, help: "Capacity used to integrate the paired past-frame visual embeddings and controls."); Picker("Temporal encoder", selection: $draft.training.architecture.recurrentKind) { ForEach(RecurrentKind.allCases) { Text($0.rawValue).tag($0) } } }
                         HStack {
                             Picker("Spatial pooling", selection: Binding(get: { draft.training.architecture.effectiveVisualPooling }, set: { draft.training.architecture.visualPooling = $0 })) { ForEach(VisualPoolingKind.allCases) { Text($0.rawValue).tag($0) } }
                             IntField("Attention keypoints", value: Binding(get: { draft.training.architecture.effectiveAttentionHeads }, set: { draft.training.architecture.attentionHeads = $0 }), help: "Independent learned spatial queries. Each retains visual features and exact X/Y while global mean/max preserve whole-screen context.")
@@ -230,7 +255,7 @@ private struct ProfileEditor: View {
                             Spacer()
                             InfoTip("Attention Keypoints preserves spatial position with a compact learned pool whose dense parameter count barely changes with resolution. Flattened Grid is retained only for exact compatibility with older brains.")
                         }
-                        HStack { InfoTip("The four-stage encoder sees the current frame, signed frame-to-frame motion, and screen coordinates. Convolution channels control visual capacity; recurrent width controls short action history."); Spacer() }
+                        HStack { InfoTip("The shared encoder sees the current frame and each real reduced-resolution past frame with screen coordinates. The temporal encoder then reads every past visual embedding together with the controls tied to that frame."); Spacer() }
                         HStack { IntArrayField("Conv channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
                         HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
                     }
@@ -298,11 +323,29 @@ private struct ProfileEditor: View {
             }
         } message: {
             if acceptedDraft.isDeletionProtected {
-                Text("This protected AI cannot lose or replace its brain. Duplicate it with its training intact, then make the architecture or exact-vision change on the copy.")
+                Text("This protected AI cannot lose or replace its brain. Duplicate it with its training intact, then make the architecture, exact-vision, or temporal-context change on the copy.")
             } else {
-                Text("This changes the AI's architecture or exact vision contract. Its existing weights, optimizer state, saved brains, steps, and epochs cannot be attached safely and will be permanently cleared. Recordings are kept.")
+                Text("This changes the AI's architecture, exact vision, or temporal-context contract. Its existing weights, optimizer state, saved brains, steps, and epochs cannot be attached safely and will be permanently cleared. Recordings are kept.")
             }
         }
+    }
+
+    private func temporalIntBinding(_ keyPath: WritableKeyPath<TemporalVisionConfiguration, Int>) -> Binding<Int> {
+        Binding(
+            get: { draft.training.effectiveTemporalVision[keyPath: keyPath] },
+            set: { value in
+                var temporal = draft.training.effectiveTemporalVision
+                temporal[keyPath: keyPath] = value
+                draft.training.temporalVision = temporal
+            }
+        )
+    }
+
+    private var temporalFormatDetail: String {
+        let colorDetail = draft.preprocessing.colorMode == .color
+            ? "color mode and \(draft.preprocessing.chroma.rawValue) chroma"
+            : "grayscale luminance"
+        return "Past frames use the same \(colorDetail), \(draft.preprocessing.bitDepth)-bit detail, and resize policy as the current frame."
     }
 
     private func handleDraftChange(_ value: AIProfile) {
@@ -344,7 +387,7 @@ private struct NeuralNetworkInputOverview: View {
             VStack(alignment: .leading, spacing: 13) {
                 HStack(spacing: 7) {
                     Text("Input size check").font(.headline).foregroundStyle(ATColor.cyan)
-                    InfoTip("This is a quick comparison between the values used for one decision and the number of learned parameters in the selected network. Comfortable or Balanced means there is no obvious size mismatch. High or Too high suggests choosing a larger architecture preset or reducing resolution or history. It is a practical guide, not a guarantee of training quality.")
+                    InfoTip("This is a quick comparison between the values used for one decision and the number of learned parameters in the selected network. Comfortable or Balanced means there is no obvious size mismatch. High or Too high suggests choosing a larger architecture preset, reducing resolution, using fewer past frames, or increasing their downscale. It is a practical guide, not a guarantee of training quality.")
                     Spacer()
                     StatusPill(text: statusTitle(capacity.level), color: color)
                 }
@@ -387,7 +430,7 @@ private struct NeuralNetworkInputOverview: View {
                         Label(showsTechnicalDetails ? "Hide technical details" : "Show technical details", systemImage: "slider.horizontal.3")
                             .font(.caption.bold()).foregroundStyle(ATColor.cyan)
                         Spacer()
-                        Text("vision, history, memory, and rates").font(.caption2).foregroundStyle(.secondary)
+                        Text("current vision, past frames, controls, memory, and rates").font(.caption2).foregroundStyle(.secondary)
                     }
                 }
                 .tint(ATColor.cyan)
@@ -400,9 +443,9 @@ private struct NeuralNetworkInputOverview: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 NeuralInputMetric(
-                    title: "First convolution",
-                    value: input.firstConvolutionValues.formatted(),
-                    detail: "\(profile.preprocessing.width) × \(profile.preprocessing.height) × \(profile.preprocessing.channelCount * 2 + 2)",
+                    title: "Current-frame convolution",
+                    value: input.currentFirstConvolutionValues.formatted(),
+                    detail: "\(profile.preprocessing.width) × \(profile.preprocessing.height) × \(profile.preprocessing.channelCount + 2)",
                     color: ATColor.violet
                 )
                 NeuralInputMetric(
@@ -415,33 +458,39 @@ private struct NeuralNetworkInputOverview: View {
 
             LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], alignment: .leading, spacing: 10) {
                 NeuralInputBreakdown(
-                    title: "Packed vision source",
-                    value: "\(input.packedVisionValues.formatted()) UInt8 values",
-                    detail: packedVisionDetail(input),
+                    title: "Packed current frame",
+                    value: "\(input.currentPackedVisionValues.formatted()) UInt8 values",
+                    detail: currentPackedVisionDetail(input),
                     color: ATColor.amber
                 )
                 NeuralInputBreakdown(
-                    title: "Expanded model vision",
-                    value: "\(input.expandedVisionValues.formatted()) values",
+                    title: "Packed past frames",
+                    value: "\((input.pastPackedVisionValuesPerFrame * input.pastFrameCount).formatted()) UInt8 values",
+                    detail: pastPackedVisionDetail(input),
+                    color: ATColor.amber
+                )
+                NeuralInputBreakdown(
+                    title: "Expanded current vision",
+                    value: "\(input.currentExpandedVisionValues.formatted()) values",
                     detail: "\(profile.preprocessing.width) × \(profile.preprocessing.height) × \(profile.preprocessing.channelCount) after chroma expansion",
                     color: ATColor.cyan
                 )
                 NeuralInputBreakdown(
-                    title: "Signed visual motion",
-                    value: "\(input.temporalDifferenceValues.formatted()) values",
-                    detail: "Current frame minus the immediately preceding perception frame",
-                    color: ATColor.amber
+                    title: "Expanded past vision",
+                    value: "\((input.pastExpandedVisionValuesPerFrame * input.pastFrameCount).formatted()) values",
+                    detail: "\(input.pastFrameCount.formatted()) real lower-resolution frames; no motion extraction or upscaling",
+                    color: ATColor.cyan
                 )
                 NeuralInputBreakdown(
                     title: "Generated coordinates",
-                    value: "\(input.coordinateValues.formatted()) values",
-                    detail: "X and Y at every one of \(input.pixelCount.formatted()) pixels",
+                    value: "\((input.currentCoordinateValues + input.pastCoordinateValuesPerFrame * input.pastFrameCount).formatted()) values",
+                    detail: "Independent X/Y planes for the current frame and every native-size past frame",
                     color: ATColor.violet
                 )
                 NeuralInputBreakdown(
-                    title: "Previous-action history",
-                    value: "\(input.historyValues.formatted()) values",
-                    detail: historyDetail(input),
+                    title: "Frame-aligned controls",
+                    value: "\(input.pastControlValues.formatted()) values",
+                    detail: "\(input.pastFrameCount.formatted()) frames × \(input.actionValuesPerPastFrame.formatted()) complete outputs • \(input.temporalLookbackSeconds.formatted(.number.precision(.fractionLength(3))))s lookback",
                     color: ATColor.green
                 )
             }
@@ -488,9 +537,9 @@ private struct NeuralNetworkInputOverview: View {
         case .balanced:
             "This input and network size are reasonably matched. You can train with these settings."
         case .high:
-            "Consider a larger architecture preset, or lower the resolution or History value."
+            "Consider a larger architecture preset, lower the resolution, use fewer past frames, or increase their downscale."
         case .tooHigh:
-            "Choose a larger architecture preset or reduce resolution or History before training."
+            "Choose a larger architecture preset or reduce current/past visual input before training."
         }
     }
 
@@ -525,20 +574,21 @@ private struct NeuralNetworkInputOverview: View {
         return count.formatted()
     }
 
-    private func packedVisionDetail(_ input: NeuralInputSummary) -> String {
-        let storedBytes = bytes(input.packedVisionValues)
+    private func currentPackedVisionDetail(_ input: NeuralInputSummary) -> String {
+        let storedBytes = bytes(input.currentPackedVisionValues)
         let levels = input.quantizationLevels.formatted()
         if profile.preprocessing.colorMode == .grayscale {
-            return "\(input.lumaValues.formatted()) Y • \(storedBytes) stored • \(levels) levels (\(input.effectivePackedBits.formatted()) meaningful bits)"
+            return "\(input.currentLumaValues.formatted()) Y • \(storedBytes) stored • \(levels) levels"
         }
-        return "\(input.lumaValues.formatted()) Y + 2 × \(input.chromaValuesPerPlane.formatted()) chroma at \(profile.preprocessing.chroma.rawValue) • \(storedBytes) stored • \(levels) levels (\(input.effectivePackedBits.formatted()) meaningful bits)"
+        return "\(input.currentLumaValues.formatted()) Y + 2 × \(input.currentChromaValuesPerPlane.formatted()) chroma at \(profile.preprocessing.chroma.rawValue) • \(storedBytes) stored • \(levels) levels"
     }
 
-    private func historyDetail(_ input: NeuralInputSummary) -> String {
-        if profile.training.historyLength == 0 {
-            return "History disabled; one all-zero row × \(input.actionValuesPerHistoryStep.formatted()) keeps a valid recurrent shape"
-        }
-        return "\(input.historySteps.formatted()) earlier actions × \(input.actionValuesPerHistoryStep.formatted()) values • \(input.historyDurationSeconds.formatted(.number.precision(.fractionLength(3))))s at \(profile.training.actionFPS.formatted()) Action FPS"
+    private func pastPackedVisionDetail(_ input: NeuralInputSummary) -> String {
+        let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+        let colorDetail = profile.preprocessing.colorMode == .color
+            ? "color/\(profile.preprocessing.chroma.rawValue)"
+            : "grayscale luminance"
+        return "\(input.pastFrameCount.formatted()) × \(pastSpec.width) × \(pastSpec.height) • same \(colorDetail) and \(profile.preprocessing.bitDepth)-bit detail • every \(input.frameSpacingSeconds.formatted(.number.precision(.fractionLength(3))))s"
     }
 
     private func bytes(_ count: Int64) -> String {
@@ -932,7 +982,7 @@ struct TrainingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                SectionTitle("Training", "Compiled MLX training uses compact spatial attention, temporal vision, focal class-balanced controls, transition-balanced batches, anti-shortcut history masking, adaptive cosine scheduling, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
+                SectionTitle("Training", "Compiled MLX training uses compact spatial attention, native multi-frame temporal vision, frame-aligned controls with anti-shortcut control masking, focal class balance, transition-balanced batches, adaptive cosine scheduling, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
                 HStack {
                     if model.isTraining, let profile = displayedProfile {
                         Text(profile.name).font(.title2.bold())
@@ -991,6 +1041,12 @@ struct TrainingView: View {
                     MetricCard(title: "Equivalent experience", value: (displayedTiming.experienceIsEstimated ? "~" : "") + TrainingDurationFormatter.string(seconds: displayedTiming.experienceSeconds), symbol: "brain.head.profile.fill", color: ATColor.violet)
                     MetricCard(title: "Samples / sec", value: model.trainingMetrics.samplesPerSecond.formatted(.number.precision(.fractionLength(0))), symbol: "bolt.fill", color: ATColor.amber)
                     MetricCard(title: "Optimizer steps", value: displayedSteps.formatted(), symbol: "arrow.triangle.2.circlepath", color: ATColor.green)
+                }
+                HStack(spacing: 12) {
+                    MetricCard(title: "Pipelined step", value: "\(model.trainingMetrics.trainingStepMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms", symbol: "timer", color: ATColor.cyan)
+                    MetricCard(title: "Mapped input gather", value: "\(model.trainingMetrics.batchPreparationMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms", symbol: "externaldrive.fill", color: ATColor.violet)
+                    MetricCard(title: "Throughput retained", value: "\((100 * model.trainingMetrics.throughputRetention).formatted(.number.precision(.fractionLength(0))))%", symbol: "chart.line.uptrend.xyaxis", color: model.trainingMetrics.throughputRetention < 0.8 ? ATColor.coral : ATColor.green)
+                    MetricCard(title: "Thermal pressure", value: model.trainingMetrics.thermalState.rawValue, symbol: "thermometer.medium", color: model.trainingMetrics.thermalState == .nominal ? ATColor.green : ATColor.coral)
                 }
                 HStack(spacing: 12) {
                     MetricCard(title: "MLX active unified", value: ByteCountFormatter.string(fromByteCount: Int64(model.trainingMetrics.mlxActiveMemory), countStyle: .memory), symbol: "memorychip", color: ATColor.green)
@@ -1406,7 +1462,7 @@ struct DiagnosticsView: View {
                 PermissionStrip(model: model)
                 HStack(spacing: 12) { MetricCard(title: "MLX active", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .memory), symbol: "memorychip", color: ATColor.green); MetricCard(title: "MLX peak", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .memory), symbol: "chart.bar.fill", color: ATColor.amber); MetricCard(title: "MLX cache", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.cacheMemory), countStyle: .memory), symbol: "shippingbox", color: ATColor.violet) }
                 OLEDCard { VStack(alignment: .leading, spacing: 10) { LabeledContent("Chip", value: hardwareName()); LabeledContent("MLX device", value: Device.defaultDevice().deviceType == .gpu ? "Apple GPU" : "CPU"); LabeledContent("Physical unified memory", value: ByteCountFormatter.string(fromByteCount: Int64(ProcessInfo.processInfo.physicalMemory), countStyle: .memory)); LabeledContent("Local workspace", value: ByteCountFormatter.string(fromByteCount: model.storageBytes, countStyle: .file)); LabeledContent("Bundle identifier", value: Bundle.main.bundleIdentifier ?? "local.agenttrainer.mac"); LabeledContent("Networking", value: "GitHub Releases update check only") } }
-                OLEDCard { HStack { VStack(alignment: .leading) { HStack { Text("Packed dataset caches").font(.headline); InfoTip("Caches store each perception frame once, map faster action ticks to compact frame indices, and preserve the exact previous frame for motion input. Clearing them never deletes recordings, profiles, or checkpoints.") }; Text("Delete reusable decoded observations without deleting recordings or models.").foregroundStyle(.secondary) }; Spacer(); Button("Clear Caches") { Task { await model.clearCaches() } }.primaryButton(color: ATColor.amber) } }
+                OLEDCard { HStack { VStack(alignment: .leading) { HStack { Text("Packed dataset caches").font(.headline); InfoTip("Caches store each perception once at current and configured past-frame resolution, map action ticks to exact causal frame sequences, and retain complete controls paired with every perception interval. Clearing them never deletes recordings, profiles, or checkpoints.") }; Text("Delete reusable decoded observations without deleting recordings or models.").foregroundStyle(.secondary) }; Spacer(); Button("Clear Caches") { Task { await model.clearCaches() } }.primaryButton(color: ATColor.amber) } }
                 let crashReports = AppLogStore.crashReports()
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 10) {

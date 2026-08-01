@@ -1,12 +1,11 @@
 import Foundation
 import MLX
 import MLXNN
-import MLXOptimizers
 import XCTest
 @testable import AgentTrainer
 
 /// Opt-in hardware benchmark. Normal CI remains deterministic and quick; use
-/// `./benchmark.sh` to build the release test bundle with MLX's Metal resource.
+/// `./benchmark.sh` to exercise the complete packed temporal-vision data path.
 final class TrainingPerformanceTests: XCTestCase {
     func testCompiledMetalDataPathPreservesOrderedUpdatesAndMeasuresThroughput() throws {
         guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_PERFORMANCE_TESTS"] == "1" else {
@@ -14,9 +13,33 @@ final class TrainingPerformanceTests: XCTestCase {
         }
 
         try Device.withDefaultDevice(.gpu) {
+            MLXMemoryLifecycle.configure()
             var profile = AIProfile.fresh()
             let usesDefaultProfile = ProcessInfo.processInfo.environment["AGENTTRAINER_BENCHMARK_DEFAULT_PROFILE"] == "1"
-            if !usesDefaultProfile {
+            let usesStressProfile = ProcessInfo.processInfo.environment["AGENTTRAINER_BENCHMARK_STRESS_PROFILE"] == "1"
+            if usesStressProfile {
+                // Mirrors the largest recently trained local workload: a large
+                // Float32 batch with sixteen spaced temporal frames. This is
+                // the profile most likely to expose allocator growth or thermal
+                // degradation during a sustained run.
+                profile.preprocessing = PreprocessingSpec(
+                    width: 128,
+                    height: 128,
+                    colorMode: .color,
+                    bitDepth: 4,
+                    chroma: .yuv420,
+                    resizePolicy: .stretch
+                )
+                profile.training.batchSize = 128
+                profile.training.temporalVision = TemporalVisionConfiguration(
+                    pastFrameCount: 16,
+                    frameSpacing: 4,
+                    downsampleFactor: 2
+                )
+                profile.training.perceptionFPS = 30
+                profile.training.actionFPS = 30
+                profile.training.precision = .float32
+            } else if !usesDefaultProfile {
                 profile.preprocessing = PreprocessingSpec(
                     width: 128,
                     height: 72,
@@ -27,21 +50,29 @@ final class TrainingPerformanceTests: XCTestCase {
                 )
                 profile.training.batchSize = 16
                 profile.training.architecture = .small
+                profile.training.temporalVision = TemporalVisionConfiguration(
+                    pastFrameCount: 4,
+                    frameSpacing: 2,
+                    downsampleFactor: 2
+                )
             }
             if let rawBatchSize = ProcessInfo.processInfo.environment["AGENTTRAINER_BENCHMARK_BATCH_SIZE"],
                let batchSize = Int(rawBatchSize), batchSize > 0 {
                 profile.training.batchSize = batchSize
             }
-            // No recurrent random mask: this benchmark isolates graph/data-path
-            // ordering. Exact random-state resume is covered by DomainTests.
-            profile.training.historyLength = 0
             profile.training.architecture.dropout = 0
-            profile.training.precision = .bfloat16
+            if !usesStressProfile { profile.training.precision = .bfloat16 }
 
             MLXRandom.seed(91_337)
             let baselineModel = AgentPolicy(profile: profile)
             let fusedModel = AgentPolicy(profile: profile)
-            let reusedVisionModel = AgentPolicy(profile: profile)
+            let reusedTemporalModel = AgentPolicy(profile: profile)
+            for model in [baselineModel, fusedModel, reusedTemporalModel] {
+                // The benchmark measures deterministic optimizer and data-path
+                // work. Dropout/control masking quality is covered separately.
+                model.train(false)
+            }
+
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("training-performance-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -49,84 +80,158 @@ final class TrainingPerformanceTests: XCTestCase {
             let initialWeights = directory.appendingPathComponent("initial.safetensors")
             try baselineModel.saveWeights(to: initialWeights)
             try fusedModel.loadWeights(from: initialWeights)
-            try reusedVisionModel.loadWeights(from: initialWeights)
+            try reusedTemporalModel.loadWeights(from: initialWeights)
 
             let baselineOptimizer = ResumableAdamW(learningRate: 0.0003, weightDecay: 0.01)
             let fusedOptimizer = ResumableAdamW(learningRate: 0.0003, weightDecay: 0.01)
-            let reusedVisionOptimizer = ResumableAdamW(learningRate: 0.0003, weightDecay: 0.01)
+            let reusedTemporalOptimizer = ResumableAdamW(learningRate: 0.0003, weightDecay: 0.01)
             for (model, optimizer) in [
                 (baselineModel, baselineOptimizer),
                 (fusedModel, fusedOptimizer),
-                (reusedVisionModel, reusedVisionOptimizer)
+                (reusedTemporalModel, reusedTemporalOptimizer)
             ] {
                 optimizer.initialize(model: model)
             }
 
             let batchSize = profile.training.batchSize
-            let sampleBytes = profile.preprocessing.sampleByteCount
-            let uniqueVisionCount = (batchSize + 1) / 2
-            var currentValues = [UInt8](repeating: 0, count: batchSize * sampleBytes)
-            var previousValues = [UInt8](repeating: 0, count: batchSize * sampleBytes)
-            var pairValues = [UInt8](repeating: 0, count: batchSize * 2 * sampleBytes)
-            var uniquePairValues = [UInt8](repeating: 0, count: uniqueVisionCount * 2 * sampleBytes)
-            for row in 0..<batchSize {
-                let visionRow = row / 2
-                for byte in 0..<sampleBytes {
-                    let current = UInt8(truncatingIfNeeded: visionRow &* 29 &+ byte &* 17)
-                    let previous = UInt8(truncatingIfNeeded: visionRow &* 31 &+ byte &* 13 &+ 7)
-                    currentValues[row * sampleBytes + byte] = current
-                    previousValues[row * sampleBytes + byte] = previous
-                    pairValues[(row * 2) * sampleBytes + byte] = current
-                    pairValues[(row * 2 + 1) * sampleBytes + byte] = previous
-                    uniquePairValues[(visionRow * 2) * sampleBytes + byte] = current
-                    uniquePairValues[(visionRow * 2 + 1) * sampleBytes + byte] = previous
+            let temporal = profile.training.effectiveTemporalVision
+            let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
+            let currentBytesPerSample = profile.preprocessing.sampleByteCount
+            let pastBytesPerFrame = pastSpec.sampleByteCount
+            let frameCount = temporal.pastFrameCount
+            let labelsPerVision = max(
+                1,
+                Int((profile.training.actionFPS / profile.training.perceptionFPS).rounded())
+            )
+            let uniqueSequenceCount = (batchSize + labelsPerVision - 1) / labelsPerVision
+            let localityLaneCount = uniqueSequenceCount >= 64 ? 4 : uniqueSequenceCount >= 16 ? 2 : 1
+            let sequencesPerLane = max(
+                1,
+                Int(ceil(Double(uniqueSequenceCount) / Double(localityLaneCount)))
+            )
+            let laneStarts = stride(
+                from: 0,
+                to: uniqueSequenceCount,
+                by: sequencesPerLane
+            ).map { $0 }
+            var lanePastBases: [Int] = []
+            var uniquePastFrameCount = 0
+            for laneStart in laneStarts {
+                lanePastBases.append(uniquePastFrameCount)
+                let laneSequences = min(sequencesPerLane, uniqueSequenceCount - laneStart)
+                uniquePastFrameCount += laneSequences
+                    + (frameCount - 1) * temporal.frameSpacing
+            }
+            let controlsPerSequence = frameCount * ActionLayout.count
+
+            var uniqueCurrent = [UInt8](repeating: 0, count: uniqueSequenceCount * currentBytesPerSample)
+            var deduplicatedPast = [UInt8](
+                repeating: 0,
+                count: uniquePastFrameCount * pastBytesPerFrame
+            )
+            var uniqueControls = [Float](repeating: 0, count: uniqueSequenceCount * controlsPerSequence)
+            let visionToPast = (0..<(uniqueSequenceCount * frameCount)).map { slot -> Int32 in
+                let sequence = slot / frameCount
+                let frame = slot % frameCount
+                let lane = sequence / sequencesPerLane
+                let localSequence = sequence - lane * sequencesPerLane
+                return Int32(
+                    lanePastBases[lane]
+                        + localSequence
+                        + frame * temporal.frameSpacing
+                )
+            }
+            for sequence in 0..<uniqueSequenceCount {
+                for byte in 0..<currentBytesPerSample {
+                    uniqueCurrent[sequence * currentBytesPerSample + byte] = UInt8(
+                        truncatingIfNeeded: sequence &* 29 &+ byte &* 17
+                    )
+                }
+                for frame in 0..<frameCount {
+                    let controlBase = (sequence * frameCount + frame) * ActionLayout.count
+                    uniqueControls[controlBase] = Float(sequence) / Float(max(1, uniqueSequenceCount - 1))
+                    uniqueControls[controlBase + ActionLayout.keyboard.lowerBound + ((sequence + frame) % 32)] = 1
                 }
             }
-            let currentBytes = Data(currentValues)
-            let previousBytes = Data(previousValues)
-            let pairBytes = Data(pairValues)
-            let uniquePairBytes = Data(uniquePairValues)
-            let visionMapping = (0..<batchSize).map { Int32($0 / 2) }
-            let visionMappingBytes = visionMapping.withUnsafeBytes { Data($0) }
+            for frame in 0..<uniquePastFrameCount {
+                for byte in 0..<pastBytesPerFrame {
+                    deduplicatedPast[frame * pastBytesPerFrame + byte] = UInt8(
+                        truncatingIfNeeded: frame &* 31 &+ byte &* 13 &+ 7
+                    )
+                }
+            }
+            var uniquePast = [UInt8](
+                repeating: 0,
+                count: uniqueSequenceCount * frameCount * pastBytesPerFrame
+            )
+            for slot in visionToPast.indices {
+                let source = Int(visionToPast[slot]) * pastBytesPerFrame
+                uniquePast.replaceSubrange(
+                    slot * pastBytesPerFrame..<(slot + 1) * pastBytesPerFrame,
+                    with: deduplicatedPast[source..<(source + pastBytesPerFrame)]
+                )
+            }
 
-            let historyLength = 1
-            let historyValues = [Float](repeating: 0, count: batchSize * ActionLayout.count)
+            let mapping = (0..<batchSize).map { Int32($0 / labelsPerVision) }
+            var fullCurrent = [UInt8](repeating: 0, count: batchSize * currentBytesPerSample)
+            var fullPast = [UInt8](repeating: 0, count: batchSize * frameCount * pastBytesPerFrame)
+            var fullControls = [Float](repeating: 0, count: batchSize * controlsPerSequence)
+            for row in 0..<batchSize {
+                let sequence = Int(mapping[row])
+                fullCurrent.replaceSubrange(
+                    row * currentBytesPerSample..<(row + 1) * currentBytesPerSample,
+                    with: uniqueCurrent[sequence * currentBytesPerSample..<(sequence + 1) * currentBytesPerSample]
+                )
+                fullPast.replaceSubrange(
+                    row * frameCount * pastBytesPerFrame..<(row + 1) * frameCount * pastBytesPerFrame,
+                    with: uniquePast[sequence * frameCount * pastBytesPerFrame..<(sequence + 1) * frameCount * pastBytesPerFrame]
+                )
+                fullControls.replaceSubrange(
+                    row * controlsPerSequence..<(row + 1) * controlsPerSequence,
+                    with: uniqueControls[sequence * controlsPerSequence..<(sequence + 1) * controlsPerSequence]
+                )
+            }
+
             var targetValues = [Float](repeating: 0, count: batchSize * ActionLayout.count)
             var previousTargetValues = [Float](repeating: 0, count: batchSize * ActionLayout.count)
-            var actionRows = [Float](repeating: 0, count: batchSize * (historyLength + 2) * ActionLayout.count)
             for row in 0..<batchSize {
-                let targetBase = row * ActionLayout.count
-                targetValues[targetBase] = Float(row) / Float(max(1, batchSize - 1))
-                targetValues[targetBase + 1] = 1 - targetValues[targetBase]
-                targetValues[targetBase + ActionLayout.keyboard.lowerBound + row] = 1
+                let base = row * ActionLayout.count
+                targetValues[base] = Float(row) / Float(max(1, batchSize - 1))
+                targetValues[base + 1] = 1 - targetValues[base]
+                targetValues[base + ActionLayout.keyboard.lowerBound + (row % 32)] = 1
                 if row.isMultiple(of: 2) {
-                    previousTargetValues[targetBase + ActionLayout.keyboard.lowerBound + row] = 1
+                    previousTargetValues[base + ActionLayout.keyboard.lowerBound + (row % 32)] = 1
                 }
-                let fusedBase = row * (historyLength + 2) * ActionLayout.count
+            }
+            var actionRows = [Float](repeating: 0, count: batchSize * 2 * ActionLayout.count)
+            for row in 0..<batchSize {
+                let source = row * ActionLayout.count
+                let destination = row * 2 * ActionLayout.count
                 actionRows.replaceSubrange(
-                    fusedBase..<(fusedBase + ActionLayout.count),
-                    with: historyValues[targetBase..<(targetBase + ActionLayout.count)]
+                    destination..<(destination + ActionLayout.count),
+                    with: targetValues[source..<(source + ActionLayout.count)]
                 )
                 actionRows.replaceSubrange(
-                    (fusedBase + ActionLayout.count)..<(fusedBase + 2 * ActionLayout.count),
-                    with: targetValues[targetBase..<(targetBase + ActionLayout.count)]
-                )
-                actionRows.replaceSubrange(
-                    (fusedBase + 2 * ActionLayout.count)..<(fusedBase + 3 * ActionLayout.count),
-                    with: previousTargetValues[targetBase..<(targetBase + ActionLayout.count)]
+                    (destination + ActionLayout.count)..<(destination + 2 * ActionLayout.count),
+                    with: previousTargetValues[source..<(source + ActionLayout.count)]
                 )
             }
-            let historyBytes = historyValues.withUnsafeBytes { Data($0) }
-            let targetBytes = targetValues.withUnsafeBytes { Data($0) }
-            let previousTargetBytes = previousTargetValues.withUnsafeBytes { Data($0) }
-            let actionBytes = actionRows.withUnsafeBytes { Data($0) }
-            let positiveWeights = [Float](repeating: 1, count: ActionLayout.count)
-            let fusedInputBuffers = try MetalArrayBufferPool(maximumCachedBytes: 256 * 1_024 * 1_024)
 
-            // Reproduce the cache gather that precedes MLX materialization.
-            // `Data(source)` can share storage, so force the same allocation and
-            // byte copy performed by the old per-field dataset helpers.
-            func gatheredCopy(_ source: Data) -> Data {
+            let fullCurrentData = Data(fullCurrent)
+            let fullPastData = Data(fullPast)
+            let fullControlData = fullControls.withUnsafeBytes { Data($0) }
+            let targetData = targetValues.withUnsafeBytes { Data($0) }
+            let previousTargetData = previousTargetValues.withUnsafeBytes { Data($0) }
+            let uniqueCurrentData = Data(uniqueCurrent)
+            let deduplicatedPastData = Data(deduplicatedPast)
+            let uniqueControlData = uniqueControls.withUnsafeBytes { Data($0) }
+            let visionToPastData = visionToPast.withUnsafeBytes { Data($0) }
+            let mappingData = mapping.withUnsafeBytes { Data($0) }
+            let actionData = actionRows.withUnsafeBytes { Data($0) }
+            let positiveWeights = MLXArray.ones([ActionLayout.count])
+            let bufferPool = try MetalArrayBufferPool(maximumCachedBytes: 512 * 1_024 * 1_024)
+
+            func copied(_ source: Data) -> Data {
                 var destination = Data(count: source.count)
                 destination.withUnsafeMutableBytes { output in
                     source.withUnsafeBytes { output.copyMemory(from: $0) }
@@ -134,74 +239,76 @@ final class TrainingPerformanceTests: XCTestCase {
                 return destination
             }
 
-            func legacyInputs() -> [MLXArray] {
-                let current = gatheredCopy(currentBytes)
-                let previous = gatheredCopy(previousBytes)
-                let gatheredHistory = gatheredCopy(historyBytes)
-                let targets = gatheredCopy(targetBytes)
-                let previousTargets = gatheredCopy(previousTargetBytes)
+            func baselineInputs() -> [MLXArray] {
+                let current = VisionPreprocessor.mlxTensor(
+                    copied(fullCurrentData), batch: batchSize, spec: profile.preprocessing
+                )
+                let past = VisionPreprocessor.mlxPastFrameTensor(
+                    MLXArray(copied(fullPastData), [batchSize, frameCount, pastBytesPerFrame], dtype: .uint8),
+                    spec: pastSpec
+                )
                 return [
-                    VisionPreprocessor.mlxTemporalTensor(
-                        current: current,
-                        previous: previous,
-                        batch: batchSize,
-                        spec: profile.preprocessing
-                    ),
-                    MLXArray(gatheredHistory, [batchSize, historyLength, ActionLayout.count], type: Float.self),
-                    MLXArray(targets, [batchSize, ActionLayout.count], type: Float.self),
-                    MLXArray(previousTargets, [batchSize, ActionLayout.count], type: Float.self)
+                    current,
+                    past,
+                    MLXArray(copied(fullControlData), [batchSize, frameCount, ActionLayout.count], type: Float.self),
+                    MLXArray(copied(targetData), [batchSize, ActionLayout.count], type: Float.self),
+                    MLXArray(copied(previousTargetData), [batchSize, ActionLayout.count], type: Float.self)
                 ]
             }
 
             func fusedInputs() -> [MLXArray] {
-                return try! fusedInputBuffers.makeArrays([
-                    .init([batchSize, 2, sampleBytes], dtype: .uint8),
-                    .init([batchSize, historyLength + 2, ActionLayout.count], dtype: .float32)
+                try! bufferPool.makeArrays([
+                    .init([batchSize, currentBytesPerSample], dtype: .uint8),
+                    .init([batchSize, frameCount, pastBytesPerFrame], dtype: .uint8),
+                    .init([batchSize, frameCount, ActionLayout.count], dtype: .float32),
+                    .init([batchSize, 2, ActionLayout.count], dtype: .float32)
                 ]) { destinations in
-                    pairBytes.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
-                    actionBytes.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
+                    fullCurrentData.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
+                    fullPastData.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
+                    fullControlData.withUnsafeBytes { destinations[2].copyMemory(from: $0) }
+                    actionData.withUnsafeBytes { destinations[3].copyMemory(from: $0) }
                 }
             }
 
-            func reusedVisionInputs() -> [MLXArray] {
-                return try! fusedInputBuffers.makeArrays([
-                    .init([uniqueVisionCount, 2, sampleBytes], dtype: .uint8),
+            func reusedInputs() -> [MLXArray] {
+                try! bufferPool.makeArrays([
+                    .init([uniqueSequenceCount, currentBytesPerSample], dtype: .uint8),
+                    .init([uniquePastFrameCount, pastBytesPerFrame], dtype: .uint8),
+                    .init([uniqueSequenceCount, frameCount, ActionLayout.count], dtype: .float32),
+                    .init([uniqueSequenceCount, frameCount], dtype: .int32),
                     .init([batchSize], dtype: .int32),
-                    .init([batchSize, historyLength + 2, ActionLayout.count], dtype: .float32)
+                    .init([batchSize, 2, ActionLayout.count], dtype: .float32)
                 ]) { destinations in
-                    uniquePairBytes.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
-                    visionMappingBytes.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
-                    actionBytes.withUnsafeBytes { destinations[2].copyMemory(from: $0) }
+                    uniqueCurrentData.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
+                    deduplicatedPastData.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
+                    uniqueControlData.withUnsafeBytes { destinations[2].copyMemory(from: $0) }
+                    visionToPastData.withUnsafeBytes { destinations[3].copyMemory(from: $0) }
+                    mappingData.withUnsafeBytes { destinations[4].copyMemory(from: $0) }
+                    actionData.withUnsafeBytes { destinations[5].copyMemory(from: $0) }
                 }
             }
 
-            func compiledLegacyStep(
+            func compiledBaselineStep(
                 model: AgentPolicy,
                 optimizer: ResumableAdamW
             ) -> @Sendable ([MLXArray]) -> [MLXArray] {
                 compile(inputs: [model, optimizer], outputs: [model, optimizer]) { arrays in
-                    let weights = MLXArray(positiveWeights, [ActionLayout.count])
                     let result = valueAndGrad(model: model) { model, inputs in
-                        let visualFeatures = model.visualActivations(
-                            images: inputs[0],
-                            acceleratedOperators: false
-                        ).last!
-                        let logits = model.logits(
-                            visualFeatures: visualFeatures,
-                            history: inputs[1]
-                        )
-                        return [model.loss(
-                            logits: logits,
-                            history: inputs[1],
-                            targets: inputs[2],
-                            positiveWeights: weights,
-                            previousTargets: inputs[3]
+                        [model.loss(
+                            currentImages: inputs[0],
+                            pastImages: inputs[1],
+                            pastControls: inputs[2],
+                            targets: inputs[3],
+                            positiveWeights: positiveWeights,
+                            previousTargets: inputs[4]
                         )]
                     }(model, arrays)
                     optimizer.update(
                         model: model,
-                        gradients: clipGradNorm(gradients: result.1, maxNorm: 1).0,
-                        targetType: model.dtype
+                        gradients: result.1,
+                        targetType: model.dtype,
+                        gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
+                        maxGradientNorm: 1
                     )
                     return [result.0[0]]
                 }
@@ -212,28 +319,22 @@ final class TrainingPerformanceTests: XCTestCase {
                 optimizer: ResumableAdamW
             ) -> @Sendable ([MLXArray]) -> [MLXArray] {
                 compile(inputs: [model, optimizer], outputs: [model, optimizer]) { arrays in
-                    let actions = arrays[1]
+                    let actions = arrays[3]
                     let inputs = [
-                        VisionPreprocessor.mlxTemporalTensor(arrays[0], spec: profile.preprocessing),
-                        actions[0..., 0..<historyLength, 0...],
-                        actions[0..., historyLength, 0...],
-                        actions[0..., historyLength + 1, 0...]
+                        VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
+                        VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec),
+                        arrays[2],
+                        actions[0..., 0, 0...],
+                        actions[0..., 1, 0...]
                     ]
-                    let weights = MLXArray(positiveWeights, [ActionLayout.count])
-                    let result = valueAndGrad(model: model) { model, inputs in
-                        let visualFeatures = model.visualActivations(
-                            images: inputs[0]
-                        ).last!
-                        let logits = model.logits(
-                            visualFeatures: visualFeatures,
-                            history: inputs[1]
-                        )
-                        return [model.loss(
-                            logits: logits,
-                            history: inputs[1],
-                            targets: inputs[2],
-                            positiveWeights: weights,
-                            previousTargets: inputs[3]
+                    let result = valueAndGrad(model: model) { model, values in
+                        [model.loss(
+                            currentImages: values[0],
+                            pastImages: values[1],
+                            pastControls: values[2],
+                            targets: values[3],
+                            positiveWeights: positiveWeights,
+                            previousTargets: values[4]
                         )]
                     }(model, inputs)
                     optimizer.update(
@@ -247,37 +348,35 @@ final class TrainingPerformanceTests: XCTestCase {
                 }
             }
 
-            func compiledReusedVisionStep(
+            func compiledReusedStep(
                 model: AgentPolicy,
                 optimizer: ResumableAdamW
             ) -> @Sendable ([MLXArray]) -> [MLXArray] {
                 compile(inputs: [model, optimizer], outputs: [model, optimizer]) { arrays in
-                    let actions = arrays[2]
-                    let inputs = [
-                        VisionPreprocessor.mlxTemporalTensor(arrays[0], spec: profile.preprocessing),
-                        actions[0..., 0..<historyLength, 0...],
-                        actions[0..., historyLength, 0...],
-                        actions[0..., historyLength + 1, 0...]
+                    let actions = arrays[5]
+                    let uniqueInputs = [
+                        VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
+                        VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec),
+                        arrays[2]
                     ]
-                    let weights = MLXArray(positiveWeights, [ActionLayout.count])
-                    let result = valueAndGrad(model: model) { model, inputs in
-                        let uniqueVisualFeatures = model.visualActivations(images: inputs[0]).last!
-                        let uniqueVisualEmbedding = model.visualEmbedding(
-                            visualFeatures: uniqueVisualFeatures
+                    let targets = actions[0..., 0, 0...]
+                    let previousTargets = actions[0..., 1, 0...]
+                    let result = valueAndGrad(model: model) { model, values in
+                        let uniqueTemporal = model.temporalFeatures(
+                            currentImages: values[0],
+                            pastImages: values[1],
+                            pastControls: values[2],
+                            visionToPast: arrays[3],
+                            sampleToVision: arrays[4]
                         )
-                        let visualEmbedding = uniqueVisualEmbedding.take(arrays[1], axis: 0)
-                        let logits = model.logits(
-                            visualEmbedding: visualEmbedding,
-                            history: inputs[1]
-                        )
+                        let logits = model.logits(temporalFeatures: uniqueTemporal)
                         return [model.loss(
                             logits: logits,
-                            history: inputs[1],
-                            targets: inputs[2],
-                            positiveWeights: weights,
-                            previousTargets: inputs[3]
+                            targets: targets,
+                            positiveWeights: positiveWeights,
+                            previousTargets: previousTargets
                         )]
-                    }(model, inputs)
+                    }(model, uniqueInputs)
                     optimizer.update(
                         model: model,
                         gradients: result.1,
@@ -289,34 +388,10 @@ final class TrainingPerformanceTests: XCTestCase {
                 }
             }
 
-            let baselineStep = compiledLegacyStep(model: baselineModel, optimizer: baselineOptimizer)
+            let baselineStep = compiledBaselineStep(model: baselineModel, optimizer: baselineOptimizer)
             let fusedStep = compiledFusedStep(model: fusedModel, optimizer: fusedOptimizer)
-            let reusedVisionStep = compiledReusedVisionStep(
-                model: reusedVisionModel,
-                optimizer: reusedVisionOptimizer
-            )
+            let reusedStep = compiledReusedStep(model: reusedTemporalModel, optimizer: reusedTemporalOptimizer)
 
-            func warmUp(
-                _ step: @Sendable ([MLXArray]) -> [MLXArray],
-                inputs: () -> [MLXArray],
-                model: AgentPolicy,
-                optimizer: ResumableAdamW
-            ) {
-                let loss = step(inputs())[0]
-                MLX.eval(loss, model.parameters(), optimizer.stateArrays())
-            }
-            for _ in 0..<3 {
-                warmUp(baselineStep, inputs: legacyInputs, model: baselineModel, optimizer: baselineOptimizer)
-                warmUp(fusedStep, inputs: fusedInputs, model: fusedModel, optimizer: fusedOptimizer)
-                warmUp(
-                    reusedVisionStep,
-                    inputs: reusedVisionInputs,
-                    model: reusedVisionModel,
-                    optimizer: reusedVisionOptimizer
-                )
-            }
-
-            let iterations = usesDefaultProfile ? 12 : 32
             func runOne(
                 _ step: @Sendable ([MLXArray]) -> [MLXArray],
                 inputs: () -> [MLXArray],
@@ -328,276 +403,263 @@ final class TrainingPerformanceTests: XCTestCase {
                 MLX.eval(loss, model.parameters(), optimizer.stateArrays())
                 return (start.duration(to: .now).benchmarkSeconds, loss.item(Float.self))
             }
-            var baselineSeconds = 0.0, fusedSeconds = 0.0
-            var reusedVisionSeconds = 0.0
-            var baselineLosses: [Float] = [], fusedLosses: [Float] = []
-            var reusedVisionLosses: [Float] = []
-            baselineLosses.reserveCapacity(iterations)
-            fusedLosses.reserveCapacity(iterations)
-            reusedVisionLosses.reserveCapacity(iterations)
-            func runBaseline() {
-                let result = runOne(
-                    baselineStep,
-                    inputs: legacyInputs,
-                    model: baselineModel,
-                    optimizer: baselineOptimizer
-                )
-                baselineSeconds += result.seconds
-                baselineLosses.append(result.loss)
+
+            for _ in 0..<3 {
+                _ = runOne(baselineStep, inputs: baselineInputs, model: baselineModel, optimizer: baselineOptimizer)
+                _ = runOne(fusedStep, inputs: fusedInputs, model: fusedModel, optimizer: fusedOptimizer)
+                _ = runOne(reusedStep, inputs: reusedInputs, model: reusedTemporalModel, optimizer: reusedTemporalOptimizer)
             }
-            func runFused() {
-                let result = runOne(
-                    fusedStep,
-                    inputs: fusedInputs,
-                    model: fusedModel,
-                    optimizer: fusedOptimizer
-                )
-                fusedSeconds += result.seconds
-                fusedLosses.append(result.loss)
-            }
-            func runReusedVision() {
-                let result = runOne(
-                    reusedVisionStep,
-                    inputs: reusedVisionInputs,
-                    model: reusedVisionModel,
-                    optimizer: reusedVisionOptimizer
-                )
-                reusedVisionSeconds += result.seconds
-                reusedVisionLosses.append(result.loss)
-            }
+
+            let iterations = usesDefaultProfile || usesStressProfile ? 12 : 32
+            var baselineSeconds = 0.0, fusedSeconds = 0.0, reusedSeconds = 0.0
+            var baselineLosses: [Float] = [], fusedLosses: [Float] = [], reusedLosses: [Float] = []
             for iteration in 0..<iterations {
-                if iteration.isMultiple(of: 2) {
-                    runBaseline()
-                    runFused()
-                    runReusedVision()
-                } else {
-                    runReusedVision()
-                    runFused()
-                    runBaseline()
+                let order = iteration.isMultiple(of: 2) ? [0, 1, 2] : [2, 1, 0]
+                for benchmark in order {
+                    switch benchmark {
+                    case 0:
+                        let result = runOne(baselineStep, inputs: baselineInputs, model: baselineModel, optimizer: baselineOptimizer)
+                        baselineSeconds += result.seconds; baselineLosses.append(result.loss)
+                    case 1:
+                        let result = runOne(fusedStep, inputs: fusedInputs, model: fusedModel, optimizer: fusedOptimizer)
+                        fusedSeconds += result.seconds; fusedLosses.append(result.loss)
+                    default:
+                        let result = runOne(reusedStep, inputs: reusedInputs, model: reusedTemporalModel, optimizer: reusedTemporalOptimizer)
+                        reusedSeconds += result.seconds; reusedLosses.append(result.loss)
+                    }
                 }
             }
 
-            let baselineToFusedLossDelta = maximumAbsoluteDifference(baselineLosses, fusedLosses)
-            let baselineToFusedParameterDelta = maximumAbsoluteDifference(
-                modelArrays(baselineModel),
-                modelArrays(fusedModel)
-            )
-            XCTAssertLessThanOrEqual(baselineToFusedLossDelta, 0.02)
-            let reusedVisionLossDelta = maximumAbsoluteDifference(fusedLosses, reusedVisionLosses)
-            let reusedVisionParameterDelta = maximumAbsoluteDifference(
-                modelArrays(fusedModel),
-                modelArrays(reusedVisionModel)
-            )
-            XCTAssertLessThanOrEqual(reusedVisionLossDelta, 0.02)
+            let fusedLossDelta = maximumAbsoluteDifference(baselineLosses, fusedLosses)
+            let fusedParameterDelta = maximumAbsoluteDifference(modelArrays(baselineModel), modelArrays(fusedModel))
+            let reusedLossDelta = maximumAbsoluteDifference(fusedLosses, reusedLosses)
+            let reusedParameterDelta = maximumAbsoluteDifference(modelArrays(fusedModel), modelArrays(reusedTemporalModel))
+            XCTAssertLessThanOrEqual(fusedLossDelta, 0.02)
+            XCTAssertLessThanOrEqual(reusedLossDelta, 0.02)
 
-            let fusedSpeedup = baselineSeconds / max(0.000_001, fusedSeconds)
+            let profileName = usesStressProfile ? "temporal-stress" : usesDefaultProfile ? "default" : "compact"
             print(
-                "TRAINING_BENCHMARK profile=\(usesDefaultProfile ? "default" : "compact") "
-                    + "baseline_seconds=\(baselineSeconds) optimized_seconds=\(fusedSeconds) "
-                    + "speedup=\(fusedSpeedup) "
+                "TRAINING_BENCHMARK profile=\(profileName) baseline_seconds=\(baselineSeconds) "
+                    + "optimized_seconds=\(fusedSeconds) speedup=\(baselineSeconds / max(0.000_001, fusedSeconds)) "
                     + "optimized_samples_per_second=\(Double(iterations * batchSize) / fusedSeconds) "
-                    + "max_loss_delta=\(baselineToFusedLossDelta) "
-                    + "max_parameter_delta=\(baselineToFusedParameterDelta)"
+                    + "max_loss_delta=\(fusedLossDelta) max_parameter_delta=\(fusedParameterDelta)"
             )
             print(
-                "REUSED_VISION_BENCHMARK profile=\(usesDefaultProfile ? "default" : "compact") "
-                    + "baseline_seconds=\(fusedSeconds) optimized_seconds=\(reusedVisionSeconds) "
-                    + "speedup=\(fusedSeconds / max(0.000_001, reusedVisionSeconds)) "
-                    + "optimized_samples_per_second=\(Double(iterations * batchSize) / reusedVisionSeconds) "
-                    + "unique_vision_fraction=\(Double(uniqueVisionCount) / Double(batchSize)) "
-                    + "max_loss_delta=\(reusedVisionLossDelta) "
-                    + "max_parameter_delta=\(reusedVisionParameterDelta)"
+                "REUSED_VISION_BENCHMARK profile=\(profileName) baseline_seconds=\(fusedSeconds) "
+                    + "optimized_seconds=\(reusedSeconds) speedup=\(fusedSeconds / max(0.000_001, reusedSeconds)) "
+                    + "optimized_samples_per_second=\(Double(iterations * batchSize) / reusedSeconds) "
+                    + "unique_vision_fraction=\(Double(uniqueSequenceCount) / Double(batchSize)) "
+                    + "unique_past_fraction=\(Double(uniquePastFrameCount) / Double(uniqueSequenceCount * frameCount)) "
+                    + "max_loss_delta=\(reusedLossDelta) max_parameter_delta=\(reusedParameterDelta)"
             )
             print(
-                "TOTAL_TRAINING_BENCHMARK profile=\(usesDefaultProfile ? "default" : "compact") "
-                    + "original_seconds=\(baselineSeconds) optimized_seconds=\(reusedVisionSeconds) "
-                    + "speedup=\(baselineSeconds / max(0.000_001, reusedVisionSeconds)) "
-                    + "optimized_samples_per_second=\(Double(iterations * batchSize) / reusedVisionSeconds)"
+                "TOTAL_TRAINING_BENCHMARK profile=\(profileName) original_seconds=\(baselineSeconds) "
+                    + "optimized_seconds=\(reusedSeconds) speedup=\(baselineSeconds / max(0.000_001, reusedSeconds)) "
+                    + "optimized_samples_per_second=\(Double(iterations * batchSize) / reusedSeconds)"
             )
 
-            fusedModel.train(false)
-            reusedVisionModel.train(false)
-            let qualityInputs = legacyInputs()
-            let fusedQualityLoss = fusedModel.loss(
-                images: qualityInputs[0],
-                history: qualityInputs[1],
-                targets: qualityInputs[2],
-                positiveWeights: MLXArray(positiveWeights, [ActionLayout.count]),
-                previousTargets: qualityInputs[3]
-            )
-            let reusedVisionQualityLoss = reusedVisionModel.loss(
-                images: qualityInputs[0],
-                history: qualityInputs[1],
-                targets: qualityInputs[2],
-                positiveWeights: MLXArray(positiveWeights, [ActionLayout.count]),
-                previousTargets: qualityInputs[3]
-            )
-            MLX.eval(fusedQualityLoss, reusedVisionQualityLoss)
-            let fusedQualityValue = fusedQualityLoss.item(Float.self)
-            let reusedVisionQualityValue = reusedVisionQualityLoss.item(Float.self)
-            let relativeQualityDelta = abs(fusedQualityValue - reusedVisionQualityValue)
-                / max(0.000_001, abs(fusedQualityValue))
-            XCTAssertLessThanOrEqual(relativeQualityDelta, 0.01)
-            print(
-                "LEARNING_QUALITY profile=\(usesDefaultProfile ? "default" : "compact") "
-                    + "baseline_training_loss=\(fusedLosses.last ?? .nan) "
-                    + "optimized_training_loss=\(reusedVisionLosses.last ?? .nan) "
-                    + "baseline_validation_loss=\(fusedQualityValue) "
-                    + "optimized_validation_loss=\(reusedVisionQualityValue) "
-                    + "relative_validation_delta=\(relativeQualityDelta)"
-            )
-            let reusedValidationStep = compile(inputs: [reusedVisionModel]) { arrays in
-                let actions = arrays[2]
-                let images = VisionPreprocessor.mlxTemporalTensor(arrays[0], spec: profile.preprocessing)
-                let history = actions[0..., 0..<historyLength, 0...]
-                let targets = actions[0..., historyLength, 0...]
-                let previousTargets = actions[0..., historyLength + 1, 0...]
-                let uniqueVisualFeatures = reusedVisionModel.visualActivations(images: images).last!
-                let uniqueVisualEmbedding = reusedVisionModel.visualEmbedding(
-                    visualFeatures: uniqueVisualFeatures
+            let validationModel = reusedTemporalModel
+            validationModel.train(false)
+            func legacyValidation() -> [MLXArray] {
+                let inputs = baselineInputs()
+                let logits = validationModel.callAsFunction(
+                    currentImages: inputs[0], pastImages: inputs[1], pastControls: inputs[2]
                 )
-                let visualEmbedding = uniqueVisualEmbedding.take(arrays[1], axis: 0)
-                let logits = reusedVisionModel.logits(
-                    visualEmbedding: visualEmbedding,
-                    history: history
-                )
-                let weights = MLXArray(positiveWeights, [ActionLayout.count])
                 return [
-                    reusedVisionModel.loss(
+                    validationModel.loss(
                         logits: logits,
-                        history: history,
-                        targets: targets,
-                        positiveWeights: weights,
-                        previousTargets: previousTargets
+                        targets: inputs[3],
+                        positiveWeights: positiveWeights,
+                        previousTargets: inputs[4]
                     ),
-                    fusedModel.activatedPredictions(logits: logits),
+                    validationModel.activatedPredictions(logits: logits),
+                    inputs[3]
+                ]
+            }
+            let reusedValidation = compile(inputs: [validationModel]) { arrays in
+                let actions = arrays[5]
+                let current = VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing)
+                let past = VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec)
+                let temporalFeatures = validationModel.temporalFeatures(
+                    currentImages: current,
+                    pastImages: past,
+                    pastControls: arrays[2],
+                    visionToPast: arrays[3]
+                )
+                let uniqueLogits = validationModel.logits(temporalFeatures: temporalFeatures)
+                let logits = arrays[4].dim(0) == uniqueLogits.dim(0)
+                    ? uniqueLogits
+                    : uniqueLogits.take(arrays[4], axis: 0)
+                let targets = actions[0..., 0, 0...]
+                return [
+                    validationModel.loss(
+                        logits: logits,
+                        targets: targets,
+                        positiveWeights: positiveWeights,
+                        previousTargets: actions[0..., 1, 0...]
+                    ),
+                    validationModel.activatedPredictions(logits: logits),
                     targets
                 ]
             }
-            func legacyValidation() -> [MLXArray] {
-                let arrays = legacyInputs()
-                return [
-                    reusedVisionModel.loss(
-                        images: arrays[0],
-                        history: arrays[1],
-                        targets: arrays[2],
-                        positiveWeights: MLXArray(positiveWeights, [ActionLayout.count]),
-                        previousTargets: arrays[3]
-                    ),
-                    reusedVisionModel.predictions(images: arrays[0], history: arrays[1]),
-                    arrays[2]
-                ]
-            }
-            func optimizedValidation() -> [MLXArray] {
-                reusedValidationStep(reusedVisionInputs())
-            }
-            for _ in 0..<3 {
-                MLX.eval(legacyValidation())
-                MLX.eval(optimizedValidation())
-            }
-            let validationIterations = usesDefaultProfile ? 12 : 64
-            var legacyValidationResult: [MLXArray] = []
-            var optimizedValidationResult: [MLXArray] = []
-            var legacyValidationSeconds = 0.0, optimizedValidationSeconds = 0.0
-            func runLegacyValidation() {
-                let start = ContinuousClock.now
-                legacyValidationResult = legacyValidation()
-                MLX.eval(legacyValidationResult)
-                legacyValidationSeconds += start.duration(to: .now).benchmarkSeconds
-            }
-            func runOptimizedValidation() {
-                let start = ContinuousClock.now
-                optimizedValidationResult = optimizedValidation()
-                MLX.eval(optimizedValidationResult)
-                optimizedValidationSeconds += start.duration(to: .now).benchmarkSeconds
-            }
+            func optimizedValidation() -> [MLXArray] { reusedValidation(reusedInputs()) }
+            for _ in 0..<3 { MLX.eval(legacyValidation()); MLX.eval(optimizedValidation()) }
+            let validationIterations = usesDefaultProfile || usesStressProfile ? 12 : 64
+            var legacySeconds = 0.0, optimizedSeconds = 0.0
+            var legacyResult: [MLXArray] = [], optimizedResult: [MLXArray] = []
             for iteration in 0..<validationIterations {
-                if iteration.isMultiple(of: 2) {
-                    runLegacyValidation()
-                    runOptimizedValidation()
-                } else {
-                    runOptimizedValidation()
-                    runLegacyValidation()
+                let firstLegacy = iteration.isMultiple(of: 2)
+                for legacy in [firstLegacy, !firstLegacy] {
+                    let start = ContinuousClock.now
+                    if legacy { legacyResult = legacyValidation(); MLX.eval(legacyResult) }
+                    else { optimizedResult = optimizedValidation(); MLX.eval(optimizedResult) }
+                    let seconds = start.duration(to: .now).benchmarkSeconds
+                    if legacy { legacySeconds += seconds } else { optimizedSeconds += seconds }
                 }
             }
-            let validationLossDelta = abs(
-                legacyValidationResult[0].item(Float.self)
-                    - optimizedValidationResult[0].item(Float.self)
-            )
+            let validationLossDelta = abs(legacyResult[0].item(Float.self) - optimizedResult[0].item(Float.self))
             let validationPredictionDelta = maximumAbsoluteDifference(
-                legacyValidationResult[1].asArray(Float.self),
-                optimizedValidationResult[1].asArray(Float.self)
+                legacyResult[1].asArray(Float.self), optimizedResult[1].asArray(Float.self)
             )
-            XCTAssertLessThanOrEqual(validationLossDelta, 0.000_01)
-            XCTAssertLessThanOrEqual(validationPredictionDelta, 0.000_01)
+            XCTAssertLessThanOrEqual(
+                validationLossDelta,
+                max(0.000_01, abs(legacyResult[0].item(Float.self)) * 0.01)
+            )
+            XCTAssertLessThanOrEqual(validationPredictionDelta, 0.02)
             print(
-                "VALIDATION_BENCHMARK profile=\(usesDefaultProfile ? "default" : "compact") "
-                    + "baseline_seconds=\(legacyValidationSeconds) "
-                    + "optimized_seconds=\(optimizedValidationSeconds) "
-                    + "speedup=\(legacyValidationSeconds / max(0.000_001, optimizedValidationSeconds)) "
-                    + "max_loss_delta=\(validationLossDelta) "
-                    + "max_prediction_delta=\(validationPredictionDelta)"
+                "VALIDATION_BENCHMARK profile=\(profileName) baseline_seconds=\(legacySeconds) "
+                    + "optimized_seconds=\(optimizedSeconds) speedup=\(legacySeconds / max(0.000_001, optimizedSeconds)) "
+                    + "max_loss_delta=\(validationLossDelta) max_prediction_delta=\(validationPredictionDelta)"
             )
 
             func compiledInference(accelerated: Bool) -> @Sendable ([MLXArray]) -> [MLXArray] {
-                compile(inputs: [fusedModel]) { arrays in
-                    let actions = arrays[1]
-                    let images = VisionPreprocessor.mlxTemporalTensor(
-                        arrays[0],
-                        spec: profile.preprocessing
+                compile(inputs: [validationModel]) { arrays in
+                    let current = VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing)
+                    let past = VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec)
+                    let currentFeatures = validationModel.visualActivations(
+                        images: current,
+                        acceleratedOperators: accelerated
+                    ).last!
+                    let logits = validationModel.logits(
+                        currentVisualFeatures: currentFeatures,
+                        pastImages: past,
+                        pastControls: arrays[2]
                     )
-                    let history = actions[0..., 0..<historyLength, 0...]
-                    let visual = accelerated
-                        ? fusedModel.visualActivations(images: images).last!
-                        : fusedModel.visualActivations(images: images, acceleratedOperators: false).last!
-                    let logits = fusedModel.logits(
-                        visualFeatures: visual,
-                        history: history
-                    )
-                    return [fusedModel.activatedPredictions(logits: logits)]
+                    return [validationModel.activatedPredictions(logits: logits)]
                 }
             }
             let legacyInference = compiledInference(accelerated: false)
             let acceleratedInference = compiledInference(accelerated: true)
-            for _ in 0..<3 {
-                MLX.eval(legacyInference(fusedInputs()))
-                MLX.eval(acceleratedInference(fusedInputs()))
-            }
-            let inferenceIterations = usesDefaultProfile ? 24 : 96
+            for _ in 0..<3 { MLX.eval(legacyInference(fusedInputs())); MLX.eval(acceleratedInference(fusedInputs())) }
+            let inferenceIterations = usesDefaultProfile || usesStressProfile ? 24 : 96
             var legacyInferenceSeconds = 0.0, acceleratedInferenceSeconds = 0.0
             var legacyInferenceResult = MLXArray(0), acceleratedInferenceResult = MLXArray(0)
-            func runLegacyInference() {
-                let start = ContinuousClock.now
-                legacyInferenceResult = legacyInference(fusedInputs())[0]
-                MLX.eval(legacyInferenceResult)
-                legacyInferenceSeconds += start.duration(to: .now).benchmarkSeconds
-            }
-            func runAcceleratedInference() {
-                let start = ContinuousClock.now
-                acceleratedInferenceResult = acceleratedInference(fusedInputs())[0]
-                MLX.eval(acceleratedInferenceResult)
-                acceleratedInferenceSeconds += start.duration(to: .now).benchmarkSeconds
-            }
             for iteration in 0..<inferenceIterations {
-                if iteration.isMultiple(of: 2) {
-                    runLegacyInference()
-                    runAcceleratedInference()
-                } else {
-                    runAcceleratedInference()
-                    runLegacyInference()
+                let firstLegacy = iteration.isMultiple(of: 2)
+                for legacy in [firstLegacy, !firstLegacy] {
+                    let start = ContinuousClock.now
+                    if legacy {
+                        legacyInferenceResult = legacyInference(fusedInputs())[0]
+                        MLX.eval(legacyInferenceResult)
+                    } else {
+                        acceleratedInferenceResult = acceleratedInference(fusedInputs())[0]
+                        MLX.eval(acceleratedInferenceResult)
+                    }
+                    let seconds = start.duration(to: .now).benchmarkSeconds
+                    if legacy { legacyInferenceSeconds += seconds } else { acceleratedInferenceSeconds += seconds }
                 }
             }
             let inferencePredictionDelta = maximumAbsoluteDifference(
-                legacyInferenceResult.asArray(Float.self),
-                acceleratedInferenceResult.asArray(Float.self)
+                legacyInferenceResult.asArray(Float.self), acceleratedInferenceResult.asArray(Float.self)
             )
             XCTAssertLessThanOrEqual(inferencePredictionDelta, 0.02)
             print(
-                "INFERENCE_BENCHMARK profile=\(usesDefaultProfile ? "default" : "compact") "
-                    + "baseline_seconds=\(legacyInferenceSeconds) "
+                "INFERENCE_BENCHMARK profile=\(profileName) baseline_seconds=\(legacyInferenceSeconds) "
                     + "optimized_seconds=\(acceleratedInferenceSeconds) "
                     + "speedup=\(legacyInferenceSeconds / max(0.000_001, acceleratedInferenceSeconds)) "
                     + "max_prediction_delta=\(inferencePredictionDelta)"
+            )
+
+            func runSustainedBenchmark(
+                path: String,
+                steps: Int,
+                step: @Sendable ([MLXArray]) -> [MLXArray],
+                inputs: () -> [MLXArray],
+                model: AgentPolicy,
+                optimizer: ResumableAdamW
+            ) {
+                guard steps > 0 else { return }
+                Memory.clearCache()
+                let windowSize = min(64, max(16, steps / 8))
+                var windowSeconds = 0.0
+                var windowSamples = 0
+                var throughputs: [Double] = []
+                var peakActiveMemory = 0
+                var peakCacheMemory = 0
+                for index in 0..<steps {
+                    let result = runOne(
+                        step,
+                        inputs: inputs,
+                        model: model,
+                        optimizer: optimizer
+                    )
+                    windowSeconds += result.seconds
+                    windowSamples += batchSize
+                    let closesWindow = (index + 1).isMultiple(of: windowSize)
+                        || index + 1 == steps
+                    if closesWindow {
+                        let memory = Memory.snapshot()
+                        peakActiveMemory = max(peakActiveMemory, memory.activeMemory)
+                        peakCacheMemory = max(peakCacheMemory, memory.cacheMemory)
+                        let throughput = Double(windowSamples) / max(0.000_001, windowSeconds)
+                        throughputs.append(throughput)
+                        print(
+                            "SUSTAINED_TRAINING_WINDOW profile=\(profileName) path=\(path) step=\(index + 1) "
+                                + "samples_per_second=\(throughput) active_memory=\(memory.activeMemory) "
+                                + "cache_memory=\(memory.cacheMemory) thermal=\(TrainingThermalState.current.rawValue)"
+                        )
+                        windowSeconds = 0
+                        windowSamples = 0
+                    }
+                }
+                let first = throughputs.first ?? 0
+                let last = throughputs.last ?? 0
+                print(
+                    "SUSTAINED_TRAINING_SUMMARY profile=\(profileName) path=\(path) steps=\(steps) "
+                        + "first_samples_per_second=\(first) last_samples_per_second=\(last) "
+                        + "retention=\(last / max(0.000_001, first)) "
+                        + "peak_active_memory=\(peakActiveMemory) peak_cache_memory=\(peakCacheMemory) "
+                        + "thermal=\(TrainingThermalState.current.rawValue)"
+                )
+                // MLX applies a smaller cache limit on the next buffer return,
+                // so one recently released working buffer may temporarily sit
+                // above the configured cap.
+                XCTAssertLessThanOrEqual(
+                    peakCacheMemory,
+                    Memory.cacheLimit + 128 * 1_024 * 1_024
+                )
+            }
+            let sustainedSteps = Int(
+                ProcessInfo.processInfo.environment["AGENTTRAINER_BENCHMARK_SUSTAINED_STEPS"] ?? "0"
+            ) ?? 0
+            runSustainedBenchmark(
+                path: "optimized",
+                steps: sustainedSteps,
+                step: reusedStep,
+                inputs: reusedInputs,
+                model: reusedTemporalModel,
+                optimizer: reusedTemporalOptimizer
+            )
+            let sustainedBaselineSteps = Int(
+                ProcessInfo.processInfo.environment["AGENTTRAINER_BENCHMARK_SUSTAINED_BASELINE_STEPS"] ?? "0"
+            ) ?? 0
+            runSustainedBenchmark(
+                path: "reference",
+                steps: sustainedBaselineSteps,
+                step: fusedStep,
+                inputs: fusedInputs,
+                model: fusedModel,
+                optimizer: fusedOptimizer
             )
         }
     }

@@ -146,53 +146,57 @@ final class DomainTests: XCTestCase {
         XCTAssertFalse(monitor.isRunning)
     }
 
-    func testNeuralInputSizingMirrorsPackedDenseCoordinateAndHistoryContracts() {
+    func testNeuralInputSizingMirrorsCurrentPastAndFrameControlContracts() {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 5, height: 3, colorMode: .color, bitDepth: 2, chroma: .yuv420, resizePolicy: .fit)
-        profile.training.historyLength = 4
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 4, frameSpacing: 2, downsampleFactor: 2)
         profile.training.batchSize = 2
         profile.training.precision = .float16
         profile.training.perceptionFPS = 10
         profile.training.actionFPS = 20
 
         let input = NeuralInputSizing.summary(for: profile)
-        XCTAssertEqual(input.pixelCount, 15)
-        XCTAssertEqual(input.lumaValues, 15)
-        XCTAssertEqual(input.chromaValuesPerPlane, 6)
-        XCTAssertEqual(input.packedVisionValues, 27)
-        XCTAssertEqual(input.expandedVisionValues, 45)
-        XCTAssertEqual(input.temporalDifferenceValues, 45)
-        XCTAssertEqual(input.coordinateValues, 30)
-        XCTAssertEqual(input.firstConvolutionValues, 120)
-        XCTAssertEqual(input.historySteps, 4)
-        XCTAssertEqual(input.historyValues, 4 * 146)
-        XCTAssertEqual(input.historyDurationSeconds, 0.2, accuracy: 0.000_001)
-        XCTAssertEqual(input.valuesPerDecision, 120 + 4 * 146)
-        XCTAssertEqual(input.runtimeValuesPerSecond, 10 * (120 + 4 * 146))
-        XCTAssertEqual(input.packedVisionBytesPerSecond, 270)
-        XCTAssertEqual(input.valuesPerTrainingBatch, 2 * (120 + 4 * 146))
+        XCTAssertEqual(input.currentPixelCount, 15)
+        XCTAssertEqual(input.currentLumaValues, 15)
+        XCTAssertEqual(input.currentChromaValuesPerPlane, 6)
+        XCTAssertEqual(input.currentPackedVisionValues, 27)
+        XCTAssertEqual(input.currentExpandedVisionValues, 45)
+        XCTAssertEqual(input.currentCoordinateValues, 30)
+        XCTAssertEqual(input.currentFirstConvolutionValues, 75)
+        XCTAssertEqual(input.pastPixelCountPerFrame, 6)
+        XCTAssertEqual(input.pastPackedVisionValuesPerFrame, 10)
+        XCTAssertEqual(input.pastExpandedVisionValuesPerFrame, 18)
+        XCTAssertEqual(input.pastFirstConvolutionValuesPerFrame, 30)
+        XCTAssertEqual(input.pastFrameCount, 4)
+        XCTAssertEqual(input.pastControlValues, 4 * 146)
+        XCTAssertEqual(input.frameSpacingSeconds, 0.2, accuracy: 0.000_001)
+        XCTAssertEqual(input.temporalLookbackSeconds, 0.8, accuracy: 0.000_001)
+        XCTAssertEqual(input.valuesPerDecision, 75 + 4 * (30 + 146))
+        XCTAssertEqual(input.runtimeValuesPerSecond, 10 * (75 + 4 * (30 + 146)))
+        XCTAssertEqual(input.packedVisionBytesPerSecond, 670)
+        XCTAssertEqual(input.valuesPerTrainingBatch, 2 * (75 + 4 * (30 + 146)))
         XCTAssertEqual(input.quantizationLevels, 4)
-        XCTAssertEqual(input.effectivePackedBits, 27 * 2)
-        XCTAssertEqual(input.nominalBytesPerTrainingBatch, 2 * 2 * (120 + 4 * 146))
+        XCTAssertEqual(input.effectivePackedBits, 67 * 2)
+        XCTAssertEqual(input.nominalBytesPerTrainingBatch, 2 * 2 * (75 + 4 * (30 + 146)))
     }
 
-    func testNeuralInputSizingShowsTheZeroHistoryTensorAndIgnoresChromaForGrayscale() {
+    func testNeuralInputSizingKeepsPastGrayscaleAtNativeLowerResolution() {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 5, height: 3, colorMode: .grayscale, bitDepth: 8, chroma: .yuv420, resizePolicy: .stretch)
-        profile.training.historyLength = 0
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.batchSize = 1
         profile.training.precision = .float32
 
         let input = NeuralInputSizing.summary(for: profile)
-        XCTAssertEqual(input.packedVisionValues, 15)
-        XCTAssertEqual(input.chromaValuesPerPlane, 0)
-        XCTAssertEqual(input.expandedVisionValues, 15)
-        XCTAssertEqual(input.temporalDifferenceValues, 15)
-        XCTAssertEqual(input.firstConvolutionValues, 60)
-        XCTAssertEqual(input.historySteps, 1)
-        XCTAssertEqual(input.historyValues, 146)
-        XCTAssertEqual(input.valuesPerDecision, 206)
-        XCTAssertEqual(input.nominalBytesPerDecision, 206 * 4)
+        XCTAssertEqual(input.currentPackedVisionValues, 15)
+        XCTAssertEqual(input.currentChromaValuesPerPlane, 0)
+        XCTAssertEqual(input.currentExpandedVisionValues, 15)
+        XCTAssertEqual(input.currentFirstConvolutionValues, 45)
+        XCTAssertEqual(input.pastPackedVisionValuesPerFrame, 6)
+        XCTAssertEqual(input.pastFrameCount, 1)
+        XCTAssertEqual(input.pastControlValues, 146)
+        XCTAssertEqual(input.valuesPerDecision, 209)
+        XCTAssertEqual(input.nominalBytesPerDecision, 209 * 4)
     }
 
     func testNeuralInputCapacityGuideUsesSimpleConservativeBands() {
@@ -316,10 +320,13 @@ final class DomainTests: XCTestCase {
             1,
             profile.preprocessing.height,
             profile.preprocessing.width,
-            profile.preprocessing.channelCount * 2
+            profile.preprocessing.channelCount
         ], dtype: .float32)
-        let history = MLXArray.zeros([1, profile.training.historyLength, ActionLayout.count], dtype: .float32)
-        let predictions = model.predictions(images: images, history: history)
+        let temporal = profile.training.effectiveTemporalVision
+        let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
+        let pastImages = MLXArray.zeros([1, temporal.pastFrameCount, pastSpec.height, pastSpec.width, pastSpec.channelCount], dtype: .float32)
+        let pastControls = MLXArray.zeros([1, temporal.pastFrameCount, ActionLayout.count], dtype: .float32)
+        let predictions = model.predictions(currentImages: images, pastImages: pastImages, pastControls: pastControls)
         MLX.eval(predictions)
         XCTAssertEqual(predictions.shape, [1, ActionLayout.count])
         XCTAssertTrue(predictions.asArray(Float.self).allSatisfy(\.isFinite))
@@ -755,7 +762,7 @@ final class DomainTests: XCTestCase {
 
         var profile = AIProfile.fresh(name: "Preserved profile")
         profile.activeVersionID = UUID()
-        profile.training.historyLength = 128
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 20, frameSpacing: 3, downsampleFactor: 3)
         profile.training.learningRate = 0.005
         profile.training.architecture = ArchitectureSpec(convolutionChannels: [64, 128, 256], visualEmbedding: 512, recurrentWidth: 384, fusionWidths: [768, 512])
         try await store.saveProfile(profile)
@@ -805,7 +812,7 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(remainingProfiles.allSatisfy { $0.activeVersionID == nil })
         let migrated = try XCTUnwrap(remainingProfiles.first { $0.name == "Preserved profile" })
         XCTAssertEqual(migrated.training.architecture, .large)
-        XCTAssertEqual(migrated.training.historyLength, 32)
+        XCTAssertEqual(migrated.training.effectiveTemporalVision, TemporalVisionConfiguration())
         XCTAssertEqual(migrated.training.learningRate, 0.0003)
         let secondPass = try await store.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
         XCTAssertEqual(secondPass, 0)
@@ -818,7 +825,7 @@ final class DomainTests: XCTestCase {
         try await store.prepare()
 
         var profile = AIProfile.fresh(name: "Current mixed library")
-        profile.training.historyLength = 73
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 7, frameSpacing: 5, downsampleFactor: 3)
         profile.training.learningRate = 0.00025
         let currentID = UUID()
         profile.activeVersionID = currentID
@@ -870,7 +877,7 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(reloaded.trainingProgress?.globalStep, profile.trainingProgress?.globalStep)
         XCTAssertEqual(reloaded.trainingProgress?.epoch, profile.trainingProgress?.epoch)
         XCTAssertEqual(reloaded.trainingProgress?.savedBrainCount, profile.trainingProgress?.savedBrainCount)
-        XCTAssertEqual(reloaded.training.historyLength, 73)
+        XCTAssertEqual(reloaded.training.effectiveTemporalVision, profile.training.effectiveTemporalVision)
         XCTAssertEqual(reloaded.training.learningRate, 0.00025)
         let secondPass = try await store.removeObsoleteModelArtifacts(currentSchema: ModelContract.schemaVersion)
         XCTAssertEqual(secondPass, 0)
@@ -988,13 +995,16 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(TrainingContinuationPlan.targetEpoch(completedEpoch: 2_000, batchOffset: 0, savedTarget: 2_000, configuredIncrement: 250), 2_250)
     }
 
-    func testOnlyExactVisionAndArchitectureChangeTheLearnedBrainContract() {
+    func testExactVisionTemporalContextAndArchitectureChangeTheLearnedBrainContract() {
         var profile = AIProfile.fresh()
         let original = profile.learnedBrainContract
         profile.training.epochs = 9_999
         profile.training.learningRate = 0.00001
-        profile.training.historyLength = 32
+        profile.training.actionFPS = 120
         XCTAssertEqual(profile.learnedBrainContract, original)
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 8, frameSpacing: 2, downsampleFactor: 2)
+        XCTAssertNotEqual(profile.learnedBrainContract, original)
+        profile.training.temporalVision = original.temporalVision
         profile.training.architecture.recurrentWidth += 1
         XCTAssertNotEqual(profile.learnedBrainContract, original)
         profile.training.architecture.recurrentWidth -= 1
@@ -1311,16 +1321,7 @@ final class DomainTests: XCTestCase {
 
         let repeated = latch.consume()
         XCTAssertTrue(repeated?.isFresh == false)
-        let repeatedHistory = RuntimeActionSemantics.historyValues(
-            try XCTUnwrap(repeated?.values),
-            predictionIsFresh: repeated?.isFresh ?? true
-        )
-        XCTAssertEqual(repeatedHistory[2], 0)
-        XCTAssertEqual(repeatedHistory[3], 0)
-        XCTAssertEqual(repeatedHistory[12], 0)
-        XCTAssertEqual(repeatedHistory[13], 0)
-        XCTAssertEqual(repeatedHistory[4], 1, "Held mouse-button state must survive a reused tick")
-        XCTAssertEqual(repeatedHistory[14 + 13], 1, "Held keyboard state must survive a reused tick")
+        XCTAssertEqual(repeated?.values, prediction, "The latch retains state while marking reused predictions stale so transient execution can be suppressed separately")
 
         latch.publish(prediction, at: 124)
         XCTAssertTrue(latch.consume()?.isFresh == true)
@@ -1328,7 +1329,7 @@ final class DomainTests: XCTestCase {
         XCTAssertNil(latch.consume())
     }
 
-    func testRuntimeHistoryContainsOnlyThresholdedExecutableActions() {
+    func testTemporalFrameControlsContainOnlyThresholdedExecutableActions() {
         var prediction = [Float](repeating: 0, count: ActionLayout.count)
         prediction[0] = 1.4
         prediction[2] = -0.8
@@ -1343,28 +1344,27 @@ final class DomainTests: XCTestCase {
 
         var restrictions = ActionRestrictions()
         restrictions.blockedMouseButtons = [1]
-        let history = RuntimeActionSemantics.historyValues(
+        let controls = RuntimeActionSemantics.temporalControlValues(
             prediction,
-            predictionIsFresh: true,
             channels: .all,
             restrictions: restrictions,
             allowedKeyCodes: [12, 13, 59],
             outputPermissions: RuntimeOutputPermissions(),
             shiftUsesKeyboardChannel: true
         )
-        XCTAssertEqual(history[0], 1, "Continuous history should use the same bounded value as execution")
-        XCTAssertEqual(history[2], -0.8, accuracy: 0.000_001)
-        XCTAssertEqual(history[ActionLayout.buttons.lowerBound], 1)
-        XCTAssertEqual(history[ActionLayout.buttons.lowerBound + 1], 0)
-        XCTAssertEqual(history[ActionLayout.keyboard.lowerBound + 2], 0, "The demonstrated-key firewall must also guard recurrent state")
-        XCTAssertEqual(history[ActionLayout.keyboard.lowerBound + 12], 0)
-        XCTAssertEqual(history[ActionLayout.keyboard.lowerBound + 13], 1)
-        XCTAssertEqual(history[ActionLayout.keyboard.lowerBound + 59], 0, "Duplicate modifier key-code slots must never become hidden state")
-        XCTAssertEqual(history[ActionLayout.commandOptionControl.lowerBound], 1)
+        XCTAssertEqual(controls[0], 1, "Frame controls should use the same bounded value as execution")
+        XCTAssertEqual(controls[2], -0.8, accuracy: 0.000_001)
+        XCTAssertEqual(controls[ActionLayout.scroll.lowerBound], 0.25, accuracy: 0.000_001, "Fresh frame controls retain transient scroll")
+        XCTAssertEqual(controls[ActionLayout.buttons.lowerBound], 1)
+        XCTAssertEqual(controls[ActionLayout.buttons.lowerBound + 1], 0)
+        XCTAssertEqual(controls[ActionLayout.keyboard.lowerBound + 2], 0, "The demonstrated-key firewall must also guard temporal state")
+        XCTAssertEqual(controls[ActionLayout.keyboard.lowerBound + 12], 0)
+        XCTAssertEqual(controls[ActionLayout.keyboard.lowerBound + 13], 1)
+        XCTAssertEqual(controls[ActionLayout.keyboard.lowerBound + 59], 0, "Duplicate modifier key-code slots must never become hidden state")
+        XCTAssertEqual(controls[ActionLayout.commandOptionControl.lowerBound], 1)
 
-        let blocked = RuntimeActionSemantics.historyValues(
+        let blocked = RuntimeActionSemantics.temporalControlValues(
             prediction,
-            predictionIsFresh: true,
             channels: .all,
             allowedKeyCodes: [13, 59],
             outputPermissions: RuntimeOutputPermissions(cursorMovement: false, keyboard: false)
@@ -1376,9 +1376,8 @@ final class DomainTests: XCTestCase {
 
         var oldChannels = ActionChannels.all
         oldChannels.keyboard = false
-        let oldShift = RuntimeActionSemantics.historyValues(
+        let oldShift = RuntimeActionSemantics.temporalControlValues(
             prediction.enumerated().map { $0.offset == ActionLayout.shift.lowerBound ? 1 : $0.element },
-            predictionIsFresh: true,
             channels: oldChannels,
             allowedKeyCodes: [56],
             shiftUsesKeyboardChannel: false
@@ -1701,32 +1700,39 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(image.size, NSSize(width: 3, height: 2))
     }
 
-    func testTemporalVisionTensorContainsCurrentPixelsAndSignedFrameDifference() {
-        let spec = PreprocessingSpec(width: 2, height: 1, colorMode: .grayscale, bitDepth: 8)
-        let tensor = VisionPreprocessor.mlxTemporalTensor(
-            current: Data([255, 0]),
-            previous: Data([0, 255]),
+    func testTemporalVisionKeepsCurrentAndPastFramesIndependent() {
+        let currentSpec = PreprocessingSpec(width: 4, height: 2, colorMode: .color, bitDepth: 8, chroma: .yuv444)
+        let temporal = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 3, downsampleFactor: 2)
+        let pastSpec = temporal.pastFrameSpec(from: currentSpec)
+        XCTAssertEqual(pastSpec.width, 2)
+        XCTAssertEqual(pastSpec.height, 1)
+        XCTAssertEqual(pastSpec.colorMode, currentSpec.colorMode)
+        XCTAssertEqual(pastSpec.chroma, currentSpec.chroma)
+        XCTAssertEqual(pastSpec.bitDepth, currentSpec.bitDepth)
+
+        let current = VisionPreprocessor.mlxTensor(
+            Data(repeating: 255, count: currentSpec.sampleByteCount),
             batch: 1,
-            spec: spec
+            spec: currentSpec
         )
-        MLX.eval(tensor)
-        XCTAssertEqual(tensor.shape, [1, 1, 2, 2])
-        let values = tensor.asArray(Float.self)
+        let pastBytes = Data([
+            255, 0, 64, 128, 192, 255,
+            0, 255, 128, 64, 255, 192
+        ])
+        let past = VisionPreprocessor.mlxPastFrameTensor(
+            MLXArray(pastBytes, [1, 2, pastSpec.sampleByteCount], dtype: .uint8),
+            spec: pastSpec
+        )
+        MLX.eval(current, past)
+
+        XCTAssertEqual(current.shape, [1, 2, 4, 3])
+        XCTAssertEqual(past.shape, [1, 2, 1, 2, 3])
+        XCTAssertEqual(current.asArray(Float.self), [Float](repeating: 1, count: 24))
+        let values = past.asArray(Float.self)
         XCTAssertEqual(values[0], 1, accuracy: 0.000_001)
-        XCTAssertEqual(values[1], 1, accuracy: 0.000_001)
-        XCTAssertEqual(values[2], 0, accuracy: 0.000_001)
-        XCTAssertEqual(values[3], -1, accuracy: 0.000_001)
-
-        let packedPair = VisionPreprocessor.mlxTemporalTensor(
-            MLXArray(Data([255, 0, 0, 255]), [1, 2, spec.sampleByteCount], dtype: .uint8),
-            spec: spec
-        )
-        MLX.eval(packedPair)
-        XCTAssertEqual(packedPair.asArray(Float.self), values)
-
-        let firstFrame = VisionPreprocessor.mlxTemporalTensor(current: Data([255, 0]), previous: nil, batch: 1, spec: spec)
-        MLX.eval(firstFrame)
-        XCTAssertEqual(firstFrame.asArray(Float.self), [1, 0, 0, 0])
+        XCTAssertEqual(values[1], Float(64) / 255, accuracy: 0.000_001)
+        XCTAssertEqual(values[6], 0, accuracy: 0.000_001)
+        XCTAssertEqual(values[7], Float(128) / 255, accuracy: 0.000_001)
     }
 
     func testMetalSharedInputBufferHandsExactBytesToMLX() throws {
@@ -1973,7 +1979,7 @@ final class DomainTests: XCTestCase {
     func testCompiledTrainingStepMatchesUncompiledAdamW() throws {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 16, height: 12, colorMode: .grayscale, bitDepth: 8)
-        profile.training.historyLength = 1
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .float32
@@ -1986,21 +1992,24 @@ final class DomainTests: XCTestCase {
         let optimizerA = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01)
         let optimizerB = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01)
         optimizerA.initialize(model: modelA); optimizerB.initialize(model: modelB)
-        let images = grayscaleTemporalTensor(batch: 2, width: 16, height: 12, value: 0.25)
-        let history = MLXArray([Float](repeating: 0, count: 2 * ActionLayout.count), [2, 1, ActionLayout.count])
+        let inputs = temporalModelInputs(profile: profile, batch: 2, value: 0.25)
         let targets = MLXArray([Float](repeating: 0, count: 2 * ActionLayout.count), [2, ActionLayout.count])
 
-        let gradientA = valueAndGrad(model: modelA) { model, arrays in [model.loss(images: arrays[0], history: arrays[1], targets: arrays[2])] }
-        let resultA = gradientA(modelA, [images, history, targets])
+        let gradientA = valueAndGrad(model: modelA) { model, arrays in
+            [model.loss(currentImages: arrays[0], pastImages: arrays[1], pastControls: arrays[2], targets: arrays[3])]
+        }
+        let resultA = gradientA(modelA, [inputs.current, inputs.past, inputs.controls, targets])
         optimizerA.update(model: modelA, gradients: resultA.1, targetType: modelA.dtype)
         MLX.eval(resultA.0, modelA.parameters(), optimizerA.stateArrays())
 
-        let compiled = compile(inputs: [modelB, optimizerB], outputs: [modelB, optimizerB]) { images, history, targets in
-            let result = valueAndGrad(model: modelB) { model, arrays in [model.loss(images: arrays[0], history: arrays[1], targets: arrays[2])] }(modelB, [images, history, targets])
+        let compiled = compile(inputs: [modelB, optimizerB], outputs: [modelB, optimizerB]) { (arrays: [MLXArray]) -> [MLXArray] in
+            let result = valueAndGrad(model: modelB) { model, arrays in
+                [model.loss(currentImages: arrays[0], pastImages: arrays[1], pastControls: arrays[2], targets: arrays[3])]
+            }(modelB, arrays)
             optimizerB.update(model: modelB, gradients: result.1, targetType: modelB.dtype)
-            return result.0[0]
+            return [result.0[0]]
         }
-        let lossB = compiled(images, history, targets)
+        let lossB = compiled([inputs.current, inputs.past, inputs.controls, targets])[0]
         MLX.asyncEval(lossB, modelB.parameters(), optimizerB.stateArrays())
         // Mirrors the trainer's CPU prefetch window while Metal is executing.
         XCTAssertEqual((0..<10_000).reduce(0, +), 49_995_000)
@@ -2019,26 +2028,27 @@ final class DomainTests: XCTestCase {
     func testCompiledTrainingThroughputAndActiveMemoryStayBounded() {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale, bitDepth: 8)
-        profile.training.historyLength = 1
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
         let optimizer = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01)
         optimizer.initialize(model: model)
-        let images = grayscaleTemporalTensor(batch: 2, width: 12, height: 8, value: 0.25)
-        let history = MLXArray([Float](repeating: 0, count: 2 * ActionLayout.count), [2, 1, ActionLayout.count])
+        let inputs = temporalModelInputs(profile: profile, batch: 2, value: 0.25)
         let targets = MLXArray([Float](repeating: 0, count: 2 * ActionLayout.count), [2, ActionLayout.count])
-        let step = compile(inputs: [model, optimizer], outputs: [model, optimizer]) { images, history, targets in
-            let result = valueAndGrad(model: model) { model, arrays in [model.loss(images: arrays[0], history: arrays[1], targets: arrays[2])] }(model, [images, history, targets])
+        let step = compile(inputs: [model, optimizer], outputs: [model, optimizer]) { (arrays: [MLXArray]) -> [MLXArray] in
+            let result = valueAndGrad(model: model) { model, arrays in
+                [model.loss(currentImages: arrays[0], pastImages: arrays[1], pastControls: arrays[2], targets: arrays[3])]
+            }(model, arrays)
             optimizer.update(model: model, gradients: result.1, targetType: model.dtype)
-            return result.0[0]
+            return [result.0[0]]
         }
         var durations: [Double] = []
         var settledMemory = 0
         for iteration in 0..<140 {
             let began = CFAbsoluteTimeGetCurrent()
-            let loss = step(images, history, targets)
+            let loss = step([inputs.current, inputs.past, inputs.controls, targets])[0]
             MLX.eval(loss, model.parameters(), optimizer.stateArrays())
             if iteration >= 20 { durations.append(CFAbsoluteTimeGetCurrent() - began) }
             if iteration == 60 { settledMemory = Memory.activeMemory }
@@ -2086,51 +2096,71 @@ final class DomainTests: XCTestCase {
         XCTAssertThrowsError(try TrainingRandomState.load(from: url))
     }
 
-    func testPackedActionBatchesPreserveHistoryExactly() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cache-\(UUID().uuidString).atrcache", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale, bitDepth: 8)
-        let manifest = DatasetCacheManifest(key: "test", createdAt: Date(), preprocessing: spec, actionFPS: 60, perceptionFPS: 30, historyLength: 2, sampleCount: 3, observationCount: 3, observationBytesPerSample: 1, actionValuesPerSample: ActionLayout.count, segments: [CacheSegment(recordingID: UUID(), start: 0, count: 3)])
-        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
-        try Data([1, 2, 3]).write(to: directory.appendingPathComponent("observations.bin"))
-        try observationMappings([(0, 0), (1, 0), (2, 1)]).write(to: directory.appendingPathComponent("observation-indices.bin"))
-        var actions = Data()
-        for row in 1...3 {
-            var values = [Float](repeating: 0, count: ActionLayout.count); values[0] = Float(row)
-            values.withUnsafeBytes { actions.append(contentsOf: $0) }
+    func testPackedTemporalBatchesKeepFramesControlsAndTargetsAligned() throws {
+        let sequences: [[UInt32]] = [
+            [0, .max, .max],
+            [1, .max, 0],
+            [2, 0, 1]
+        ]
+        let actionRows = (1...3).map { row -> [Float] in
+            var values = [Float](repeating: 0, count: ActionLayout.count)
+            values[0] = Float(row)
+            return values
         }
-        try actions.write(to: directory.appendingPathComponent("actions.bin"))
-        let dataset = try CachedDataset(directory: directory)
-        XCTAssertEqual(dataset.packedObservations(at: [2, 0, 1]), Data([3, 1, 2]))
-        XCTAssertEqual(dataset.precedingPackedObservations(at: [2, 0, 1]), Data([2, 1, 1]))
+        let frameActionRows = (1...3).map { row -> [Float] in
+            var values = [Float](repeating: 0, count: ActionLayout.count)
+            values[0] = Float(row * 10)
+            return values
+        }
+        let fixture = try makeSyntheticDataset(
+            name: "packed-temporal-batch",
+            pastFrameCount: 2,
+            sequences: sequences,
+            actionRows: actionRows,
+            frameActionRows: frameActionRows
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let dataset = fixture.dataset
+
+        XCTAssertEqual(dataset.packedObservations(at: [2, 0, 1]), Data([2, 0, 1]))
+        XCTAssertEqual(dataset.pastPackedObservations(at: [2, 0, 1]), Data([0, 1, 0, 0, 1, 0]))
+        let controls = MLXArray(
+            dataset.pastControlBatch(at: [2, 0, 1]),
+            [3, 2, ActionLayout.count],
+            type: Float.self
+        ).asArray(Float.self)
+        XCTAssertEqual(controls[0], 10)
+        XCTAssertEqual(controls[ActionLayout.count], 20)
+        XCTAssertEqual(controls[2 * ActionLayout.count], 0)
+        XCTAssertEqual(controls[4 * ActionLayout.count], 0)
+        XCTAssertEqual(controls[5 * ActionLayout.count], 10)
         let targets = MLXArray(dataset.actionBatch(at: [2, 0]), [2, ActionLayout.count], type: Float.self).asArray(Float.self)
         XCTAssertEqual(targets[0], 3); XCTAssertEqual(targets[ActionLayout.count], 1)
         let previous = MLXArray(dataset.previousActionBatch(at: [2, 0, 1]), [3, ActionLayout.count], type: Float.self).asArray(Float.self)
         XCTAssertEqual(previous[0], 2)
         XCTAssertEqual(previous[ActionLayout.count], 0, "A recording boundary must start from released controls.")
         XCTAssertEqual(previous[2 * ActionLayout.count], 1)
-        let history = MLXArray(dataset.historyBatch(at: [2]), [1, 2, ActionLayout.count], type: Float.self).asArray(Float.self)
-        XCTAssertEqual(history[0], 1); XCTAssertEqual(history[ActionLayout.count], 2)
     }
 
     func testFusedTrainingBatchMatchesCanonicalCacheReadsAcrossSegments() throws {
-        func verify(historyLength: Int) throws {
-            let mappings: [(UInt32, UInt32)] = [
-                (0, 0), (1, 0), (2, 1),
-                (3, 3), (4, 3), (5, 4)
+        func verify(pastFrameCount: Int) throws {
+            let sequences: [[UInt32]] = pastFrameCount == 2 ? [
+                [0, .max, .max], [1, .max, 0], [2, 0, 1],
+                [3, .max, .max], [4, .max, 3], [5, 3, 4]
+            ] : [
+                [0, .max], [1, 0], [2, 1],
+                [3, .max], [4, 3], [5, 4]
             ]
-            let rows = (0..<mappings.count).map { row -> [Float] in
+            let rows = (0..<sequences.count).map { row -> [Float] in
                 var values = [Float](repeating: 0, count: ActionLayout.count)
                 values[0] = Float(row + 1)
                 values[ActionLayout.keyboard.lowerBound + row] = 1
                 return values
             }
             let fixture = try makeSyntheticDataset(
-                name: "fused-training-batch-\(historyLength)",
-                historyLength: historyLength,
-                mappings: mappings,
+                name: "fused-training-batch-\(pastFrameCount)",
+                pastFrameCount: pastFrameCount,
+                sequences: sequences,
                 actionRows: rows,
                 segments: [
                     CacheSegment(recordingID: UUID(), start: 0, count: 3),
@@ -2141,80 +2171,128 @@ final class DomainTests: XCTestCase {
 
             let indices = [5, 0, 3, 2, 4, 1]
             let fused = fixture.dataset.trainingBatch(at: indices)
-            var expectedObservationPairs = Data()
+            var expectedCurrent = Data()
+            var expectedPast = Data()
+            var expectedControls = Data()
             var expectedActionRows = Data()
             for index in indices {
-                expectedObservationPairs.append(fixture.dataset.packedObservations(at: [index]))
-                expectedObservationPairs.append(fixture.dataset.precedingPackedObservations(at: [index]))
-                expectedActionRows.append(fixture.dataset.historyBatch(at: [index]))
+                expectedCurrent.append(fixture.dataset.packedObservations(at: [index]))
+                expectedPast.append(fixture.dataset.pastPackedObservations(at: [index]))
+                expectedControls.append(fixture.dataset.pastControlBatch(at: [index]))
                 expectedActionRows.append(fixture.dataset.actionBatch(at: [index]))
                 expectedActionRows.append(fixture.dataset.previousActionBatch(at: [index]))
             }
 
             XCTAssertEqual(fused.count, indices.count)
-            XCTAssertEqual(fused.packedObservationPairs, expectedObservationPairs)
+            XCTAssertEqual(fused.packedCurrentObservations, expectedCurrent)
+            XCTAssertEqual(fused.packedPastObservations, expectedPast)
+            XCTAssertEqual(fused.pastControlRows, expectedControls)
             XCTAssertEqual(fused.actionRows, expectedActionRows)
         }
 
-        try verify(historyLength: 2)
-        try verify(historyLength: 0)
+        try verify(pastFrameCount: 2)
+        try verify(pastFrameCount: 1)
     }
 
-    func testVisionBatchPlanDeduplicatesPairsWithoutChangingActionOrder() throws {
-        let mappings: [(UInt32, UInt32)] = [
-            (0, 0), (0, 0), (1, 0), (1, 0), (2, 1), (2, 1)
+    func testVisionBatchPlanDeduplicatesTemporalSequencesWithoutChangingActionOrder() throws {
+        let sequences: [[UInt32]] = [
+            [0, .max], [0, .max], [1, 0], [1, 0], [2, 1], [2, 1]
         ]
-        let rows = mappings.indices.map { row -> [Float] in
+        let rows = sequences.indices.map { row -> [Float] in
             var values = [Float](repeating: 0, count: ActionLayout.count)
             values[0] = Float(row)
             return values
         }
         let fixture = try makeSyntheticDataset(
             name: "deduplicated-vision-plan",
-            historyLength: 1,
-            mappings: mappings,
+            pastFrameCount: 1,
+            sequences: sequences,
             actionRows: rows,
-            segments: [CacheSegment(recordingID: UUID(), start: 0, count: mappings.count)]
+            segments: [CacheSegment(recordingID: UUID(), start: 0, count: sequences.count)]
         )
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
 
         let indices = [3, 0, 1, 2, 5, 4]
         let plan = fixture.dataset.visionBatchPlan(at: indices)
         XCTAssertEqual(
-            plan.uniquePairs,
+            plan.uniqueSequences,
             [
-                CachedObservationPair(current: 1, previous: 0),
-                CachedObservationPair(current: 0, previous: 0),
-                CachedObservationPair(current: 2, previous: 1)
+                CachedObservationSequence(indices: [1, 0]),
+                CachedObservationSequence(indices: [0, .max]),
+                CachedObservationSequence(indices: [2, 1])
             ]
         )
         XCTAssertEqual(plan.sampleToVision, [0, 1, 1, 0, 2, 2])
         XCTAssertEqual(fixture.dataset.observationReuseRatio(at: indices), 2, accuracy: 0.000_001)
+        XCTAssertEqual(plan.uniquePastObservations, [0, 1])
+        XCTAssertEqual(plan.visionToPast, [0, 0, 1])
+        XCTAssertEqual(plan.pastFrameReuseRatio, 1.5, accuracy: 0.000_001)
 
-        let sampleBytes = fixture.dataset.manifest.observationBytesPerSample
-        let historyRows = max(1, fixture.dataset.manifest.historyLength) + 2
-        var packed = Data(count: plan.uniquePairs.count * 2 * sampleBytes)
-        var actions = Data(
-            count: indices.count * historyRows * ActionLayout.count * MemoryLayout<Float>.size
-        )
-        packed.withUnsafeMutableBytes { packedDestination in
-            actions.withUnsafeMutableBytes { actionDestination in
-                fixture.dataset.populateTrainingBatch(
-                    at: indices,
-                    observationPairs: plan.uniquePairs,
-                    packedObservationPairs: packedDestination,
-                    actionRows: actionDestination
-                )
+        let rowBytes = ActionLayout.count * MemoryLayout<Float>.size
+        var current = Data(count: plan.uniqueSequences.count)
+        var past = Data(count: plan.uniqueSequences.count)
+        var controls = Data(count: plan.uniqueSequences.count * rowBytes)
+        var actions = Data(count: indices.count * 2 * rowBytes)
+        current.withUnsafeMutableBytes { currentDestination in
+            past.withUnsafeMutableBytes { pastDestination in
+                controls.withUnsafeMutableBytes { controlDestination in
+                    actions.withUnsafeMutableBytes { actionDestination in
+                        fixture.dataset.populateTrainingBatch(
+                            at: indices,
+                            observationSequences: plan.uniqueSequences,
+                            packedCurrentObservations: currentDestination,
+                            packedPastObservations: pastDestination,
+                            pastControlRows: controlDestination,
+                            actionRows: actionDestination
+                        )
+                    }
+                }
             }
         }
         let canonical = fixture.dataset.trainingBatch(at: indices)
         XCTAssertEqual(actions, canonical.actionRows)
 
-        let expandedPacked = plan.sampleToVision.reduce(into: Data()) { output, visionIndex in
-            let offset = Int(visionIndex) * 2 * sampleBytes
-            output.append(packed[offset..<(offset + 2 * sampleBytes)])
+        let expandedCurrent = plan.sampleToVision.reduce(into: Data()) { output, visionIndex in
+            output.append(current[Int(visionIndex)])
         }
-        XCTAssertEqual(expandedPacked, canonical.packedObservationPairs)
+        let expandedPast = plan.sampleToVision.reduce(into: Data()) { output, visionIndex in
+            output.append(past[Int(visionIndex)])
+        }
+        let expandedControls = plan.sampleToVision.reduce(into: Data()) { output, visionIndex in
+            let offset = Int(visionIndex) * rowBytes
+            output.append(controls[offset..<(offset + rowBytes)])
+        }
+        XCTAssertEqual(expandedCurrent, canonical.packedCurrentObservations)
+        XCTAssertEqual(expandedPast, canonical.packedPastObservations)
+        XCTAssertEqual(expandedControls, canonical.pastControlRows)
+
+        var deduplicatedPast = Data(count: plan.uniquePastObservations.count)
+        var deduplicatedCurrent = Data(count: plan.uniqueSequences.count)
+        var deduplicatedControls = Data(count: plan.uniqueSequences.count * rowBytes)
+        var deduplicatedActions = Data(count: indices.count * 2 * rowBytes)
+        deduplicatedCurrent.withUnsafeMutableBytes { currentDestination in
+            deduplicatedPast.withUnsafeMutableBytes { pastDestination in
+                deduplicatedControls.withUnsafeMutableBytes { controlDestination in
+                    deduplicatedActions.withUnsafeMutableBytes { actionDestination in
+                        fixture.dataset.populateTrainingBatch(
+                            at: indices,
+                            visionPlan: plan,
+                            packedCurrentObservations: currentDestination,
+                            packedPastObservations: pastDestination,
+                            pastControlRows: controlDestination,
+                            actionRows: actionDestination
+                        )
+                    }
+                }
+            }
+        }
+        let restoredPast = plan.visionToPast.reduce(into: Data()) { output, pastIndex in
+            output.append(deduplicatedPast[Int(pastIndex)])
+        }
+        XCTAssertEqual(deduplicatedCurrent, current)
+        XCTAssertEqual(restoredPast, past)
+        XCTAssertEqual(deduplicatedControls, controls)
+        XCTAssertEqual(deduplicatedActions, actions)
     }
 
     func testGroupedVisionOrderPreservesRowsAndKeepsPairsInsideBatches() {
@@ -2236,6 +2314,55 @@ final class DomainTests: XCTestCase {
         for start in stride(from: 0, to: order.count, by: 8) {
             let batch = order[start..<min(order.count, start + 8)]
             XCTAssertTrue(batch.contains(where: salient.contains))
+        }
+    }
+
+    func testLocalityGroupedVisionOrderRandomizesBatchesWithoutLosingLocalityOrSalience() {
+        let groups = (0..<12).map { group in [group * 2, group * 2 + 1] }
+        let salient = Set([0, 6, 12, 18])
+        let order = TrainingEngine().localityGroupedVisionTrainingOrder(
+            groups: groups,
+            batchSize: 8,
+            seed: 91,
+            salientIndices: salient
+        )
+
+        XCTAssertEqual(order.sorted(), Array(0..<24))
+        for group in groups {
+            let positions = group.compactMap(order.firstIndex)
+            XCTAssertEqual(positions.count, 2)
+            XCTAssertEqual(positions[0] / 8, positions[1] / 8)
+        }
+        for start in stride(from: 0, to: order.count, by: 8) {
+            let batch = Array(order[start..<min(order.count, start + 8)])
+            let groupIndices = batch.map { $0 / 2 }
+            XCTAssertLessThanOrEqual(
+                (groupIndices.max() ?? 0) - (groupIndices.min() ?? 0),
+                3
+            )
+            XCTAssertTrue(batch.contains(where: salient.contains))
+        }
+        XCTAssertNotEqual(order, Array(0..<24))
+    }
+
+    func testLargeLocalityBatchesMixSeveralBoundedTemporalLanes() {
+        let groups = (0..<256).map { [$0] }
+        let order = TrainingEngine().localityGroupedVisionTrainingOrder(
+            groups: groups,
+            batchSize: 128,
+            seed: 92,
+            salientIndices: []
+        )
+
+        XCTAssertEqual(order.sorted(), Array(0..<256))
+        XCTAssertNotEqual(order, Array(0..<256))
+        for start in stride(from: 0, to: order.count, by: 128) {
+            let sortedBatch = order[start..<min(order.count, start + 128)].sorted()
+            let runCount = zip(sortedBatch, sortedBatch.dropFirst()).count { pair in
+                pair.1 != pair.0 + 1
+            } + 1
+            XCTAssertLessThanOrEqual(runCount, 4)
+            XCTAssertEqual(sortedBatch.count, 128)
         }
     }
 
@@ -2268,33 +2395,44 @@ final class DomainTests: XCTestCase {
         profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
         profile.training.actionFPS = 60
         profile.training.perceptionFPS = 30
-        profile.training.historyLength = 2
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 2,
+            frameSpacing: 1,
+            downsampleFactor: 2
+        )
         let dataset = try await DatasetCacheBuilder(workspace: store).cache(for: profile, recordings: [RecordingItem(manifest: manifest, directory: directory)]) { _, _ in }
 
         XCTAssertGreaterThan(dataset.count, dataset.manifest.observationCount)
         XCTAssertGreaterThanOrEqual(dataset.manifest.observationCount, 5)
         XCTAssertTrue(dataset.demonstratedKeyCodes().contains(13))
-        XCTAssertEqual(dataset.packedObservation(at: 0), dataset.precedingPackedObservations(at: [0]))
+        XCTAssertEqual(dataset.manifest.preprocessing.width, 8)
+        XCTAssertEqual(dataset.manifest.pastPreprocessing.width, 4)
+        XCTAssertEqual(dataset.pastPackedObservations(at: [0]).count, 2 * dataset.manifest.pastObservationBytesPerSample)
+        XCTAssertTrue(
+            MLXArray(
+                dataset.pastControlBatch(at: Array(0..<dataset.count)),
+                [dataset.count, 2, ActionLayout.count],
+                type: Float.self
+            ).asArray(Float.self).contains { $0 != 0 },
+            "Frame-aligned controls should retain short demonstrated inputs instead of storing only model outputs."
+        )
     }
 
     func testPositiveClassWeightsUseOnlyRequestedRowsAndRespectRestrictions() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("weights-cache-\(UUID().uuidString).atrcache", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale, bitDepth: 8)
-        let manifest = DatasetCacheManifest(key: "weights", createdAt: Date(), preprocessing: spec, actionFPS: 60, perceptionFPS: 30, historyLength: 1, sampleCount: 4, observationCount: 1, observationBytesPerSample: 1, actionValuesPerSample: ActionLayout.count, segments: [CacheSegment(recordingID: UUID(), start: 0, count: 4)])
-        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
-        try Data([0]).write(to: directory.appendingPathComponent("observations.bin"))
-        try observationMappings([(0, 0), (0, 0), (0, 0), (0, 0)]).write(to: directory.appendingPathComponent("observation-indices.bin"))
-        var actionRows = Data()
+        var actionRows: [[Float]] = []
         for row in 0..<4 {
             var values = [Float](repeating: 0, count: ActionLayout.count)
             if row == 0 { values[ActionLayout.keyboard.lowerBound + 13] = 1 }
-            values.withUnsafeBytes { actionRows.append(contentsOf: $0) }
+            actionRows.append(values)
         }
-        try actionRows.write(to: directory.appendingPathComponent("actions.bin"))
-        let dataset = try CachedDataset(directory: directory)
+        let fixture = try makeSyntheticDataset(
+            name: "weights",
+            pastFrameCount: 1,
+            sequences: Array(repeating: [0, .max], count: 4),
+            actionRows: actionRows
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let dataset = fixture.dataset
         let weights = dataset.positiveClassWeights(at: [0, 1, 2, 3], restrictions: ActionRestrictions())
         XCTAssertEqual(weights[ActionLayout.keyboard.lowerBound + 13], 3)
         XCTAssertEqual(weights[ActionLayout.keyboard.lowerBound + 12], 0)
@@ -2304,25 +2442,23 @@ final class DomainTests: XCTestCase {
     }
 
     func testValidationSplitNeverRemovesTheOnlyTrainingExampleOfAControl() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("split-cache-\(UUID().uuidString).atrcache", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale, bitDepth: 8)
         let segments = (0..<3).map { CacheSegment(recordingID: UUID(), start: $0 * 2, count: 2) }
-        let manifest = DatasetCacheManifest(key: "split", createdAt: Date(), preprocessing: spec, actionFPS: 60, perceptionFPS: 30, historyLength: 1, sampleCount: 6, observationCount: 1, observationBytesPerSample: 1, actionValuesPerSample: ActionLayout.count, segments: segments)
-        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
-        try Data([0]).write(to: directory.appendingPathComponent("observations.bin"))
-        try observationMappings(Array(repeating: (0, 0), count: 6)).write(to: directory.appendingPathComponent("observation-indices.bin"))
-        var actionRows = Data()
+        var actionRows: [[Float]] = []
         for row in 0..<6 {
             var values = [Float](repeating: 0, count: ActionLayout.count)
             if row == 0 { values[ActionLayout.keyboard.lowerBound + 10] = 1 }
             if row == 2 || row == 4 { values[ActionLayout.keyboard.lowerBound + 13] = 1 }
-            values.withUnsafeBytes { actionRows.append(contentsOf: $0) }
+            actionRows.append(values)
         }
-        try actionRows.write(to: directory.appendingPathComponent("actions.bin"))
-        let dataset = try CachedDataset(directory: directory)
+        let fixture = try makeSyntheticDataset(
+            name: "split",
+            pastFrameCount: 1,
+            sequences: Array(repeating: [0, .max], count: 6),
+            actionRows: actionRows,
+            segments: segments
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let dataset = fixture.dataset
         let representatives = dataset.representativeValidationIndices(from: Array(0..<6), limit: 2)
         XCTAssertEqual(Set(representatives), [0, 2], "Rare positive controls must displace easy zero-only validation rows")
         let split = TrainingEngine().splitIndices(dataset: dataset, fraction: 0.9, seed: 42)
@@ -2341,12 +2477,12 @@ final class DomainTests: XCTestCase {
             return CacheSegment(recordingID: UUID(), start: start, count: count)
         }
         let rowCount = counts.reduce(0, +)
-        let mappings = Array(repeating: (UInt32(0), UInt32(0)), count: rowCount)
+        let sequences = Array(repeating: [UInt32(0), .max], count: rowCount)
         let rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: rowCount)
         let fixture = try makeSyntheticDataset(
             name: "sample-balanced-split",
-            historyLength: 1,
-            mappings: mappings,
+            pastFrameCount: 1,
+            sequences: sequences,
             actionRows: rows,
             segments: segments
         )
@@ -2362,31 +2498,39 @@ final class DomainTests: XCTestCase {
         }
     }
 
-    func testSingleRecordingValidationPurgesSharedHistoryAndPerceptionFrames() throws {
-        let mappings: [(UInt32, UInt32)] = [
-            (0, 0), (0, 0), (0, 0), (1, 0), (1, 0),
-            (1, 0), (1, 0), (1, 0), (2, 1), (2, 1),
-            (2, 1), (2, 1), (2, 1), (2, 1), (2, 1),
-            (2, 1), (3, 2), (3, 2), (4, 3), (4, 3)
+    func testSingleRecordingValidationPurgesSharedTemporalFrames() throws {
+        let sequences: [[UInt32]] = [
+            [0, .max, .max, .max], [0, .max, .max, .max], [0, .max, .max, .max],
+            [1, .max, .max, 0], [1, .max, .max, 0], [1, .max, .max, 0], [1, .max, .max, 0], [1, .max, .max, 0],
+            [2, .max, 0, 1], [2, .max, 0, 1], [2, .max, 0, 1], [2, .max, 0, 1],
+            [2, .max, 0, 1], [2, .max, 0, 1], [2, .max, 0, 1], [2, .max, 0, 1],
+            [3, 0, 1, 2], [4, 1, 2, 3], [6, 3, 4, 5], [7, 4, 5, 6]
         ]
-        let rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: mappings.count)
-        let fixture = try makeSyntheticDataset(name: "purged-validation", historyLength: 3, mappings: mappings, actionRows: rows)
+        let rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: sequences.count)
+        let fixture = try makeSyntheticDataset(name: "purged-validation", pastFrameCount: 3, sequences: sequences, actionRows: rows)
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
 
         let split = TrainingEngine().splitIndices(dataset: fixture.dataset, fraction: 0.25, seed: 42)
         XCTAssertEqual(split.train, Array(0..<15))
         XCTAssertEqual(split.validation, [18, 19])
         XCTAssertTrue(Set(split.train).isDisjoint(with: split.validation))
-        XCTAssertGreaterThanOrEqual(split.validation.first ?? 0, (split.train.last ?? 0) + 1 + 3, "Validation history may not reach back into training")
+        XCTAssertTrue(
+            fixture.dataset.firstDisjointValidationIndex(trainingEnd: 15, proposedStart: 15) == 18,
+            "Validation may begin only when every selected frame is newer than every training frame."
+        )
     }
 
     func testValidationAvailabilityIgnoresBlockedControls() throws {
-        let mappings = (0..<20).map { row -> (UInt32, UInt32) in
-            (UInt32(row), UInt32(max(0, row - 1)))
+        let sequences = (0..<20).map { row -> [UInt32] in
+            let current = UInt32(row)
+            let past = (1...3).reversed().map { distance -> UInt32 in
+                row >= distance ? UInt32(row - distance) : .max
+            }
+            return [current] + past
         }
-        var rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: mappings.count)
+        var rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: sequences.count)
         rows[18][ActionLayout.keyboard.lowerBound + 13] = 1
-        let fixture = try makeSyntheticDataset(name: "blocked-validation", historyLength: 3, mappings: mappings, actionRows: rows)
+        let fixture = try makeSyntheticDataset(name: "blocked-validation", pastFrameCount: 3, sequences: sequences, actionRows: rows)
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
 
         let unrestricted = TrainingEngine().splitIndices(dataset: fixture.dataset, fraction: 0.25, seed: 42)
@@ -2411,18 +2555,18 @@ final class DomainTests: XCTestCase {
     }
 
     func testSalienceBalancedTrainingOrderSpreadsTransitionsWithoutResampling() throws {
-        let mappings = (0..<12).map { row -> (UInt32, UInt32) in
-            (UInt32(row), UInt32(max(0, row - 1)))
+        let sequences = (0..<12).map { row -> [UInt32] in
+            [UInt32(row), row > 0 ? UInt32(row - 1) : .max]
         }
-        var rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: mappings.count)
+        var rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: sequences.count)
         rows[1][ActionLayout.keyboard.lowerBound + 13] = 1
         rows[7][ActionLayout.scroll.lowerBound] = 0.5
-        let fixture = try makeSyntheticDataset(name: "balanced-order", historyLength: 1, mappings: mappings, actionRows: rows)
+        let fixture = try makeSyntheticDataset(name: "balanced-order", pastFrameCount: 1, sequences: sequences, actionRows: rows)
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
 
         var profile = AIProfile.fresh()
         profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: true, keyboard: true, modifiers: false)
-        let indices = Array(0..<mappings.count)
+        let indices = Array(0..<sequences.count)
         let salient = fixture.dataset.salientTrainingIndices(at: indices, channels: profile.channels, restrictions: profile.effectiveRestrictions)
         XCTAssertEqual(salient, [1, 2, 7])
 
@@ -2441,10 +2585,22 @@ final class DomainTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale, bitDepth: 8)
-        let manifest = DatasetCacheManifest(key: "invalid", createdAt: Date(), preprocessing: spec, actionFPS: 60, perceptionFPS: 30, historyLength: 1, sampleCount: Int.max, observationCount: 1, observationBytesPerSample: 1, actionValuesPerSample: ActionLayout.count, segments: [CacheSegment(recordingID: UUID(), start: 0, count: Int.max)])
+        let temporal = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 1)
+        let manifest = DatasetCacheManifest(
+            key: "invalid", createdAt: Date(), preprocessing: spec,
+            pastPreprocessing: spec, temporalVision: temporal,
+            actionFPS: 60, perceptionFPS: 30,
+            sampleCount: Int.max, observationCount: 1,
+            currentObservationBytesPerSample: 1, pastObservationBytesPerSample: 1,
+            actionValuesPerSample: ActionLayout.count,
+            segments: [CacheSegment(recordingID: UUID(), start: 0, count: Int.max)]
+        )
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
-        try Data().write(to: directory.appendingPathComponent("observations.bin"))
+        try Data().write(to: directory.appendingPathComponent("current-observations.bin"))
+        try Data().write(to: directory.appendingPathComponent("past-observations.bin"))
+        try Data().write(to: directory.appendingPathComponent("observation-indices.bin"))
+        try Data().write(to: directory.appendingPathComponent("frame-actions.bin"))
         try Data().write(to: directory.appendingPathComponent("actions.bin"))
         XCTAssertThrowsError(try CachedDataset(directory: directory))
     }
@@ -2454,11 +2610,22 @@ final class DomainTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale)
-        let manifest = DatasetCacheManifest(key: "mapping", createdAt: Date(), preprocessing: spec, actionFPS: 60, perceptionFPS: 30, historyLength: 1, sampleCount: 1, observationCount: 1, observationBytesPerSample: 1, actionValuesPerSample: ActionLayout.count, segments: [CacheSegment(recordingID: UUID(), start: 0, count: 1)])
+        let temporal = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 1)
+        let manifest = DatasetCacheManifest(
+            key: "mapping", createdAt: Date(), preprocessing: spec,
+            pastPreprocessing: spec, temporalVision: temporal,
+            actionFPS: 60, perceptionFPS: 30,
+            sampleCount: 1, observationCount: 1,
+            currentObservationBytesPerSample: 1, pastObservationBytesPerSample: 1,
+            actionValuesPerSample: ActionLayout.count,
+            segments: [CacheSegment(recordingID: UUID(), start: 0, count: 1)]
+        )
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
-        try Data([0]).write(to: directory.appendingPathComponent("observations.bin"))
-        try observationMappings([(1, 0)]).write(to: directory.appendingPathComponent("observation-indices.bin"))
+        try Data([0]).write(to: directory.appendingPathComponent("current-observations.bin"))
+        try Data([0]).write(to: directory.appendingPathComponent("past-observations.bin"))
+        try observationSequenceData([[1, .max]]).write(to: directory.appendingPathComponent("observation-indices.bin"))
+        try Data(count: ActionLayout.count * MemoryLayout<Float>.size).write(to: directory.appendingPathComponent("frame-actions.bin"))
         try Data(count: ActionLayout.count * MemoryLayout<Float>.size).write(to: directory.appendingPathComponent("actions.bin"))
         XCTAssertThrowsError(try CachedDataset(directory: directory))
     }
@@ -2476,42 +2643,59 @@ final class DomainTests: XCTestCase {
     func testPolicyForwardAndGradient() throws {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 32, height: 24, colorMode: .grayscale, bitDepth: 8)
-        profile.training.historyLength = 2
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 2, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
-        let images = grayscaleTemporalTensor(batch: 2, width: 32, height: 24, value: 0.5)
-        let history = MLXArray([Float](repeating: 0, count: 2 * 2 * ActionLayout.count), [2, 2, ActionLayout.count])
+        let inputs = temporalModelInputs(profile: profile, batch: 2, value: 0.5)
         let targets = MLXArray([Float](repeating: 0, count: 2 * ActionLayout.count), [2, ActionLayout.count])
-        let gradient = valueAndGrad(model: model) { model, arrays in [model.loss(images: arrays[0], history: arrays[1], targets: arrays[2])] }
-        let result = gradient(model, [images, history, targets])
+        let gradient = valueAndGrad(model: model) { model, arrays in
+            [model.loss(currentImages: arrays[0], pastImages: arrays[1], pastControls: arrays[2], targets: arrays[3])]
+        }
+        let result = gradient(model, [inputs.current, inputs.past, inputs.controls, targets])
         MLX.eval(result.0, result.1)
-        XCTAssertEqual(model.predictions(images: images, history: history).shape, [2, ActionLayout.count])
+        XCTAssertEqual(
+            model.predictions(currentImages: inputs.current, pastImages: inputs.past, pastControls: inputs.controls).shape,
+            [2, ActionLayout.count]
+        )
         XCTAssertTrue(result.0[0].item(Float.self).isFinite)
     }
 
     func testSharedValidationForwardPreservesLossAndPredictions() {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 32, height: 24, colorMode: .grayscale, bitDepth: 8)
-        profile.training.historyLength = 2
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 2, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
         model.train(false)
-        let images = grayscaleTemporalTensor(batch: 2, width: 32, height: 24, value: 0.375)
-        let history = MLXArray([Float](repeating: 0, count: 2 * 2 * ActionLayout.count), [2, 2, ActionLayout.count])
+        let inputs = temporalModelInputs(profile: profile, batch: 2, value: 0.375)
         var targetValues = [Float](repeating: 0, count: 2 * ActionLayout.count)
         targetValues[ActionLayout.keyboard.lowerBound + 13] = 1
         targetValues[ActionLayout.count + ActionLayout.buttons.lowerBound] = 1
         let targets = MLXArray(targetValues, [2, ActionLayout.count])
         let weights = MLXArray.ones([ActionLayout.count])
 
-        let expectedLoss = model.loss(images: images, history: history, targets: targets, positiveWeights: weights)
-        let expectedPredictions = model.predictions(images: images, history: history)
-        let logits = model.callAsFunction(images: images, history: history)
-        let sharedLoss = model.loss(logits: logits, history: history, targets: targets, positiveWeights: weights)
+        let expectedLoss = model.loss(
+            currentImages: inputs.current,
+            pastImages: inputs.past,
+            pastControls: inputs.controls,
+            targets: targets,
+            positiveWeights: weights
+        )
+        let expectedPredictions = model.predictions(
+            currentImages: inputs.current,
+            pastImages: inputs.past,
+            pastControls: inputs.controls
+        )
+        let logits = model.callAsFunction(
+            currentImages: inputs.current,
+            pastImages: inputs.past,
+            pastControls: inputs.controls
+        )
+        let sharedLoss = model.loss(logits: logits, targets: targets, positiveWeights: weights)
         let sharedPredictions = model.activatedPredictions(logits: logits)
         MLX.eval(expectedLoss, expectedPredictions, sharedLoss, sharedPredictions)
 
@@ -2604,7 +2788,7 @@ final class DomainTests: XCTestCase {
         XCTAssertLessThanOrEqual(gradientDelta, 0.000_1)
     }
 
-    func testReusedVisualFeaturesPreserveBatchLossAndGradient() {
+    func testDeduplicatedTemporalVisionPreservesBatchLossAndGradient() {
         MLXRandom.seed(88_204)
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(
@@ -2612,16 +2796,29 @@ final class DomainTests: XCTestCase {
             height: 24,
             colorMode: .grayscale
         )
-        profile.training.historyLength = 0
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
-        profile.training.architecture.dropout = 0
+        profile.training.architecture.dropout = 0.15
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
-        model.train(false)
-        let uniqueImages = MLXRandom.uniform(low: -1, high: 1, [2, 24, 32, 2])
+        model.train(true)
+        let uniqueInputs = temporalModelInputs(profile: profile, batch: 2, value: 0.25)
+        let uniqueImages = uniqueInputs.current + MLXRandom.uniform(low: -0.1, high: 0.1, uniqueInputs.current.shape)
+        let generatedPast = uniqueInputs.past
+            + MLXRandom.uniform(low: -0.1, high: 0.1, uniqueInputs.past.shape)
+        let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+        let flattenedPast = generatedPast.reshaped([
+            4, pastSpec.height, pastSpec.width, pastSpec.channelCount
+        ])
+        let uniquePast = flattenedPast.take(MLXArray([Int32(0), 1, 3]), axis: 0)
+        let visionToPast = MLXArray([Int32(0), 1, 1, 2], [2, 2])
+        let sequencePast = uniquePast.take(visionToPast.flattened(), axis: 0).reshaped([
+            2, 2, pastSpec.height, pastSpec.width, pastSpec.channelCount
+        ])
         let mapping = MLXArray([Int32(0), 0, 1, 1])
         let fullImages = uniqueImages.take(mapping, axis: 0)
-        let history = MLXArray.zeros([4, 1, ActionLayout.count])
+        let fullPast = sequencePast.take(mapping, axis: 0)
+        let fullControls = uniqueInputs.controls.take(mapping, axis: 0)
         var targetValues = [Float](repeating: 0, count: 4 * ActionLayout.count)
         for row in 0..<4 {
             targetValues[row * ActionLayout.count] = Float(row) / 3
@@ -2631,30 +2828,38 @@ final class DomainTests: XCTestCase {
         let previousTargets = MLXArray.zeros(like: targets)
         let classWeights = MLXArray.ones([ActionLayout.count])
 
-        let full = valueAndGrad(model: model) { candidate, arrays in
-            [candidate.loss(
-                images: arrays[0],
-                history: arrays[1],
-                targets: arrays[2],
-                positiveWeights: classWeights,
-                previousTargets: arrays[3]
-            )]
-        }(model, [fullImages, history, targets, previousTargets])
-        let reused = valueAndGrad(model: model) { candidate, arrays in
-            let uniqueVisual = candidate.visualActivations(images: arrays[0]).last!
-            let uniqueEmbedding = candidate.visualEmbedding(visualFeatures: uniqueVisual)
-            let logits = candidate.logits(
-                visualEmbedding: uniqueEmbedding.take(mapping, axis: 0),
-                history: arrays[1]
-            )
-            return [candidate.loss(
-                logits: logits,
-                history: arrays[1],
-                targets: arrays[2],
-                positiveWeights: classWeights,
-                previousTargets: arrays[3]
-            )]
-        }(model, [uniqueImages, history, targets, previousTargets])
+        let fullRandomState = MLXRandom.RandomState(seed: 90_001)
+        let full = withRandomState(fullRandomState) {
+            valueAndGrad(model: model) { candidate, arrays in
+                [candidate.loss(
+                    currentImages: arrays[0],
+                    pastImages: arrays[1],
+                    pastControls: arrays[2],
+                    targets: arrays[3],
+                    positiveWeights: classWeights,
+                    previousTargets: arrays[4]
+                )]
+            }(model, [fullImages, fullPast, fullControls, targets, previousTargets])
+        }
+        let reusedRandomState = MLXRandom.RandomState(seed: 90_001)
+        let reused = withRandomState(reusedRandomState) {
+            valueAndGrad(model: model) { candidate, arrays in
+                let uniqueTemporal = candidate.temporalFeatures(
+                    currentImages: arrays[0],
+                    pastImages: arrays[1],
+                    pastControls: arrays[2],
+                    visionToPast: visionToPast,
+                    sampleToVision: mapping
+                )
+                let logits = candidate.logits(temporalFeatures: uniqueTemporal)
+                return [candidate.loss(
+                    logits: logits,
+                    targets: arrays[3],
+                    positiveWeights: classWeights,
+                    previousTargets: arrays[4]
+                )]
+            }(model, [uniqueImages, uniquePast, uniqueInputs.controls, targets, previousTargets])
+        }
         MLX.eval(full.0, full.1, reused.0, reused.1)
 
         XCTAssertEqual(full.0[0].item(Float.self), reused.0[0].item(Float.self), accuracy: 0.000_01)
@@ -2676,14 +2881,16 @@ final class DomainTests: XCTestCase {
         MLXRandom.seed(88_205)
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 32, height: 24, colorMode: .grayscale)
-        profile.training.historyLength = 0
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .bfloat16
         let model = AgentPolicy(profile: profile)
         model.train(false)
-        let images = MLXRandom.uniform(low: -1, high: 1, [3, 24, 32, 2]).asType(.bfloat16)
-        let history = MLXArray.zeros([3, 1, ActionLayout.count], dtype: .bfloat16)
+        let inputs = temporalModelInputs(profile: profile, batch: 3, value: 0.25)
+        let images = MLXRandom.uniform(low: -1, high: 1, inputs.current.shape).asType(.bfloat16)
+        let past = inputs.past.asType(.bfloat16)
+        let controls = inputs.controls.asType(.bfloat16)
         let selector = MLXRandom.uniform(low: -1, high: 1, [3, ActionLayout.count]).asType(.bfloat16)
 
         func selectedLogits(_ model: AgentPolicy, _ arrays: [MLXArray], accelerated: Bool) -> MLXArray {
@@ -2693,25 +2900,28 @@ final class DomainTests: XCTestCase {
             ).last!
             return (
                 model.logits(
-                    visualFeatures: visual,
-                    history: arrays[1]
-                ) * arrays[2]
+                    currentVisualFeatures: visual,
+                    pastImages: arrays[1],
+                    pastControls: arrays[2]
+                ) * arrays[3]
             ).sum()
         }
         let legacyLogits = model.logits(
-            visualFeatures: model.visualActivations(images: images, acceleratedOperators: false).last!,
-            history: history
+            currentVisualFeatures: model.visualActivations(images: images, acceleratedOperators: false).last!,
+            pastImages: past,
+            pastControls: controls
         )
         let acceleratedLogits = model.logits(
-            visualFeatures: model.visualActivations(images: images, acceleratedOperators: true).last!,
-            history: history
+            currentVisualFeatures: model.visualActivations(images: images, acceleratedOperators: true).last!,
+            pastImages: past,
+            pastControls: controls
         )
         let legacyGradient = valueAndGrad(model: model) { candidate, arrays in
             [selectedLogits(candidate, arrays, accelerated: false)]
-        }(model, [images, history, selector]).1
+        }(model, [images, past, controls, selector]).1
         let acceleratedGradient = valueAndGrad(model: model) { candidate, arrays in
             [selectedLogits(candidate, arrays, accelerated: true)]
-        }(model, [images, history, selector]).1
+        }(model, [images, past, controls, selector]).1
         let legacyPredictions = model.activatedPredictions(logits: legacyLogits)
         let acceleratedPredictions = model.activatedPredictions(logits: acceleratedLogits)
         MLX.eval(
@@ -2757,24 +2967,24 @@ final class DomainTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(gradientCosine, 0.999)
     }
 
-    func testHistoryShortcutMaskStillAppliesWhenFeatureDropoutIsZero() {
+    func testPastControlShortcutMaskStillAppliesWhenFeatureDropoutIsZero() {
         MLXRandom.seed(7_015)
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale, bitDepth: 8)
-        profile.training.historyLength = 1
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
         let batch = 32
-        let images = MLXArray.zeros([batch, 8, 12, 2], dtype: .float32)
-        var historyValues = [Float](repeating: 0, count: batch * ActionLayout.count)
-        for row in 0..<batch { historyValues[row * ActionLayout.count + ActionLayout.keyboard.lowerBound + 13] = 1 }
-        let history = MLXArray(historyValues, [batch, 1, ActionLayout.count])
+        let inputs = temporalModelInputs(profile: profile, batch: batch, value: 0)
+        var controlValues = [Float](repeating: 0, count: batch * ActionLayout.count)
+        for row in 0..<batch { controlValues[row * ActionLayout.count + ActionLayout.keyboard.lowerBound + 13] = 1 }
+        let controls = MLXArray(controlValues, [batch, 1, ActionLayout.count])
 
         model.train(false)
-        let inference = model.predictions(images: images, history: history)
-        let maskedInference = model.predictions(images: images, history: MLXArray.zeros(like: history))
+        let inference = model.predictions(currentImages: inputs.current, pastImages: inputs.past, pastControls: controls)
+        let maskedInference = model.predictions(currentImages: inputs.current, pastImages: inputs.past, pastControls: MLXArray.zeros(like: controls))
         MLX.eval(inference, maskedInference)
         let inferenceValues = inference.asArray(Float.self)
         let maskedInferenceValues = maskedInference.asArray(Float.self)
@@ -2785,7 +2995,7 @@ final class DomainTests: XCTestCase {
         }
 
         model.train(true)
-        let training = model.predictions(images: images, history: history)
+        let training = model.predictions(currentImages: inputs.current, pastImages: inputs.past, pastControls: controls)
         MLX.eval(training)
         let trainingValues = training.asArray(Float.self)
         var keptRows = 0, maskedRows = 0
@@ -2793,38 +3003,48 @@ final class DomainTests: XCTestCase {
             let values = trainingValues[row * ActionLayout.count..<(row + 1) * ActionLayout.count]
             let matchesKept = zip(values, firstInferenceRow).allSatisfy { abs($0 - $1) < 0.000_01 }
             let matchesMasked = zip(values, firstMaskedRow).allSatisfy { abs($0 - $1) < 0.000_01 }
-            XCTAssertTrue(matchesKept || matchesMasked, "Kept history must retain inference-time magnitude instead of being doubled like ordinary dropout.")
+            XCTAssertTrue(matchesKept || matchesMasked, "Kept frame controls must retain inference-time magnitude instead of being doubled like ordinary dropout.")
             keptRows += matchesKept ? 1 : 0
             maskedRows += matchesMasked ? 1 : 0
         }
         XCTAssertGreaterThan(keptRows, 0)
-        XCTAssertGreaterThan(maskedRows, 0, "Anti-shortcut history masking must not depend on ordinary feature dropout.")
+        XCTAssertGreaterThan(maskedRows, 0, "Anti-shortcut frame-control masking must not depend on ordinary feature dropout.")
     }
 
-    func testZeroHistoryTransitionLossUsesTheRealPreviousAction() {
+    func testTransitionLossUsesTheRealImmediatelyPreviousAction() {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
         profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: true, scroll: false, keyboard: false, modifiers: false)
-        profile.training.historyLength = 0
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.binaryFocalGamma = 0
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
         model.train(false)
-        let images = MLXArray.zeros([1, 8, 8, 2], dtype: .float32)
-        let history = MLXArray.zeros([1, 1, ActionLayout.count], dtype: .float32)
+        let inputs = temporalModelInputs(profile: profile, batch: 1, value: 0)
         var targetValues = [Float](repeating: 0, count: ActionLayout.count)
         targetValues[ActionLayout.buttons.lowerBound] = 1
         let targets = MLXArray(targetValues, [1, ActionLayout.count])
-        let placeholderLoss = model.loss(images: images, history: history, targets: targets)
-        let heldActionLoss = model.loss(images: images, history: history, targets: targets, previousTargets: targets)
+        let placeholderLoss = model.loss(
+            currentImages: inputs.current,
+            pastImages: inputs.past,
+            pastControls: inputs.controls,
+            targets: targets
+        )
+        let heldActionLoss = model.loss(
+            currentImages: inputs.current,
+            pastImages: inputs.past,
+            pastControls: inputs.controls,
+            targets: targets,
+            previousTargets: targets
+        )
         MLX.eval(placeholderLoss, heldActionLoss)
         XCTAssertNotEqual(
             placeholderLoss.item(Float.self),
             heldActionLoss.item(Float.self),
             accuracy: 0.000_001,
-            "A held action and a fresh transition need different weighting even when recurrent history is disabled."
+            "A held action and a fresh transition need different weighting independently of the sampled frame context."
         )
     }
 
@@ -2833,7 +3053,7 @@ final class DomainTests: XCTestCase {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
         profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: false, keyboard: true, modifiers: false)
-        profile.training.historyLength = 0
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.precision = .float32
         profile.training.architecture = ArchitectureSpec(
             convolutionChannels: [8, 12, 16, 24], kernelSizes: [7, 3, 3, 3], strides: [4, 2, 2, 2],
@@ -2843,10 +3063,12 @@ final class DomainTests: XCTestCase {
         let optimizer = ResumableAdamW(learningRate: 0.003, weightDecay: 0)
         optimizer.initialize(model: model)
         let pixels = 8 * 8
-        var imageValues = [Float](repeating: 0, count: 2 * pixels * 2)
-        for pixel in 0..<pixels { imageValues[(pixels + pixel) * 2] = 1 }
-        let images = MLXArray(imageValues, [2, 8, 8, 2])
-        let history = MLXArray.zeros([2, 1, ActionLayout.count])
+        var imageValues = [Float](repeating: 0, count: 2 * pixels)
+        for pixel in 0..<pixels { imageValues[pixels + pixel] = 1 }
+        let images = MLXArray(imageValues, [2, 8, 8, 1])
+        let temporalInputs = temporalModelInputs(profile: profile, batch: 2, value: 0)
+        let past = temporalInputs.past
+        let controls = temporalInputs.controls
         var targetValues = [Float](repeating: 0, count: 2 * ActionLayout.count)
         let key = ActionLayout.keyboard.lowerBound + 13
         targetValues[ActionLayout.count + key] = 1
@@ -2855,25 +3077,37 @@ final class DomainTests: XCTestCase {
         mutableClassWeights[key] = 1
         let classWeightValues = mutableClassWeights
         let weights = MLXArray(classWeightValues, [ActionLayout.count])
-        let initial = model.loss(images: images, history: history, targets: targets, positiveWeights: weights)
+        let initial = model.loss(
+            currentImages: images,
+            pastImages: past,
+            pastControls: controls,
+            targets: targets,
+            positiveWeights: weights
+        )
         MLX.eval(initial)
 
-        let step = compile(inputs: [model, optimizer], outputs: [model, optimizer]) { images, history, targets in
+        let step = compile(inputs: [model, optimizer], outputs: [model, optimizer]) { (arrays: [MLXArray]) -> [MLXArray] in
             let tracedWeights = MLXArray(classWeightValues, [ActionLayout.count])
             let result = valueAndGrad(model: model) { model, arrays in
-                [model.loss(images: arrays[0], history: arrays[1], targets: arrays[2], positiveWeights: tracedWeights)]
-            }(model, [images, history, targets])
+                [model.loss(
+                    currentImages: arrays[0],
+                    pastImages: arrays[1],
+                    pastControls: arrays[2],
+                    targets: arrays[3],
+                    positiveWeights: tracedWeights
+                )]
+            }(model, arrays)
             optimizer.update(model: model, gradients: clipGradNorm(gradients: result.1, maxNorm: 1).0, targetType: model.dtype)
-            return result.0[0]
+            return [result.0[0]]
         }
         var final = initial.item(Float.self)
         for _ in 0..<600 {
-            let loss = step(images, history, targets)
+            let loss = step([images, past, controls, targets])[0]
             MLX.eval(loss, model.parameters(), optimizer.stateArrays())
             final = loss.item(Float.self)
         }
         model.train(false)
-        let predictions = model.predictions(images: images, history: history)
+        let predictions = model.predictions(currentImages: images, pastImages: past, pastControls: controls)
         MLX.eval(predictions)
         let values = predictions.asArray(Float.self)
         XCTAssertLessThan(final, initial.item(Float.self) * 0.2)
@@ -2885,21 +3119,20 @@ final class DomainTests: XCTestCase {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale, bitDepth: 8)
         profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: false, keyboard: true, modifiers: false)
-        profile.training.historyLength = 1
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
-        let images = grayscaleTemporalTensor(batch: 1, width: 12, height: 8, value: 0.5)
-        let history = MLXArray([Float](repeating: 0, count: ActionLayout.count), [1, 1, ActionLayout.count])
+        let inputs = temporalModelInputs(profile: profile, batch: 1, value: 0.5)
         var targetValues = [Float](repeating: 0, count: ActionLayout.count)
         targetValues[ActionLayout.keyboard.lowerBound + 13] = 1
         let targets = MLXArray(targetValues, [1, ActionLayout.count])
         let blockedWeights = MLXArray([Float](repeating: 0, count: ActionLayout.count), [ActionLayout.count])
-        let blockedLoss = model.loss(images: images, history: history, targets: targets, positiveWeights: blockedWeights)
+        let blockedLoss = model.loss(currentImages: inputs.current, pastImages: inputs.past, pastControls: inputs.controls, targets: targets, positiveWeights: blockedWeights)
         var learnedValues = [Float](repeating: 0, count: ActionLayout.count)
         learnedValues[ActionLayout.keyboard.lowerBound + 13] = 4
-        let learnedLoss = model.loss(images: images, history: history, targets: targets, positiveWeights: MLXArray(learnedValues, [ActionLayout.count]))
+        let learnedLoss = model.loss(currentImages: inputs.current, pastImages: inputs.past, pastControls: inputs.controls, targets: targets, positiveWeights: MLXArray(learnedValues, [ActionLayout.count]))
         MLX.eval(blockedLoss, learnedLoss)
         XCTAssertEqual(blockedLoss.item(Float.self), 0, accuracy: 0.000_001)
         XCTAssertGreaterThan(learnedLoss.item(Float.self), 0)
@@ -2910,20 +3143,20 @@ final class DomainTests: XCTestCase {
             var profile = AIProfile.fresh()
             profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale, bitDepth: 8)
             profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: false, keyboard: keyboard, modifiers: modifiers)
-            profile.training.historyLength = 1
+            profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
             profile.training.architecture = .small
             profile.training.architecture.dropout = 0
             profile.training.precision = .float32
             let model = AgentPolicy(profile: profile)
-            let images = grayscaleTemporalTensor(batch: 1, width: 12, height: 8, value: 0.5)
-            let history = MLXArray([Float](repeating: 0, count: ActionLayout.count), [1, 1, ActionLayout.count])
+            let inputs = temporalModelInputs(profile: profile, batch: 1, value: 0.5)
             var targetValues = [Float](repeating: 0, count: ActionLayout.count)
             targetValues[targetIndex] = 1
             var weightValues = [Float](repeating: 0, count: ActionLayout.count)
             weightValues[targetIndex] = 4
             let result = model.loss(
-                images: images,
-                history: history,
+                currentImages: inputs.current,
+                pastImages: inputs.past,
+                pastControls: inputs.controls,
                 targets: MLXArray(targetValues, [1, ActionLayout.count]),
                 positiveWeights: MLXArray(weightValues, [ActionLayout.count])
             )
@@ -2945,49 +3178,91 @@ final class DomainTests: XCTestCase {
     func testCompiledCNNDiagnosticsPreservePredictionsAndProduceBoundedMaps() {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 32, height: 24, colorMode: .grayscale, bitDepth: 8)
-        profile.training.historyLength = 2
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 2, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
         model.train(false)
-        let images = grayscaleTemporalTensor(batch: 1, width: 32, height: 24, value: 0.5)
-        let history = MLXArray([Float](repeating: 0, count: 2 * ActionLayout.count), [1, 2, ActionLayout.count])
+        let currentSpec = profile.preprocessing
+        let temporal = profile.training.effectiveTemporalVision
+        let pastSpec = temporal.pastFrameSpec(from: currentSpec)
+        let packedCurrent = MLXArray(
+            Data(repeating: 128, count: currentSpec.sampleByteCount),
+            [1, currentSpec.sampleByteCount],
+            dtype: .uint8
+        )
+        let packedPast = MLXArray(
+            Data(repeating: 128, count: temporal.pastFrameCount * pastSpec.sampleByteCount),
+            [1, temporal.pastFrameCount, pastSpec.sampleByteCount],
+            dtype: .uint8
+        )
+        let controls = MLXArray.zeros([1, temporal.pastFrameCount, ActionLayout.count])
+        let currentImages = VisionPreprocessor.mlxTensor(packedCurrent, spec: currentSpec)
 
-        let layers = model.visualActivations(images: images)
+        let layers = model.visualActivations(images: currentImages)
         XCTAssertEqual(layers.map(\.shape), [[1, 6, 8, 24], [1, 3, 4, 48], [1, 2, 2, 72], [1, 1, 1, 96]])
 
-        let standard = compile(inputs: [model]) { images, history in model.predictions(images: images, history: history) }
+        let standard = compile(inputs: [model]) { current, past, controls in
+            model.predictions(
+                currentImages: VisionPreprocessor.mlxTensor(current, spec: currentSpec),
+                pastImages: VisionPreprocessor.mlxPastFrameTensor(past, spec: pastSpec),
+                pastControls: controls
+            )
+        }
         let activities = layers.indices.map { selectedLayer in
             compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-                let visual = model.visualActivations(images: inputs[0])
-                let logits = model.logits(visualFeatures: visual.last!, history: inputs[1])
+                let current = VisionPreprocessor.mlxTensor(inputs[0], spec: currentSpec)
+                let past = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+                let visual = model.visualActivations(images: current)
+                let logits = model.logits(
+                    currentVisualFeatures: visual.last!,
+                    pastImages: past,
+                    pastControls: inputs[2]
+                )
                 let map = model.sampledForVisualization(visual[selectedLayer]).mean(axis: -1, keepDims: true)
                 return [model.activatedPredictions(logits: logits), map]
             }
         }
         let channels = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            let visual = model.visualActivations(images: inputs[0])
-            let logits = model.logits(visualFeatures: visual.last!, history: inputs[1])
+            let current = VisionPreprocessor.mlxTensor(inputs[0], spec: currentSpec)
+            let past = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+            let visual = model.visualActivations(images: current)
+            let logits = model.logits(
+                currentVisualFeatures: visual.last!,
+                pastImages: past,
+                pastControls: inputs[2]
+            )
             return [model.activatedPredictions(logits: logits), model.strongestChannelsForVisualization(visual.last!)]
         }
         let saliency = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            let visual = model.visualActivations(images: inputs[0])
-            let logits = model.logits(visualFeatures: visual.last!, history: inputs[1])
+            let current = VisionPreprocessor.mlxTensor(inputs[0], spec: currentSpec)
+            let past = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+            let visual = model.visualActivations(images: current)
+            let logits = model.logits(
+                currentVisualFeatures: visual.last!,
+                pastImages: past,
+                pastControls: inputs[2]
+            )
             return [model.activatedPredictions(logits: logits), visual.last!]
         }
         let saliencyGradient = grad({ (inputs: [MLXArray]) -> MLXArray in
-            let logits = model.logits(visualFeatures: inputs[0], history: inputs[1])
-            return (logits * inputs[2]).sum()
+            let past = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+            let logits = model.logits(
+                currentVisualFeatures: inputs[0],
+                pastImages: past,
+                pastControls: inputs[2]
+            )
+            return (logits * inputs[3]).sum()
         }, argumentNumbers: [0])
         var selectorValues = [Float](repeating: 0, count: ActionLayout.count)
         selectorValues[ActionLayout.keyboard.lowerBound] = 1
         let selector = MLXArray(selectorValues, [1, ActionLayout.count])
-        let expected = standard(images, history)
-        let activityResults = activities.map { $0([images, history]) }
-        let channelResult = channels([images, history])
-        let saliencyForward = saliency([images, history])
-        let gradients = saliencyGradient([saliencyForward[1], history, selector])
+        let expected = standard(packedCurrent, packedPast, controls)
+        let activityResults = activities.map { $0([packedCurrent, packedPast, controls]) }
+        let channelResult = channels([packedCurrent, packedPast, controls])
+        let saliencyForward = saliency([packedCurrent, packedPast, controls])
+        let gradients = saliencyGradient([saliencyForward[1], packedPast, controls, selector])
         let weights = gradients.mean(axes: [1, 2], keepDims: true)
         let saliencyMap = model.sampledForVisualization(relu((saliencyForward[1] * weights).sum(axis: -1, keepDims: true)))
         let saliencyResult = [saliencyForward[0], saliencyMap]
@@ -3007,17 +3282,18 @@ final class DomainTests: XCTestCase {
     func testOptimizerCheckpointResumesExactly() throws {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 16, height: 12, colorMode: .grayscale, bitDepth: 8)
-        profile.training.historyLength = 1
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
         profile.training.precision = .float32
         let modelA = AgentPolicy(profile: profile)
         let optimizerA = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01)
-        let images = grayscaleTemporalTensor(batch: 1, width: 16, height: 12, value: 0.25)
-        let history = MLXArray([Float](repeating: 0, count: ActionLayout.count), [1, 1, ActionLayout.count])
+        let inputs = temporalModelInputs(profile: profile, batch: 1, value: 0.25)
         let targets = MLXArray([Float](repeating: 0, count: ActionLayout.count), [1, ActionLayout.count])
-        let gradientA = valueAndGrad(model: modelA) { model, arrays in [model.loss(images: arrays[0], history: arrays[1], targets: arrays[2])] }
-        let first = gradientA(modelA, [images, history, targets])
+        let gradientA = valueAndGrad(model: modelA) { model, arrays in
+            [model.loss(currentImages: arrays[0], pastImages: arrays[1], pastControls: arrays[2], targets: arrays[3])]
+        }
+        let first = gradientA(modelA, [inputs.current, inputs.past, inputs.controls, targets])
         optimizerA.update(model: modelA, gradients: first.1, targetType: .float32)
         MLX.eval(modelA.parameters(), optimizerA.stateArrays())
 
@@ -3028,15 +3304,17 @@ final class DomainTests: XCTestCase {
         let optimizer = directory.appendingPathComponent("optimizer.safetensors")
         try modelA.saveWeights(to: weights); try optimizerA.save(to: optimizer)
 
-        let secondA = gradientA(modelA, [images, history, targets])
+        let secondA = gradientA(modelA, [inputs.current, inputs.past, inputs.controls, targets])
         optimizerA.update(model: modelA, gradients: secondA.1, targetType: .float32)
         MLX.eval(modelA.parameters(), optimizerA.stateArrays())
 
         let modelB = AgentPolicy(profile: profile)
         let optimizerB = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01)
         try modelB.loadWeights(from: weights); try optimizerB.load(from: optimizer)
-        let gradientB = valueAndGrad(model: modelB) { model, arrays in [model.loss(images: arrays[0], history: arrays[1], targets: arrays[2])] }
-        let secondB = gradientB(modelB, [images, history, targets])
+        let gradientB = valueAndGrad(model: modelB) { model, arrays in
+            [model.loss(currentImages: arrays[0], pastImages: arrays[1], pastControls: arrays[2], targets: arrays[3])]
+        }
+        let secondB = gradientB(modelB, [inputs.current, inputs.past, inputs.controls, targets])
         optimizerB.update(model: modelB, gradients: secondB.1, targetType: .float32)
         MLX.eval(modelB.parameters(), optimizerB.stateArrays())
 
@@ -3097,45 +3375,89 @@ final class DomainTests: XCTestCase {
         guard writer.status == .completed else { throw writer.error ?? AgentTrainerError.capture("Test movie did not finish.") }
     }
 
-    private func grayscaleTemporalTensor(batch: Int, width: Int, height: Int, value: Float) -> MLXArray {
-        var values = [Float](repeating: 0, count: batch * width * height * 2)
-        for pixel in 0..<(batch * width * height) { values[pixel * 2] = value }
-        return MLXArray(values, [batch, height, width, 2])
+    private func temporalModelInputs(
+        profile: AIProfile,
+        batch: Int,
+        value: Float
+    ) -> (current: MLXArray, past: MLXArray, controls: MLXArray) {
+        let temporal = profile.training.effectiveTemporalVision
+        let currentSpec = profile.preprocessing
+        let pastSpec = temporal.pastFrameSpec(from: currentSpec)
+        return (
+            MLXArray(
+                [Float](repeating: value, count: batch * currentSpec.width * currentSpec.height * currentSpec.channelCount),
+                [batch, currentSpec.height, currentSpec.width, currentSpec.channelCount]
+            ),
+            MLXArray(
+                [Float](repeating: value, count: batch * temporal.pastFrameCount * pastSpec.width * pastSpec.height * pastSpec.channelCount),
+                [batch, temporal.pastFrameCount, pastSpec.height, pastSpec.width, pastSpec.channelCount]
+            ),
+            MLXArray.zeros([batch, temporal.pastFrameCount, ActionLayout.count])
+        )
     }
 
     private func makeSyntheticDataset(
         name: String,
-        historyLength: Int,
-        mappings: [(UInt32, UInt32)],
+        pastFrameCount: Int,
+        sequences: [[UInt32]],
         actionRows: [[Float]],
+        frameActionRows suppliedFrameActionRows: [[Float]]? = nil,
         segments: [CacheSegment]? = nil
     ) throws -> (dataset: CachedDataset, directory: URL) {
-        precondition(mappings.count == actionRows.count)
+        precondition(sequences.count == actionRows.count)
         precondition(actionRows.allSatisfy { $0.count == ActionLayout.count })
-        let segments = segments ?? [CacheSegment(recordingID: UUID(), start: 0, count: mappings.count)]
-        precondition(segments.reduce(0) { $0 + $1.count } == mappings.count)
+        precondition(sequences.allSatisfy { $0.count == pastFrameCount + 1 })
+        let segments = segments ?? [CacheSegment(recordingID: UUID(), start: 0, count: sequences.count)]
+        precondition(segments.reduce(0) { $0 + $1.count } == sequences.count)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).atrcache", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         do {
-            let observationCount = Int(mappings.flatMap { [$0.0, $0.1] }.max() ?? 0) + 1
+            let observationCount = Int(
+                sequences.flatMap { $0 }.filter { $0 != UInt32.max }.max() ?? 0
+            ) + 1
             let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale, bitDepth: 8)
+            let temporal = TemporalVisionConfiguration(
+                pastFrameCount: pastFrameCount,
+                frameSpacing: 1,
+                downsampleFactor: 1
+            )
             let manifest = DatasetCacheManifest(
                 key: name,
                 createdAt: Date(),
                 preprocessing: spec,
+                pastPreprocessing: spec,
+                temporalVision: temporal,
                 actionFPS: 60,
                 perceptionFPS: 30,
-                historyLength: historyLength,
-                sampleCount: mappings.count,
+                sampleCount: sequences.count,
                 observationCount: observationCount,
-                observationBytesPerSample: 1,
+                currentObservationBytesPerSample: 1,
+                pastObservationBytesPerSample: 1,
                 actionValuesPerSample: ActionLayout.count,
                 segments: segments
             )
             let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
-            try Data((0..<observationCount).map { UInt8(clamping: $0) }).write(to: directory.appendingPathComponent("observations.bin"))
-            try observationMappings(mappings).write(to: directory.appendingPathComponent("observation-indices.bin"))
+            let observations = Data((0..<observationCount).map { UInt8(clamping: $0) })
+            try observations.write(to: directory.appendingPathComponent("current-observations.bin"))
+            try observations.write(to: directory.appendingPathComponent("past-observations.bin"))
+            try observationSequenceData(sequences).write(to: directory.appendingPathComponent("observation-indices.bin"))
+            let frameActionRows: [[Float]]
+            if let suppliedFrameActionRows {
+                precondition(suppliedFrameActionRows.count == observationCount)
+                precondition(suppliedFrameActionRows.allSatisfy { $0.count == ActionLayout.count })
+                frameActionRows = suppliedFrameActionRows
+            } else {
+                frameActionRows = (0..<observationCount).map { observation in
+                    guard let sample = sequences.firstIndex(where: { $0[0] == UInt32(observation) }) else {
+                        return [Float](repeating: 0, count: ActionLayout.count)
+                    }
+                    return actionRows[sample]
+                }
+            }
+            var frameActions = Data(capacity: frameActionRows.count * ActionLayout.count * MemoryLayout<Float>.size)
+            for row in frameActionRows { row.withUnsafeBytes { frameActions.append(contentsOf: $0) } }
+            try frameActions.write(to: directory.appendingPathComponent("frame-actions.bin"))
             var actions = Data(capacity: actionRows.count * ActionLayout.count * MemoryLayout<Float>.size)
             for row in actionRows { row.withUnsafeBytes { actions.append(contentsOf: $0) } }
             try actions.write(to: directory.appendingPathComponent("actions.bin"))
@@ -3146,13 +3468,13 @@ final class DomainTests: XCTestCase {
         }
     }
 
-    private func observationMappings(_ pairs: [(UInt32, UInt32)]) -> Data {
-        var data = Data(capacity: pairs.count * 2 * MemoryLayout<UInt32>.size)
-        for pair in pairs {
-            var current = pair.0.littleEndian
-            var previous = pair.1.littleEndian
-            withUnsafeBytes(of: &current) { data.append(contentsOf: $0) }
-            withUnsafeBytes(of: &previous) { data.append(contentsOf: $0) }
+    private func observationSequenceData(_ sequences: [[UInt32]]) -> Data {
+        var data = Data(capacity: sequences.reduce(0) { $0 + $1.count } * MemoryLayout<UInt32>.size)
+        for sequence in sequences {
+            for index in sequence {
+                var littleEndian = index.littleEndian
+                withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+            }
         }
         return data
     }

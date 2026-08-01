@@ -50,8 +50,9 @@ enum ActionLayout {
     }
 
     /// Removes controls that do not belong to the selected training channels
-    /// from targets and recurrent action history. This prevents a disabled
-    /// channel from becoming a hidden shortcut through the history branch.
+    /// from targets and frame-aligned temporal controls. This prevents a
+    /// disabled channel from becoming a hidden shortcut through the recurrent
+    /// branch.
     static func sanitizeTrainingRows(
         _ values: UnsafeMutableBufferPointer<Float>,
         rowCount: Int,
@@ -108,46 +109,77 @@ struct DatasetCacheManifest: Codable, Hashable, Sendable {
     var key: String
     var createdAt: Date
     var preprocessing: PreprocessingSpec
+    var pastPreprocessing: PreprocessingSpec
+    var temporalVision: TemporalVisionConfiguration
     var actionFPS: Double
     var perceptionFPS: Double
-    var historyLength: Int
     var sampleCount: Int
     var observationCount: Int
-    var observationBytesPerSample: Int
+    var currentObservationBytesPerSample: Int
+    var pastObservationBytesPerSample: Int
     var actionValuesPerSample: Int
     var segments: [CacheSegment]
+
+    var observationIndexValuesPerSample: Int { 1 + temporalVision.pastFrameCount }
 }
 
-/// Compact host batch copied from the memory-mapped cache in two sequential
-/// allocations. Vision keeps current/predecessor pairs as UInt8; action rows
-/// contain history, target, and the real previous target in that order.
+/// Compact host batch copied from the memory-mapped cache. Current and past
+/// vision remain independently packed UInt8, past controls stay paired with
+/// their frames, and action rows contain target plus real previous target.
 struct CachedTrainingBatch: Sendable {
     let count: Int
-    let packedObservationPairs: Data
+    let packedCurrentObservations: Data
+    let packedPastObservations: Data
+    let pastControlRows: Data
     let actionRows: Data
 }
 
-struct CachedObservationPair: Hashable, Sendable {
-    let current: UInt32
-    let previous: UInt32
+struct CachedObservationSequence: Hashable, Sendable {
+    /// Slot zero is current. Remaining slots are causal past frames ordered
+    /// oldest to newest. `UInt32.max` marks unavailable segment-leading slots.
+    let indices: [UInt32]
 }
 
-/// Maps action rows onto the distinct temporal observations used by a batch.
+/// Maps action rows onto the distinct temporal frame sequences used by a batch.
 /// Action FPS commonly exceeds perception FPS, so several labels can share one
-/// expensive CNN input while retaining independent history and targets.
+/// expensive temporal frame sequence while retaining independent targets.
 struct CachedVisionBatchPlan: Sendable {
-    let uniquePairs: [CachedObservationPair]
+    let uniqueSequences: [CachedObservationSequence]
+    /// Distinct reduced-resolution observations referenced by every past slot
+    /// in `uniqueSequences`. Segment-leading padding resolves to that
+    /// sequence's current observation, exactly as it does in the canonical
+    /// batch path.
+    let uniquePastObservations: [UInt32]
+    /// Row-major [unique sequence, past slot] map into
+    /// `uniquePastObservations`. Keeping this as Int32 lets MLX gather the
+    /// already-encoded frame embeddings without another host conversion.
+    let visionToPast: [Int32]
     let sampleToVision: [Int32]
 
     var reuseRatio: Double {
-        Double(sampleToVision.count) / Double(max(1, uniquePairs.count))
+        Double(sampleToVision.count) / Double(max(1, uniqueSequences.count))
+    }
+
+    var pastFrameReuseRatio: Double {
+        Double(visionToPast.count) / Double(max(1, uniquePastObservations.count))
+    }
+
+    func encoderWorkReuseRatio(currentPixels: Int, pastPixels: Int) -> Double {
+        let pastFrameCount = uniqueSequences.first.map { max(0, $0.indices.count - 1) } ?? 0
+        let reference = Double(sampleToVision.count)
+            * Double(max(0, currentPixels) + pastFrameCount * max(0, pastPixels))
+        let shared = Double(uniqueSequences.count) * Double(max(0, currentPixels))
+            + Double(uniquePastObservations.count) * Double(max(0, pastPixels))
+        return reference / max(1, shared)
     }
 }
 
 final class CachedDataset: @unchecked Sendable {
     let manifest: DatasetCacheManifest
-    private let observations: Data
+    private let currentObservations: Data
+    private let pastObservations: Data
     private let observationIndices: Data
+    private let frameActions: Data
     private let actions: Data
 
     init(directory: URL) throws {
@@ -157,26 +189,36 @@ final class CachedDataset: @unchecked Sendable {
             throw AgentTrainerError.storage("This dataset cache uses an obsolete input contract and must be rebuilt.")
         }
         _ = try decoded.preprocessing.validated()
+        _ = try decoded.temporalVision.validated(current: decoded.preprocessing)
+        _ = try decoded.pastPreprocessing.validated()
+        let expectedPastSpec = decoded.temporalVision.pastFrameSpec(from: decoded.preprocessing)
         guard decoded.sampleCount >= 0,
               decoded.observationCount >= 0,
               decoded.sampleCount == 0 || decoded.observationCount > 0,
               decoded.observationCount <= Int(UInt32.max),
-              decoded.historyLength >= 0,
               decoded.actionFPS.isFinite, decoded.actionFPS > 0,
               decoded.perceptionFPS.isFinite, decoded.perceptionFPS > 0,
-              decoded.observationBytesPerSample == decoded.preprocessing.sampleByteCount,
-              decoded.observationBytesPerSample > 0,
+              decoded.pastPreprocessing == expectedPastSpec,
+              decoded.currentObservationBytesPerSample == decoded.preprocessing.sampleByteCount,
+              decoded.pastObservationBytesPerSample == decoded.pastPreprocessing.sampleByteCount,
+              decoded.currentObservationBytesPerSample > 0,
+              decoded.pastObservationBytesPerSample > 0,
               decoded.actionValuesPerSample == ActionLayout.count else {
             throw AgentTrainerError.storage("The dataset cache manifest is invalid.")
         }
 
-        let observationSize = decoded.observationCount.multipliedReportingOverflow(by: decoded.observationBytesPerSample)
-        let mappingValueCount = decoded.sampleCount.multipliedReportingOverflow(by: 2)
+        let currentObservationSize = decoded.observationCount.multipliedReportingOverflow(by: decoded.currentObservationBytesPerSample)
+        let pastObservationSize = decoded.observationCount.multipliedReportingOverflow(by: decoded.pastObservationBytesPerSample)
+        let mappingValueCount = decoded.sampleCount.multipliedReportingOverflow(by: decoded.observationIndexValuesPerSample)
         let mappingSize = mappingValueCount.partialValue.multipliedReportingOverflow(by: MemoryLayout<UInt32>.size)
         let actionValueCount = decoded.sampleCount.multipliedReportingOverflow(by: decoded.actionValuesPerSample)
         let actionSize = actionValueCount.partialValue.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
-        guard !observationSize.overflow, !mappingValueCount.overflow, !mappingSize.overflow,
-              !actionValueCount.overflow, !actionSize.overflow else {
+        let frameActionValueCount = decoded.observationCount.multipliedReportingOverflow(by: decoded.actionValuesPerSample)
+        let frameActionSize = frameActionValueCount.partialValue.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+        guard !currentObservationSize.overflow, !pastObservationSize.overflow,
+              !mappingValueCount.overflow, !mappingSize.overflow,
+              !actionValueCount.overflow, !actionSize.overflow,
+              !frameActionValueCount.overflow, !frameActionSize.overflow else {
             throw AgentTrainerError.storage("The dataset cache manifest exceeds this Mac's addressable memory.")
         }
         var segmentEnd = 0
@@ -194,47 +236,79 @@ final class CachedDataset: @unchecked Sendable {
         // Cache files can be many gigabytes. Requiring virtual mappings keeps
         // startup constant-memory and lets macOS page random shuffled batches
         // on demand instead of first copying the complete dataset into RAM.
-        let loadedObservations = try Data(contentsOf: directory.appendingPathComponent("observations.bin"), options: .alwaysMapped)
+        let loadedCurrentObservations = try Data(contentsOf: directory.appendingPathComponent("current-observations.bin"), options: .alwaysMapped)
+        let loadedPastObservations = try Data(contentsOf: directory.appendingPathComponent("past-observations.bin"), options: .alwaysMapped)
         let loadedObservationIndices = try Data(contentsOf: directory.appendingPathComponent("observation-indices.bin"), options: .alwaysMapped)
+        let loadedFrameActions = try Data(contentsOf: directory.appendingPathComponent("frame-actions.bin"), options: .alwaysMapped)
         let loadedActions = try Data(contentsOf: directory.appendingPathComponent("actions.bin"), options: .alwaysMapped)
-        guard loadedObservations.count == observationSize.partialValue,
+        guard loadedCurrentObservations.count == currentObservationSize.partialValue,
+              loadedPastObservations.count == pastObservationSize.partialValue,
               loadedObservationIndices.count == mappingSize.partialValue,
+              loadedFrameActions.count == frameActionSize.partialValue,
               loadedActions.count == actionSize.partialValue else {
             throw AgentTrainerError.storage("The dataset cache is incomplete or corrupt.")
         }
         let mappingsAreValid = loadedObservationIndices.withUnsafeBytes { raw -> Bool in
             guard decoded.sampleCount == 0 || raw.baseAddress != nil else { return false }
-            for sample in 0..<decoded.sampleCount {
-                for slot in 0..<2 {
-                    let offset = (sample * 2 + slot) * MemoryLayout<UInt32>.size
-                    let value = raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian
-                    if Int(value) >= decoded.observationCount { return false }
+            func value(sample: Int, slot: Int) -> UInt32 {
+                let offset = (sample * decoded.observationIndexValuesPerSample + slot) * MemoryLayout<UInt32>.size
+                return raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian
+            }
+            for segment in decoded.segments {
+                guard segment.count > 0 else { continue }
+                let observationBase = value(sample: segment.start, slot: 0)
+                guard observationBase != UInt32.max, Int(observationBase) < decoded.observationCount else { return false }
+                var previousCurrent = observationBase
+                for sample in segment.start..<(segment.start + segment.count) {
+                    let current = value(sample: sample, slot: 0)
+                    if current == UInt32.max || Int(current) >= decoded.observationCount || current < previousCurrent {
+                        return false
+                    }
+                    previousCurrent = current
+                    let localCurrent = Int(current - observationBase)
+                    for frame in 0..<decoded.temporalVision.pastFrameCount {
+                        let mapped = value(sample: sample, slot: frame + 1)
+                        let distance = decoded.temporalVision.frameSpacing
+                            * (decoded.temporalVision.pastFrameCount - frame)
+                        if localCurrent >= distance {
+                            let expected = current - UInt32(distance)
+                            if mapped != expected { return false }
+                        } else if mapped != UInt32.max {
+                            return false
+                        }
+                    }
                 }
             }
             return true
         }
         guard mappingsAreValid else { throw AgentTrainerError.storage("The dataset cache contains an invalid frame index.") }
-        Self.adviseRandomAccess(loadedObservations)
-        Self.adviseRandomAccess(loadedObservationIndices)
-        Self.adviseRandomAccess(loadedActions)
+        Self.adviseAdaptiveAccess(loadedCurrentObservations)
+        Self.adviseAdaptiveAccess(loadedPastObservations)
+        Self.adviseAdaptiveAccess(loadedObservationIndices)
+        Self.adviseAdaptiveAccess(loadedFrameActions)
+        Self.adviseAdaptiveAccess(loadedActions)
         manifest = decoded
-        observations = loadedObservations
+        currentObservations = loadedCurrentObservations
+        pastObservations = loadedPastObservations
         observationIndices = loadedObservationIndices
+        frameActions = loadedFrameActions
         actions = loadedActions
     }
 
     var count: Int { manifest.sampleCount }
 
-    private static func adviseRandomAccess(_ data: Data) {
+    private static func adviseAdaptiveAccess(_ data: Data) {
         data.withUnsafeBytes { bytes in
             guard let baseAddress = bytes.baseAddress, !bytes.isEmpty else { return }
-            // Epoch orders are deliberately shuffled. Telling the VM subsystem
-            // avoids spending I/O bandwidth on sequential read-ahead pages that
-            // the next batch is unlikely to consume.
+            // Training randomizes locality batches rather than individual
+            // observations. Normal advice lets macOS detect and read ahead the
+            // contiguous mapped pages inside each batch. MADV_RANDOM disabled
+            // that useful behavior and made page-fault stalls more likely once
+            // macOS began reclaiming otherwise warm file-backed pages.
             _ = madvise(
                 UnsafeMutableRawPointer(mutating: baseAddress),
                 bytes.count,
-                MADV_RANDOM
+                MADV_NORMAL
             )
         }
     }
@@ -272,9 +346,9 @@ final class CachedDataset: @unchecked Sendable {
     }
 
     func packedObservation(at index: Int) -> Data {
-        let size = manifest.observationBytesPerSample
+        let size = manifest.currentObservationBytesPerSample
         let observation = observationIndex(at: index, slot: 0)
-        return observations.subdata(in: observation * size..<(observation + 1) * size)
+        return currentObservations.subdata(in: observation * size..<(observation + 1) * size)
     }
 
     /// Gathers every tensor needed by one optimizer step in a single pass over
@@ -283,61 +357,96 @@ final class CachedDataset: @unchecked Sendable {
     /// mapping lookups, and segment binary searches.
     func trainingBatch(at indices: [Int]) -> CachedTrainingBatch {
         let batchCount = indices.count
-        let observationBytes = manifest.observationBytesPerSample
-        let historyLength = max(1, manifest.historyLength)
+        let pastFrameCount = manifest.temporalVision.pastFrameCount
+        let currentBytes = manifest.currentObservationBytesPerSample
+        let pastBytes = manifest.pastObservationBytesPerSample
         let actionRowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
-        var packedPairs = Data(count: batchCount * 2 * observationBytes)
-        var actionRows = Data(count: batchCount * (historyLength + 2) * actionRowBytes)
-        packedPairs.withUnsafeMutableBytes { packedDestination in
-            actionRows.withUnsafeMutableBytes { actionDestination in
-                populateTrainingBatch(
-                    at: indices,
-                    packedObservationPairs: packedDestination,
-                    actionRows: actionDestination
-                )
+        var packedCurrent = Data(count: batchCount * currentBytes)
+        var packedPast = Data(count: batchCount * pastFrameCount * pastBytes)
+        var pastControls = Data(count: batchCount * pastFrameCount * actionRowBytes)
+        var actionRows = Data(count: batchCount * 2 * actionRowBytes)
+        packedCurrent.withUnsafeMutableBytes { currentDestination in
+            packedPast.withUnsafeMutableBytes { pastDestination in
+                pastControls.withUnsafeMutableBytes { controlDestination in
+                    actionRows.withUnsafeMutableBytes { actionDestination in
+                        populateTrainingBatch(
+                            at: indices,
+                            packedCurrentObservations: currentDestination,
+                            packedPastObservations: pastDestination,
+                            pastControlRows: controlDestination,
+                            actionRows: actionDestination
+                        )
+                    }
+                }
             }
         }
         return CachedTrainingBatch(
             count: batchCount,
-            packedObservationPairs: packedPairs,
+            packedCurrentObservations: packedCurrent,
+            packedPastObservations: packedPast,
+            pastControlRows: pastControls,
             actionRows: actionRows
         )
     }
 
     func visionBatchPlan(at indices: [Int]) -> CachedVisionBatchPlan {
         guard !indices.isEmpty else {
-            return CachedVisionBatchPlan(uniquePairs: [], sampleToVision: [])
+            return CachedVisionBatchPlan(
+                uniqueSequences: [],
+                uniquePastObservations: [],
+                visionToPast: [],
+                sampleToVision: []
+            )
         }
-        var uniquePairs: [CachedObservationPair] = []
-        uniquePairs.reserveCapacity(indices.count)
-        var pairToIndex: [CachedObservationPair: Int32] = [:]
-        pairToIndex.reserveCapacity(indices.count)
+        var uniqueSequences: [CachedObservationSequence] = []
+        uniqueSequences.reserveCapacity(indices.count)
+        var sequenceToIndex: [CachedObservationSequence: Int32] = [:]
+        sequenceToIndex.reserveCapacity(indices.count)
         var sampleToVision: [Int32] = []
         sampleToVision.reserveCapacity(indices.count)
-        observationIndices.withUnsafeBytes { source in
-            guard let baseAddress = source.baseAddress else { return }
-            for sampleIndex in indices {
-                let offset = sampleIndex * 2 * MemoryLayout<UInt32>.size
-                let pair = CachedObservationPair(
-                    current: baseAddress.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian,
-                    previous: baseAddress.loadUnaligned(
-                        fromByteOffset: offset + MemoryLayout<UInt32>.size,
-                        as: UInt32.self
-                    ).littleEndian
-                )
-                if let existing = pairToIndex[pair] {
-                    sampleToVision.append(existing)
+        for sampleIndex in indices {
+            let sequence = observationSequence(at: sampleIndex)
+            if let existing = sequenceToIndex[sequence] {
+                sampleToVision.append(existing)
+            } else {
+                precondition(uniqueSequences.count < Int(Int32.max), "A vision batch has too many distinct frame sequences.")
+                let index = Int32(uniqueSequences.count)
+                uniqueSequences.append(sequence)
+                sequenceToIndex[sequence] = index
+                sampleToVision.append(index)
+            }
+        }
+        let pastFrameCount = manifest.temporalVision.pastFrameCount
+        var uniquePastObservations: [UInt32] = []
+        uniquePastObservations.reserveCapacity(uniqueSequences.count * pastFrameCount)
+        var pastObservationToIndex: [UInt32: Int32] = [:]
+        pastObservationToIndex.reserveCapacity(uniqueSequences.count * pastFrameCount)
+        var visionToPast: [Int32] = []
+        visionToPast.reserveCapacity(uniqueSequences.count * pastFrameCount)
+        for sequence in uniqueSequences {
+            precondition(sequence.indices.count == pastFrameCount + 1)
+            let current = sequence.indices[0]
+            for frame in 0..<pastFrameCount {
+                let mapped = sequence.indices[frame + 1]
+                let observation = mapped == UInt32.max ? current : mapped
+                if let existing = pastObservationToIndex[observation] {
+                    visionToPast.append(existing)
                 } else {
-                    precondition(uniquePairs.count < Int(Int32.max), "A vision batch has too many distinct frames.")
-                    let index = Int32(uniquePairs.count)
-                    uniquePairs.append(pair)
-                    pairToIndex[pair] = index
-                    sampleToVision.append(index)
+                    precondition(
+                        uniquePastObservations.count < Int(Int32.max),
+                        "A vision batch has too many distinct past frames."
+                    )
+                    let index = Int32(uniquePastObservations.count)
+                    uniquePastObservations.append(observation)
+                    pastObservationToIndex[observation] = index
+                    visionToPast.append(index)
                 }
             }
         }
         return CachedVisionBatchPlan(
-            uniquePairs: uniquePairs,
+            uniqueSequences: uniqueSequences,
+            uniquePastObservations: uniquePastObservations,
+            visionToPast: visionToPast,
             sampleToVision: sampleToVision
         )
     }
@@ -354,7 +463,7 @@ final class CachedDataset: @unchecked Sendable {
             plan.sampleToVision.count == indices.count,
             "A vision plan must describe every supplied dataset row."
         )
-        var groups = Array(repeating: [Int](), count: plan.uniquePairs.count)
+        var groups = Array(repeating: [Int](), count: plan.uniqueSequences.count)
         for (row, sampleIndex) in indices.enumerated() {
             groups[Int(plan.sampleToVision[row])].append(sampleIndex)
         }
@@ -370,48 +479,152 @@ final class CachedDataset: @unchecked Sendable {
     /// temporary `Data` into MLX input storage.
     func populateTrainingBatch(
         at indices: [Int],
-        packedObservationPairs destination: UnsafeMutableRawBufferPointer,
+        packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
+        packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
+        pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
         actionRows actionDestination: UnsafeMutableRawBufferPointer
     ) {
+        let sequences = indices.map(observationSequence(at:))
         populateTrainingBatch(
             at: indices,
-            observationPairs: observationPairs(at: indices),
-            packedObservationPairs: destination,
+            observationSequences: sequences,
+            pastObservationIndices: expandedPastObservationIndices(for: sequences),
+            packedCurrentObservations: currentDestination,
+            packedPastObservations: pastDestination,
+            pastControlRows: controlDestination,
             actionRows: actionDestination
         )
     }
 
     func populateTrainingBatch(
         at indices: [Int],
-        observationPairs: [CachedObservationPair],
-        packedObservationPairs destination: UnsafeMutableRawBufferPointer,
+        observationSequences: [CachedObservationSequence],
+        packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
+        packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
+        pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
+        actionRows actionDestination: UnsafeMutableRawBufferPointer
+    ) {
+        populateTrainingBatch(
+            at: indices,
+            observationSequences: observationSequences,
+            pastObservationIndices: expandedPastObservationIndices(for: observationSequences),
+            packedCurrentObservations: currentDestination,
+            packedPastObservations: pastDestination,
+            pastControlRows: controlDestination,
+            actionRows: actionDestination
+        )
+    }
+
+    /// Writes a deduplicated visual batch. Current images remain one per unique
+    /// temporal sequence, while each reduced-resolution past observation is
+    /// copied and encoded only once even when overlapping causal windows refer
+    /// to it repeatedly. Controls intentionally remain sequence-shaped because
+    /// padding slots and real slots can share an image but never share meaning.
+    func populateTrainingBatch(
+        at indices: [Int],
+        visionPlan: CachedVisionBatchPlan,
+        packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
+        packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
+        pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
+        actionRows actionDestination: UnsafeMutableRawBufferPointer
+    ) {
+        precondition(visionPlan.sampleToVision.count == indices.count)
+        precondition(
+            visionPlan.visionToPast.count
+                == visionPlan.uniqueSequences.count * manifest.temporalVision.pastFrameCount
+        )
+        populateTrainingBatch(
+            at: indices,
+            observationSequences: visionPlan.uniqueSequences,
+            pastObservationIndices: visionPlan.uniquePastObservations,
+            packedCurrentObservations: currentDestination,
+            packedPastObservations: pastDestination,
+            pastControlRows: controlDestination,
+            actionRows: actionDestination
+        )
+    }
+
+    private func expandedPastObservationIndices(
+        for observationSequences: [CachedObservationSequence]
+    ) -> [UInt32] {
+        let pastFrameCount = manifest.temporalVision.pastFrameCount
+        var result: [UInt32] = []
+        result.reserveCapacity(observationSequences.count * pastFrameCount)
+        for sequence in observationSequences {
+            precondition(sequence.indices.count == pastFrameCount + 1)
+            let current = sequence.indices[0]
+            for frame in 0..<pastFrameCount {
+                let mapped = sequence.indices[frame + 1]
+                result.append(mapped == UInt32.max ? current : mapped)
+            }
+        }
+        return result
+    }
+
+    private func populateTrainingBatch(
+        at indices: [Int],
+        observationSequences: [CachedObservationSequence],
+        pastObservationIndices: [UInt32],
+        packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
+        packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
+        pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
         actionRows actionDestination: UnsafeMutableRawBufferPointer
     ) {
         let batchCount = indices.count
-        let observationBytes = manifest.observationBytesPerSample
-        let historyLength = max(1, manifest.historyLength)
+        let pastFrameCount = manifest.temporalVision.pastFrameCount
+        let currentBytes = manifest.currentObservationBytesPerSample
+        let pastBytes = manifest.pastObservationBytesPerSample
         let actionRowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
-        precondition(destination.count == observationPairs.count * 2 * observationBytes)
-        precondition(actionDestination.count == batchCount * (historyLength + 2) * actionRowBytes)
+        precondition(currentDestination.count == observationSequences.count * currentBytes)
+        precondition(pastDestination.count == pastObservationIndices.count * pastBytes)
+        precondition(controlDestination.count == observationSequences.count * pastFrameCount * actionRowBytes)
+        precondition(actionDestination.count == batchCount * 2 * actionRowBytes)
+        if let controlBase = controlDestination.baseAddress {
+            memset(controlBase, 0, controlDestination.count)
+        }
         if let actionBase = actionDestination.baseAddress {
             memset(actionBase, 0, actionDestination.count)
         }
 
-        observations.withUnsafeBytes { observationSource in
-            guard let destinationBase = destination.baseAddress,
-                  let observationBase = observationSource.baseAddress else { return }
-            for (visionRow, pair) in observationPairs.enumerated() {
-                let destinationOffset = visionRow * 2 * observationBytes
-                memcpy(
-                    destinationBase.advanced(by: destinationOffset),
-                    observationBase.advanced(by: Int(pair.current) * observationBytes),
-                    observationBytes
-                )
-                memcpy(
-                    destinationBase.advanced(by: destinationOffset + observationBytes),
-                    observationBase.advanced(by: Int(pair.previous) * observationBytes),
-                    observationBytes
-                )
+        currentObservations.withUnsafeBytes { currentSource in
+            pastObservations.withUnsafeBytes { pastSource in
+                frameActions.withUnsafeBytes { frameActionSource in
+                    guard let currentDestinationBase = currentDestination.baseAddress,
+                          let pastDestinationBase = pastDestination.baseAddress,
+                          let controlDestinationBase = controlDestination.baseAddress,
+                          let currentSourceBase = currentSource.baseAddress,
+                          let pastSourceBase = pastSource.baseAddress,
+                          let frameActionSourceBase = frameActionSource.baseAddress else { return }
+                    for (visionRow, sequence) in observationSequences.enumerated() {
+                        precondition(sequence.indices.count == pastFrameCount + 1)
+                        let current = Int(sequence.indices[0])
+                        memcpy(
+                            currentDestinationBase.advanced(by: visionRow * currentBytes),
+                            currentSourceBase.advanced(by: current * currentBytes),
+                            currentBytes
+                        )
+                        for frame in 0..<pastFrameCount {
+                            let mapped = sequence.indices[frame + 1]
+                            // Padding frames intentionally carry no controls, so
+                            // duplicating the current low-resolution image at a
+                            // segment boundary can never leak its target action.
+                            if mapped != UInt32.max {
+                                memcpy(
+                                    controlDestinationBase.advanced(by: (visionRow * pastFrameCount + frame) * actionRowBytes),
+                                    frameActionSourceBase.advanced(by: Int(mapped) * actionRowBytes),
+                                    actionRowBytes
+                                )
+                            }
+                        }
+                    }
+                    for (pastRow, observation) in pastObservationIndices.enumerated() {
+                        memcpy(
+                            pastDestinationBase.advanced(by: pastRow * pastBytes),
+                            pastSourceBase.advanced(by: Int(observation) * pastBytes),
+                            pastBytes
+                        )
+                    }
+                }
             }
         }
 
@@ -419,27 +632,14 @@ final class CachedDataset: @unchecked Sendable {
             guard let destinationBase = actionDestination.baseAddress,
                   let sourceBase = source.baseAddress else { return }
             for (batchRow, sampleIndex) in indices.enumerated() {
-                let segmentStart = segmentStart(for: sampleIndex)
-                let batchBase = batchRow * (historyLength + 2)
-                if manifest.historyLength > 0 {
-                    for historyRow in 0..<manifest.historyLength {
-                        let sourceIndex = sampleIndex - manifest.historyLength + historyRow
-                        guard sourceIndex >= segmentStart, sourceIndex < sampleIndex else { continue }
-                        memcpy(
-                            destinationBase.advanced(by: (batchBase + historyRow) * actionRowBytes),
-                            sourceBase.advanced(by: sourceIndex * actionRowBytes),
-                            actionRowBytes
-                        )
-                    }
-                }
                 memcpy(
-                    destinationBase.advanced(by: (batchBase + historyLength) * actionRowBytes),
+                    destinationBase.advanced(by: batchRow * 2 * actionRowBytes),
                     sourceBase.advanced(by: sampleIndex * actionRowBytes),
                     actionRowBytes
                 )
-                if sampleIndex > segmentStart {
+                if sampleIndex > segmentStart(for: sampleIndex) {
                     memcpy(
-                        destinationBase.advanced(by: (batchBase + historyLength + 1) * actionRowBytes),
+                        destinationBase.advanced(by: (batchRow * 2 + 1) * actionRowBytes),
                         sourceBase.advanced(by: (sampleIndex - 1) * actionRowBytes),
                         actionRowBytes
                     )
@@ -448,33 +648,11 @@ final class CachedDataset: @unchecked Sendable {
         }
     }
 
-    private func observationPairs(at indices: [Int]) -> [CachedObservationPair] {
-        var pairs: [CachedObservationPair] = []
-        pairs.reserveCapacity(indices.count)
-        observationIndices.withUnsafeBytes { source in
-            guard let baseAddress = source.baseAddress else { return }
-            for sampleIndex in indices {
-                let offset = sampleIndex * 2 * MemoryLayout<UInt32>.size
-                pairs.append(CachedObservationPair(
-                    current: baseAddress.loadUnaligned(
-                        fromByteOffset: offset,
-                        as: UInt32.self
-                    ).littleEndian,
-                    previous: baseAddress.loadUnaligned(
-                        fromByteOffset: offset + MemoryLayout<UInt32>.size,
-                        as: UInt32.self
-                    ).littleEndian
-                ))
-            }
-        }
-        return pairs
-    }
-
     func packedObservations(at indices: [Int]) -> Data {
-        let size = manifest.observationBytesPerSample
+        let size = manifest.currentObservationBytesPerSample
         var result = Data(count: indices.count * size)
         result.withUnsafeMutableBytes { destination in
-            observations.withUnsafeBytes { source in
+            currentObservations.withUnsafeBytes { source in
                 guard let destinationBase = destination.baseAddress, let sourceBase = source.baseAddress else { return }
                 for (row, index) in indices.enumerated() {
                     let observation = observationIndex(at: index, slot: 0)
@@ -485,20 +663,51 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
-    /// Returns the exact immediately preceding perception frame for every
-    /// action sample. Compact frame indices avoid duplicating large packed
-    /// images when Action FPS exceeds Perception FPS and remain exact even when
-    /// the two rates are not integer multiples. Segment boundaries point to the
-    /// current frame, yielding an intentional zero temporal difference.
-    func precedingPackedObservations(at indices: [Int]) -> Data {
-        let size = manifest.observationBytesPerSample
-        var result = Data(count: indices.count * size)
+    /// Returns every causal past frame at its native reduced resolution,
+    /// ordered oldest to newest for each action sample.
+    func pastPackedObservations(at indices: [Int]) -> Data {
+        let frameCount = manifest.temporalVision.pastFrameCount
+        let size = manifest.pastObservationBytesPerSample
+        var result = Data(count: indices.count * frameCount * size)
         result.withUnsafeMutableBytes { destination in
-            observations.withUnsafeBytes { source in
+            pastObservations.withUnsafeBytes { source in
                 guard let destinationBase = destination.baseAddress, let sourceBase = source.baseAddress else { return }
-                for (row, index) in indices.enumerated() {
-                    let observation = observationIndex(at: index, slot: 1)
-                    memcpy(destinationBase.advanced(by: row * size), sourceBase.advanced(by: observation * size), size)
+                for (row, sample) in indices.enumerated() {
+                    let sequence = observationSequence(at: sample)
+                    let current = Int(sequence.indices[0])
+                    for frame in 0..<frameCount {
+                        let mapped = sequence.indices[frame + 1]
+                        let observation = mapped == UInt32.max ? current : Int(mapped)
+                        memcpy(
+                            destinationBase.advanced(by: (row * frameCount + frame) * size),
+                            sourceBase.advanced(by: observation * size),
+                            size
+                        )
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    func pastControlBatch(at indices: [Int]) -> Data {
+        let frameCount = manifest.temporalVision.pastFrameCount
+        let rowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
+        var result = Data(count: indices.count * frameCount * rowBytes)
+        result.withUnsafeMutableBytes { destination in
+            frameActions.withUnsafeBytes { source in
+                guard let destinationBase = destination.baseAddress, let sourceBase = source.baseAddress else { return }
+                for (row, sample) in indices.enumerated() {
+                    let sequence = observationSequence(at: sample)
+                    for frame in 0..<frameCount {
+                        let mapped = sequence.indices[frame + 1]
+                        guard mapped != UInt32.max else { continue }
+                        memcpy(
+                            destinationBase.advanced(by: (row * frameCount + frame) * rowBytes),
+                            sourceBase.advanced(by: Int(mapped) * rowBytes),
+                            rowBytes
+                        )
+                    }
                 }
             }
         }
@@ -587,19 +796,22 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
-    /// Returns the first single-recording validation row whose complete action
-    /// history and current/preceding perception pair are disjoint from training.
+    /// Returns the first single-recording validation row whose complete current
+    /// and past-frame sequence is disjoint from training.
     /// Recorded frame delivery can be irregular, so an FPS-derived fixed gap is
     /// not sufficient: a static frame may back many action rows.
     func firstDisjointValidationIndex(trainingEnd: Int, proposedStart: Int) -> Int? {
         guard trainingEnd > 0, trainingEnd < count else { return nil }
-        let lastTrainingPair = observationPair(at: trainingEnd - 1)
-        let maximumTrainingObservation = max(lastTrainingPair.current, lastTrainingPair.previous)
-        var candidate = max(proposedStart, trainingEnd + manifest.historyLength)
+        let lastTrainingSequence = observationSequence(at: trainingEnd - 1)
+        let maximumTrainingObservation = lastTrainingSequence.indices
+            .filter { $0 != UInt32.max }
+            .max() ?? 0
+        var candidate = max(proposedStart, trainingEnd)
         while candidate < count {
-            let pair = observationPair(at: candidate)
-            if pair.current > maximumTrainingObservation,
-               pair.previous > maximumTrainingObservation {
+            let sequence = observationSequence(at: candidate)
+            let frames = sequence.indices.filter { $0 != UInt32.max }
+            if frames.count == manifest.observationIndexValuesPerSample,
+               frames.allSatisfy({ $0 > maximumTrainingObservation }) {
                 return candidate
             }
             candidate += 1
@@ -711,11 +923,9 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
-    /// Returns the real immediately preceding action row for transition loss,
-    /// independently of how much history the model is configured to observe.
-    /// Segment starts use zero state. This closes the zero-history loophole
-    /// where the placeholder recurrent row made every held positive look like a
-    /// fresh press on every training tick.
+    /// Returns the real immediately preceding action row for transition loss.
+    /// It is intentionally separate from the more widely spaced controls paired
+    /// with past visual frames. Segment starts use zero state.
     func previousActionBatch(at indices: [Int]) -> Data {
         let rowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
         var result = Data(count: indices.count * rowBytes)
@@ -732,40 +942,6 @@ final class CachedDataset: @unchecked Sendable {
             }
         }
         return result
-    }
-
-    func historyBatch(at indices: [Int]) -> Data {
-        let historyLength = max(1, manifest.historyLength)
-        let rowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
-        var result = Data(count: indices.count * historyLength * rowBytes)
-        guard manifest.historyLength > 0 else { return result }
-        result.withUnsafeMutableBytes { destination in
-            actions.withUnsafeBytes { source in
-                guard let destinationBase = destination.baseAddress, let sourceBase = source.baseAddress else { return }
-                for (batchRow, index) in indices.enumerated() {
-                    let segmentStart = segmentStart(for: index)
-                    for historyRow in 0..<manifest.historyLength {
-                        let sourceIndex = index - manifest.historyLength + historyRow
-                        guard sourceIndex >= segmentStart, sourceIndex < index else { continue }
-                        let destinationOffset = (batchRow * historyLength + historyRow) * rowBytes
-                        memcpy(destinationBase.advanced(by: destinationOffset), sourceBase.advanced(by: sourceIndex * rowBytes), rowBytes)
-                    }
-                }
-            }
-        }
-        return result
-    }
-
-    func history(at index: Int) -> [Float] {
-        let segmentStart = segmentStart(for: index)
-        var values = [Float](repeating: 0, count: max(1, manifest.historyLength) * ActionLayout.count)
-        guard manifest.historyLength > 0 else { return values }
-        for h in 0..<manifest.historyLength {
-            let source = index - manifest.historyLength + h
-            guard source >= segmentStart, source < index else { continue }
-            values.replaceSubrange(h * ActionLayout.count..<(h + 1) * ActionLayout.count, with: action(at: source))
-        }
-        return values
     }
 
     func segmentCount(at indices: [Int]) -> Int {
@@ -790,13 +966,21 @@ final class CachedDataset: @unchecked Sendable {
 
     private func observationIndex(at sample: Int, slot: Int) -> Int {
         observationIndices.withUnsafeBytes { raw in
-            let offset = (sample * 2 + slot) * MemoryLayout<UInt32>.size
+            let offset = (sample * manifest.observationIndexValuesPerSample + slot) * MemoryLayout<UInt32>.size
             return Int(raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian)
         }
     }
 
-    private func observationPair(at sample: Int) -> (current: Int, previous: Int) {
-        (observationIndex(at: sample, slot: 0), observationIndex(at: sample, slot: 1))
+    private func observationSequence(at sample: Int) -> CachedObservationSequence {
+        observationIndices.withUnsafeBytes { raw in
+            let base = sample * manifest.observationIndexValuesPerSample * MemoryLayout<UInt32>.size
+            return CachedObservationSequence(indices: (0..<manifest.observationIndexValuesPerSample).map { slot in
+                raw.loadUnaligned(
+                    fromByteOffset: base + slot * MemoryLayout<UInt32>.size,
+                    as: UInt32.self
+                ).littleEndian
+            })
+        }
     }
 }
 
@@ -821,8 +1005,10 @@ actor DatasetCacheBuilder {
 
         let temporary = root.appendingPathComponent(".\(key).\(UUID().uuidString).tmp", isDirectory: true)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
-        let observations = try BufferedFileWriter(url: temporary.appendingPathComponent("observations.bin"), capacity: 8 * 1_024 * 1_024)
+        let currentObservations = try BufferedFileWriter(url: temporary.appendingPathComponent("current-observations.bin"), capacity: 8 * 1_024 * 1_024)
+        let pastObservations = try BufferedFileWriter(url: temporary.appendingPathComponent("past-observations.bin"), capacity: 8 * 1_024 * 1_024)
         let observationIndices = try BufferedFileWriter(url: temporary.appendingPathComponent("observation-indices.bin"), capacity: 1 * 1_024 * 1_024)
+        let frameActions = try BufferedFileWriter(url: temporary.appendingPathComponent("frame-actions.bin"), capacity: 1 * 1_024 * 1_024)
         let actions = try BufferedFileWriter(url: temporary.appendingPathComponent("actions.bin"), capacity: 1 * 1_024 * 1_024)
         var segments: [CacheSegment] = []
         var sampleCount = 0
@@ -844,8 +1030,10 @@ actor DatasetCacheBuilder {
                     recording,
                     profile: profile,
                     observationBase: observationCount,
-                    observations: observations,
+                    currentObservations: currentObservations,
+                    pastObservations: pastObservations,
                     observationIndices: observationIndices,
+                    frameActions: frameActions,
                     actions: actions,
                     progress: { recordingFraction in
                         let overall = min(0.999, (completedDuration + recordingDuration * recordingFraction) / totalUsableDuration)
@@ -859,8 +1047,25 @@ actor DatasetCacheBuilder {
                     segments.append(CacheSegment(recordingID: recording.id, start: start, count: appended.samples))
                 }
             }
-            try observations.finish(); try observationIndices.finish(); try actions.finish()
-            let manifest = DatasetCacheManifest(key: key, createdAt: Date(), preprocessing: profile.preprocessing, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, historyLength: profile.training.historyLength, sampleCount: sampleCount, observationCount: observationCount, observationBytesPerSample: profile.preprocessing.sampleByteCount, actionValuesPerSample: ActionLayout.count, segments: segments)
+            try currentObservations.finish(); try pastObservations.finish()
+            try observationIndices.finish(); try frameActions.finish(); try actions.finish()
+            let temporal = profile.training.effectiveTemporalVision
+            let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
+            let manifest = DatasetCacheManifest(
+                key: key,
+                createdAt: Date(),
+                preprocessing: profile.preprocessing,
+                pastPreprocessing: pastSpec,
+                temporalVision: temporal,
+                actionFPS: profile.training.actionFPS,
+                perceptionFPS: profile.training.perceptionFPS,
+                sampleCount: sampleCount,
+                observationCount: observationCount,
+                currentObservationBytesPerSample: profile.preprocessing.sampleByteCount,
+                pastObservationBytesPerSample: pastSpec.sampleByteCount,
+                actionValuesPerSample: ActionLayout.count,
+                segments: segments
+            )
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(manifest).write(to: temporary.appendingPathComponent("manifest.json"), options: .atomic)
             if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
@@ -868,7 +1073,9 @@ actor DatasetCacheBuilder {
             progress(1, "Dataset cache ready")
             return try CachedDataset(directory: directory)
         } catch {
-            try? observations.finish(); try? observationIndices.finish(); try? actions.finish(); try? FileManager.default.removeItem(at: temporary)
+            try? currentObservations.finish(); try? pastObservations.finish()
+            try? observationIndices.finish(); try? frameActions.finish(); try? actions.finish()
+            try? FileManager.default.removeItem(at: temporary)
             throw error
         }
     }
@@ -877,22 +1084,34 @@ actor DatasetCacheBuilder {
         struct Identity: Encodable {
             let cacheSchema: Int
             let preprocessing: PreprocessingSpec
+            let temporalVision: TemporalVisionConfiguration
             let actionFPS: Double
             let perceptionFPS: Double
-            let historyLength: Int
             let recordings: [RecordingManifest]
         }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]; encoder.dateEncodingStrategy = .iso8601
-        let identity = Identity(cacheSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, historyLength: profile.training.historyLength, recordings: recordings.map(\.manifest))
+        let identity = Identity(cacheSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, temporalVision: profile.training.effectiveTemporalVision, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, recordings: recordings.map(\.manifest))
         let digest = SHA256.hash(data: try encoder.encode(identity))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    private func appendRecording(_ recording: RecordingItem, profile: AIProfile, observationBase: Int, observations: BufferedFileWriter, observationIndices: BufferedFileWriter, actions: BufferedFileWriter, progress: (Double) -> Void) async throws -> (samples: Int, observations: Int) {
+    private func appendRecording(
+        _ recording: RecordingItem,
+        profile: AIProfile,
+        observationBase: Int,
+        currentObservations: BufferedFileWriter,
+        pastObservations: BufferedFileWriter,
+        observationIndices: BufferedFileWriter,
+        frameActions: BufferedFileWriter,
+        actions: BufferedFileWriter,
+        progress: (Double) -> Void
+    ) async throws -> (samples: Int, observations: Int) {
         guard let preprocessor else { throw AgentTrainerError.model("Metal preprocessing is unavailable.") }
         guard recording.manifest.isStructurallyValid, recording.manifest.hostStartNanos > 0 else {
             throw AgentTrainerError.storage("\(recording.manifest.name) has an invalid recording timeline or manifest.")
         }
+        let temporal = try profile.training.effectiveTemporalVision.validated(current: profile.preprocessing)
+        let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         let events = try InputEventReader.mapped(url: recording.directory.appendingPathComponent(recording.manifest.eventFile))
         let asset = AVURLAsset(url: recording.directory.appendingPathComponent(recording.manifest.videoFile))
         guard let track = try await asset.loadTracks(withMediaType: .video).first else { return (0, 0) }
@@ -915,41 +1134,26 @@ actor DatasetCacheBuilder {
 
         let actionInterval = 1 / max(0.0001, profile.training.actionFPS)
         let perceptionInterval = 1 / max(0.0001, profile.training.perceptionFPS)
-        var nextAction = trainingStart
         var nextPerception = trainingStart
         var firstPTS: CMTime?
-        var latestObservationIndex: Int?
-        var precedingObservationIndex: Int?
-        var localObservationCount = 0
-        var eventIndex = 0
-        let initialPointer = events.first { $0.kind == .mouseMove || $0.kind == .mouseButton || $0.kind == .scroll }
-        var accumulator = ActionAccumulator(manifest: recording.manifest, initialPointer: initialPointer)
-        var count = 0
+        var observationTimes: [Double] = []
+        observationTimes.reserveCapacity(max(1, Int((trainingEnd - trainingStart) * profile.training.perceptionFPS)))
         let usableDuration = trainingEnd - trainingStart
         let progressInterval = max(2, usableDuration / 100)
         var nextProgressTime = trainingStart
         let maximumPackedPipelineBytes = 64 * 1_024 * 1_024
+        let bytesPerPendingObservation = profile.preprocessing.sampleByteCount + pastSpec.sampleByteCount
         let packedPipelineDepth = max(
             1,
-            min(3, maximumPackedPipelineBytes / max(1, profile.preprocessing.sampleByteCount))
+            min(3, maximumPackedPipelineBytes / max(1, bytesPerPendingObservation))
         )
-        var pendingPackedFrames: [VisionPreprocessor.PendingPackedFrame] = []
+        var pendingPackedFrames: [(current: VisionPreprocessor.PendingPackedFrame, past: VisionPreprocessor.PendingPackedFrame)] = []
         pendingPackedFrames.reserveCapacity(packedPipelineDepth)
         func writeOldestPackedFrame() throws {
             let frame = pendingPackedFrames.removeFirst()
-            try frame.withPackedBytes { try observations.append($0) }
+            try frame.current.withPackedBytes { try currentObservations.append($0) }
+            try frame.past.withPackedBytes { try pastObservations.append($0) }
         }
-
-        // Establish the held-control and pointer state at the trim boundary,
-        // but discard movement/scroll that happened before the usable range.
-        // Without this priming, the first target can contain the entire trimmed
-        // lead-in as one large, directionally biased mouse action.
-        let trainingStartNanos = try absoluteHostNanos(recording.manifest, seconds: trainingStart)
-        while eventIndex < events.count, events[eventIndex].timestampNanos <= trainingStartNanos {
-            accumulator.consume(events[eventIndex])
-            eventIndex += 1
-        }
-        accumulator.endTick()
 
         while let sample = output.copyNextSampleBuffer(), let buffer = sample.imageBuffer {
             try Task.checkCancellation()
@@ -961,55 +1165,96 @@ actor DatasetCacheBuilder {
                 progress(min(1, max(0, (t - trainingStart) / usableDuration)))
                 nextProgressTime = t + progressInterval
             }
-            if let currentObservation = latestObservationIndex, let precedingObservation = precedingObservationIndex {
-                while nextAction < t - 0.000_001 && nextAction <= trainingEnd {
-                    try writeTick(currentObservation: currentObservation, precedingObservation: precedingObservation, time: nextAction, actionInterval: actionInterval, trainingEnd: trainingEnd, recording: recording, events: events, eventIndex: &eventIndex, accumulator: &accumulator, observationIndices: observationIndices, actions: actions)
-                    count += 1; nextAction += actionInterval
-                }
-            }
-            if latestObservationIndex == nil || t + 0.000_001 >= nextPerception {
-                pendingPackedFrames.append(try preprocessor.submit(buffer, spec: profile.preprocessing))
+            if observationTimes.isEmpty || t + 0.000_001 >= nextPerception {
+                pendingPackedFrames.append((
+                    current: try preprocessor.submit(buffer, spec: profile.preprocessing),
+                    past: try preprocessor.submit(buffer, spec: pastSpec)
+                ))
                 if pendingPackedFrames.count >= packedPipelineDepth {
                     try writeOldestPackedFrame()
                 }
-                let newIndex = observationBase + localObservationCount
-                localObservationCount += 1
-                precedingObservationIndex = latestObservationIndex ?? newIndex
-                latestObservationIndex = newIndex
+                observationTimes.append(min(trainingEnd, max(trainingStart, t)))
                 while nextPerception <= t { nextPerception += perceptionInterval }
-            }
-            if let currentObservation = latestObservationIndex, let precedingObservation = precedingObservationIndex {
-                while nextAction <= t + 0.000_001 && nextAction <= trainingEnd {
-                    try writeTick(currentObservation: currentObservation, precedingObservation: precedingObservation, time: nextAction, actionInterval: actionInterval, trainingEnd: trainingEnd, recording: recording, events: events, eventIndex: &eventIndex, accumulator: &accumulator, observationIndices: observationIndices, actions: actions)
-                    count += 1; nextAction += actionInterval
-                }
             }
         }
         if reader.status == .failed { throw reader.error ?? AgentTrainerError.storage("Video decoding failed while building the cache.") }
         while !pendingPackedFrames.isEmpty { try writeOldestPackedFrame() }
-        if let currentObservation = latestObservationIndex, let precedingObservation = precedingObservationIndex {
-            while nextAction <= trainingEnd {
-                try writeTick(currentObservation: currentObservation, precedingObservation: precedingObservation, time: nextAction, actionInterval: actionInterval, trainingEnd: trainingEnd, recording: recording, events: events, eventIndex: &eventIndex, accumulator: &accumulator, observationIndices: observationIndices, actions: actions)
-                count += 1; nextAction += actionInterval
+        guard !observationTimes.isEmpty else { progress(1); return (0, 0) }
+
+        let initialPointer = events.first { $0.kind == .mouseMove || $0.kind == .mouseButton || $0.kind == .scroll }
+        let trainingStartNanos = try absoluteHostNanos(recording.manifest, seconds: trainingStart)
+        func primedAccumulator() -> (ActionAccumulator, Int) {
+            var accumulator = ActionAccumulator(manifest: recording.manifest, initialPointer: initialPointer)
+            var eventIndex = 0
+            while eventIndex < events.count, events[eventIndex].timestampNanos <= trainingStartNanos {
+                accumulator.consume(events[eventIndex])
+                eventIndex += 1
             }
+            // Retain held state and pointer position, but discard all additive
+            // movement, scroll, and tap edges from before the usable trim.
+            accumulator.endTick()
+            return (accumulator, eventIndex)
+        }
+
+        // Build one comprehensive control row for every perception interval.
+        // These rows include held state, sub-frame taps, mouse deltas, buttons,
+        // scroll, keys, and modifiers and are later paired with past frames.
+        var (frameAccumulator, frameEventIndex) = primedAccumulator()
+        for observation in observationTimes.indices {
+            let intervalEnd = observation + 1 < observationTimes.count
+                ? min(trainingEnd, observationTimes[observation + 1])
+                : trainingEnd
+            let endNanos = try absoluteHostNanos(recording.manifest, seconds: intervalEnd)
+            while frameEventIndex < events.count, events[frameEventIndex].timestampNanos < endNanos {
+                frameAccumulator.consume(events[frameEventIndex])
+                frameEventIndex += 1
+            }
+            try frameAccumulator.withActionBytes { try frameActions.append($0) }
+            frameAccumulator.endTick()
+        }
+
+        // Action targets retain their independently configured rate. Every row
+        // maps its current perception plus the exact requested causal frame
+        // spacing; unavailable leading slots use the reserved sentinel.
+        var (targetAccumulator, targetEventIndex) = primedAccumulator()
+        var nextAction = trainingStart
+        var currentLocalObservation = 0
+        var sampleCount = 0
+        while nextAction <= trainingEnd + 0.000_001 {
+            while currentLocalObservation + 1 < observationTimes.count,
+                  observationTimes[currentLocalObservation + 1] <= nextAction + 0.000_001 {
+                currentLocalObservation += 1
+            }
+            let targetEnd = min(trainingEnd, nextAction + actionInterval)
+            let targetEndNanos = try absoluteHostNanos(recording.manifest, seconds: targetEnd)
+            while targetEventIndex < events.count, events[targetEventIndex].timestampNanos < targetEndNanos {
+                targetAccumulator.consume(events[targetEventIndex])
+                targetEventIndex += 1
+            }
+            let currentGlobal = observationBase + currentLocalObservation
+            guard let current = UInt32(exactly: currentGlobal), current != UInt32.max else {
+                throw AgentTrainerError.storage("The dataset contains too many perception frames for its index format.")
+            }
+            try observationIndices.appendLittleEndian(current)
+            for frame in 0..<temporal.pastFrameCount {
+                let distance = temporal.frameSpacing * (temporal.pastFrameCount - frame)
+                let localPast = currentLocalObservation - distance
+                if localPast >= 0 {
+                    guard let past = UInt32(exactly: observationBase + localPast), past != UInt32.max else {
+                        throw AgentTrainerError.storage("The dataset contains too many perception frames for its index format.")
+                    }
+                    try observationIndices.appendLittleEndian(past)
+                } else {
+                    try observationIndices.appendLittleEndian(UInt32.max)
+                }
+            }
+            try targetAccumulator.withActionBytes { try actions.append($0) }
+            targetAccumulator.endTick()
+            sampleCount += 1
+            nextAction += actionInterval
         }
         progress(1)
-        return (count, localObservationCount)
-    }
-
-    private func writeTick(currentObservation: Int, precedingObservation: Int, time: Double, actionInterval: Double, trainingEnd: Double, recording: RecordingItem, events: InputEventReader.MappedEvents, eventIndex: inout Int, accumulator: inout ActionAccumulator, observationIndices: BufferedFileWriter, actions: BufferedFileWriter) throws {
-        // Pair the frame at `time` with the controls demonstrated immediately
-        // after it. This causal interval is what live inference must predict.
-        let targetEnd = min(trainingEnd, time + actionInterval)
-        let absoluteNanos = try absoluteHostNanos(recording.manifest, seconds: targetEnd)
-        while eventIndex < events.count, events[eventIndex].timestampNanos < absoluteNanos { accumulator.consume(events[eventIndex]); eventIndex += 1 }
-        guard let current = UInt32(exactly: currentObservation), let preceding = UInt32(exactly: precedingObservation) else {
-            throw AgentTrainerError.storage("The dataset contains too many perception frames for its index format.")
-        }
-        try observationIndices.appendLittleEndian(current)
-        try observationIndices.appendLittleEndian(preceding)
-        try accumulator.withActionBytes { try actions.append($0) }
-        accumulator.endTick()
+        return (sampleCount, observationTimes.count)
     }
 
     private func absoluteHostNanos(_ manifest: RecordingManifest, seconds: Double) throws -> UInt64 {

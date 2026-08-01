@@ -220,8 +220,8 @@ final class VisionPreprocessor: @unchecked Sendable {
     }
 
     /// Array-input form used by compiled training graphs. Keeping UInt8
-    /// expansion inside the compiled function lets MLX fuse normalization,
-    /// chroma expansion, and temporal differencing with the policy graph.
+    /// expansion inside the compiled function lets MLX fuse normalization and
+    /// chroma expansion with the policy graph.
     static func mlxTensor(_ packed: MLXArray, spec: PreprocessingSpec) -> MLXArray {
         precondition(
             packed.ndim == 2 && packed.dim(1) == spec.sampleByteCount,
@@ -249,33 +249,24 @@ final class VisionPreprocessor: @unchecked Sendable {
         return concatenated([y, cb, cr], axis: -1)
     }
 
-    /// Builds the temporal vision input used by Policy v4. Supplying both the
-    /// current frame and its signed difference from the preceding perception
-    /// gives the policy motion/velocity evidence without running the CNN once
-    /// per history frame. A missing predecessor deliberately produces a zero
-    /// difference at recording and runtime segment boundaries.
-    static func mlxTemporalTensor(current: Data, previous: Data?, batch: Int, spec: PreprocessingSpec) -> MLXArray {
-        let currentTensor = mlxTensor(current, batch: batch, spec: spec)
-        let previousTensor = previous.map { mlxTensor($0, batch: batch, spec: spec) } ?? currentTensor
-        return temporalTensor(current: currentTensor, previous: previousTensor)
-    }
-
-    /// Expands a compact `[batch, 2, sampleByteCount]` UInt8 tensor, where slot
-    /// zero is current perception and slot one is its causal predecessor.
-    static func mlxTemporalTensor(_ packedPair: MLXArray, spec: PreprocessingSpec) -> MLXArray {
+    /// Expands independently packed lower-resolution frames without changing
+    /// their spatial size or synthesizing motion channels. The result keeps the
+    /// temporal axis so each visual embedding can stay paired with its controls.
+    static func mlxPastFrameTensor(_ packedFrames: MLXArray, spec: PreprocessingSpec) -> MLXArray {
         precondition(
-            packedPair.ndim == 3
-                && packedPair.dim(1) == 2
-                && packedPair.dim(2) == spec.sampleByteCount,
-            "Packed temporal vision must have shape [batch, 2, sampleByteCount]."
+            packedFrames.ndim == 3 && packedFrames.dim(1) > 0
+                && packedFrames.dim(2) == spec.sampleByteCount,
+            "Packed past vision must have shape [batch, frames, sampleByteCount]."
         )
-        let current = mlxTensor(packedPair[0..., 0, 0...], spec: spec)
-        let previous = mlxTensor(packedPair[0..., 1, 0...], spec: spec)
-        return temporalTensor(current: current, previous: previous)
-    }
-
-    static func temporalTensor(current: MLXArray, previous: MLXArray) -> MLXArray {
-        concatenated([current, current - previous], axis: -1)
+        let batch = packedFrames.dim(0)
+        let frameCount = packedFrames.dim(1)
+        let dense = mlxTensor(
+            packedFrames.reshaped([batch * frameCount, spec.sampleByteCount]),
+            spec: spec
+        )
+        return dense.reshaped([
+            batch, frameCount, spec.height, spec.width, spec.channelCount
+        ])
     }
 
     /// Renders the exact packed Y/Cb/Cr values consumed by the policy. This is only

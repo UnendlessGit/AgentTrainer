@@ -1,4 +1,4 @@
-# AgentTrainer 1.9.6
+# AgentTrainer 1.9.7
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -25,6 +25,17 @@ The package pins MLX Swift exactly in `Package.resolved`.
 
 Training and another already-trained AI may run at the same time when they use different profiles.
 
+## Temporal vision
+
+Every decision uses one exact-resolution current frame plus a configurable causal sequence of real past frames. Past frames:
+
+- are reduced by a configurable linear factor while retaining the current frame's aspect, color mode, chroma layout, bit detail, and resize policy
+- are sampled at a configurable number of Perception FPS intervals, with the editor showing both nominal seconds per step and total lookback
+- remain ordinary images; AgentTrainer does not synthesize motion or difference channels
+- carry the complete controls from their own perception interval: cursor position and raw movement, mouse buttons, scroll, keyboard, Shift, Control, Option, and Command
+
+The default context is four past frames, two perception intervals apart, at half width and half height. The current frame always remains at the exact configured model resolution. Changing temporal vision creates a new model contract, and older incompatible brains are archived while recordings remain available for retraining.
+
 ## Safety
 
 Runtime output is constrained in several independent layers:
@@ -46,13 +57,13 @@ Run the complete test suite:
 ./test.sh
 ```
 
-Run the opt-in release benchmark for a compact fixture and the default vision/model/batch hardware profile (with stochastic layers disabled for repeatability):
+Run the opt-in release benchmark for a compact fixture, the default vision/model/batch hardware profile, and a large 16-frame Float32 temporal stress profile (with stochastic layers disabled for repeatability):
 
 ```sh
 ./benchmark.sh
 ```
 
-The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. It compares training and validation loss after matched update counts; low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
+The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. Default and temporal-stress runs also report sustained throughput windows, MLX memory, and thermal pressure. It compares training and validation loss after matched update counts; low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
 
 Build, sign, package, and install:
 
@@ -68,7 +79,7 @@ The default installed application is:
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-1.9.6.dmg`
+- `AgentTrainer-1.9.7.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 
