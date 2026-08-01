@@ -1,4 +1,4 @@
-# AgentTrainer 1.9.6
+# AgentTrainer 1.9.7
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -24,6 +24,17 @@ The package pins MLX Swift exactly in `Package.resolved`.
 6. Use the configured panic shortcut at any time to stop hooks and release held controls.
 
 Training and another already-trained AI may run at the same time when they use different profiles.
+
+## Temporal vision
+
+Every decision uses one exact-resolution current frame plus a configurable causal sequence of real past frames. Past frames:
+
+- are reduced by a configurable linear factor while retaining the current frame's aspect, color mode, chroma layout, bit detail, and resize policy
+- are sampled at a configurable number of Perception FPS intervals, with the editor showing both nominal seconds per step and total lookback
+- remain ordinary images; AgentTrainer does not synthesize motion or difference channels
+- carry the complete controls from their own perception interval: cursor position and raw movement, mouse buttons, scroll, keyboard, Shift, Control, Option, and Command
+
+The default context is four past frames, two perception intervals apart, at half width and half height. The current frame always remains at the exact configured model resolution. Changing temporal vision creates a new model contract, and older incompatible brains are archived while recordings remain available for retraining.
 
 ## Safety
 
@@ -68,7 +79,7 @@ The default installed application is:
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-1.9.6.dmg`
+- `AgentTrainer-1.9.7.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

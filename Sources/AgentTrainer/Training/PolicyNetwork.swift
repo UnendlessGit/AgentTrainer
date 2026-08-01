@@ -11,13 +11,17 @@ final class AgentPolicy: Module, @unchecked Sendable {
     // putting it in AdamW would waste two Float32 moment arrays and allow
     // optimization to distort the meaning of X/Y coordinates.
     private let _coordinateGrid: MLXArray
+    private let _pastCoordinateGrid: MLXArray
     private let _poolCoordinates: MLXArray?
+    private let _pastPoolCoordinates: MLXArray?
 
     @ModuleInfo var convolutions: [Conv2d]
     @ModuleInfo var convolutionNormalizations: [GroupNorm]
     @ModuleInfo var spatialAttention: Linear?
     @ModuleInfo var visualProjection: Linear
     @ModuleInfo var visualNormalization: LayerNorm
+    @ModuleInfo var pastVisualProjection: Linear?
+    @ModuleInfo var pastVisualNormalization: LayerNorm?
     @ModuleInfo var gru: GRU?
     @ModuleInfo var lstm: LSTM?
     @ModuleInfo var fusion: [Linear]
@@ -40,11 +44,12 @@ final class AgentPolicy: Module, @unchecked Sendable {
         let architecture = profile.training.architecture
         let width = max(1, profile.preprocessing.width)
         let height = max(1, profile.preprocessing.height)
-        let x = broadcast(MLXArray.linspace(Float(-1), Float(1), count: width).reshaped([1, 1, width, 1]), to: [1, height, width, 1])
-        let y = broadcast(MLXArray.linspace(Float(-1), Float(1), count: height).reshaped([1, height, 1, 1]), to: [1, height, width, 1])
-        _coordinateGrid = concatenated([x, y], axis: -1).asType(dtype)
-        // Current planes, signed temporal differences, and explicit X/Y.
-        var inputChannels = profile.preprocessing.channelCount * 2 + 2
+        let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+        _coordinateGrid = Self.coordinateGrid(width: width, height: height, dtype: dtype)
+        _pastCoordinateGrid = Self.coordinateGrid(width: pastSpec.width, height: pastSpec.height, dtype: dtype)
+        // Real color planes plus explicit X/Y. Current and past images use the
+        // same weights and never include a synthetic difference channel.
+        var inputChannels = profile.preprocessing.channelCount + 2
         var convs: [Conv2d] = []
         var convolutionNormalizations: [GroupNorm] = []
         for i in architecture.convolutionChannels.indices {
@@ -58,35 +63,36 @@ final class AgentPolicy: Module, @unchecked Sendable {
         convolutions = convs
         self.convolutionNormalizations = convolutionNormalizations
         let visualSize = CNNGeometry.outputSize(width: width, height: height, architecture: architecture)
+        let pastVisualSize = CNNGeometry.outputSize(width: pastSpec.width, height: pastSpec.height, architecture: architecture)
         let visualProjectionInput: Int
         if architecture.effectiveVisualPooling == .attention {
             let heads = architecture.effectiveAttentionHeads
             spatialAttention = Linear(inputChannels, heads)
-            let poolX = broadcast(
-                MLXArray.linspace(Float(-1), Float(1), count: visualSize.width).reshaped([1, 1, visualSize.width, 1]),
-                to: [1, visualSize.height, visualSize.width, 1]
-            )
-            let poolY = broadcast(
-                MLXArray.linspace(Float(-1), Float(1), count: visualSize.height).reshaped([1, visualSize.height, 1, 1]),
-                to: [1, visualSize.height, visualSize.width, 1]
-            )
-            _poolCoordinates = concatenated([poolX, poolY], axis: -1)
-                .reshaped([1, visualSize.width * visualSize.height, 2])
-                .asType(dtype)
+            _poolCoordinates = Self.poolCoordinates(size: visualSize, dtype: dtype)
+            _pastPoolCoordinates = Self.poolCoordinates(size: pastVisualSize, dtype: dtype)
             visualProjectionInput = heads * (inputChannels + 2) + 2 * inputChannels
         } else {
             spatialAttention = nil
             _poolCoordinates = nil
+            _pastPoolCoordinates = nil
             visualProjectionInput = max(1, visualSize.width * visualSize.height * inputChannels)
         }
         visualProjection = Linear(visualProjectionInput, architecture.visualEmbedding)
         visualNormalization = LayerNorm(dimensions: architecture.visualEmbedding)
+        if architecture.effectiveVisualPooling == .flattened {
+            let pastProjectionInput = max(1, pastVisualSize.width * pastVisualSize.height * inputChannels)
+            pastVisualProjection = Linear(pastProjectionInput, architecture.visualEmbedding)
+            pastVisualNormalization = LayerNorm(dimensions: architecture.visualEmbedding)
+        } else {
+            pastVisualProjection = nil
+            pastVisualNormalization = nil
+        }
         if architecture.recurrentKind == .gru {
-            gru = GRU(inputSize: ActionLayout.count, hiddenSize: architecture.recurrentWidth)
+            gru = GRU(inputSize: architecture.visualEmbedding + ActionLayout.count, hiddenSize: architecture.recurrentWidth)
             lstm = nil
         } else {
             gru = nil
-            lstm = LSTM(inputSize: ActionLayout.count, hiddenSize: architecture.recurrentWidth)
+            lstm = LSTM(inputSize: architecture.visualEmbedding + ActionLayout.count, hiddenSize: architecture.recurrentWidth)
         }
         var fusionLayers: [Linear] = []
         var fusionNormalizations: [LayerNorm] = []
@@ -113,12 +119,32 @@ final class AgentPolicy: Module, @unchecked Sendable {
         [8, 4, 2].first(where: { channels.isMultiple(of: $0) }) ?? 1
     }
 
+    private static func coordinateGrid(width: Int, height: Int, dtype: DType) -> MLXArray {
+        let x = broadcast(
+            MLXArray.linspace(Float(-1), Float(1), count: width).reshaped([1, 1, width, 1]),
+            to: [1, height, width, 1]
+        )
+        let y = broadcast(
+            MLXArray.linspace(Float(-1), Float(1), count: height).reshaped([1, height, 1, 1]),
+            to: [1, height, width, 1]
+        )
+        return concatenated([x, y], axis: -1).asType(dtype)
+    }
+
+    private static func poolCoordinates(size: (width: Int, height: Int), dtype: DType) -> MLXArray {
+        coordinateGrid(width: size.width, height: size.height, dtype: dtype)
+            .reshaped([1, size.width * size.height, 2])
+    }
+
     /// Returns every normalized post-SiLU spatial stage without changing the
     /// normal policy graph or its saved parameters. Runtime diagnostics consume
     /// these tensors only when explicitly enabled.
     func visualActivations(images: MLXArray) -> [MLXArray] {
         visualActivations(
             images: images,
+            coordinateGrid: _coordinateGrid,
+            width: profile.preprocessing.width,
+            height: profile.preprocessing.height,
             acceleratedOperators: Self.usesAcceleratedVisionPath(
                 batch: images.dim(0),
                 width: profile.preprocessing.width,
@@ -141,6 +167,37 @@ final class AgentPolicy: Module, @unchecked Sendable {
     /// the pre-optimization graph against the adaptive production graph with
     /// identical weights.
     func visualActivations(images: MLXArray, acceleratedOperators: Bool) -> [MLXArray] {
+        visualActivations(
+            images: images,
+            coordinateGrid: _coordinateGrid,
+            width: profile.preprocessing.width,
+            height: profile.preprocessing.height,
+            acceleratedOperators: acceleratedOperators
+        )
+    }
+
+    func pastVisualActivations(images: MLXArray) -> [MLXArray] {
+        let spec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+        return visualActivations(
+            images: images,
+            coordinateGrid: _pastCoordinateGrid,
+            width: spec.width,
+            height: spec.height,
+            acceleratedOperators: Self.usesAcceleratedVisionPath(
+                batch: images.dim(0),
+                width: spec.width,
+                height: spec.height
+            )
+        )
+    }
+
+    private func visualActivations(
+        images: MLXArray,
+        coordinateGrid: MLXArray,
+        width: Int,
+        height: Int,
+        acceleratedOperators: Bool
+    ) -> [MLXArray] {
         var vision = images.asType(dtype)
         var activations: [MLXArray] = []
         activations.reserveCapacity(max(1, convolutions.count))
@@ -151,14 +208,14 @@ final class AgentPolicy: Module, @unchecked Sendable {
             if index == 0, acceleratedOperators, images.dim(0) > 1 {
                 vision = Self.sharedCoordinateConvolution(
                     vision,
-                    coordinates: _coordinateGrid,
+                    coordinates: coordinateGrid,
                     convolution: convolution
                 )
             } else {
                 if index == 0 {
                     let coordinates = broadcast(
-                        _coordinateGrid,
-                        to: [images.dim(0), profile.preprocessing.height, profile.preprocessing.width, 2]
+                        coordinateGrid,
+                        to: [images.dim(0), height, width, 2]
                     )
                     vision = concatenated([vision, coordinates], axis: -1)
                 }
@@ -177,8 +234,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
         // Treat its coordinate-aware input as the only visual stage.
         if activations.isEmpty {
             let coordinates = broadcast(
-                _coordinateGrid,
-                to: [images.dim(0), profile.preprocessing.height, profile.preprocessing.width, 2]
+                coordinateGrid,
+                to: [images.dim(0), height, width, 2]
             )
             activations.append(concatenated([vision, coordinates], axis: -1))
         }
@@ -240,9 +297,32 @@ final class AgentPolicy: Module, @unchecked Sendable {
     }
 
     func visualEmbedding(visualFeatures: MLXArray) -> MLXArray {
+        projectedVisualEmbedding(
+            visualFeatures: visualFeatures,
+            poolCoordinates: _poolCoordinates,
+            projection: visualProjection,
+            normalization: visualNormalization
+        )
+    }
+
+    func pastVisualEmbedding(visualFeatures: MLXArray) -> MLXArray {
+        projectedVisualEmbedding(
+            visualFeatures: visualFeatures,
+            poolCoordinates: _pastPoolCoordinates,
+            projection: pastVisualProjection ?? visualProjection,
+            normalization: pastVisualNormalization ?? visualNormalization
+        )
+    }
+
+    private func projectedVisualEmbedding(
+        visualFeatures: MLXArray,
+        poolCoordinates: MLXArray?,
+        projection: Linear,
+        normalization: LayerNorm
+    ) -> MLXArray {
         let batch = visualFeatures.dim(0)
         var vision: MLXArray
-        if let spatialAttention, let poolCoordinates = _poolCoordinates {
+        if let spatialAttention, let poolCoordinates {
             let spatial = visualFeatures.reshaped([batch, -1, visualFeatures.dim(3)])
             // Softmax over locations makes each learned head an interpretable
             // spatial keypoint. Pooling exact coordinates retains layout while
@@ -260,47 +340,95 @@ final class AgentPolicy: Module, @unchecked Sendable {
         } else {
             vision = visualFeatures.reshaped([batch, -1])
         }
-        return silu(visualNormalization(visualProjection(vision)))
+        return silu(normalization(projection(vision)))
     }
 
-    func logits(visualFeatures: MLXArray, history: MLXArray) -> MLXArray {
-        logits(
-            visualEmbedding: visualEmbedding(visualFeatures: visualFeatures),
-            history: history
+    func temporalFeatures(
+        currentImages: MLXArray,
+        pastImages: MLXArray,
+        pastControls: MLXArray
+    ) -> MLXArray {
+        temporalFeatures(
+            currentVisualFeatures: visualActivations(images: currentImages).last!,
+            pastImages: pastImages,
+            pastControls: pastControls
         )
     }
 
-    func logits(visualEmbedding vision: MLXArray, history: MLXArray) -> MLXArray {
-        let batch = vision.dim(0)
+    func temporalFeatures(
+        currentVisualFeatures: MLXArray,
+        pastImages: MLXArray,
+        pastControls: MLXArray
+    ) -> MLXArray {
+        temporalFeatures(
+            currentVisualEmbedding: visualEmbedding(visualFeatures: currentVisualFeatures),
+            pastImages: pastImages,
+            pastControls: pastControls
+        )
+    }
 
-        var history = history.asType(dtype)
-        // Ground-truth action history is an exceptionally tempting shortcut:
-        // a model can copy the previous held key and achieve a tiny loss while
-        // ignoring the screen. Drop the complete history branch for half of
-        // every training batch independently of ordinary feature dropout, so a
-        // user cannot reopen that shortcut by setting Dropout to zero.
-        // Inference still gets normal history, but vision must be independently
-        // predictive.
-        if training, profile.training.historyLength > 0 {
+    func temporalFeatures(
+        currentVisualEmbedding: MLXArray,
+        pastImages: MLXArray,
+        pastControls: MLXArray
+    ) -> MLXArray {
+        precondition(pastImages.ndim == 5, "Past images must have shape [batch, frames, height, width, channels].")
+        precondition(pastControls.ndim == 3, "Past controls must have shape [batch, frames, controls].")
+        let batch = currentVisualEmbedding.dim(0)
+        let frameCount = pastImages.dim(1)
+        let temporal = profile.training.effectiveTemporalVision
+        let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
+        precondition(
+            frameCount == temporal.pastFrameCount
+                && pastImages.dim(0) == batch
+                && pastImages.dim(2) == pastSpec.height
+                && pastImages.dim(3) == pastSpec.width
+                && pastImages.dim(4) == pastSpec.channelCount,
+            "Past images do not match this brain's immutable temporal-vision contract."
+        )
+        precondition(
+            pastControls.dim(0) == batch
+                && pastControls.dim(1) == frameCount
+                && pastControls.dim(2) == ActionLayout.count,
+            "Past controls must pair one complete control row with every past image."
+        )
+        let flattenedPast = pastImages.reshaped([
+            batch * frameCount,
+            pastImages.dim(2),
+            pastImages.dim(3),
+            pastImages.dim(4)
+        ])
+        let pastEmbedding = pastVisualEmbedding(
+            visualFeatures: pastVisualActivations(images: flattenedPast).last!
+        ).reshaped([batch, frameCount, profile.training.architecture.visualEmbedding])
+
+        var controls = pastControls.asType(dtype)
+        // Complete frame-aligned controls are useful temporal evidence, but
+        // held keys and buttons are still an easy shortcut. Mask only the
+        // control half for half of training samples; past vision always remains
+        // visible and inference always receives the full paired sequence.
+        if training {
             let keepProbability: Float = 0.5
             let mask = MLXRandom.bernoulli(keepProbability, [batch, 1, 1]).asType(dtype)
-            // This is structured branch masking rather than ordinary inverted
-            // dropout. Kept histories retain their inference-time magnitude;
-            // doubling them would create a train/run distribution mismatch.
-            history = history * mask
+            controls = controls * mask
         }
+        let temporalSteps = concatenated([pastEmbedding, controls], axis: -1)
         let recurrent: MLXArray
         if let gru {
-            recurrent = gru(history)[.ellipsis, -1, 0...]
+            recurrent = gru(temporalSteps)[.ellipsis, -1, 0...]
         } else if let lstm {
-            recurrent = lstm(history).0[.ellipsis, -1, 0...]
+            recurrent = lstm(temporalSteps).0[.ellipsis, -1, 0...]
         } else {
             recurrent = MLXArray.zeros(
                 [batch, profile.training.architecture.recurrentWidth],
                 dtype: dtype
             )
         }
-        var fused = concatenated([vision, recurrent], axis: -1)
+        return concatenated([currentVisualEmbedding, recurrent], axis: -1)
+    }
+
+    func logits(temporalFeatures: MLXArray) -> MLXArray {
+        var fused = temporalFeatures
         for (index, layer) in fusion.enumerated() {
             fused = layer(fused)
             if fusionNormalizations.indices.contains(index) {
@@ -314,8 +442,28 @@ final class AgentPolicy: Module, @unchecked Sendable {
         ], axis: -1)
     }
 
-    func callAsFunction(images: MLXArray, history: MLXArray) -> MLXArray {
-        logits(visualFeatures: visualActivations(images: images).last!, history: history)
+    func logits(
+        currentVisualFeatures: MLXArray,
+        pastImages: MLXArray,
+        pastControls: MLXArray
+    ) -> MLXArray {
+        logits(temporalFeatures: temporalFeatures(
+            currentVisualFeatures: currentVisualFeatures,
+            pastImages: pastImages,
+            pastControls: pastControls
+        ))
+    }
+
+    func callAsFunction(
+        currentImages: MLXArray,
+        pastImages: MLXArray,
+        pastControls: MLXArray
+    ) -> MLXArray {
+        logits(temporalFeatures: temporalFeatures(
+            currentImages: currentImages,
+            pastImages: pastImages,
+            pastControls: pastControls
+        ))
     }
 
     func activatedPredictions(logits: MLXArray) -> MLXArray {
@@ -329,8 +477,16 @@ final class AgentPolicy: Module, @unchecked Sendable {
         ], axis: -1)
     }
 
-    func predictions(images: MLXArray, history: MLXArray) -> MLXArray {
-        activatedPredictions(logits: callAsFunction(images: images, history: history))
+    func predictions(
+        currentImages: MLXArray,
+        pastImages: MLXArray,
+        pastControls: MLXArray
+    ) -> MLXArray {
+        activatedPredictions(logits: callAsFunction(
+            currentImages: currentImages,
+            pastImages: pastImages,
+            pastControls: pastControls
+        ))
     }
 
     /// Caps the longest spatial side copied out of MLX while preserving every
@@ -355,16 +511,20 @@ final class AgentPolicy: Module, @unchecked Sendable {
     }
 
     func loss(
-        images: MLXArray,
-        history: MLXArray,
+        currentImages: MLXArray,
+        pastImages: MLXArray,
+        pastControls: MLXArray,
         targets: MLXArray,
         positiveWeights: MLXArray? = nil,
         previousTargets: MLXArray? = nil
     ) -> MLXArray {
-        let logits = callAsFunction(images: images, history: history)
+        let logits = callAsFunction(
+            currentImages: currentImages,
+            pastImages: pastImages,
+            pastControls: pastControls
+        )
         return loss(
             logits: logits,
-            history: history,
             targets: targets,
             positiveWeights: positiveWeights,
             previousTargets: previousTargets
@@ -376,18 +536,15 @@ final class AgentPolicy: Module, @unchecked Sendable {
     /// evaluation instead of running the convolutional/recurrent stack twice.
     func loss(
         logits: MLXArray,
-        history: MLXArray,
         targets: MLXArray,
         positiveWeights: MLXArray? = nil,
         previousTargets: MLXArray? = nil
     ) -> MLXArray {
         let targets = targets.asType(dtype)
-        // Training passes the actual preceding cached action explicitly. This
-        // remains correct when model history is disabled; using the mandatory
-        // zero placeholder row incorrectly marked every held control as a new
-        // transition and upweighted long holds fourfold.
+        // Transition weighting uses the immediately preceding action target,
+        // not one of the more widely spaced frame-aligned context controls.
         let previous = previousTargets?.asType(dtype)
-            ?? history.asType(dtype)[.ellipsis, -1, 0...]
+            ?? MLXArray.zeros(like: targets)
         let positiveWeights = positiveWeights?.asType(dtype)
         var losses: [MLXArray] = []
         let channels = profile.channels

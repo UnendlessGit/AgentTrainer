@@ -31,7 +31,7 @@ final class AgentRuntime: @unchecked Sendable {
     private let actionQueue = DispatchQueue(label: "AgentTrainer.Actions", qos: .userInteractive)
     private let lock = NSLock()
     private var model: AgentPolicy?
-    private var predictionFunction: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    private var predictionFunction: VisualizationFunction?
     private var activationVisualizationFunctions: [VisualizationFunction] = []
     private var channelVisualizationFunction: (@Sendable ([MLXArray]) -> [MLXArray])?
     private var saliencyVisualizationFunction: (@Sendable ([MLXArray]) -> [MLXArray])?
@@ -50,8 +50,46 @@ final class AgentRuntime: @unchecked Sendable {
     private var lastUsableCaptureFrame: CVPixelBuffer?
     private var processing = false
     private var predictionLatch = RuntimePredictionLatch()
-    private var history: [[Float]] = []
-    private var historyWriteIndex = 0
+    private struct TemporalFrame: Sendable {
+        var packed: Data
+        var controls: [Float]
+    }
+    /// Fixed-capacity circular storage keeps sampling and appending O(1), even
+    /// at the largest supported frame count and spacing. Slot zero relative to
+    /// the end is the most recently completed perception.
+    private struct TemporalFrameRing: Sendable {
+        private var storage: [TemporalFrame?] = []
+        private var oldest = 0
+        private(set) var count = 0
+
+        mutating func reset() {
+            storage.removeAll(keepingCapacity: false)
+            oldest = 0
+            count = 0
+        }
+
+        mutating func append(_ frame: TemporalFrame, capacity rawCapacity: Int) {
+            let capacity = max(1, rawCapacity)
+            if storage.count != capacity {
+                storage = [TemporalFrame?](repeating: nil, count: capacity)
+                oldest = 0
+                count = 0
+            }
+            if count < capacity {
+                storage[(oldest + count) % capacity] = frame
+                count += 1
+            } else {
+                storage[oldest] = frame
+                oldest = (oldest + 1) % capacity
+            }
+        }
+
+        func frame(distanceBack: Int) -> TemporalFrame? {
+            guard distanceBack > 0, distanceBack <= count, !storage.isEmpty else { return nil }
+            return storage[(oldest + count - distanceBack) % storage.count]
+        }
+    }
+    private var temporalFrames = TemporalFrameRing()
     private var actionTimer: DispatchSourceTimer?
     private var nextPerceptionTime = 0.0
     private var metrics = RuntimeMetrics()
@@ -65,7 +103,6 @@ final class AgentRuntime: @unchecked Sendable {
     private var lastVisualizationTime = 0.0
     private var lastMetricsReportTime = 0.0
     private var lastFocusCheckTime = 0.0
-    private var previousPackedVision: Data?
     private var launchRevision: UInt64 = 0
     private var starting = false
     private var teardownInProgress = false
@@ -106,54 +143,68 @@ final class AgentRuntime: @unchecked Sendable {
             waiters.forEach { $0.resume() }
         }
 
-        // A runnable brain is immutable. Timing, history length, enabled heads,
+        // A runnable brain is immutable. Timing, temporal vision, enabled heads,
         // precision, and architecture must come from the saved version rather
         // than mutable editor fields that may have changed after training.
         var runtimeProfile = profile
         runtimeProfile.preprocessing = version.preprocessing
         runtimeProfile.channels = RuntimeActionSemantics.effectiveChannels(saved: version.channels, current: profile.channels)
         runtimeProfile.training = version.training
+        _ = try runtimeProfile.preprocessing.validated()
+        _ = try runtimeProfile.training.effectiveTemporalVision.validated(
+            current: runtimeProfile.preprocessing
+        )
         let startRevisions = lock.withLock { (outputPermissionsRevision, visualizationSettingsRevision) }
         let model = AgentPolicy(profile: runtimeProfile)
         let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
         model.train(false)
-        let predictionFunction = compile(inputs: [model]) { packedVision, history in
-            model.predictions(
-                images: VisionPreprocessor.mlxTemporalTensor(packedVision, spec: runtimeProfile.preprocessing),
-                history: history
-            )
+        let pastSpec = runtimeProfile.training.effectiveTemporalVision.pastFrameSpec(from: runtimeProfile.preprocessing)
+        let predictionFunction: VisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
+            [model.predictions(
+                currentImages: VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing),
+                pastImages: VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec),
+                pastControls: inputs[2]
+            )]
         }
         // Diagnostic graphs are lazy: creating these closures does not execute
         // or materialize an extra tensor. The selected graph first compiles only
         // when its view is enabled and reaches its independently capped rate.
         let activationVisualizationFunctions: [VisualizationFunction] = (0..<max(1, model.convolutions.count)).map { selectedLayer in
             compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-                let images = VisionPreprocessor.mlxTemporalTensor(inputs[0], spec: runtimeProfile.preprocessing)
-                let layers = model.visualActivations(images: images)
-                let logits = model.logits(visualFeatures: layers.last!, history: inputs[1])
+                let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
+                let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+                let layers = model.visualActivations(images: currentImages)
+                let logits = model.logits(currentVisualFeatures: layers.last!, pastImages: pastImages, pastControls: inputs[2])
                 let map = model.sampledForVisualization(layers[selectedLayer]).mean(axis: -1, keepDims: true)
                 return [model.activatedPredictions(logits: logits), map]
             }
         }
         let channelVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            let images = VisionPreprocessor.mlxTemporalTensor(inputs[0], spec: runtimeProfile.preprocessing)
-            let layers = model.visualActivations(images: images)
-            let logits = model.logits(visualFeatures: layers.last!, history: inputs[1])
+            let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
+            let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+            let layers = model.visualActivations(images: currentImages)
+            let logits = model.logits(currentVisualFeatures: layers.last!, pastImages: pastImages, pastControls: inputs[2])
             return [model.activatedPredictions(logits: logits), model.strongestChannelsForVisualization(layers.last!)]
         }
         let saliencyVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            let images = VisionPreprocessor.mlxTemporalTensor(inputs[0], spec: runtimeProfile.preprocessing)
-            let layers = model.visualActivations(images: images)
-            let logits = model.logits(visualFeatures: layers.last!, history: inputs[1])
+            let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
+            let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+            let layers = model.visualActivations(images: currentImages)
+            let logits = model.logits(currentVisualFeatures: layers.last!, pastImages: pastImages, pastControls: inputs[2])
             // Keep the exact final tensor on GPU for the post-CNN gradient.
             // This graph intentionally omits the channel ranking used by the
             // separate feature-grid view.
             return [model.activatedPredictions(logits: logits), layers.last!]
         }
         let saliencyGradient = grad({ (inputs: [MLXArray]) -> MLXArray in
-            let logits = model.logits(visualFeatures: inputs[0], history: inputs[1])
-            return (logits * inputs[2].asType(model.dtype)).sum()
+            let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+            let logits = model.logits(
+                currentVisualFeatures: inputs[0],
+                pastImages: pastImages,
+                pastControls: inputs[2]
+            )
+            return (logits * inputs[3].asType(model.dtype)).sum()
         }, argumentNumbers: [0])
         let accepted = lock.withLock { () -> Bool in
             guard launchRevision == launchToken, starting, stopped else { return false }
@@ -180,8 +231,8 @@ final class AgentRuntime: @unchecked Sendable {
             self.previewFPS = max(0, previewFPS)
             self.lastPreviewTime = 0
             self.lastVisualizationTime = 0
-            latestFrame = nil; lastUsableCaptureFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: max(1, runtimeProfile.training.historyLength))
-            historyWriteIndex = 0; metrics = RuntimeMetrics(); startedAt = CACurrentMediaTime(); nextPerceptionTime = 0; lastMetricsReportTime = 0; lastFocusCheckTime = 0; stopped = false
+            latestFrame = nil; lastUsableCaptureFrame = nil; predictionLatch.reset(); temporalFrames.reset()
+            metrics = RuntimeMetrics(); startedAt = CACurrentMediaTime(); nextPerceptionTime = 0; lastMetricsReportTime = 0; lastFocusCheckTime = 0; stopped = false
             // Keep session enablement ordered with live permission changes. A
             // toggle made while model weights are loading must not be replaced
             // by the older settings captured when `start` was first called.
@@ -261,7 +312,7 @@ final class AgentRuntime: @unchecked Sendable {
             stopped = true
             teardownInProgress = true
             let timer = actionTimer; actionTimer = nil
-            latestFrame = nil; lastUsableCaptureFrame = nil; previousPackedVision = nil; predictionLatch.reset(); targetPID = nil
+            latestFrame = nil; lastUsableCaptureFrame = nil; temporalFrames.reset(); predictionLatch.reset(); targetPID = nil
             return .perform(timer)
         }
         let timer: DispatchSourceTimer?
@@ -291,7 +342,7 @@ final class AgentRuntime: @unchecked Sendable {
         await drain(queue: inferenceQueue)
         lock.withLock {
             predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
-            latestFrame = nil; lastUsableCaptureFrame = nil; previousPackedVision = nil; predictionLatch.reset(); history.removeAll(keepingCapacity: false); historyWriteIndex = 0; processing = false
+            latestFrame = nil; lastUsableCaptureFrame = nil; temporalFrames.reset(); predictionLatch.reset(); processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
         MLXMemoryLifecycle.reclaimCaches(after: "agent runtime")
@@ -357,8 +408,10 @@ final class AgentRuntime: @unchecked Sendable {
     private func infer(_ buffer: CVPixelBuffer) {
         lock.lock()
         guard !stopped, let predictionFunction, let model, let profile else { lock.unlock(); return }
-        let history: [Float] = (0..<self.history.count).flatMap { offset in
-            self.history[(historyWriteIndex + offset) % self.history.count]
+        let temporal = profile.training.effectiveTemporalVision
+        let selectedPriorFrames: [TemporalFrame?] = (0..<temporal.pastFrameCount).map { frame in
+            let distance = temporal.frameSpacing * (temporal.pastFrameCount - frame)
+            return temporalFrames.frame(distanceBack: distance)
         }
         let now = CACurrentMediaTime()
         let settings = visualizationSettings
@@ -372,44 +425,55 @@ final class AgentRuntime: @unchecked Sendable {
         lock.unlock()
         let began = CACurrentMediaTime()
         do {
-            let packed = try preprocessor.process(buffer, spec: profile.preprocessing)
-            let previousPacked = lock.withLock { () -> Data? in
-                let previous = previousPackedVision
-                previousPackedVision = packed
-                return previous
+            let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
+            // Submit both sizes before waiting so Metal can process the full
+            // current frame and the reduced copy retained for future context.
+            let currentJob = try preprocessor.submit(buffer, spec: profile.preprocessing)
+            let pastJob = try preprocessor.submit(buffer, spec: pastSpec)
+            let packed = try currentJob.withPackedBytes { Data($0) }
+            let packedPastFrame = try pastJob.withPackedBytes { Data($0) }
+            let zeroControls = [Float](repeating: 0, count: ActionLayout.count)
+            let selectedFrames: [TemporalFrame] = selectedPriorFrames.map { frame in
+                frame ?? TemporalFrame(packed: packedPastFrame, controls: zeroControls)
             }
-            let predecessor = previousPacked ?? packed
-            let packedVision = try inferenceInputBuffers.makeArrays([
-                .init([1, 2, profile.preprocessing.sampleByteCount], dtype: .uint8)
+            let inferenceInputs = try inferenceInputBuffers.makeArrays([
+                .init([1, profile.preprocessing.sampleByteCount], dtype: .uint8),
+                .init([1, temporal.pastFrameCount, pastSpec.sampleByteCount], dtype: .uint8),
+                .init([1, temporal.pastFrameCount, ActionLayout.count], dtype: .float32)
             ]) { destinations in
                 packed.withUnsafeBytes { source in
-                    UnsafeMutableRawBufferPointer(
-                        rebasing: destinations[0][..<profile.preprocessing.sampleByteCount]
-                    ).copyMemory(from: source)
+                    destinations[0].copyMemory(from: source)
                 }
-                predecessor.withUnsafeBytes { source in
-                    UnsafeMutableRawBufferPointer(
-                        rebasing: destinations[0][profile.preprocessing.sampleByteCount...]
-                    ).copyMemory(from: source)
+                let controlRowBytes = ActionLayout.count * MemoryLayout<Float>.size
+                for (frame, selected) in selectedFrames.enumerated() {
+                    selected.packed.withUnsafeBytes { source in
+                        UnsafeMutableRawBufferPointer(
+                            rebasing: destinations[1][frame * pastSpec.sampleByteCount..<(frame + 1) * pastSpec.sampleByteCount]
+                        ).copyMemory(from: source)
+                    }
+                    selected.controls.withUnsafeBytes { source in
+                        UnsafeMutableRawBufferPointer(
+                            rebasing: destinations[2][frame * controlRowBytes..<(frame + 1) * controlRowBytes]
+                        ).copyMemory(from: source)
+                    }
                 }
-            }[0]
-            let historyArray = MLXArray(history, [1, max(1, profile.training.historyLength), ActionLayout.count])
+            }
             let result: [MLXArray] = Device.withDefaultDevice(.gpu) {
-                guard visualizationDue else { return [predictionFunction(packedVision, historyArray)] }
+                guard visualizationDue else { return predictionFunction(inferenceInputs) }
                 switch settings.mode {
                 case .activationOverlay:
                     let selectedLayer = max(0, settings.convolutionLayer)
-                    guard activationVisualizationFunctions.indices.contains(selectedLayer) else { return [predictionFunction(packedVision, historyArray)] }
-                    return activationVisualizationFunctions[selectedLayer]([packedVision, historyArray])
+                    guard activationVisualizationFunctions.indices.contains(selectedLayer) else { return predictionFunction(inferenceInputs) }
+                    return activationVisualizationFunctions[selectedLayer](inferenceInputs)
                 case .featureChannels:
-                    guard let forward = channelVisualizationFunction?([packedVision, historyArray]), forward.count >= 2 else { return [predictionFunction(packedVision, historyArray)] }
+                    guard let forward = channelVisualizationFunction?(inferenceInputs), forward.count >= 2 else { return predictionFunction(inferenceInputs) }
                     return forward
                 case .actionSaliency:
                     let selector = Self.actionSelector(focus: settings.actionFocus, mouseMode: mouseMode)
-                    guard let saliencyVisualizationFunction, let saliencyGradientFunction else { return [predictionFunction(packedVision, historyArray)] }
-                    let forward = saliencyVisualizationFunction([packedVision, historyArray])
-                    guard forward.count >= 2 else { return [predictionFunction(packedVision, historyArray)] }
-                    let gradients = saliencyGradientFunction([forward[1], historyArray, selector])
+                    guard let saliencyVisualizationFunction, let saliencyGradientFunction else { return predictionFunction(inferenceInputs) }
+                    let forward = saliencyVisualizationFunction(inferenceInputs)
+                    guard forward.count >= 2 else { return predictionFunction(inferenceInputs) }
+                    let gradients = saliencyGradientFunction([forward[1], inferenceInputs[1], inferenceInputs[2], selector])
                     let weights = gradients.mean(axes: [1, 2], keepDims: true)
                     let saliency = relu((forward[1] * weights).sum(axis: -1, keepDims: true))
                     return [forward[0], model.sampledForVisualization(saliency)]
@@ -450,6 +514,19 @@ final class AgentRuntime: @unchecked Sendable {
             if let preview { onPreview?(preview) }
             lock.lock()
             guard !stopped else { lock.unlock(); return }
+            let frameControls = RuntimeActionSemantics.temporalControlValues(
+                values,
+                channels: profile.channels,
+                restrictions: profile.effectiveRestrictions,
+                allowedKeyCodes: allowedKeyCodes,
+                outputPermissions: outputPermissions,
+                shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
+            )
+            let retainedFrameCount = temporal.pastFrameCount * temporal.frameSpacing
+            temporalFrames.append(
+                TemporalFrame(packed: packedPastFrame, controls: frameControls),
+                capacity: retainedFrameCount
+            )
             predictionLatch.publish(values)
             metrics.frameCount += 1
             let elapsed = max(0.001, CACurrentMediaTime() - startedAt)
@@ -521,7 +598,7 @@ final class AgentRuntime: @unchecked Sendable {
         lock.lock()
         guard !stopped, let latched = predictionLatch.consume(), let profile else { lock.unlock(); return }
         let prediction = latched.values
-        let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes, shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel, outputPermissions = self.outputPermissions
+        let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes, shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel
         let now = CACurrentMediaTime()
         let maximumPredictionAge = max(0.35, 3 / max(0.0001, profile.training.perceptionFPS))
         if now - latched.publishedAt > maximumPredictionAge {
@@ -543,21 +620,6 @@ final class AgentRuntime: @unchecked Sendable {
         metrics.actionCount += 1
         let elapsed = max(0.001, CACurrentMediaTime() - startedAt)
         metrics.actionFPS = Double(metrics.actionCount) / elapsed
-        // A configured history of zero still uses one placeholder tensor row,
-        // matching training, but that row must remain zero rather than becoming
-        // an accidental one-step runtime history.
-        if profile.training.historyLength > 0, !history.isEmpty {
-            history[historyWriteIndex] = RuntimeActionSemantics.historyValues(
-                prediction,
-                predictionIsFresh: latched.isFresh,
-                channels: profile.channels,
-                restrictions: profile.effectiveRestrictions,
-                allowedKeyCodes: allowedKeyCodes,
-                outputPermissions: outputPermissions,
-                shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
-            )
-            historyWriteIndex = (historyWriteIndex + 1) % history.count
-        }
         let snapshot: RuntimeMetrics? = now - lastMetricsReportTime >= 0.1 ? metrics : nil
         if snapshot != nil { lastMetricsReportTime = now }
         lock.unlock()
@@ -670,12 +732,11 @@ enum RuntimeActionSemantics {
         return result
     }
 
-    /// Training history is one row per action tick. Reused policy state remains
-    /// useful for held buttons/keys, while additive channels are zero on ticks
-    /// where no new prediction was executed.
-    static func historyValues(
+    /// Produces the complete executable controls paired with one perceived
+    /// frame. Every row represents a fresh prediction, so relative movement and
+    /// scroll are retained once alongside held keys, modifiers, and buttons.
+    static func temporalControlValues(
         _ prediction: [Float],
-        predictionIsFresh: Bool,
         channels: ActionChannels? = nil,
         restrictions: ActionRestrictions = ActionRestrictions(),
         allowedKeyCodes: Set<UInt16>? = nil,
@@ -697,10 +758,6 @@ enum RuntimeActionSemantics {
         for index in ActionLayout.relativeMouse {
             values[index] = outputPermissions.cursorMovement && mouseMovementEnabled
                 ? min(1, max(-1, values[index])) : 0
-        }
-        if !predictionIsFresh {
-            for index in ActionLayout.relativeMouse { values[index] = 0 }
-            for index in ActionLayout.scroll { values[index] = 0 }
         }
         for button in 0..<8 {
             let allowed = buttonsEnabled && restrictions.allowsButton(UInt8(button))

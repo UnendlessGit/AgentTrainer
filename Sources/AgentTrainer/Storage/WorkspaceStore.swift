@@ -277,7 +277,7 @@ actor WorkspaceStore {
             // already uses the current contract. Never rewrite its settings.
             if compatibleVersionIDs.isEmpty && !keepsCheckpoint {
                 profile.training.architecture = migratedArchitecture(profile.training.architecture)
-                profile.training.historyLength = min(32, max(0, profile.training.historyLength))
+                profile.training.temporalVision = TemporalVisionConfiguration()
                 if !profile.training.learningRate.isFinite || profile.training.learningRate <= 0 {
                     profile.training.learningRate = 0.0003
                 } else {
@@ -334,11 +334,11 @@ actor WorkspaceStore {
         try atomicWrite(try encoder.encode(manifest), to: directory.appendingPathComponent("manifest.json"))
     }
 
-    /// Repairs legacy manifests before the strict library scan runs. Policy
-    /// v4 added defensive validation, but filtering first made an older
-    /// recording with a stale duration/trim disappear from the UI before the
-    /// existing clock repair could discover it. This pass enumerates recording
-    /// directories directly and changes only invalid, decodable manifests.
+    /// Repairs legacy manifests before the strict library scan runs. Earlier
+    /// defensive validation filtered some older recordings before the existing
+    /// clock repair could discover their stale duration/trim. This pass
+    /// enumerates recording directories directly and changes only invalid,
+    /// decodable manifests.
     /// Video and input files are never moved, rewritten, or removed.
     @discardableResult
     func repairInvalidRecordingManifests() async throws -> Int {

@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 1.9.6. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 1.9.7. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -21,7 +21,7 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Storage/InputEventFile.swift` — fixed-width binary event writer and validated mapped reader
 - `Preprocessing/VisionPreprocessor.swift` — Metal resize, color conversion, packing, and MLX expansion
 - `Training/DatasetCache.swift` — causal frame/action pairing and memory-mapped datasets
-- `Training/PolicyNetwork.swift` — Policy v4 and resumable AdamW
+- `Training/PolicyNetwork.swift` — Policy v5 and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
 - `Agent/AgentRuntime.swift` — capture, inference scheduling, prediction latching, and teardown
@@ -71,9 +71,25 @@ Packed observations are `UInt8`:
 - grayscale: Y
 - color: Y plus Cb/Cr using the selected 4:2:0, 4:2:2, or 4:4:4 layout
 
-MLX expands color to dense RGB-like channels. Policy input concatenates the current frame, signed difference from the previous perception frame, and generated X/Y coordinate planes.
+MLX expands each packed image independently to dense RGB-like channels at its native configured size. The visual encoder appends generated X/Y coordinate planes internally.
 
-`TrainingDataContract.schemaVersion` is 7. Dataset caches are disposable and must be invalidated when causal pairing or target meaning changes.
+Temporal vision is an explicit three-part input:
+
+1. one current frame at the exact configured `PreprocessingSpec`
+2. `pastFrameCount` real causal frames at `pastFrameSpec`, ordered oldest to newest
+3. one complete 146-value control row paired with each past frame
+
+`TemporalVisionConfiguration` owns past-frame count, spacing in Perception FPS intervals, and linear downscale. Its displayed seconds are nominal values derived from configured Perception FPS; dropped or delayed live perceptions can increase wall-clock separation. The reduced specification must copy color mode, chroma layout, bit detail, and resize policy from the current frame. Width and height use the same scale, with only unavoidable integer-pixel rounding. Never resize past images back to current resolution and never synthesize difference, optical-flow, or motion channels.
+
+The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 1–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context.
+
+`TrainingDataContract.schemaVersion` is 8. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, or target meaning changes. A cache has:
+
+- `current-observations.bin` — one full-resolution packed image per perception
+- `past-observations.bin` — one reduced packed image of the same perception
+- `observation-indices.bin` — current plus configured past indices for every action row; unavailable segment-leading frames use `UInt32.max`
+- `frame-actions.bin` — one complete control row per perception interval
+- `actions.bin` — action-rate targets; the immediately preceding target remains separate for transition weighting
 
 One action row has 146 values:
 
@@ -85,33 +101,36 @@ One action row has 146 values:
 - `142` Shift
 - `143..<146` Control, Option, Command
 
-Shift belongs to Keyboard. Control, Option, and Command use only their dedicated outputs; their duplicate ordinary key-code slots must be zeroed in targets, loss, history, and runtime.
+Shift belongs to Keyboard. Control, Option, and Command use only their dedicated outputs; their duplicate ordinary key-code slots must be zeroed in targets, loss, frame-aligned controls, and runtime.
 
-Sub-tick taps must survive action sampling. Observation mappings retain current and preceding perception frames so motion is causal. Validation context must not reach into training rows or cross recording boundaries.
+Every frame-control row includes normalized absolute cursor position, raw relative movement, held and sub-tick mouse-button presses, scroll, held and sub-tick key presses, Shift, Control, Option, and Command. Sub-tick taps must survive both action and perception-interval sampling. Cache loading verifies exact configured spacing, strictly causal indices, monotonic current frames, segment-leading sentinels, file sizes, and bounded arithmetic. Validation context must not reach into training frames or cross recording boundaries.
 
 ## Model and training contracts
 
-`ModelContract.schemaVersion` is 4 and the weight format is `AgentTrainer.Policy.v4`.
+`ModelContract.schemaVersion` is 5 and the weight format is `AgentTrainer.Policy.v5`.
 
-A runnable version is immutable. Runtime vision, architecture, precision, history, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
+A runnable version is immutable. Runtime current vision, temporal vision, architecture, precision, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
 
-Current Policy v4 combines:
+Current Policy v5 combines:
 
-- convolutional spatial features
-- current-frame difference channels and coordinate planes
+- one shared convolutional encoder for the real current and past images
+- independent X/Y coordinate planes at each image's native resolution
 - attention or legacy flattened visual pooling
-- GRU/LSTM action history
+- a GRU/LSTM sequence over each past visual embedding concatenated with that frame's 146 controls
+- fusion of the current visual embedding with the final temporal state
 - per-head bounded activations
 
-Training uses class/transition weighting, focal binary loss, anti-shortcut history masking, deterministic salience-balanced order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Do not change those semantics without updating tests and the relevant schema.
+Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. Past control rows are masked for half of training samples while past images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
+
+Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Do not change those semantics without updating tests and the relevant schema.
 
 The performance path preserves those semantics:
 
 - VideoToolbox decode, Metal resize/color packing, and cache writes overlap through a bounded ordered pipeline.
-- Dataset files are required memory mappings with random-access VM advice. A batch gathers both causal frames and all action rows once into pooled Metal shared memory; MLX expands `UInt8` temporal vision inside the compiled graph.
-- When action sampling reuses perception pairs above the measured crossover, epoch ordering colocates those rows and evaluates each distinct visual encoder input once per batch. The resulting embedding is gathered back to every independent history/target row; no label is removed, duplicated, averaged, or reused as another label.
+- Dataset files are required memory mappings with random-access VM advice. A batch gathers current images, native-size past images, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
+- When action sampling reuses a temporal frame sequence, epoch ordering colocates those rows and evaluates each distinct current/past/control feature once per batch. The resulting temporal feature is gathered back to every independent target row; no label is removed, duplicated, averaged, or reused as another label.
 - Above the measured workload crossover, the coordinate contribution to the first convolution is evaluated once per batch and the established GroupNorm layout uses MLX's fused Metal layer-normalization kernel. Small tensors retain the lower-overhead kernels.
-- Validation adaptively shares repeated visual inputs, expands packed input, runs one compiled policy forward, then derives both loss and predictions from the shared logits.
+- Validation adaptively shares repeated temporal inputs, expands packed input, runs one compiled policy forward, then derives both loss and predictions from the shared logits.
 - CPU gathering of the next batch overlaps the current Metal graph. Every optimizer step still evaluates the complete model, AdamW moments, scheduler, and MLX random state before advancing the checkpoint cursor.
 
 Do not queue stateful optimizer steps merely to improve a benchmark. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
@@ -136,6 +155,8 @@ The final executable action is the intersection of:
 6. the allowed control region unless full-Mac control is enabled
 
 Predictions must contain 146 finite values. Held keys/buttons may persist between fresh predictions, but cursor deltas and scroll are transient. The prediction latch consumes transient outputs once.
+
+At runtime, every successfully inferred perception stores its reduced packed image with the sanitized controls predicted for that interval. Exact spaced frames are selected from a fixed-capacity circular buffer; unavailable startup slots duplicate the current reduced image with zero controls. This matches training padding without target leakage and keeps sampling/appending O(1).
 
 All synthetic events carry `agentTrainerSyntheticTag`; input safety monitors ignore that tag. Panic and normal stop both drain action work and release held state.
 

@@ -114,6 +114,67 @@ struct PreprocessingSpec: Codable, Hashable, Sendable {
     private func saturatedAdd(_ lhs: Int, _ rhs: Int) -> Int { let result = lhs.addingReportingOverflow(rhs); return result.overflow ? Int.max : result.partialValue }
 }
 
+/// Defines the causal visual context supplied with each current frame. Past
+/// frames keep the current frame's color mode, chroma layout, bit detail, and
+/// resize policy; only their pixel dimensions are reduced.
+struct TemporalVisionConfiguration: Codable, Hashable, Sendable {
+    static let defaultPastFrameCount = 4
+    static let defaultFrameSpacing = 2
+    static let defaultDownsampleFactor = 2
+    static let maximumPastFrameCount = 32
+    static let maximumFrameSpacing = 240
+    static let maximumDownsampleFactor = 8
+    static let maximumRuntimeTemporalBytes = 512 * 1_024 * 1_024
+
+    /// Number of causal frames supplied before the full-resolution current one.
+    var pastFrameCount = defaultPastFrameCount
+    /// Distance between selected frames in perception-frame intervals. A value
+    /// of one selects consecutive perceptions.
+    var frameSpacing = defaultFrameSpacing
+    /// Linear reduction applied equally to width and height. Two means roughly
+    /// half width and half height (one quarter of the current pixel count).
+    var downsampleFactor = defaultDownsampleFactor
+
+    func pastFrameSpec(from current: PreprocessingSpec) -> PreprocessingSpec {
+        var result = current
+        let factor = max(1, downsampleFactor)
+        // Apply one scale to both axes. Integer pixels can make an odd-sized
+        // source differ by less than one pixel from its mathematical ratio.
+        result.width = max(1, Int((Double(max(1, current.width)) / Double(factor)).rounded()))
+        result.height = max(1, Int((Double(max(1, current.height)) / Double(factor)).rounded()))
+        return result
+    }
+
+    func spacingSeconds(perceptionFPS: Double) -> Double {
+        guard perceptionFPS.isFinite, perceptionFPS > 0 else { return 0 }
+        return Double(frameSpacing) / perceptionFPS
+    }
+
+    func lookbackSeconds(perceptionFPS: Double) -> Double {
+        spacingSeconds(perceptionFPS: perceptionFPS) * Double(pastFrameCount)
+    }
+
+    func validated(current: PreprocessingSpec) throws -> Self {
+        guard (1...Self.maximumPastFrameCount).contains(pastFrameCount),
+              (1...Self.maximumFrameSpacing).contains(frameSpacing),
+              (1...Self.maximumDownsampleFactor).contains(downsampleFactor) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "Temporal vision supports 1–\(Self.maximumPastFrameCount) past frames, spacing of 1–\(Self.maximumFrameSpacing) perception frames, and a 1×–\(Self.maximumDownsampleFactor)× past-frame downscale."
+            )
+        }
+        let past = try pastFrameSpec(from: current).validated()
+        let retainedFrameCount = pastFrameCount.multipliedReportingOverflow(by: frameSpacing)
+        let retainedBytes = retainedFrameCount.partialValue.multipliedReportingOverflow(by: past.sampleByteCount)
+        guard !retainedFrameCount.overflow, !retainedBytes.overflow,
+              retainedBytes.partialValue <= Self.maximumRuntimeTemporalBytes else {
+            throw AgentTrainerError.invalidConfiguration(
+                "This temporal spacing would retain more than 512 MB of past vision while running. Reduce past frames, spacing, resolution, color detail, or increase the past-frame downscale."
+            )
+        }
+        return self
+    }
+}
+
 struct ActionChannels: Codable, Hashable, Sendable {
     var absoluteMouse = true
     var relativeMouse = false
@@ -143,23 +204,22 @@ enum MouseControlMode: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 enum ModelContract {
-    /// Version 4 replaces the shallow globally-pooled encoder with a temporal,
-    /// coordinate-aware spatial encoder. The new weights intentionally cannot
-    /// be attached to older profiles because their tensor shapes and meaning
-    /// are different.
-    static let schemaVersion = 4
-    static let weightFormat = "AgentTrainer.Policy.v4"
+    /// Version 5 replaces signed frame differencing and free-running action
+    /// history with native current vision plus lower-resolution causal frames,
+    /// each paired with the complete controls demonstrated for that frame.
+    static let schemaVersion = 5
+    static let weightFormat = "AgentTrainer.Policy.v5"
 }
 
 /// Version of the causal pairing between a captured frame and the controls the
 /// model should perform next. This remains separate from the weight format so
 /// a data-only correction can invalidate caches/checkpoints without needlessly
-/// changing tensor shapes. Policy v4 itself is an intentional weight break.
+/// changing tensor shapes. Policy v5 itself is an intentional weight break.
 enum TrainingDataContract {
-    /// Version 7 preserves sub-tick key/button taps and preceding-perception
-    /// motion, and assigns Shift to the Keyboard channel while the Modifiers
-    /// channel owns only Control, Option, and Command.
-    static let schemaVersion = 7
+    /// Version 8 stores full- and reduced-resolution copies of each perception,
+    /// causal frame-sequence mappings, and complete per-frame controls. Version
+    /// 7's sub-tick tap and modifier ownership semantics remain unchanged.
+    static let schemaVersion = 8
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -205,9 +265,9 @@ enum RecurrentKind: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 enum VisualPoolingKind: String, Codable, CaseIterable, Identifiable, Sendable {
-    /// Preserves the exact Policy-v4 projection used by existing brains. It is
-    /// expressive, but the first visual dense layer grows with every output
-    /// grid position and therefore dominates larger models.
+    /// Preserves the legacy flattened-grid architecture choice when an older
+    /// profile is migrated. It is expressive, but each native image size needs
+    /// its own projection and that dense layer grows with every grid position.
     case flattened = "Flattened Grid (Legacy)"
     /// Learns a small set of spatial keypoints, pools both features and exact
     /// coordinates around them, and retains global context. This keeps layout
@@ -368,7 +428,9 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     var batchSize = 32
     var learningRate: Double = 0.0003
     var weightDecay: Double = 0.01
-    var historyLength = 16
+    /// Optional preserves decoding of profiles saved before temporal vision was
+    /// configurable. New profiles persist the effective default immediately.
+    var temporalVision: TemporalVisionConfiguration? = TemporalVisionConfiguration()
     var perceptionFPS: Double = 30
     var actionFPS: Double = 60
     var precision: TrainingPrecision = .bfloat16
@@ -390,6 +452,9 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     var binaryFocalGamma: Double? = 1.5
 
     var effectiveMaximumSteps: Int { maximumSteps ?? 10_000 }
+    var effectiveTemporalVision: TemporalVisionConfiguration {
+        temporalVision ?? TemporalVisionConfiguration()
+    }
     var effectiveLearningRateSchedule: LearningRateSchedule { learningRateSchedule ?? .legacyInverseSquareRoot }
     var effectiveCosineCycleEpochs: Int { max(1, cosineCycleEpochs ?? 8) }
     var effectivePlateauPatience: Int { max(1, plateauPatience ?? 5) }
@@ -696,7 +761,11 @@ struct AIProfile: Codable, Hashable, Identifiable, Sendable {
     /// these requires a new brain instead of attaching incompatible weights to
     /// a differently shaped or differently sampled policy.
     var learnedBrainContract: LearnedBrainContract {
-        LearnedBrainContract(preprocessing: preprocessing, architecture: training.architecture)
+        LearnedBrainContract(
+            preprocessing: preprocessing,
+            temporalVision: training.effectiveTemporalVision,
+            architecture: training.architecture
+        )
     }
 
     /// Uses exact persisted counters when available. Older profiles estimate
@@ -745,6 +814,7 @@ enum TrainingDurationFormatter {
 
 struct LearnedBrainContract: Hashable, Sendable {
     var preprocessing: PreprocessingSpec
+    var temporalVision: TemporalVisionConfiguration
     var architecture: ArchitectureSpec
 }
 
@@ -855,8 +925,10 @@ enum ModelSizing {
     static func parameterCount(_ profile: AIProfile) -> Int64 {
         let architecture = profile.training.architecture
         var total: Int64 = 0
-        // Current color planes + temporal differences + explicit X/Y.
-        var input = profile.preprocessing.channelCount * 2 + 2
+        // Current and past frames share the same convolutional weights. Each
+        // carries its real color planes plus generated X/Y coordinates; there
+        // are no synthetic motion-difference channels in Policy v5.
+        var input = profile.preprocessing.channelCount + 2
         for i in architecture.convolutionChannels.indices {
             let output = max(1, architecture.convolutionChannels[i])
             let kernel = architecture.kernelSizes.indices.contains(i) ? max(1, architecture.kernelSizes[i]) : 3
@@ -865,12 +937,12 @@ enum ModelSizing {
             total = add(total, multiply(2, Int64(output)))
             input = output
         }
-        let output = CNNGeometry.outputSize(width: profile.preprocessing.width, height: profile.preprocessing.height, architecture: architecture)
+        let currentOutput = CNNGeometry.outputSize(width: profile.preprocessing.width, height: profile.preprocessing.height, architecture: architecture)
         let finalChannels = Int64(max(1, input))
         let visualProjectionInput: Int64
         switch architecture.effectiveVisualPooling {
         case .flattened:
-            visualProjectionInput = multiply(multiply(Int64(output.width), Int64(output.height)), finalChannels)
+            visualProjectionInput = multiply(multiply(Int64(currentOutput.width), Int64(currentOutput.height)), finalChannels)
         case .attention:
             let heads = Int64(architecture.effectiveAttentionHeads)
             // A learned score per head and spatial feature, including bias.
@@ -881,9 +953,19 @@ enum ModelSizing {
         }
         total = add(total, multiply(add(visualProjectionInput, 1), Int64(max(1, architecture.visualEmbedding))))
         total = add(total, multiply(2, Int64(max(1, architecture.visualEmbedding))))
+        if architecture.effectiveVisualPooling == .flattened {
+            // Legacy flattened pooling cannot share a projection between the
+            // full-resolution current grid and the smaller past-frame grid.
+            let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+            let pastOutput = CNNGeometry.outputSize(width: pastSpec.width, height: pastSpec.height, architecture: architecture)
+            let pastProjectionInput = multiply(multiply(Int64(pastOutput.width), Int64(pastOutput.height)), finalChannels)
+            total = add(total, multiply(add(pastProjectionInput, 1), Int64(max(1, architecture.visualEmbedding))))
+            total = add(total, multiply(2, Int64(max(1, architecture.visualEmbedding))))
+        }
         let recurrent = max(1, architecture.recurrentWidth)
         let gates = architecture.recurrentKind == .gru ? 3 : 4
-        total = add(total, multiply(multiply(Int64(gates), Int64(recurrent)), add(add(Int64(ActionLayout.count), Int64(recurrent)), 1)))
+        let temporalStepWidth = add(Int64(max(1, architecture.visualEmbedding)), Int64(ActionLayout.count))
+        total = add(total, multiply(multiply(Int64(gates), Int64(recurrent)), add(add(temporalStepWidth, Int64(recurrent)), 1)))
         // MLX's GRU has the usual three-gate bias plus a separate hidden-state
         // candidate bias (`bhn`) of one value per hidden unit. LSTM uses only
         // its four-gate bias, which is already included above.
@@ -913,21 +995,30 @@ enum ModelSizing {
 }
 
 /// Exact input counts for one policy decision and one optimizer batch. This
-/// mirrors `VisionPreprocessor`, `AgentPolicy`, and the fixed action-history
+/// mirrors `VisionPreprocessor`, `AgentPolicy`, and the frame-aligned controls
 /// layout so the UI never has to approximate the model contract independently.
 struct NeuralInputSummary: Hashable, Sendable {
-    var pixelCount: Int64
-    var lumaValues: Int64
-    var chromaValuesPerPlane: Int64
-    var packedVisionValues: Int64
-    var expandedVisionValues: Int64
-    var temporalDifferenceValues: Int64
-    var coordinateValues: Int64
-    var firstConvolutionValues: Int64
-    var historySteps: Int64
-    var actionValuesPerHistoryStep: Int64
-    var historyValues: Int64
-    var historyDurationSeconds: Double
+    var currentPixelCount: Int64
+    var pastPixelCountPerFrame: Int64
+    var currentLumaValues: Int64
+    var currentChromaValuesPerPlane: Int64
+    var pastLumaValuesPerFrame: Int64
+    var pastChromaValuesPerPlane: Int64
+    var currentPackedVisionValues: Int64
+    var pastPackedVisionValuesPerFrame: Int64
+    var totalPackedVisionValues: Int64
+    var currentExpandedVisionValues: Int64
+    var pastExpandedVisionValuesPerFrame: Int64
+    var currentCoordinateValues: Int64
+    var pastCoordinateValuesPerFrame: Int64
+    var currentFirstConvolutionValues: Int64
+    var pastFirstConvolutionValuesPerFrame: Int64
+    var pastFrameCount: Int64
+    var frameSpacing: Int64
+    var actionValuesPerPastFrame: Int64
+    var pastControlValues: Int64
+    var frameSpacingSeconds: Double
+    var temporalLookbackSeconds: Double
     var valuesPerDecision: Int64
     var runtimeValuesPerSecond: Int64
     var packedVisionBytesPerSecond: Int64
@@ -977,60 +1068,57 @@ enum NeuralInputSizing {
     }
 
     static func summary(for profile: AIProfile) -> NeuralInputSummary {
-        let spec = profile.preprocessing
-        let width = max(0, Int64(spec.width))
-        let height = max(0, Int64(spec.height))
-        let pixels = multiply(width, height)
-        let luma = pixels
-
-        let chromaPerPlane: Int64
-        if spec.colorMode == .grayscale {
-            chromaPerPlane = 0
-        } else {
-            let chromaWidth = spec.chroma == .yuv444 ? width : width / 2 + width % 2
-            let chromaHeight = spec.chroma == .yuv420 ? height / 2 + height % 2 : height
-            chromaPerPlane = multiply(chromaWidth, chromaHeight)
-        }
-
-        let packedVision = add(luma, multiply(2, chromaPerPlane))
-        let denseChannels: Int64 = spec.colorMode == .grayscale ? 1 : 3
-        let expandedVision = multiply(pixels, denseChannels)
-        let coordinates = multiply(pixels, 2)
-        let temporalDifference = expandedVision
-        let firstConvolution = add(add(expandedVision, temporalDifference), coordinates)
-
-        // Dataset and runtime tensors deliberately retain one zero row when
-        // history is disabled so recurrent input always has a valid shape.
-        let historySteps = max(1, Int64(profile.training.historyLength))
+        let current = profile.preprocessing
+        let temporal = profile.training.effectiveTemporalVision
+        let past = temporal.pastFrameSpec(from: current)
+        let currentCounts = visionCounts(for: current)
+        let pastCounts = visionCounts(for: past)
+        let denseChannels: Int64 = current.colorMode == .grayscale ? 1 : 3
+        let currentExpanded = multiply(currentCounts.pixels, denseChannels)
+        let pastExpanded = multiply(pastCounts.pixels, denseChannels)
+        let currentCoordinates = multiply(currentCounts.pixels, 2)
+        let pastCoordinates = multiply(pastCounts.pixels, 2)
+        let currentConvolution = add(currentExpanded, currentCoordinates)
+        let pastConvolution = add(pastExpanded, pastCoordinates)
+        let pastFrameCount = Int64(max(1, temporal.pastFrameCount))
         let actionValues = Int64(ActionLayout.count)
-        let history = multiply(historySteps, actionValues)
-        let perDecision = add(firstConvolution, history)
-        let actionFPS = profile.training.actionFPS.isFinite ? max(0.0001, profile.training.actionFPS) : 60
-        let historyDuration = profile.training.historyLength > 0 ? Double(profile.training.historyLength) / actionFPS : 0
+        let controls = multiply(pastFrameCount, actionValues)
+        let pastVision = multiply(pastFrameCount, pastConvolution)
+        let perDecision = add(currentConvolution, add(pastVision, controls))
         let perceptionFPS = profile.training.perceptionFPS.isFinite ? max(0, profile.training.perceptionFPS) : 0
         let runtimeValuesPerSecond = rate(perDecision, fps: perceptionFPS)
-        let packedVisionBytesPerSecond = rate(packedVision, fps: perceptionFPS)
+        let totalPackedVision = add(currentCounts.packed, multiply(pastFrameCount, pastCounts.packed))
+        let packedVisionBytesPerSecond = rate(totalPackedVision, fps: perceptionFPS)
         let batchSize = max(1, Int64(profile.training.batchSize))
         let perBatch = multiply(perDecision, batchSize)
 
-        let effectiveBitDepth = min(8, max(1, spec.bitDepth))
+        let effectiveBitDepth = min(8, max(1, current.bitDepth))
         let levels = Int64(1 << effectiveBitDepth)
-        let meaningfulBits = multiply(packedVision, Int64(effectiveBitDepth))
+        let meaningfulBits = multiply(totalPackedVision, Int64(effectiveBitDepth))
         let scalarBytes: Int64 = profile.training.precision == .float32 ? 4 : 2
 
         return NeuralInputSummary(
-            pixelCount: pixels,
-            lumaValues: luma,
-            chromaValuesPerPlane: chromaPerPlane,
-            packedVisionValues: packedVision,
-            expandedVisionValues: expandedVision,
-            temporalDifferenceValues: temporalDifference,
-            coordinateValues: coordinates,
-            firstConvolutionValues: firstConvolution,
-            historySteps: historySteps,
-            actionValuesPerHistoryStep: actionValues,
-            historyValues: history,
-            historyDurationSeconds: historyDuration,
+            currentPixelCount: currentCounts.pixels,
+            pastPixelCountPerFrame: pastCounts.pixels,
+            currentLumaValues: currentCounts.pixels,
+            currentChromaValuesPerPlane: currentCounts.chroma,
+            pastLumaValuesPerFrame: pastCounts.pixels,
+            pastChromaValuesPerPlane: pastCounts.chroma,
+            currentPackedVisionValues: currentCounts.packed,
+            pastPackedVisionValuesPerFrame: pastCounts.packed,
+            totalPackedVisionValues: totalPackedVision,
+            currentExpandedVisionValues: currentExpanded,
+            pastExpandedVisionValuesPerFrame: pastExpanded,
+            currentCoordinateValues: currentCoordinates,
+            pastCoordinateValuesPerFrame: pastCoordinates,
+            currentFirstConvolutionValues: currentConvolution,
+            pastFirstConvolutionValuesPerFrame: pastConvolution,
+            pastFrameCount: pastFrameCount,
+            frameSpacing: Int64(max(1, temporal.frameSpacing)),
+            actionValuesPerPastFrame: actionValues,
+            pastControlValues: controls,
+            frameSpacingSeconds: temporal.spacingSeconds(perceptionFPS: perceptionFPS),
+            temporalLookbackSeconds: temporal.lookbackSeconds(perceptionFPS: perceptionFPS),
             valuesPerDecision: perDecision,
             runtimeValuesPerSecond: runtimeValuesPerSecond,
             packedVisionBytesPerSecond: packedVisionBytesPerSecond,
@@ -1042,6 +1130,17 @@ enum NeuralInputSizing {
             nominalBytesPerDecision: multiply(perDecision, scalarBytes),
             nominalBytesPerTrainingBatch: multiply(perBatch, scalarBytes)
         )
+    }
+
+    private static func visionCounts(for spec: PreprocessingSpec) -> (pixels: Int64, chroma: Int64, packed: Int64) {
+        let width = max(0, Int64(spec.width))
+        let height = max(0, Int64(spec.height))
+        let pixels = multiply(width, height)
+        guard spec.colorMode == .color else { return (pixels, 0, pixels) }
+        let chromaWidth = spec.chroma == .yuv444 ? width : width / 2 + width % 2
+        let chromaHeight = spec.chroma == .yuv420 ? height / 2 + height % 2 : height
+        let chroma = multiply(chromaWidth, chromaHeight)
+        return (pixels, chroma, add(pixels, multiply(2, chroma)))
     }
 
     private static func multiply(_ lhs: Int64, _ rhs: Int64) -> Int64 {

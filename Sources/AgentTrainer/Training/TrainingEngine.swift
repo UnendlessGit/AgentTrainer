@@ -128,7 +128,7 @@ final class TrainingEngine: @unchecked Sendable {
         let stepsPerEpoch = Int(ceil(Double(split.train.count) / Double(batchSize)))
         let (observationReuseRatio, groupedTrainingObservations): (Double, [[Int]]) = {
             let plan = dataset.visionBatchPlan(at: split.train)
-            // A gather has a small fixed cost. Require enough duplicate visual
+            // A gather has a small fixed cost. Require enough duplicate temporal
             // work to recover it even on compact networks; common 60/30 FPS
             // datasets are close to 2x and comfortably exceed this crossover.
             guard plan.reuseRatio >= Self.minimumVisionReuseRatio else {
@@ -247,19 +247,18 @@ final class TrainingEngine: @unchecked Sendable {
                 profile: profile,
                 reusesVisionFeatures: reusesValidationVisionFeatures
             )
-            let visualFeatures = model.visualActivations(images: batch.images).last!
-            let visualEmbedding = model.visualEmbedding(visualFeatures: visualFeatures)
-            let expandedVisualEmbedding = batch.sampleToVision.map {
-                visualEmbedding.take($0, axis: 0)
-            } ?? visualEmbedding
-            let logits = model.logits(
-                visualEmbedding: expandedVisualEmbedding,
-                history: batch.history
+            let temporalFeatures = model.temporalFeatures(
+                currentImages: batch.currentImages,
+                pastImages: batch.pastImages,
+                pastControls: batch.pastControls
             )
+            let expandedTemporalFeatures = batch.sampleToVision.map {
+                temporalFeatures.take($0, axis: 0)
+            } ?? temporalFeatures
+            let logits = model.logits(temporalFeatures: expandedTemporalFeatures)
             return [
                 model.loss(
                     logits: logits,
-                    history: batch.history,
                     targets: batch.targets,
                     positiveWeights: classWeights,
                     previousTargets: batch.previousTargets
@@ -349,8 +348,9 @@ final class TrainingEngine: @unchecked Sendable {
                 reusesVisionFeatures: reusesVisionFeatures
             )
             let gradientInputs = [
-                batch.images,
-                batch.history,
+                batch.currentImages,
+                batch.pastImages,
+                batch.pastControls,
                 batch.targets,
                 batch.previousTargets
             ]
@@ -359,21 +359,20 @@ final class TrainingEngine: @unchecked Sendable {
             // to construct a meaningless gradient for it.
             let sampleToVision = batch.sampleToVision
             let result = valueAndGrad(model: model) { model, arrays in
-                let visualFeatures = model.visualActivations(images: arrays[0]).last!
-                let visualEmbedding = model.visualEmbedding(visualFeatures: visualFeatures)
-                let expandedVisualEmbedding = sampleToVision.map {
-                    visualEmbedding.take($0, axis: 0)
-                } ?? visualEmbedding
-                let logits = model.logits(
-                    visualEmbedding: expandedVisualEmbedding,
-                    history: arrays[1]
+                let temporalFeatures = model.temporalFeatures(
+                    currentImages: arrays[0],
+                    pastImages: arrays[1],
+                    pastControls: arrays[2]
                 )
+                let expandedTemporalFeatures = sampleToVision.map {
+                    temporalFeatures.take($0, axis: 0)
+                } ?? temporalFeatures
+                let logits = model.logits(temporalFeatures: expandedTemporalFeatures)
                 return [model.loss(
                     logits: logits,
-                    history: arrays[1],
-                    targets: arrays[2],
+                    targets: arrays[3],
                     positiveWeights: classWeights,
-                    previousTargets: arrays[3]
+                    previousTargets: arrays[4]
                 )]
             }(model, gradientInputs)
             optimizer.update(
@@ -590,7 +589,7 @@ final class TrainingEngine: @unchecked Sendable {
                     )
                     samplesSinceRate = 0
                     let visionStatus = reusesVisionFeatures
-                        ? " • shared visual work \(observationReuseRatio.formatted(.number.precision(.fractionLength(2))))×"
+                        ? " • shared temporal work \(observationReuseRatio.formatted(.number.precision(.fractionLength(2))))×"
                         : ""
                     metrics(report, "Pipelined training on Apple-silicon GPU\(visionStatus)")
                 }
@@ -724,42 +723,54 @@ final class TrainingEngine: @unchecked Sendable {
         inputBufferPool: MetalArrayBufferPool,
         reusesVisionFeatures: Bool
     ) throws -> [MLXArray] {
-        let historyLength = max(1, profile.training.historyLength)
+        let temporal = profile.training.effectiveTemporalVision
+        let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         let count = indices.count
         let visionPlan = reusesVisionFeatures ? dataset.visionBatchPlan(at: indices) : nil
-        let visionCount = visionPlan?.uniquePairs.count ?? count
+        let visionCount = visionPlan?.uniqueSequences.count ?? count
         var descriptors: [MetalArrayBufferPool.Descriptor] = [
-            .init([visionCount, 2, profile.preprocessing.sampleByteCount], dtype: .uint8)
+            .init([visionCount, profile.preprocessing.sampleByteCount], dtype: .uint8),
+            .init([visionCount, temporal.pastFrameCount, pastSpec.sampleByteCount], dtype: .uint8),
+            .init([visionCount, temporal.pastFrameCount, ActionLayout.count], dtype: .float32)
         ]
         if reusesVisionFeatures {
             descriptors.append(.init([count], dtype: .int32))
         }
         descriptors.append(
-            .init([count, historyLength + 2, ActionLayout.count], dtype: .float32)
+            .init([count, 2, ActionLayout.count], dtype: .float32)
         )
         return try inputBufferPool.makeArrays(descriptors) { destinations in
-            let actionDestination = destinations[reusesVisionFeatures ? 2 : 1]
+            let actionDestination = destinations[reusesVisionFeatures ? 4 : 3]
             if let visionPlan {
                 dataset.populateTrainingBatch(
                     at: indices,
-                    observationPairs: visionPlan.uniquePairs,
-                    packedObservationPairs: destinations[0],
+                    observationSequences: visionPlan.uniqueSequences,
+                    packedCurrentObservations: destinations[0],
+                    packedPastObservations: destinations[1],
+                    pastControlRows: destinations[2],
                     actionRows: actionDestination
                 )
                 visionPlan.sampleToVision.withUnsafeBytes {
-                    destinations[1].copyMemory(from: $0)
+                    destinations[3].copyMemory(from: $0)
                 }
             } else {
                 dataset.populateTrainingBatch(
                     at: indices,
-                    packedObservationPairs: destinations[0],
+                    packedCurrentObservations: destinations[0],
+                    packedPastObservations: destinations[1],
+                    pastControlRows: destinations[2],
                     actionRows: actionDestination
                 )
             }
-            let values = actionDestination.bindMemory(to: Float.self)
             ActionLayout.sanitizeTrainingRows(
-                values,
-                rowCount: count * (historyLength + 2),
+                destinations[2].bindMemory(to: Float.self),
+                rowCount: visionCount * temporal.pastFrameCount,
+                channels: profile.channels,
+                restrictions: profile.effectiveRestrictions
+            )
+            ActionLayout.sanitizeTrainingRows(
+                actionDestination.bindMemory(to: Float.self),
+                rowCount: count * 2,
                 channels: profile.channels,
                 restrictions: profile.effectiveRestrictions
             )
@@ -771,14 +782,15 @@ final class TrainingEngine: @unchecked Sendable {
         profile: AIProfile,
         reusesVisionFeatures: Bool
     ) -> ExpandedTrainingBatch {
-        let historyLength = max(1, profile.training.historyLength)
-        let actions = arrays[reusesVisionFeatures ? 2 : 1]
+        let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+        let actions = arrays[reusesVisionFeatures ? 4 : 3]
         return ExpandedTrainingBatch(
-            images: VisionPreprocessor.mlxTemporalTensor(arrays[0], spec: profile.preprocessing),
-            sampleToVision: reusesVisionFeatures ? arrays[1] : nil,
-            history: actions[0..., 0..<historyLength, 0...],
-            targets: actions[0..., historyLength, 0...],
-            previousTargets: actions[0..., historyLength + 1, 0...]
+            currentImages: VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
+            pastImages: VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec),
+            pastControls: arrays[2],
+            sampleToVision: reusesVisionFeatures ? arrays[3] : nil,
+            targets: actions[0..., 0, 0...],
+            previousTargets: actions[0..., 1, 0...]
         )
     }
 
@@ -1083,8 +1095,8 @@ final class TrainingEngine: @unchecked Sendable {
         var missing = Set(learnableBinaryOutputs.filter { totalCounts[$0] > 0 && trainCounts[$0] == 0 })
         if !missing.isEmpty {
             // Keep a single recording temporally contiguous. Moving isolated
-            // validation rows into training leaks their neighboring frames and
-            // action history; extend the boundary through the needed example.
+            // validation rows into training leaks their neighboring temporal
+            // frames; extend the boundary through the needed example.
             for index in trainingEnd..<dataset.count where !missing.isEmpty {
                 let action = dataset.action(at: index)
                 let covered = missing.filter { action[$0] >= 0.5 }
@@ -1337,9 +1349,10 @@ private struct CheckpointRestore {
 }
 
 private struct ExpandedTrainingBatch {
-    let images: MLXArray
+    let currentImages: MLXArray
+    let pastImages: MLXArray
+    let pastControls: MLXArray
     let sampleToVision: MLXArray?
-    let history: MLXArray
     let targets: MLXArray
     let previousTargets: MLXArray
 }
