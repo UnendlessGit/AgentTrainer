@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 1.9.8. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 1.9.9. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -61,6 +61,8 @@ Capture uses a monotonic host-time clock shared with input events. A recording i
 Large event streams stay memory-mapped. Do not replace summary or dataset paths with eager arrays.
 
 Recording manifests validate schema, finite timing, dimensions, trims, and leaf-only artifact names. Legacy repair may correct malformed metadata after reading the real video duration, but it must retain the original manifest and never rewrite source video or input.
+
+Recording transfer is producer-neutral. Import accepts a native `.atrrecord` directory, a folder containing packages, or an exported root containing `Recordings` and `recording-folders.json`. Validate every manifest, event file, video track, displayed dimension, and first-frame clock before changing the library. Stage the full batch, preserve video/event bytes, map folder metadata deterministically, regenerate colliding package IDs, and roll back the folder index plus every committed package if publication fails. Export writes the same portable root, includes only referenced folders, copies packages unchanged, verifies the copy, and never overwrites a non-empty destination.
 
 Capture status matters: complete/started frames are usable, idle frames may reuse the last good frame, and blank/suspended/stopped frames are dropped.
 

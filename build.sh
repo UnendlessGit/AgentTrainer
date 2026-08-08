@@ -134,13 +134,39 @@ if [[ -z "$METALLIB" || ! -f "$METALLIB" ]]; then
   exit 1
 fi
 
+# AppIcon.icon is the editable Icon Composer source of truth. Compile it with
+# Xcode's asset compiler so its Default, Dark, and Mono variants remain native
+# bundle assets; flattening to one .icns would lose those appearances.
+ICON_DOCUMENT="$ROOT/Resources/AppIcon.icon"
+ASSET_CATALOG_OUTPUT="$BUILD_ROOT/AppIconAssets"
+ASSET_CATALOG_PLIST="$ASSET_CATALOG_OUTPUT/asset-info.plist"
+if [[ ! -d "$ICON_DOCUMENT" ]]; then
+  echo "AppIcon.icon is unavailable." >&2
+  exit 1
+fi
+rm -rf "$ASSET_CATALOG_OUTPUT"
+mkdir -p "$ASSET_CATALOG_OUTPUT"
+actool --compile "$ASSET_CATALOG_OUTPUT" \
+  --output-partial-info-plist "$ASSET_CATALOG_PLIST" \
+  "$ICON_DOCUMENT" \
+  --platform macosx \
+  --minimum-deployment-target 15.0 \
+  --app-icon AppIcon
+GENERATED_ICON="$ASSET_CATALOG_OUTPUT/AppIcon.icns"
+GENERATED_ASSETS="$ASSET_CATALOG_OUTPUT/Assets.car"
+if [[ ! -f "$GENERATED_ICON" || ! -f "$GENERATED_ASSETS" ]]; then
+  echo "Xcode did not compile the AppIcon assets." >&2
+  exit 1
+fi
+
 # Assemble and verify a complete bundle before touching the installed copy.
 rm -rf "$STAGED_APP"
 mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
 /bin/cp "$BIN" "$STAGED_APP/Contents/MacOS/AgentTrainer"
 /bin/chmod 755 "$STAGED_APP/Contents/MacOS/AgentTrainer"
 /bin/cp "$ROOT/Resources/Info.plist" "$STAGED_APP/Contents/Info.plist"
-/bin/cp "$ROOT/Resources/AppIcon.icns" "$STAGED_APP/Contents/Resources/AppIcon.icns"
+/bin/cp "$GENERATED_ICON" "$STAGED_APP/Contents/Resources/AppIcon.icns"
+/bin/cp "$GENERATED_ASSETS" "$STAGED_APP/Contents/Resources/Assets.car"
 /bin/cp "$METALLIB" "$STAGED_APP/Contents/MacOS/mlx.metallib"
 /bin/cp "$METALLIB" "$STAGED_APP/Contents/Resources/mlx.metallib"
 sign_app_bundle "$STAGED_APP"

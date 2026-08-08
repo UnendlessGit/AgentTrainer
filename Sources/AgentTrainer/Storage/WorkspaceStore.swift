@@ -46,6 +46,17 @@ struct WorkspaceVersionActivation: Sendable {
     var checkpointIsResumable: Bool
 }
 
+struct RecordingImportResult: Equatable, Sendable {
+    var importedCount: Int
+    var createdFolderCount: Int
+    var regeneratedIdentifierCount: Int
+}
+
+struct RecordingExportResult: Equatable, Sendable {
+    var destination: URL
+    var exportedCount: Int
+}
+
 actor WorkspaceStore {
     static let shared = WorkspaceStore()
 
@@ -334,6 +345,201 @@ actor WorkspaceStore {
         try atomicWrite(try encoder.encode(manifest), to: directory.appendingPathComponent("manifest.json"))
     }
 
+    /// Imports native recording packages without translating their video or
+    /// input stream. A transfer may be one or more `.atrrecord` directories, a
+    /// folder containing those packages, or an exported recording library with
+    /// `Recordings` and `recording-folders.json` at its root.
+    ///
+    /// Every source is validated before the managed library changes. The folder
+    /// index and all packages then commit as one transaction; a collision gets
+    /// a fresh recording identifier while the media and input bytes stay exact.
+    func importRecordings(from selectedURLs: [URL], fallbackFolderID requestedFallbackFolderID: UUID?) async throws -> RecordingImportResult {
+        try prepare()
+        let sources = try recordingImportSources(from: selectedURLs)
+        guard !sources.isEmpty else {
+            throw AgentTrainerError.storage("No AgentTrainer recording packages were found in the selected location.")
+        }
+
+        var validated: [ValidatedRecordingImport] = []
+        validated.reserveCapacity(sources.count)
+        for source in sources {
+            validated.append(try await validateRecordingImport(source))
+        }
+
+        let originalFolders = listRecordingFolders()
+        var folders = originalFolders
+        let needsFallbackFolder = validated.contains { item in
+            guard let folderID = item.manifest.folderID else { return true }
+            return item.sourceFolders[folderID] == nil
+        }
+        var fallbackFolderID = requestedFallbackFolderID.flatMap { requested in
+            originalFolders.contains(where: { $0.id == requested }) ? requested : nil
+        } ?? originalFolders.first?.id
+        var folderMapping: [UUID: UUID] = [:]
+        var createdFolderCount = 0
+        if fallbackFolderID == nil, needsFallbackFolder {
+            let fallback = RecordingFolder(id: UUID(), name: "Recordings", createdAt: Date())
+            folders.append(fallback)
+            fallbackFolderID = fallback.id
+            createdFolderCount += 1
+        }
+
+        for item in validated {
+            guard let sourceFolderID = item.manifest.folderID else { continue }
+            if folderMapping[sourceFolderID] != nil { continue }
+            guard let sourceFolder = item.sourceFolders[sourceFolderID] else {
+                if let fallbackFolderID { folderMapping[sourceFolderID] = fallbackFolderID }
+                continue
+            }
+            if let exact = folders.first(where: { $0.id == sourceFolder.id }) {
+                folderMapping[sourceFolderID] = exact.id
+            } else if let sameName = folders.first(where: {
+                $0.name.localizedCaseInsensitiveCompare(sourceFolder.name) == .orderedSame
+            }) {
+                folderMapping[sourceFolderID] = sameName.id
+            } else {
+                var importedFolder = sourceFolder
+                importedFolder.name = sourceFolder.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !importedFolder.name.isEmpty else {
+                    if fallbackFolderID == nil {
+                        let fallback = RecordingFolder(id: UUID(), name: "Recordings", createdAt: Date())
+                        folders.append(fallback); fallbackFolderID = fallback.id; createdFolderCount += 1
+                    }
+                    folderMapping[sourceFolderID] = fallbackFolderID
+                    continue
+                }
+                if folders.contains(where: { $0.id == importedFolder.id }) { importedFolder.id = UUID() }
+                folders.append(importedFolder)
+                folderMapping[sourceFolderID] = importedFolder.id
+                createdFolderCount += 1
+            }
+        }
+
+        let existingIDs = Set(listRecordings().map(\.id))
+        var reservedIDs = existingIDs
+        var regeneratedIdentifierCount = 0
+        let stagingRoot = recordingsRoot.appendingPathComponent(".RecordingImport.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: false)
+        var staged: [(temporary: URL, destination: URL)] = []
+        staged.reserveCapacity(validated.count)
+
+        do {
+            for item in validated {
+                var manifest = item.manifest
+                if reservedIDs.contains(manifest.id) {
+                    repeat { manifest.id = UUID() } while reservedIDs.contains(manifest.id)
+                    regeneratedIdentifierCount += 1
+                }
+                reservedIDs.insert(manifest.id)
+                let mappedFolderID = item.manifest.folderID.flatMap { folderMapping[$0] }
+                guard let destinationFolderID = mappedFolderID ?? fallbackFolderID ?? folders.first?.id else {
+                    throw AgentTrainerError.storage("A destination folder could not be established for \(manifest.name).")
+                }
+                manifest.folderID = destinationFolderID
+
+                let temporary = stagingRoot.appendingPathComponent("\(manifest.id.uuidString).atrrecord", isDirectory: true)
+                try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false)
+                try copyRecordingArtifacts(for: manifest, from: item.directory, to: temporary)
+                try atomicWrite(try encoder.encode(manifest), to: temporary.appendingPathComponent("manifest.json"))
+
+                let copiedEvents = temporary.appendingPathComponent(manifest.eventFile)
+                let copiedEventCount = try InputEventReader.mapped(url: copiedEvents).count
+                guard copiedEventCount == manifest.eventCount else {
+                    throw AgentTrainerError.storage("\(manifest.name) declares \(manifest.eventCount) inputs but contains \(copiedEventCount).")
+                }
+                let destination = recordingsRoot.appendingPathComponent("\(manifest.id.uuidString).atrrecord", isDirectory: true)
+                guard !FileManager.default.fileExists(atPath: destination.path) else {
+                    throw AgentTrainerError.storage("A recording identifier collision could not be resolved safely.")
+                }
+                staged.append((temporary, destination))
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: stagingRoot)
+            throw error
+        }
+
+        let originalFolderData = try? Data(contentsOf: foldersURL)
+        var committed: [URL] = []
+        do {
+            try atomicWrite(try encoder.encode(folders), to: foldersURL)
+            for item in staged {
+                try FileManager.default.moveItem(at: item.temporary, to: item.destination)
+                committed.append(item.destination)
+            }
+            try FileManager.default.removeItem(at: stagingRoot)
+        } catch {
+            for directory in committed { try? FileManager.default.removeItem(at: directory) }
+            if let originalFolderData { try? atomicWrite(originalFolderData, to: foldersURL) }
+            else { try? FileManager.default.removeItem(at: foldersURL) }
+            try? FileManager.default.removeItem(at: stagingRoot)
+            throw AgentTrainerError.storage("The recordings could not all be imported, so the library was restored: \(error.localizedDescription)")
+        }
+
+        return RecordingImportResult(
+            importedCount: staged.count,
+            createdFolderCount: createdFolderCount,
+            regeneratedIdentifierCount: regeneratedIdentifierCount
+        )
+    }
+
+    /// Exports a self-contained subset of the native recording library. The
+    /// package layout is deliberately the same on every platform: a Recordings
+    /// directory plus the subset of `recording-folders.json` it references.
+    /// Source packages are copied as-is and verified before publication.
+    func exportRecordings(_ requestedItems: [RecordingItem], to requestedDestination: URL) throws -> RecordingExportResult {
+        try prepare()
+        let itemsByID = Dictionary(requestedItems.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let items = itemsByID.values.sorted { $0.manifest.createdAt < $1.manifest.createdAt }
+        guard !items.isEmpty else { throw AgentTrainerError.storage("Select at least one recording to export.") }
+
+        let managedRoot = normalized(recordingsRoot)
+        for item in items {
+            let directory = normalized(item.directory)
+            guard directory.deletingLastPathComponent() == managedRoot,
+                  directory.pathExtension == "atrrecord",
+                  FileManager.default.fileExists(atPath: directory.path) else {
+                throw AgentTrainerError.storage("A selected recording is no longer in the managed library.")
+            }
+        }
+
+        let destination = requestedDestination.standardizedFileURL
+        guard destination.isFileURL else { throw AgentTrainerError.storage("Recording exports require a local or mounted file-system folder.") }
+        guard !items.contains(where: { pathsOverlap(destination, $0.directory) }) else {
+            throw AgentTrainerError.storage("Choose an export location outside the selected recording packages.")
+        }
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory) {
+            guard isDirectory.boolValue else { throw AgentTrainerError.storage("Choose a folder for the recording export.") }
+            let contents = try FileManager.default.contentsOfDirectory(atPath: destination.path)
+            guard contents.isEmpty else { throw AgentTrainerError.storage("The export folder must be empty so existing files are never overwritten.") }
+        }
+
+        let parent = destination.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let staging = parent.appendingPathComponent(".AgentTrainer-Recording-Export.\(UUID().uuidString).tmp", isDirectory: true)
+        let stagedRecordings = staging.appendingPathComponent("Recordings", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagedRecordings, withIntermediateDirectories: true)
+        do {
+            for item in items {
+                let copied = stagedRecordings.appendingPathComponent(item.directory.lastPathComponent, isDirectory: true)
+                try FileManager.default.copyItem(at: item.directory, to: copied)
+                guard contentSummary(at: item.directory) == contentSummary(at: copied) else {
+                    throw AgentTrainerError.storage("\(item.manifest.name) could not be verified after copying.")
+                }
+            }
+            let folderIDs = Set(items.compactMap { $0.manifest.folderID })
+            let folders = listRecordingFolders().filter { folderIDs.contains($0.id) }
+            try atomicWrite(try encoder.encode(folders), to: staging.appendingPathComponent("recording-folders.json"))
+
+            if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
+            try FileManager.default.moveItem(at: staging, to: destination)
+        } catch {
+            try? FileManager.default.removeItem(at: staging)
+            throw error
+        }
+        return RecordingExportResult(destination: destination, exportedCount: items.count)
+    }
+
     /// Repairs legacy manifests before the strict library scan runs. Earlier
     /// defensive validation filtered some older recordings before the existing
     /// clock repair could discover their stale duration/trim. This pass
@@ -530,6 +736,168 @@ actor WorkspaceStore {
             }
         }
         try atomicWrite(try encoder.encode(remaining), to: foldersURL)
+    }
+
+    private struct RecordingImportSource {
+        var directory: URL
+        var sourceFolders: [UUID: RecordingFolder]
+    }
+
+    private struct ValidatedRecordingImport {
+        var directory: URL
+        var manifest: RecordingManifest
+        var sourceFolders: [UUID: RecordingFolder]
+    }
+
+    private func recordingImportSources(from selectedURLs: [URL]) throws -> [RecordingImportSource] {
+        var result: [RecordingImportSource] = []
+        var seen: Set<String> = []
+
+        func decodedFolders(at root: URL) throws -> [UUID: RecordingFolder] {
+            let index = root.appendingPathComponent("recording-folders.json")
+            guard FileManager.default.fileExists(atPath: index.path) else { return [:] }
+            do {
+                let folders = try decoder.decode([RecordingFolder].self, from: Data(contentsOf: index))
+                return Dictionary(folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            } catch {
+                throw AgentTrainerError.storage("The selected recording folder index is unreadable: \(error.localizedDescription)")
+            }
+        }
+
+        func appendPackage(_ package: URL, folders: [UUID: RecordingFolder]) throws {
+            let unresolvedValues = try package.standardizedFileURL.resourceValues(forKeys: [.isSymbolicLinkKey])
+            guard unresolvedValues.isSymbolicLink != true else {
+                throw AgentTrainerError.storage("Recording packages cannot be symbolic links.")
+            }
+            let normalizedPackage = normalized(package)
+            let values = try normalizedPackage.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isDirectory == true, values.isSymbolicLink != true,
+                  normalizedPackage.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame else { return }
+            guard seen.insert(normalizedPackage.path).inserted else { return }
+            result.append(RecordingImportSource(directory: normalizedPackage, sourceFolders: folders))
+        }
+
+        for selected in selectedURLs {
+            let unresolvedValues = try selected.standardizedFileURL.resourceValues(forKeys: [.isSymbolicLinkKey])
+            guard unresolvedValues.isSymbolicLink != true else {
+                throw AgentTrainerError.storage("Recording imports must be folders, not files or symbolic links.")
+            }
+            let selected = normalized(selected)
+            let values = try selected.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isDirectory == true, values.isSymbolicLink != true else {
+                throw AgentTrainerError.storage("Recording imports must be folders, not files or symbolic links.")
+            }
+            if selected.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame {
+                let parent = selected.deletingLastPathComponent()
+                let indexRoot = parent.lastPathComponent == "Recordings" ? parent.deletingLastPathComponent() : parent
+                try appendPackage(selected, folders: decodedFolders(at: indexRoot))
+                continue
+            }
+
+            let libraryRecordings = selected.appendingPathComponent("Recordings", isDirectory: true)
+            let packageRoot: URL
+            let indexRoot: URL
+            var packageRootIsDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: libraryRecordings.path, isDirectory: &packageRootIsDirectory), packageRootIsDirectory.boolValue {
+                packageRoot = libraryRecordings
+                indexRoot = selected
+            } else {
+                packageRoot = selected
+                indexRoot = selected
+            }
+            let folders = try decodedFolders(at: indexRoot)
+            let children = try FileManager.default.contentsOfDirectory(
+                at: packageRoot,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+            )
+            for child in children { try appendPackage(child, folders: folders) }
+        }
+        return result
+    }
+
+    private func validateRecordingImport(_ source: RecordingImportSource) async throws -> ValidatedRecordingImport {
+        let manifestURL = source.directory.appendingPathComponent("manifest.json")
+        let manifest: RecordingManifest
+        do { manifest = try decoder.decode(RecordingManifest.self, from: Data(contentsOf: manifestURL)) }
+        catch { throw AgentTrainerError.storage("A selected recording has an unreadable manifest: \(error.localizedDescription)") }
+        guard manifest.isStructurallyValid, manifest.hostStartNanos > 0 else {
+            throw AgentTrainerError.storage("\(manifest.name) has an invalid recording manifest or timeline.")
+        }
+        let artifactNames = [manifest.videoFile, manifest.eventFile] + (manifest.thumbnailFile.map { [$0] } ?? [])
+        guard Set(artifactNames).count == artifactNames.count else {
+            throw AgentTrainerError.storage("\(manifest.name) reuses an artifact filename and cannot be imported safely.")
+        }
+
+        let videoURL = source.directory.appendingPathComponent(manifest.videoFile)
+        let eventURL = source.directory.appendingPathComponent(manifest.eventFile)
+        guard try regularImportFile(videoURL), try regularImportFile(eventURL) else {
+            throw AgentTrainerError.storage("\(manifest.name) is missing its video or synchronized input file.")
+        }
+        let events: InputEventReader.MappedEvents
+        do { events = try InputEventReader.mapped(url: eventURL) }
+        catch { throw AgentTrainerError.storage("\(manifest.name) has an invalid synchronized input file: \(error.localizedDescription)") }
+        guard events.count == manifest.eventCount else {
+            throw AgentTrainerError.storage("\(manifest.name) declares \(manifest.eventCount) inputs but contains \(events.count).")
+        }
+        if let first = events.first, first.timestampNanos < manifest.hostStartNanos {
+            throw AgentTrainerError.storage("\(manifest.name) contains input from before its first video frame.")
+        }
+
+        let asset = AVURLAsset(url: videoURL)
+        let durationTime: CMTime
+        let track: AVAssetTrack
+        do {
+            durationTime = try await asset.load(.duration)
+            guard let loadedTrack = try await asset.loadTracks(withMediaType: .video).first else {
+                throw AgentTrainerError.storage("\(manifest.name) does not contain a video track.")
+            }
+            track = loadedTrack
+        } catch {
+            throw AgentTrainerError.storage("\(manifest.name) contains video that AgentTrainer cannot decode: \(error.localizedDescription)")
+        }
+        let videoDuration = CMTimeGetSeconds(durationTime)
+        guard videoDuration.isFinite, videoDuration > 0 else {
+            throw AgentTrainerError.storage("\(manifest.name) has an empty or invalid video timeline.")
+        }
+        do {
+            let naturalSize = try await track.load(.naturalSize)
+            let transform = try await track.load(.preferredTransform)
+            let displayed = CGRect(origin: .zero, size: naturalSize).applying(transform).standardized
+            let width = Int(abs(displayed.width).rounded())
+            let height = Int(abs(displayed.height).rounded())
+            guard abs(width - manifest.pixelWidth) <= 1, abs(height - manifest.pixelHeight) <= 1 else {
+                throw AgentTrainerError.storage("\(manifest.name)'s manifest dimensions do not match its video.")
+            }
+        } catch let error as AgentTrainerError { throw error }
+        catch {
+            throw AgentTrainerError.storage("\(manifest.name)'s video dimensions could not be verified: \(error.localizedDescription)")
+        }
+
+        if let thumbnailFile = manifest.thumbnailFile {
+            let thumbnail = source.directory.appendingPathComponent(thumbnailFile)
+            if FileManager.default.fileExists(atPath: thumbnail.path), try !regularImportFile(thumbnail) {
+                throw AgentTrainerError.storage("\(manifest.name) has an unsafe thumbnail artifact.")
+            }
+        }
+        return ValidatedRecordingImport(directory: source.directory, manifest: manifest, sourceFolders: source.sourceFolders)
+    }
+
+    private func regularImportFile(_ url: URL) throws -> Bool {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        return values.isRegularFile == true && values.isSymbolicLink != true
+    }
+
+    private func copyRecordingArtifacts(for manifest: RecordingManifest, from source: URL, to destination: URL) throws {
+        for name in [manifest.videoFile, manifest.eventFile] {
+            try FileManager.default.copyItem(at: source.appendingPathComponent(name), to: destination.appendingPathComponent(name))
+        }
+        if let thumbnailFile = manifest.thumbnailFile {
+            let sourceThumbnail = source.appendingPathComponent(thumbnailFile)
+            if FileManager.default.fileExists(atPath: sourceThumbnail.path) {
+                try FileManager.default.copyItem(at: sourceThumbnail, to: destination.appendingPathComponent(thumbnailFile))
+            }
+        }
     }
 
     func saveProfile(_ profile: AIProfile) throws {

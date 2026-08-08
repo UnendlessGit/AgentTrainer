@@ -463,6 +463,62 @@ final class AppModel: ObservableObject {
     func renameRecordingFolder(_ folder: RecordingFolder, name: String) async { do { var changed = folder; changed.name = name; try await WorkspaceStore.shared.saveRecordingFolder(changed); await refreshLibrary() } catch { present(error) } }
     func deleteRecordingFolder(_ folder: RecordingFolder, includingRecordings: Bool = true) async { do { try await WorkspaceStore.shared.deleteRecordingFolder(folder, includingRecordings: includingRecordings); if recordingDestinationFolderID == folder.id { recordingDestinationFolderID = nil }; await refreshLibrary() } catch { present(error) } }
 
+    func importRecordings() async {
+        guard !recordingIsActiveOrStarting, !isReplaying else {
+            present(AgentTrainerError.storage("Stop recording or replay before importing recordings."))
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Import Recordings"
+        panel.message = "Choose one or more .atrrecord packages, a folder containing them, or an exported recording library. Video and synchronized input remain in their native format."
+        panel.prompt = "Import"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+
+        let existingIDs = Set(recordings.map(\.id))
+        do {
+            activityStatus = "Validating and importing recordings…"
+            let result = try await WorkspaceStore.shared.importRecordings(
+                from: panel.urls,
+                fallbackFolderID: recordingDestinationFolderID
+            )
+            await refreshLibrary()
+            await ensureRecordingThumbnails()
+            let importedIDs = Set(recordings.map(\.id)).subtracting(existingIDs)
+            selectedRecordingIDs = importedIDs
+            selectedRecordingID = recordings.first(where: { importedIDs.contains($0.id) })?.id
+            let folderDetail = result.createdFolderCount > 0 ? " and \(result.createdFolderCount) folder\(result.createdFolderCount == 1 ? "" : "s")" : ""
+            let collisionDetail = result.regeneratedIdentifierCount > 0 ? " • \(result.regeneratedIdentifierCount) duplicate identifier\(result.regeneratedIdentifierCount == 1 ? "" : "s") safely regenerated" : ""
+            activityStatus = "Imported \(result.importedCount) recording\(result.importedCount == 1 ? "" : "s")\(folderDetail)\(collisionDetail)"
+            AppLog.write(category: "Storage", "Recordings imported", details: activityStatus)
+        } catch { present(error) }
+    }
+
+    func exportRecordings(_ items: [RecordingItem]) async {
+        guard !items.isEmpty else {
+            present(AgentTrainerError.storage("Select at least one recording to export."))
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = items.count == 1 ? "Export Recording" : "Export Recordings"
+        panel.message = "Choose a new empty folder. The export keeps the native recording packages and their folder metadata unchanged."
+        panel.prompt = "Export"
+        panel.canCreateDirectories = true
+        let date = String(ISO8601DateFormatter().string(from: Date()).prefix(10))
+        panel.nameFieldStringValue = "Recording Export \(date)"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do {
+            activityStatus = "Copying and verifying recording export…"
+            let result = try await WorkspaceStore.shared.exportRecordings(items, to: destination)
+            activityStatus = "Exported \(result.exportedCount) recording\(result.exportedCount == 1 ? "" : "s")"
+            AppLog.write(category: "Storage", "Recordings exported", details: result.destination.path)
+            NSWorkspace.shared.activateFileViewerSelecting([result.destination])
+        } catch { present(error) }
+    }
+
     func createProfile(name: String) {
         Task {
             do { let profile = AIProfile.fresh(name: name); try await WorkspaceStore.shared.saveProfile(profile); unloadVersions(); await refreshLibrary(); selectedProfileID = profile.id }

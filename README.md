@@ -1,4 +1,4 @@
-# AgentTrainer 1.9.8
+# AgentTrainer 1.9.9
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -18,6 +18,7 @@ The package pins MLX Swift exactly in `Package.resolved`.
 
 1. Open AgentTrainer and grant the permissions needed for the operation you want.
 2. Create a recording folder, choose a display, window, or region, optionally save those settings as a reusable preset, then record a demonstration.
+   Existing native `.atrrecord` packages or a portable recording export can also be imported from the Library without transcoding.
 3. Create an AI profile, select recording folders, and configure its vision, controls, and network.
 4. Train the profile. Pause publishes a runnable brain and retains an exact checkpoint.
 5. In Run, choose cursor mode and output permissions, then start the AI.
@@ -77,9 +78,16 @@ The default installed application is:
 /Applications/AgentTrainer.app
 ```
 
+### App icon
+
+The editable icon source is [`Resources/AppIcon.icon`](Resources/AppIcon.icon),
+an Icon Composer document. Open it in Xcode's Icon Composer, make and save your
+changes, then run `./build.sh`; the build compiles its native Default, Dark, and
+Mono variants for the app bundle and the icon shown inside AgentTrainer.
+
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-1.9.8.dmg`
+- `AgentTrainer-1.9.9.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 
@@ -105,6 +113,8 @@ It contains:
 - `Caches` — rebuildable packed datasets
 - `Profiles` — profile metadata, immutable runnable versions, and exact checkpoints
 - `Logs` — bounded local diagnostics
+
+The Library can export any selected recording subset as a self-contained `Recordings` folder plus its folder metadata. Import validates every video, manifest, and synchronized input stream before changing the managed library; duplicate recording identifiers are regenerated without rewriting media or event contents.
 
 Settings can relocate training data and models independently. Moves use copy, verification, switch, and cleanup steps; selecting an existing AgentTrainer library switches to it without merging. Do not manually edit manifests or move only part of a managed library.
 

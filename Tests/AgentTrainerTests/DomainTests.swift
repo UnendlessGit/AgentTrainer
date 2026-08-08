@@ -437,6 +437,64 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(try InputEventReader.read(url: url), [expected])
     }
 
+    func testExternalRecorderGoldenManifestAndInputAreNativeCompatible() throws {
+        let manifestData = Data(#"""
+        {
+          "schemaVersion": 2,
+          "id": "11111111-2222-3333-4444-555555555555",
+          "name": "Mixed platform sample",
+          "createdAt": "2026-08-08T09:34:56Z",
+          "hostStartNanos": 5000000000,
+          "duration": 1,
+          "capture": {
+            "kind": "Window Region",
+            "windowID": 42,
+            "region": { "x": 3, "y": 4, "width": 640, "height": 360 },
+            "requestedFPS": 60,
+            "showsCursor": true
+          },
+          "globalRect": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+          "pixelWidth": 1920,
+          "pixelHeight": 1080,
+          "deliveredFPS": 60,
+          "eventCount": 1,
+          "videoFile": "capture.mov",
+          "eventFile": "events.atrevents",
+          "trimStart": 0,
+          "trimEnd": 1,
+          "folderID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+          "excludedKeyCodes": [0, 49, 56]
+        }
+        """#.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let manifest = try decoder.decode(RecordingManifest.self, from: manifestData)
+        XCTAssertTrue(manifest.isStructurallyValid)
+        XCTAssertEqual(manifest.capture.kind, .windowRegion)
+        XCTAssertEqual(manifest.capture.windowID, 42)
+        XCTAssertEqual(manifest.excludedKeyCodes, [0, 49, 56])
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("external-golden-\(UUID().uuidString).atrevents")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let encoded = "QVRSRVZUMDEBAAAACAcGBQQDAgECAQcAfgAAAAAAEgAAAAAAAAAAAACAKEAAAAAAAIAzwAAAAAAAAA5AAAAAAAAAEsAAAAAAAIAYQAAAAAAAgCDA"
+        try XCTUnwrap(Data(base64Encoded: encoded)).write(to: url)
+        let events = try InputEventReader.read(url: url)
+        XCTAssertEqual(events, [InputSample(
+            timestampNanos: 0x0102_0304_0506_0708,
+            kind: .mouseButton,
+            x: 12.25,
+            y: -19.5,
+            deltaX: 3.75,
+            deltaY: -4.5,
+            button: 7,
+            scrollX: 6.125,
+            scrollY: -8.25,
+            keyCode: 0x7E,
+            modifiers: 0x0012_0000,
+            isDown: true
+        )])
+    }
+
     func testInputEventWriterKeepsConcurrentHostTimesMonotonic() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("events-monotonic-\(UUID().uuidString).atrevents")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -686,6 +744,107 @@ final class DomainTests: XCTestCase {
         try await store.deleteRecordings(moved)
         let remaining = await store.listRecordings()
         XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testRecordingExportAndImportPreserveNativeArtifactsFoldersAndCollisionSafety() async throws {
+        let container = FileManager.default.temporaryDirectory.appendingPathComponent("recording-transfer-\(UUID().uuidString)", isDirectory: true)
+        let sourceRoot = container.appendingPathComponent("Source", isDirectory: true)
+        let targetRoot = container.appendingPathComponent("Target", isDirectory: true)
+        let exportRoot = container.appendingPathComponent("Recording Export", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+
+        let source = WorkspaceStore(root: sourceRoot)
+        try await source.prepare()
+        let folder = RecordingFolder(id: UUID(), name: "Portable Demonstrations", createdAt: Date())
+        try await source.saveRecordingFolder(folder)
+        let recordingID = UUID()
+        let recordingDirectory = try await source.createRecordingDirectory(id: recordingID)
+        let videoURL = recordingDirectory.appendingPathComponent("capture.mov")
+        let eventURL = recordingDirectory.appendingPathComponent("events.atrevents")
+        try await writeTestMovie(to: videoURL, width: 16, height: 16, frameCount: 6, fps: 30)
+        let eventWriter = try InputEventWriter(url: eventURL)
+        eventWriter.append(InputSample(timestampNanos: 1_000_000_000, kind: .mouseMove, x: 8, y: 8, deltaX: 2, deltaY: -1))
+        eventWriter.append(InputSample(timestampNanos: 1_010_000_000, kind: .key, keyCode: 13, isDown: true))
+        eventWriter.append(InputSample(timestampNanos: 1_020_000_000, kind: .key, keyCode: 13, isDown: false))
+        let eventCount = try eventWriter.finish()
+        let manifest = RecordingManifest(
+            id: recordingID,
+            name: "Portable",
+            createdAt: Date(),
+            hostStartNanos: 1_000_000_000,
+            duration: 0.2,
+            capture: CaptureSpec(requestedFPS: 30),
+            globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
+            pixelWidth: 16,
+            pixelHeight: 16,
+            deliveredFPS: 30,
+            eventCount: eventCount,
+            folderID: folder.id,
+            excludedKeyCodes: [49]
+        )
+        try await source.writeRecording(manifest, to: recordingDirectory)
+        let sourceVideo = try Data(contentsOf: videoURL)
+        let sourceEvents = try Data(contentsOf: eventURL)
+        let sourceItems = await source.listRecordings()
+
+        let exported = try await source.exportRecordings(sourceItems, to: exportRoot)
+        XCTAssertEqual(exported.exportedCount, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: exportRoot.appendingPathComponent("recording-folders.json").path))
+
+        let target = WorkspaceStore(root: targetRoot)
+        try await target.prepare()
+        let firstImport = try await target.importRecordings(from: [exportRoot], fallbackFolderID: nil)
+        XCTAssertEqual(firstImport, RecordingImportResult(importedCount: 1, createdFolderCount: 1, regeneratedIdentifierCount: 0))
+        var imported = await target.listRecordings()
+        XCTAssertEqual(imported.map(\.id), [recordingID])
+        XCTAssertEqual(imported.first?.manifest.excludedKeyCodes, [49])
+        XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(imported.first).directory.appendingPathComponent("capture.mov")), sourceVideo)
+        XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(imported.first).directory.appendingPathComponent("events.atrevents")), sourceEvents)
+        let importedFolders = await target.listRecordingFolders()
+        XCTAssertEqual(importedFolders.map(\.name), [folder.name])
+
+        let secondImport = try await target.importRecordings(from: [exportRoot], fallbackFolderID: nil)
+        XCTAssertEqual(secondImport.importedCount, 1)
+        XCTAssertEqual(secondImport.createdFolderCount, 0)
+        XCTAssertEqual(secondImport.regeneratedIdentifierCount, 1)
+        imported = await target.listRecordings()
+        XCTAssertEqual(imported.count, 2)
+        XCTAssertEqual(Set(imported.compactMap { $0.manifest.folderID }).count, 1)
+        XCTAssertEqual(Set(imported.map(\.id)).count, 2)
+        XCTAssertTrue(imported.allSatisfy {
+            (try? Data(contentsOf: $0.directory.appendingPathComponent("capture.mov"))) == sourceVideo
+                && (try? Data(contentsOf: $0.directory.appendingPathComponent("events.atrevents"))) == sourceEvents
+        })
+    }
+
+    func testRecordingImportRejectsCorruptInputBeforeChangingTheLibrary() async throws {
+        let container = FileManager.default.temporaryDirectory.appendingPathComponent("recording-import-reject-\(UUID().uuidString)", isDirectory: true)
+        let package = container.appendingPathComponent("Broken.atrrecord", isDirectory: true)
+        let targetRoot = container.appendingPathComponent("Target", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        try await writeTestMovie(to: package.appendingPathComponent("capture.mov"), width: 16, height: 16, frameCount: 3, fps: 30)
+        try Data("ATREVT01".utf8).write(to: package.appendingPathComponent("events.atrevents"))
+        let manifest = RecordingManifest(
+            id: UUID(), name: "Broken", createdAt: Date(), hostStartNanos: 1, duration: 0.1,
+            capture: CaptureSpec(requestedFPS: 30), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
+            pixelWidth: 16, pixelHeight: 16, deliveredFPS: 30, eventCount: 0
+        )
+        let manifestEncoder = JSONEncoder(); manifestEncoder.dateEncodingStrategy = .iso8601
+        try manifestEncoder.encode(manifest).write(to: package.appendingPathComponent("manifest.json"))
+
+        let target = WorkspaceStore(root: targetRoot)
+        try await target.prepare()
+        do {
+            _ = try await target.importRecordings(from: [package], fallbackFolderID: nil)
+            XCTFail("A truncated event header must be rejected")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.localizedCaseInsensitiveContains("input"))
+        }
+        let remainingRecordings = await target.listRecordings()
+        let remainingFolders = await target.listRecordingFolders()
+        XCTAssertTrue(remainingRecordings.isEmpty)
+        XCTAssertTrue(remainingFolders.isEmpty)
     }
 
     func testLegacyInvalidRecordingIsRecoveredBeforeStrictLibraryScanWithoutTouchingSources() async throws {

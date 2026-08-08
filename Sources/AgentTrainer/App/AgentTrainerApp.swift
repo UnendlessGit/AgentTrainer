@@ -20,6 +20,18 @@ struct AgentTrainerApp: App {
                 Button(model.recordingIsActiveOrStarting ? "Stop Recording" : "Start Recording") { Task { model.recordingIsActiveOrStarting ? await model.stopRecording() : await model.startRecording() } }
                 Button(model.agentIsActiveOrStarting ? "Stop Agent" : "Run Agent") { Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() } }
             }
+            CommandMenu("Recordings") {
+                Button("Import Recordings…") {
+                    model.selection = .library
+                    Task { await model.importRecordings() }
+                }
+                .disabled(model.recordingIsActiveOrStarting || model.isReplaying)
+                Button("Export Selected Recordings…") {
+                    model.selection = .library
+                    Task { await model.exportRecordings(model.selectedRecordings) }
+                }
+                .disabled(model.selectedRecordings.isEmpty)
+            }
         }
 
         MenuBarExtra {

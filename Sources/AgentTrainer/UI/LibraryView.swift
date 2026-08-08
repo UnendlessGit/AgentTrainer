@@ -100,6 +100,12 @@ struct LibraryView: View {
             } else {
                 Text("Shift-click to select a range").font(.caption).foregroundStyle(.tertiary)
             }
+            Button("Import Recordings…") { Task { await model.importRecordings() } }
+                .primaryButton(color: ATColor.cyan)
+                .disabled(model.recordingIsActiveOrStarting || model.isReplaying)
+            Button("Export Selected…") { Task { await model.exportRecordings(model.selectedRecordings) } }
+                .primaryButton(color: ATColor.violet)
+                .disabled(model.selectedRecordings.isEmpty)
             Button { Task { await model.refreshLibrary(); ensureSelection() } } label: { Image(systemName: "arrow.clockwise") }.primaryButton()
         }
     }
