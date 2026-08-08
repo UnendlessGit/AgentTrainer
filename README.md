@@ -1,4 +1,4 @@
-# AgentTrainer 1.9.7
+# AgentTrainer 1.9.8
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -17,7 +17,7 @@ The package pins MLX Swift exactly in `Package.resolved`.
 ## Workflow
 
 1. Open AgentTrainer and grant the permissions needed for the operation you want.
-2. Create a recording folder, choose a display, window, or region, then record a demonstration.
+2. Create a recording folder, choose a display, window, or region, optionally save those settings as a reusable preset, then record a demonstration.
 3. Create an AI profile, select recording folders, and configure its vision, controls, and network.
 4. Train the profile. Pause publishes a runnable brain and retains an exact checkpoint.
 5. In Run, choose cursor mode and output permissions, then start the AI.
@@ -79,7 +79,7 @@ The default installed application is:
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-1.9.7.dmg`
+- `AgentTrainer-1.9.8.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

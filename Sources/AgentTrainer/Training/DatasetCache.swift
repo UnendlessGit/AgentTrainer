@@ -1155,6 +1155,18 @@ actor DatasetCacheBuilder {
             try frame.past.withPackedBytes { try pastObservations.append($0) }
         }
 
+        func appendObservation(_ buffer: CVPixelBuffer, at time: Double) throws {
+            pendingPackedFrames.append((
+                current: try preprocessor.submit(buffer, spec: profile.preprocessing),
+                past: try preprocessor.submit(buffer, spec: pastSpec)
+            ))
+            if pendingPackedFrames.count >= packedPipelineDepth {
+                try writeOldestPackedFrame()
+            }
+            observationTimes.append(min(trainingEnd, max(trainingStart, time)))
+        }
+
+        var lastDecodedBuffer: CVPixelBuffer?
         while let sample = output.copyNextSampleBuffer(), let buffer = sample.imageBuffer {
             try Task.checkCancellation()
             let pts = sample.presentationTimeStamp
@@ -1165,19 +1177,29 @@ actor DatasetCacheBuilder {
                 progress(min(1, max(0, (t - trainingStart) / usableDuration)))
                 nextProgressTime = t + progressInterval
             }
-            if observationTimes.isEmpty || t + 0.000_001 >= nextPerception {
-                pendingPackedFrames.append((
-                    current: try preprocessor.submit(buffer, spec: profile.preprocessing),
-                    past: try preprocessor.submit(buffer, spec: pastSpec)
-                ))
-                if pendingPackedFrames.count >= packedPipelineDepth {
-                    try writeOldestPackedFrame()
+            if let previous = lastDecodedBuffer {
+                // A compressed frame remains visually current until the next
+                // decoded frame's PTS. Materialize every configured perception
+                // interval in that gap from the held frame. This is essential for
+                // static screens, where ScreenCaptureKit may emit only idle status.
+                while nextPerception < min(trainingEnd, t) - 0.000_001 {
+                    try appendObservation(previous, at: nextPerception)
+                    nextPerception += perceptionInterval
                 }
-                observationTimes.append(min(trainingEnd, max(trainingStart, t)))
-                while nextPerception <= t { nextPerception += perceptionInterval }
             }
+            if nextPerception <= min(trainingEnd, t) + 0.000_001 {
+                try appendObservation(buffer, at: nextPerception)
+                nextPerception += perceptionInterval
+            }
+            lastDecodedBuffer = buffer
         }
         if reader.status == .failed { throw reader.error ?? AgentTrainerError.storage("Video decoding failed while building the cache.") }
+        if let lastDecodedBuffer {
+            while nextPerception <= trainingEnd + 0.000_001 {
+                try appendObservation(lastDecodedBuffer, at: nextPerception)
+                nextPerception += perceptionInterval
+            }
+        }
         while !pendingPackedFrames.isEmpty { try writeOldestPackedFrame() }
         guard !observationTimes.isEmpty else { progress(1); return (0, 0) }
 

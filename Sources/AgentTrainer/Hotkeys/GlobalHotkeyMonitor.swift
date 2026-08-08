@@ -13,34 +13,78 @@ import Foundation
 final class HotkeySuppression: @unchecked Sendable {
     static let shared = HotkeySuppression()
 
+    enum Decision: Equatable {
+        case pass(InputSample)
+        case suppress(HotkeyBinding)
+    }
+
+    private struct Active {
+        var binding: HotkeyBinding
+        var expiresAt: UInt64
+        var triggerReleased = false
+        var modifiersReleased: Bool
+    }
+
     private let lock = NSLock()
-    private var activeBinding: HotkeyBinding?
-    private var expiresAt: UInt64 = 0
+    private var active: Active?
 
     func activate(_ binding: HotkeyBinding, duration: TimeInterval = 1) {
         lock.lock()
-        activeBinding = binding
         let seconds = duration.isFinite ? min(60, max(0, duration)) : 1
-        expiresAt = DispatchTime.now().uptimeNanoseconds &+ UInt64(seconds * 1_000_000_000)
+        active = Active(
+            binding: binding,
+            expiresAt: DispatchTime.now().uptimeNanoseconds &+ UInt64(seconds * 1_000_000_000),
+            modifiersReleased: binding.cgEventModifiers == 0
+        )
         lock.unlock()
     }
 
-    func suppresses(_ sample: InputSample) -> Bool {
+    /// Suppresses only the physical lifecycle that invoked a global shortcut.
+    /// A fixed time window alone is insufficient: after the shortcut is fully
+    /// released it can swallow an unrelated Shift/Control release that happens
+    /// to occur during that window. Foreign modifiers are preserved with only
+    /// the shortcut-owned modifier bits removed.
+    func process(_ sample: InputSample) -> Decision {
         lock.lock()
         defer { lock.unlock() }
-        guard DispatchTime.now().uptimeNanoseconds <= expiresAt, let binding = activeBinding else {
-            activeBinding = nil
-            return false
+        guard var active, DispatchTime.now().uptimeNanoseconds <= active.expiresAt else {
+            self.active = nil
+            return .pass(sample)
         }
-        switch sample.kind {
+
+        let triggerMatches = switch sample.kind {
         case .key:
-            return UInt16(exactly: binding.keyCode) == sample.keyCode
-        case .flags:
-            let relevant = sample.modifiers & HotkeyBinding.cgModifierMask
-            return relevant & ~binding.cgEventModifiers == 0
-        default:
-            return false
+            active.binding.mouseButton == nil && UInt16(exactly: active.binding.keyCode) == sample.keyCode
+        case .mouseButton:
+            active.binding.mouseButton == sample.button
+        case .flags, .mouseMove, .scroll:
+            false
         }
+        if triggerMatches {
+            if !sample.isDown { active.triggerReleased = true }
+            self.active = active.triggerReleased && active.modifiersReleased ? nil : active
+            return .suppress(active.binding)
+        }
+
+        if sample.kind == .flags, !active.modifiersReleased {
+            let relevant = sample.modifiers & HotkeyBinding.cgModifierMask
+            let shortcutModifiers = active.binding.cgEventModifiers
+            let foreignModifiers = relevant & ~shortcutModifiers
+            if relevant & shortcutModifiers == 0 { active.modifiersReleased = true }
+            self.active = active.triggerReleased && active.modifiersReleased ? nil : active
+            if foreignModifiers == 0 { return .suppress(active.binding) }
+            var sanitized = sample
+            sanitized.modifiers &= ~shortcutModifiers
+            return .pass(sanitized)
+        }
+
+        self.active = active
+        if !active.modifiersReleased, active.binding.cgEventModifiers != 0 {
+            var sanitized = sample
+            sanitized.modifiers &= ~active.binding.cgEventModifiers
+            return .pass(sanitized)
+        }
+        return .pass(sample)
     }
 }
 
@@ -54,9 +98,11 @@ final class GlobalHotkeyMonitor: @unchecked Sendable {
     private var nativeBindingPressed = false
     private let identifier: UInt32
     #else
-    private var globalMonitor: Any?
-    private var localMonitor: Any?
+    private var globalKeyboardMonitor: Any?
+    private var localKeyboardMonitor: Any?
     #endif
+    private var globalMouseMonitor: Any?
+    private var localMouseMonitor: Any?
     private let action: @Sendable () -> Void
     private var binding: HotkeyBinding
     private(set) var registrationStatus: Int32 = successStatus
@@ -71,6 +117,10 @@ final class GlobalHotkeyMonitor: @unchecked Sendable {
     }
 
     func start() {
+        if binding.mouseButton != nil {
+            startMouseMonitoring()
+            return
+        }
         #if canImport(Carbon)
         guard reference == nil, handler == nil else { return }
         nativeBindingPressed = false
@@ -105,15 +155,15 @@ final class GlobalHotkeyMonitor: @unchecked Sendable {
             handler = nil; reference = nil
         }
         #else
-        guard globalMonitor == nil, localMonitor == nil else { return }
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        guard globalKeyboardMonitor == nil, localKeyboardMonitor == nil else { return }
+        globalKeyboardMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handle(event)
         }
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        localKeyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handle(event)
             return event
         }
-        registrationStatus = globalMonitor != nil && localMonitor != nil ? Self.successStatus : Self.unavailableStatus
+        registrationStatus = globalKeyboardMonitor != nil && localKeyboardMonitor != nil ? Self.successStatus : Self.unavailableStatus
         if registrationStatus != Self.successStatus { stop() }
         #endif
     }
@@ -121,14 +171,17 @@ final class GlobalHotkeyMonitor: @unchecked Sendable {
     func update(_ binding: HotkeyBinding) { stop(); self.binding = binding; start() }
 
     func stop() {
+        if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor) }
+        if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
+        globalMouseMonitor = nil; localMouseMonitor = nil
         #if canImport(Carbon)
         if let reference { UnregisterEventHotKey(reference) }
         if let handler { RemoveEventHandler(handler) }
         reference = nil; handler = nil; nativeBindingPressed = false
         #else
-        if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
-        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
-        globalMonitor = nil; localMonitor = nil
+        if let globalKeyboardMonitor { NSEvent.removeMonitor(globalKeyboardMonitor) }
+        if let localKeyboardMonitor { NSEvent.removeMonitor(localKeyboardMonitor) }
+        globalKeyboardMonitor = nil; localKeyboardMonitor = nil
         #endif
     }
 
@@ -143,6 +196,29 @@ final class GlobalHotkeyMonitor: @unchecked Sendable {
         action()
     }
     #endif
+
+    private func startMouseMonitoring() {
+        guard globalMouseMonitor == nil, localMouseMonitor == nil else { return }
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
+            _ = self?.handleMouse(event)
+        }
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            self?.handleMouse(event) == true ? nil : event
+        }
+        registrationStatus = globalMouseMonitor != nil && localMouseMonitor != nil ? Self.successStatus : Self.unavailableStatus
+        if registrationStatus != Self.successStatus { stop() }
+    }
+
+    @discardableResult
+    private func handleMouse(_ event: NSEvent) -> Bool {
+        guard let button = binding.mouseButton,
+              event.buttonNumber == Int(button),
+              event.modifierFlags.intersection(.deviceIndependentFlagsMask).intersection([.shift, .control, .option, .command]) == binding.nsEventModifiers else { return false }
+        HotkeySuppression.shared.activate(binding)
+        action()
+        return true
+    }
 }
 
 extension HotkeyBinding {
@@ -167,7 +243,25 @@ extension HotkeyBinding {
     }
 
     func matches(_ sample: InputSample) -> Bool {
-        sample.kind == .key && UInt16(exactly: keyCode) == sample.keyCode && (sample.modifiers & Self.cgModifierMask) == cgEventModifiers
+        let inputMatches: Bool
+        if let mouseButton {
+            inputMatches = sample.kind == .mouseButton && sample.button == mouseButton
+        } else {
+            inputMatches = sample.kind == .key && UInt16(exactly: keyCode) == sample.keyCode
+        }
+        return inputMatches && (sample.modifiers & Self.cgModifierMask) == cgEventModifiers
+    }
+
+    var displayName: String {
+        if let mouseButton {
+            return switch mouseButton {
+            case 0: "Left Mouse"
+            case 1: "Right Mouse"
+            case 2: "Middle Mouse"
+            default: "Mouse \(Int(mouseButton) + 1)"
+            }
+        }
+        return KeyNames.name(for: UInt16(clamping: keyCode))
     }
 }
 

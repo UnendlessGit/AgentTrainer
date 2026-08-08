@@ -21,12 +21,13 @@ struct LibraryView: View {
     @State private var reenactmentArmed = false
     @State private var loadingDetails = false
     @State private var detailTask: Task<Void, Never>?
-    @State private var deleteRecording: RecordingItem?
+    @State private var recordingsToDelete: [RecordingItem] = []
     @State private var deleteFolder: RecordingFolder?
     @State private var folderToRename: RecordingFolder?
     @State private var folderRenameText = ""
     @State private var expandedFolderIDs: Set<UUID> = []
     @State private var showsTimeline = false
+    @State private var selectionAnchorID: UUID?
 
     private var visibleRecordings: [RecordingItem] {
         var result = model.recordings.filter { item in
@@ -55,13 +56,25 @@ struct LibraryView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding(24)
-        .onAppear { ensureSelection(); if let item = model.selectedRecording { load(item) } }
-        .onChange(of: model.selectedRecordingID) { _, _ in if let item = model.selectedRecording { load(item) } }
+        .onAppear { ensureSelection(); if model.selectedRecordings.count == 1, let item = model.selectedRecording { load(item) } }
+        .onChange(of: model.selectedRecordingID) { _, _ in if model.selectedRecordings.count == 1, let item = model.selectedRecording { load(item) } }
+        .onChange(of: model.selectedRecordingIDs) { _, _ in
+            if model.selectedRecordings.count == 1, let item = model.selectedRecording { load(item) }
+            else { detailTask?.cancel(); player?.pause() }
+        }
         .onDisappear { detailTask?.cancel(); player?.pause() }
-        .alert("Delete recording?", isPresented: Binding(get: { deleteRecording != nil }, set: { if !$0 { deleteRecording = nil } })) {
-            Button("Cancel", role: .cancel) { deleteRecording = nil }
-            Button("Delete", role: .destructive) { if let item = deleteRecording { Task { await model.deleteRecording(item) } }; deleteRecording = nil }
-        } message: { Text("This permanently removes “\(deleteRecording?.manifest.name ?? "")”, its video, and recorded inputs.") }
+        .alert(recordingsToDelete.count == 1 ? "Delete recording?" : "Delete \(recordingsToDelete.count) recordings?", isPresented: Binding(get: { !recordingsToDelete.isEmpty }, set: { if !$0 { recordingsToDelete = [] } })) {
+            Button("Cancel", role: .cancel) { recordingsToDelete = [] }
+            Button("Delete", role: .destructive) {
+                let items = recordingsToDelete
+                recordingsToDelete = []
+                Task { items.count == 1 ? await model.deleteRecording(items[0]) : await model.deleteRecordings(items) }
+            }
+        } message: {
+            Text(recordingsToDelete.count == 1
+                 ? "This permanently removes “\(recordingsToDelete.first?.manifest.name ?? "")”, its video, and recorded inputs."
+                 : "This permanently removes every selected video and its recorded inputs. This cannot be undone.")
+        }
         .alert("Delete folder and recordings?", isPresented: Binding(get: { deleteFolder != nil }, set: { if !$0 { deleteFolder = nil } })) {
             Button("Cancel", role: .cancel) { deleteFolder = nil }
             Button("Delete Folder", role: .destructive) { if let folder = deleteFolder { Task { await model.deleteRecordingFolder(folder) } }; deleteFolder = nil }
@@ -81,6 +94,12 @@ struct LibraryView: View {
             SectionTitle("Library", "Expand folders to browse recordings, inspect captured controls, and replay locally.")
             TextField("Search recordings", text: $search).textFieldStyle(.roundedBorder).frame(width: 240)
             Picker("Sort", selection: $sortOrder) { ForEach(SortOrder.allCases) { Text($0.rawValue).tag($0) } }.frame(width: 130)
+            if model.selectedRecordingIDs.count > 1 {
+                StatusPill(text: "\(model.selectedRecordingIDs.count) selected", color: ATColor.cyan)
+                Button("Clear") { clearSelection() }.buttonStyle(.plain).foregroundStyle(ATColor.cyan).font(.caption.bold())
+            } else {
+                Text("Shift-click to select a range").font(.caption).foregroundStyle(.tertiary)
+            }
             Button { Task { await model.refreshLibrary(); ensureSelection() } } label: { Image(systemName: "arrow.clockwise") }.primaryButton()
         }
     }
@@ -115,12 +134,12 @@ struct LibraryView: View {
                             } else {
                                 ForEach(items) { item in
                                     HStack(spacing: 5) {
-                                        Button { model.selectedRecordingID = item.id } label: {
-                                            LibraryRecordingRow(item: item, selected: model.selectedRecordingID == item.id)
+                                        Button { select(item) } label: {
+                                            LibraryRecordingRow(item: item, selected: model.selectedRecordingIDs.contains(item.id))
                                         }
                                         .buttonStyle(.plain)
                                         .frame(maxWidth: .infinity)
-                                        Button { deleteRecording = item } label: {
+                                        Button { recordingsToDelete = [item] } label: {
                                             Image(systemName: "trash")
                                                 .frame(width: 30, height: 30)
                                                 .contentShape(Rectangle())
@@ -160,7 +179,9 @@ struct LibraryView: View {
     }
 
     @ViewBuilder private var inspector: some View {
-        if let item = model.selectedRecording {
+        if model.selectedRecordings.count > 1 {
+            bulkInspector(items: model.selectedRecordings)
+        } else if let item = model.selectedRecording {
             OLEDCard(padding: 13) {
                 List {
                     VStack(alignment: .leading, spacing: 12) {
@@ -217,7 +238,7 @@ struct LibraryView: View {
                         HStack {
                             if model.isReplaying { Button("Stop Replay") { model.stopReenactment() }.primaryButton(color: ATColor.coral) }
                             else { Button("Reenact") { model.startReenactment() }.primaryButton(color: ATColor.amber).disabled(!reenactmentArmed || model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting) }
-                            Spacer(); Button("Delete", role: .destructive) { deleteRecording = item }.primaryButton(color: ATColor.coral)
+                            Spacer(); Button("Delete", role: .destructive) { recordingsToDelete = [item] }.primaryButton(color: ATColor.coral)
                         }
                     }
                     .listRowInsets(EdgeInsets())
@@ -236,8 +257,112 @@ struct LibraryView: View {
         }
     }
 
+    private func bulkInspector(items: [RecordingItem]) -> some View {
+        let folderIDs = Set(items.compactMap { $0.manifest.folderID })
+        let commonFolderID = folderIDs.count == 1 && items.allSatisfy({ $0.manifest.folderID != nil }) ? folderIDs.first : nil
+        let totalDuration = items.reduce(0) { $0 + effectiveDuration($1) }
+        return OLEDCard(padding: 13) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill").font(.title2).foregroundStyle(ATColor.cyan)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(items.count) recordings selected").font(.title3.bold())
+                        Text("\(durationString(totalDuration)) total • \(items.reduce(0) { $0 + $1.manifest.eventCount }.formatted()) input events")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Text("Shift-click another recording to change the contiguous range. Command-click toggles an individual recording.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Selected recordings").font(.subheadline.bold())
+                    ForEach(items.prefix(8)) { item in
+                        HStack {
+                            Image(systemName: "video.fill").foregroundStyle(ATColor.violet)
+                            Text(item.manifest.name).lineLimit(1)
+                            Spacer()
+                            Text(durationString(effectiveDuration(item))).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
+                    }
+                    if items.count > 8 { Text("and \(items.count - 8) more…").font(.caption).foregroundStyle(.tertiary) }
+                }
+                .padding(10)
+                .raisedGlassSurface(cornerRadius: 9)
+                Divider()
+                Picker("Move all to folder", selection: Binding<UUID?>(
+                    get: { commonFolderID },
+                    set: { folderID in
+                        guard let folderID else { return }
+                        Task { await model.moveRecordings(items, to: folderID) }
+                    }
+                )) {
+                    if commonFolderID == nil { Text("Mixed folders").tag(UUID?.none) }
+                    ForEach(model.recordingFolders) { Text($0.name).tag(Optional($0.id)) }
+                }
+                HStack {
+                    Button("Keep Only Current") { clearSelection() }.primaryButton(color: ATColor.cyan)
+                    Spacer()
+                    Button("Delete Selected", role: .destructive) { recordingsToDelete = items }.primaryButton(color: ATColor.coral)
+                }
+            }
+        }
+        .frame(width: 380)
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+
     private func ensureSelection() {
-        if model.selectedRecording == nil { model.selectedRecordingID = visibleRecordings.first?.id }
+        if model.selectedRecording == nil, let first = visibleRecordings.first {
+            model.selectedRecordingID = first.id
+            model.selectedRecordingIDs = [first.id]
+            selectionAnchorID = first.id
+        } else if model.selectedRecordingIDs.isEmpty, let selectedRecordingID = model.selectedRecordingID {
+            model.selectedRecordingIDs = [selectedRecordingID]
+            selectionAnchorID = selectedRecordingID
+        }
+    }
+
+    private func select(_ item: RecordingItem) {
+        let modifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let ordered = displayedRecordingIDs
+        if modifiers.contains(.shift),
+           let anchor = selectionAnchorID,
+           let start = ordered.firstIndex(of: anchor),
+           let end = ordered.firstIndex(of: item.id) {
+            model.selectedRecordingIDs = Set(ordered[min(start, end)...max(start, end)])
+        } else if modifiers.contains(.command) {
+            if model.selectedRecordingIDs.contains(item.id), model.selectedRecordingIDs.count > 1 {
+                model.selectedRecordingIDs.remove(item.id)
+                model.selectedRecordingID = model.selectedRecordingIDs.first
+                selectionAnchorID = model.selectedRecordingID
+            } else {
+                model.selectedRecordingIDs.insert(item.id)
+                model.selectedRecordingID = item.id
+                selectionAnchorID = item.id
+            }
+        } else {
+            model.selectedRecordingIDs = [item.id]
+            selectionAnchorID = item.id
+            model.selectedRecordingID = item.id
+        }
+        if modifiers.contains(.shift) { model.selectedRecordingID = item.id }
+    }
+
+    private var displayedRecordingIDs: [UUID] {
+        model.recordingFolders.flatMap { folder in
+            let expanded = expandedFolderIDs.contains(folder.id) || !search.isEmpty
+            return expanded ? recordings(in: folder).map(\.id) : []
+        }
+    }
+
+    private func clearSelection() {
+        if let selectedRecordingID = model.selectedRecordingID {
+            model.selectedRecordingIDs = [selectedRecordingID]
+            selectionAnchorID = selectedRecordingID
+        } else {
+            model.selectedRecordingIDs = []
+            selectionAnchorID = nil
+        }
     }
 
     private func load(_ item: RecordingItem) {

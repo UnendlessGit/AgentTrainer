@@ -56,6 +56,8 @@ private struct PermissionBadge: View {
 
 struct RecordView: View {
     @ObservedObject var model: AppModel
+    @State private var presetName = ""
+    @State private var presetToDelete: RecordingPreset?
     private var sources: [CaptureSourceOption] {
         model.captureSources.filter { source in
             switch model.captureKind { case .display, .screenRegion: source.kind == .display; case .window, .windowRegion: source.kind == .window }
@@ -65,6 +67,7 @@ struct RecordView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 SectionTitle("Record", "Hardware HEVC video with frame-accurate input synchronization and configurable cleanup at both ends.")
+                recordingPresets
                 HStack(alignment: .top, spacing: 16) {
                     OLEDCard {
                         VStack(alignment: .leading, spacing: 16) {
@@ -108,6 +111,68 @@ struct RecordView: View {
                 }
             }.padding(28)
         }
+        .onAppear {
+            if let id = model.selectedRecordingPresetID,
+               let preset = model.recordingPresets.first(where: { $0.id == id }) {
+                presetName = preset.name
+            }
+        }
+        .alert("Delete recording preset?", isPresented: Binding(get: { presetToDelete != nil }, set: { if !$0 { presetToDelete = nil } })) {
+            Button("Cancel", role: .cancel) { presetToDelete = nil }
+            Button("Delete", role: .destructive) {
+                if let presetToDelete { model.deleteRecordingPreset(presetToDelete) }
+                self.presetToDelete = nil
+                presetName = ""
+            }
+        } message: {
+            Text("This deletes only the preset “\(presetToDelete?.name ?? "")”. Existing recordings are unchanged.")
+        }
+    }
+
+    private var recordingPresets: some View {
+        OLEDCard {
+            HStack(spacing: 10) {
+                Label("Recording presets", systemImage: "slider.horizontal.3").font(.headline).foregroundStyle(ATColor.violet)
+                Picker("Preset", selection: Binding(
+                    get: { model.selectedRecordingPresetID },
+                    set: { id in
+                        guard let id, let preset = model.recordingPresets.first(where: { $0.id == id }) else {
+                            model.selectedRecordingPresetID = nil
+                            presetName = ""
+                            return
+                        }
+                        presetName = preset.name
+                        model.applyRecordingPreset(preset)
+                    }
+                )) {
+                    Text("Unsaved settings").tag(UUID?.none)
+                    ForEach(model.recordingPresets) { preset in Text(preset.name).tag(Optional(preset.id)) }
+                }
+                .frame(minWidth: 190)
+                TextField("Preset name", text: $presetName).textFieldStyle(.roundedBorder).frame(width: 190)
+                Button("Save New") {
+                    model.createRecordingPreset(name: presetName)
+                }
+                .primaryButton(color: ATColor.violet)
+                .disabled(presetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Update") {
+                    guard let id = model.selectedRecordingPresetID,
+                          let preset = model.recordingPresets.first(where: { $0.id == id }) else { return }
+                    model.updateRecordingPreset(preset, name: presetName)
+                }
+                .primaryButton(color: ATColor.cyan)
+                .disabled(model.selectedRecordingPresetID == nil || presetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Delete", role: .destructive) {
+                    guard let id = model.selectedRecordingPresetID else { return }
+                    presetToDelete = model.recordingPresets.first { $0.id == id }
+                }
+                .primaryButton(color: ATColor.coral)
+                .disabled(model.selectedRecordingPresetID == nil)
+                Spacer(minLength: 0)
+                InfoTip("Save the complete capture type, source, destination, FPS, cursor, region, trim, and input blacklist. Update overwrites the selected preset with the settings currently shown below.")
+            }
+        }
+        .disabled(model.recordingIsActiveOrStarting)
     }
 }
 
@@ -1548,7 +1613,7 @@ struct SettingsView: View {
                 OLEDCard { VStack(alignment: .leading, spacing: 14) { Text("macOS permissions").font(.headline); PermissionSetting("Screen Recording", granted: model.screenPermission) { model.openPrivacyPane("Privacy_ScreenCapture") }; PermissionSetting("Input Monitoring", granted: model.inputPermission) { model.openPrivacyPane("Privacy_ListenEvent") }; PermissionSetting("Accessibility", granted: model.accessibilityPermission) { model.openPrivacyPane("Privacy_Accessibility") }; Button("Refresh Permission Status") { model.refreshPermissions() }.primaryButton() } }
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 12) {
-                        HStack { Text("Global keybinds").font(.headline).foregroundStyle(ATColor.cyan); InfoTip("Click a shortcut, then press a new combination. Shortcuts work globally and are removed from recordings and human-interruption safety.") }
+                        HStack { Text("Global keybinds").font(.headline).foregroundStyle(ATColor.cyan); InfoTip("Click a shortcut, then press a keyboard key or any mouse button, with optional modifiers. Middle and additional side buttons are supported. Shortcuts work globally and are removed from recordings and human-interruption safety.") }
                         HotkeySettingsEditor(model: model).disabled(model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting)
                         if model.agentIsActiveOrStarting || model.recordingIsActiveOrStarting { Text("Shortcuts are locked until the active recording or agent session stops.").font(.caption).foregroundStyle(ATColor.amber) }
                     }
@@ -1827,7 +1892,8 @@ private struct HotkeySettingsEditor: View {
     enum Field { case panic, record, run }
     @ObservedObject var model: AppModel
     @State private var listening: Field?
-    @State private var monitor: Any?
+    @State private var keyMonitor: Any?
+    @State private var mouseMonitor: Any?
     var body: some View {
         VStack(spacing: 8) {
             row("Panic and release everything", field: .panic, binding: model.hotkeys.panic)
@@ -1843,28 +1909,43 @@ private struct HotkeySettingsEditor: View {
 
     private func begin(_ field: Field) {
         stop(resume: false); model.suspendGlobalHotkeys(); listening = field
-        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            var modifiers: UInt32 = 0
-            if event.modifierFlags.contains(.command) { modifiers |= UInt32(1 << 8) }
-            if event.modifierFlags.contains(.shift) { modifiers |= UInt32(1 << 9) }
-            if event.modifierFlags.contains(.option) { modifiers |= UInt32(1 << 11) }
-            if event.modifierFlags.contains(.control) { modifiers |= UInt32(1 << 12) }
-            var settings = model.hotkeys
-            let captured = HotkeyBinding(keyCode: UInt32(event.keyCode), carbonModifiers: modifiers)
-            switch field { case .panic: settings.panic = captured; case .record: settings.record = captured; case .run: settings.run = captured }
-            stop(resume: false)
-            model.saveHotkeys(settings)
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard !event.isARepeat else { return nil }
+            commit(HotkeyBinding(keyCode: UInt32(event.keyCode), carbonModifiers: carbonModifiers(event.modifierFlags)), to: field)
+            return nil
+        }
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { event in
+            commit(.mouse(UInt8(clamping: event.buttonNumber), carbonModifiers: carbonModifiers(event.modifierFlags)), to: field)
             return nil
         }
     }
-    private func stop(resume: Bool = true) { if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }; listening = nil; if resume { model.resumeGlobalHotkeys() } }
+    private func commit(_ captured: HotkeyBinding, to field: Field) {
+        var settings = model.hotkeys
+        switch field { case .panic: settings.panic = captured; case .record: settings.record = captured; case .run: settings.run = captured }
+        stop(resume: false)
+        model.saveHotkeys(settings)
+    }
+    private func stop(resume: Bool = true) {
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
+        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor); self.mouseMonitor = nil }
+        listening = nil
+        if resume { model.resumeGlobalHotkeys() }
+    }
+    private func carbonModifiers(_ flags: NSEvent.ModifierFlags) -> UInt32 {
+        var modifiers: UInt32 = 0
+        if flags.contains(.command) { modifiers |= UInt32(1 << 8) }
+        if flags.contains(.shift) { modifiers |= UInt32(1 << 9) }
+        if flags.contains(.option) { modifiers |= UInt32(1 << 11) }
+        if flags.contains(.control) { modifiers |= UInt32(1 << 12) }
+        return modifiers
+    }
     private func display(_ value: HotkeyBinding) -> String {
         var result = ""
         if value.carbonModifiers & UInt32(1 << 12) != 0 { result += "⌃" }
         if value.carbonModifiers & UInt32(1 << 11) != 0 { result += "⌥" }
         if value.carbonModifiers & UInt32(1 << 9) != 0 { result += "⇧" }
         if value.carbonModifiers & UInt32(1 << 8) != 0 { result += "⌘" }
-        return result + KeyNames.name(for: UInt16(clamping: value.keyCode))
+        return result + value.displayName
     }
 }
 

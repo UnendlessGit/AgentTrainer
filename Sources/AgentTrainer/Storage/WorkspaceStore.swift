@@ -415,6 +415,40 @@ actor WorkspaceStore {
         try FileManager.default.removeItem(at: item.directory)
     }
 
+    /// Moves the complete set out of the visible library before deleting it.
+    /// If any move fails, every prior move is rolled back; a final cleanup
+    /// failure leaves a hidden recovery directory rather than a partial library.
+    func deleteRecordings(_ items: [RecordingItem]) throws {
+        let items = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }).values
+        guard !items.isEmpty else { return }
+        let root = recordingsRoot.standardizedFileURL
+        for item in items {
+            guard item.directory.deletingLastPathComponent().standardizedFileURL == root,
+                  item.directory.pathExtension == "atrrecord",
+                  FileManager.default.fileExists(atPath: item.directory.path) else {
+                throw AgentTrainerError.storage("A selected recording is no longer in the managed library.")
+            }
+        }
+        let staging = recordingsRoot.appendingPathComponent(".RecordingDeletion.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+        var moved: [(source: URL, staged: URL)] = []
+        do {
+            for item in items {
+                let destination = staging.appendingPathComponent(item.directory.lastPathComponent, isDirectory: true)
+                try FileManager.default.moveItem(at: item.directory, to: destination)
+                moved.append((item.directory, destination))
+            }
+        } catch {
+            for item in moved.reversed() { try? FileManager.default.moveItem(at: item.staged, to: item.source) }
+            try? FileManager.default.removeItem(at: staging)
+            throw AgentTrainerError.storage("The recordings could not all be deleted, so the library was restored: \(error.localizedDescription)")
+        }
+        do { try FileManager.default.removeItem(at: staging) }
+        catch {
+            AppLog.write(.warning, category: "Storage", "Deleted recordings remain in a hidden recovery directory", details: staging.path)
+        }
+    }
+
     func saveRecordingFolder(_ folder: RecordingFolder) throws {
         var folder = folder
         folder.name = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -458,6 +492,26 @@ actor WorkspaceStore {
         var manifest = item.manifest
         manifest.folderID = folderID
         try writeRecording(manifest, to: item.directory)
+    }
+
+    func assignRecordings(_ items: [RecordingItem], to folderID: UUID) throws {
+        guard listRecordingFolders().contains(where: { $0.id == folderID }) else {
+            throw AgentTrainerError.storage("The destination recording folder no longer exists.")
+        }
+        let items = Array(Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }).values)
+        var originals: [(url: URL, data: Data)] = []
+        do {
+            for item in items {
+                let url = item.directory.appendingPathComponent("manifest.json")
+                originals.append((url, try Data(contentsOf: url)))
+                var manifest = item.manifest
+                manifest.folderID = folderID
+                try writeRecording(manifest, to: item.directory)
+            }
+        } catch {
+            for original in originals { try? atomicWrite(original.data, to: original.url) }
+            throw AgentTrainerError.storage("The recordings could not all be moved, so their original folders were restored: \(error.localizedDescription)")
+        }
     }
 
     func deleteRecordingFolder(_ folder: RecordingFolder, includingRecordings: Bool) throws {

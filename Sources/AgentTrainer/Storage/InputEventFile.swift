@@ -8,6 +8,7 @@ final class InputEventWriter: @unchecked Sendable {
     private(set) var count = 0
     private var closed = false
     private var failure: Error?
+    private var lastTimestamp: UInt64?
 
     init(url: URL) throws {
         FileManager.default.createFile(atPath: url.path, contents: nil)
@@ -23,6 +24,14 @@ final class InputEventWriter: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !closed, failure == nil else { return }
+        var event = event
+        // The first-frame seed is written by the capture queue while physical
+        // events arrive on the tap thread. Preserve file ordering even if two
+        // host-clock reads straddle that hand-off by a few nanoseconds.
+        if let lastTimestamp, event.timestampNanos < lastTimestamp {
+            event.timestampNanos = lastTimestamp
+        }
+        lastTimestamp = event.timestampNanos
         buffer.appendInteger(event.timestampNanos)
         buffer.append(event.kind.rawValue)
         buffer.append(event.isDown ? 1 : 0)

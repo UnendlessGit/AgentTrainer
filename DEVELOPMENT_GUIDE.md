@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 1.9.7. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 1.9.8. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -64,6 +64,12 @@ Recording manifests validate schema, finite timing, dimensions, trims, and leaf-
 
 Capture status matters: complete/started frames are usable, idle frames may reuse the last good frame, and blank/suspended/stopped frames are dropped.
 
+The input event tap is backed by a low-rate physical-state reconciliation pass. If macOS disables the tap or drops a transition, the next pass emits only the missing key, modifier, or mouse-button edges. Recording shutdown appends balanced releases for every logical control still held. The first complete screen frame seeds controls that were already held during asynchronous startup. Shortcut and blacklist filters apply to both ordinary and reconciled input.
+
+Live HUD state and persisted recording state are intentionally separate. The HUD reduces blacklist-sanitized physical samples immediately, so a held modifier or mouse button is visible on its down edge; monotonic state revisions prevent cross-thread UI delivery from restoring an older state. The event file may briefly buffer modifier transitions to determine whether they belong to a global shortcut, but it preserves their original timestamps and separately held modifiers. Global shortcut suppression ends with the trigger/modifier release lifecycle; it must never consume an unrelated input merely because it occurs inside an expiry window. Caps Lock is normalized to a tap and Fn/Globe retains physical key edges so both remain in the ordinary keyboard action space.
+
+Saved HEVC sessions end on the shared host clock even when ScreenCaptureKit reports only idle frames. Dataset construction materializes the last decoded frame at every configured perception interval until a newer frame becomes causal; a static screen must not collapse temporal spacing or observation count.
+
 ## Vision and dataset contracts
 
 Packed observations are `UInt8`:
@@ -83,7 +89,7 @@ Temporal vision is an explicit three-part input:
 
 The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 1–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context.
 
-`TrainingDataContract.schemaVersion` is 8. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, or target meaning changes. A cache has:
+`TrainingDataContract.schemaVersion` is 9. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, or target meaning changes. A cache has:
 
 - `current-observations.bin` — one full-resolution packed image per perception
 - `past-observations.bin` — one reduced packed image of the same perception
@@ -204,6 +210,8 @@ The app owns a solid top bar and sidebar for consistent macOS 15+ rendering. Exp
 Theme controls are bounded and global. Motion honors Reduce Motion, can be disabled, and pauses when the app is inactive. Charts keep bounded histories and downsample while preserving extrema.
 
 User-facing technical values must be derived from shared contract helpers such as `NeuralInputSizing` and `ModelSizing`, not duplicated formulas.
+
+Recording presets are user-owned, editable snapshots of Record-page settings. Applying a preset must tolerate an unavailable source or deleted destination without inventing an identifier. Library range selection follows the visible folder/search order; bulk manifest moves roll back as a set, and bulk deletion stages all recording directories before cleanup. Global shortcuts may use keyboard keys or any macOS mouse-button number, including additional side buttons, and must remain excluded from recording and human-input safety hooks.
 
 ## Validation and release
 
