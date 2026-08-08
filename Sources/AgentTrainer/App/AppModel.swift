@@ -20,6 +20,9 @@ final class AppModel: ObservableObject {
     @Published var recordingFolders: [RecordingFolder] = []
     @Published var recordingDestinationFolderID: UUID?
     @Published var selectedRecordingID: UUID?
+    @Published var selectedRecordingIDs: Set<UUID> = []
+    @Published private(set) var recordingPresets: [RecordingPreset] = []
+    @Published var selectedRecordingPresetID: UUID?
     @Published var profiles: [AIProfile] = []
     @Published var selectedProfileID: UUID?
     @Published var versions: [ModelVersionManifest] = []
@@ -102,6 +105,7 @@ final class AppModel: ObservableObject {
     private var activeRecordingFolderID: UUID?
     private var activeRecordingExcludedKeyCodes: Set<UInt16> = []
     private var recordingLaunchRevision: UInt64 = 0
+    private var humanHUDStateRevision: UInt64 = 0
     private var agentLaunchRevision: UInt64 = 0
     private var lastEventClock = RecordingClock()
     private var profileAutosaveTask: Task<Void, Never>?
@@ -117,6 +121,7 @@ final class AppModel: ObservableObject {
 
     var selectedSource: CaptureSourceOption? { captureSources.first { $0.id == selectedSourceID && sourceMatchesKind($0) } }
     var selectedRecording: RecordingItem? { recordings.first { $0.id == selectedRecordingID } }
+    var selectedRecordings: [RecordingItem] { recordings.filter { selectedRecordingIDs.contains($0.id) } }
     var selectedProfile: AIProfile? { profiles.first { $0.id == selectedProfileID } }
     var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording || isStoppingRecording }
     var agentIsActiveOrStarting: Bool { isRunning || isStartingAgent }
@@ -148,6 +153,10 @@ final class AppModel: ObservableObject {
         if migratedMouseMode { persistWorkflowSettings() }
         if let data = UserDefaults.standard.data(forKey: "AgentTrainer.Hotkeys"), let saved = try? JSONDecoder().decode(HotkeySettings.self, from: data) { hotkeys = saved }
         if Set([hotkeys.panic, hotkeys.record, hotkeys.run]).count != 3 { hotkeys = HotkeySettings() }
+        if let data = UserDefaults.standard.data(forKey: "AgentTrainer.RecordingPresets"),
+           let saved = try? JSONDecoder().decode([RecordingPreset].self, from: data) {
+            recordingPresets = saved.compactMap { try? $0.validated() }.sorted { $0.createdAt < $1.createdAt }
+        }
         input.ignoredHotkeys = [hotkeys.panic, hotkeys.record, hotkeys.run]
         reenactor.onFinish = { [weak self] reason in Task { @MainActor in self?.isReplaying = false; self?.activityStatus = reason ?? "Reenactment complete" } }
         AppLog.write(category: "Lifecycle", "Application model initialized")
@@ -268,7 +277,15 @@ final class AppModel: ObservableObject {
         }
         profiles = await WorkspaceStore.shared.listProfiles()
         await refreshStorageState()
-        if selectedRecordingID == nil || !recordings.contains(where: { $0.id == selectedRecordingID }) { selectedRecordingID = recordings.first?.id }
+        let validRecordingIDs = Set(recordings.map(\.id))
+        selectedRecordingIDs.formIntersection(validRecordingIDs)
+        if selectedRecordingID.map(validRecordingIDs.contains) != true {
+            selectedRecordingID = recordings.first(where: { selectedRecordingIDs.contains($0.id) })?.id ?? recordings.first?.id
+        }
+        if selectedRecordingIDs.isEmpty, let selectedRecordingID { selectedRecordingIDs = [selectedRecordingID] }
+        else if let selectedRecordingID, !selectedRecordingIDs.contains(selectedRecordingID), let retained = selectedRecordingIDs.first {
+            self.selectedRecordingID = retained
+        }
         if selectedProfileID == nil || !profiles.contains(where: { $0.id == selectedProfileID }) { selectedProfileID = profiles.first?.id }
         if let loaded = versionsLoadedForProfileID {
             if loaded == selectedProfileID { await refreshVersions() }
@@ -303,6 +320,8 @@ final class AppModel: ObservableObject {
         guard !recordingIsActiveOrStarting, !agentIsActiveOrStarting, !isReplaying else { return }
         guard let source = selectedSource else { present(AgentTrainerError.invalidConfiguration("Select a capture source.")); return }
         guard let destinationFolderID = recordingDestinationFolderID else { present(AgentTrainerError.invalidConfiguration("Create or select a recording folder.")); return }
+        guard recordingFolders.contains(where: { $0.id == destinationFolderID }) else { present(AgentTrainerError.invalidConfiguration("The selected recording folder no longer exists.")); return }
+        do { try validateCurrentRecordingSettings(source: source) } catch { present(error); return }
         isStartingRecording = true
         recordingLaunchRevision &+= 1
         let launchToken = recordingLaunchRevision
@@ -325,30 +344,37 @@ final class AppModel: ObservableObject {
                 writer?.append(sample)
                 eventClock.update(sample.timestampNanos)
             }
-            input.onState = { [weak self] state in Task { @MainActor in self?.hudModel.update(state: state, source: .human) } }
+            input.onState = { [weak self] state, revision in
+                Task { @MainActor [weak self] in
+                    guard let self, revision > self.humanHUDStateRevision else { return }
+                    self.humanHUDStateRevision = revision
+                    self.hudModel.update(state: state, source: .human)
+                }
+            }
+            // Install the live surface before either input or ScreenCaptureKit
+            // starts so first-frame held controls cannot be reset by a later
+            // HUD show call.
+            hudModel.show(source: .human, vision: false)
             try input.start()
             guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             try await capture.start(spec: spec, recordingURL: directory.appendingPathComponent("capture.mov"), onFirstFrame: { [weak self, weak writer] nanos in
                 let pointer = CGEvent(source: nil)?.location ?? CGPoint(x: captureRect.midX, y: captureRect.midY)
-                // The global Record chord is commonly still being released on
-                // the first captured frame. Do not seed those shortcut
-                // modifiers as demonstrated controls; later real input events
-                // restore any modifier the user intentionally keeps held.
-                let initialModifiers = CGEventSource.flagsState(.combinedSessionState).rawValue & ~recordingShortcut.cgEventModifiers
-                var initialFilter = RecordingKeyFilter(excludedKeyCodes: excludedKeys)
-                let initialSample = initialFilter.process(InputSample(
-                    timestampNanos: nanos,
-                    kind: .mouseMove,
-                    x: pointer.x,
-                    y: pointer.y,
-                    modifiers: initialModifiers
-                ))
-                if let initialSample { writer?.append(initialSample); eventClock.update(nanos) }
+                // Seed every already-held logical control at the exact first
+                // frame. The Record shortcut itself remains capture-excluded.
+                let initialSamples = self?.input.recordingSeedSamples(timestampNanos: nanos, pointer: pointer, excluding: recordingShortcut) ?? []
+                for sample in initialSamples { writer?.append(sample) }
+                if !initialSamples.isEmpty { eventClock.update(nanos) }
                 clock.set(nanos)
                 Task { @MainActor [weak self] in self?.recordingHostStart = nanos }
+            }, onUnexpectedStop: { [weak self] error in
+                Task { @MainActor [weak self] in
+                    guard let self, self.recordingIsActiveOrStarting else { return }
+                    AppLog.write(.error, category: "Capture", "Recording stream stopped unexpectedly", details: error.localizedDescription)
+                    self.errorMessage = "Screen capture stopped unexpectedly. AgentTrainer is saving every complete frame and input received before the interruption.\n\n\(error.localizedDescription)"
+                    await self.stopRecording()
+                }
             })
             guard recordingLaunchRevision == launchToken else { throw CancellationError() }
-            hudModel.show(source: .human, vision: false)
             isRecording = true; activityStatus = "Recording — live keyboard is capture-excluded"
             AppLog.write(category: "Recording", "Recording started", details: "\(spec.kind.rawValue), \(Int(captureRect.width))×\(Int(captureRect.height)) at \(captureFPS.formatted()) FPS")
         } catch {
@@ -374,7 +400,7 @@ final class AppModel: ObservableObject {
         isStoppingRecording = true
         activityStatus = "Saving recording…"
         defer { isStoppingRecording = false }
-        input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
+        input.stop(flushHeldState: true); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide()
         let eventResult = Result { try eventWriter?.finish() ?? 0 }
         eventWriter = nil
         do {
@@ -392,6 +418,9 @@ final class AppModel: ObservableObject {
             await createThumbnail(for: directory.appendingPathComponent("capture.mov"), at: max(0, min(duration * 0.25, 2)), destination: directory.appendingPathComponent("thumbnail.jpg"))
             activityStatus = "Recording saved"
             AppLog.write(category: "Recording", "Recording saved", details: "\(eventCount) input events, \(result.width)×\(result.height), \(duration.formatted(.number.precision(.fractionLength(2)))) seconds")
+            if result.droppedFrameCount > 0 {
+                AppLog.write(.warning, category: "Recording", "Skipped unusable or backpressured capture frames", details: "\(result.droppedFrameCount) frames; input timing and the remaining HEVC timeline were preserved")
+            }
         } catch { try? FileManager.default.removeItem(at: directory); present(error) }
         isRecording = false; recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []; recordingClock = RecordingClock(); lastEventClock = RecordingClock(); await refreshLibrary()
     }
@@ -401,12 +430,33 @@ final class AppModel: ObservableObject {
             let nextSelection = recordings.first(where: { $0.id != item.id })?.id
             try await WorkspaceStore.shared.deleteRecording(item)
             if selectedRecordingID == item.id { selectedRecordingID = nextSelection }
+            selectedRecordingIDs.remove(item.id)
             await refreshLibrary()
             activityStatus = "Recording deleted"
         } catch { present(error) }
     }
     func renameRecording(_ item: RecordingItem, name: String) async { do { try await WorkspaceStore.shared.renameRecording(item, to: name); await refreshLibrary() } catch { present(error) } }
     func moveRecording(_ item: RecordingItem, to folderID: UUID?) async { do { try await WorkspaceStore.shared.assignRecording(item, to: folderID); await refreshLibrary() } catch { present(error) } }
+    func deleteRecordings(_ items: [RecordingItem]) async {
+        guard !items.isEmpty else { return }
+        do {
+            let ids = Set(items.map(\.id))
+            try await WorkspaceStore.shared.deleteRecordings(items)
+            selectedRecordingIDs.subtract(ids)
+            if selectedRecordingID.map(ids.contains) == true { selectedRecordingID = nil }
+            await refreshLibrary()
+            activityStatus = "\(items.count) recordings deleted"
+        } catch { present(error) }
+    }
+    func moveRecordings(_ items: [RecordingItem], to folderID: UUID) async {
+        guard !items.isEmpty else { return }
+        do {
+            try await WorkspaceStore.shared.assignRecordings(items, to: folderID)
+            await refreshLibrary()
+            selectedRecordingIDs.formUnion(items.map(\.id))
+            activityStatus = "Moved \(items.count) recordings"
+        } catch { present(error) }
+    }
     func createRecordingFolder(name: String = "New Folder") async {
         do { let folder = RecordingFolder(id: UUID(), name: name, createdAt: Date()); try await WorkspaceStore.shared.saveRecordingFolder(folder); recordingDestinationFolderID = folder.id; await refreshLibrary() } catch { present(error) }
     }
@@ -843,6 +893,75 @@ final class AppModel: ObservableObject {
     func suspendGlobalHotkeys() { panicHotkey.stop(); recordHotkey.stop(); runHotkey.stop() }
     func resumeGlobalHotkeys() { panicHotkey.start(); recordHotkey.start(); runHotkey.start() }
 
+    func createRecordingPreset(name: String) {
+        do {
+            let preset = try currentRecordingPreset(id: UUID(), name: name, createdAt: Date()).validated()
+            guard !recordingPresets.contains(where: { $0.name.localizedCaseInsensitiveCompare(preset.name) == .orderedSame }) else {
+                throw AgentTrainerError.invalidConfiguration("A recording preset with that name already exists.")
+            }
+            recordingPresets.append(preset)
+            recordingPresets.sort { $0.createdAt < $1.createdAt }
+            selectedRecordingPresetID = preset.id
+            persistRecordingPresets()
+            activityStatus = "Recording preset created"
+        } catch { present(error) }
+    }
+
+    func updateRecordingPreset(_ preset: RecordingPreset, name: String) {
+        do {
+            let updated = try currentRecordingPreset(id: preset.id, name: name, createdAt: preset.createdAt).validated()
+            guard !recordingPresets.contains(where: { $0.id != preset.id && $0.name.localizedCaseInsensitiveCompare(updated.name) == .orderedSame }) else {
+                throw AgentTrainerError.invalidConfiguration("A recording preset with that name already exists.")
+            }
+            guard let index = recordingPresets.firstIndex(where: { $0.id == preset.id }) else {
+                throw AgentTrainerError.invalidConfiguration("That recording preset no longer exists.")
+            }
+            recordingPresets[index] = updated
+            selectedRecordingPresetID = updated.id
+            persistRecordingPresets()
+            activityStatus = "Recording preset updated"
+        } catch { present(error) }
+    }
+
+    func applyRecordingPreset(_ preset: RecordingPreset) {
+        do {
+            let preset = try preset.validated()
+            captureKind = preset.captureKind
+            captureFPS = preset.captureFPS
+            showsCursor = preset.showsCursor
+            regionX = preset.region.x; regionY = preset.region.y
+            regionWidth = preset.region.width; regionHeight = preset.region.height
+            recordingTrimStart = preset.trimStart; recordingTrimEnd = preset.trimEnd
+            recordingExcludedKeyCodes = preset.excludedKeyCodes
+            let sourceAvailable = preset.selectedSourceID.flatMap { id in
+                captureSources.first { source in
+                    source.id == id && sourceMatchesKind(source)
+                }
+            }
+            selectedSourceID = sourceAvailable?.id
+            var unavailable: [String] = []
+            if sourceAvailable == nil, preset.selectedSourceID != nil { unavailable.append("capture source") }
+            if let folderID = preset.destinationFolderID,
+               recordingFolders.contains(where: { $0.id == folderID }) {
+                recordingDestinationFolderID = folderID
+            } else {
+                recordingDestinationFolderID = nil
+                if preset.destinationFolderID != nil { unavailable.append("destination folder") }
+            }
+            selectedRecordingPresetID = preset.id
+            activityStatus = unavailable.isEmpty
+                ? "Recording preset applied"
+                : "Preset applied; choose a current \(unavailable.joined(separator: " and "))"
+        } catch { present(error) }
+    }
+
+    func deleteRecordingPreset(_ preset: RecordingPreset) {
+        recordingPresets.removeAll { $0.id == preset.id }
+        if selectedRecordingPresetID == preset.id { selectedRecordingPresetID = nil }
+        persistRecordingPresets()
+        activityStatus = "Recording preset deleted"
+    }
+
     func selectScreenRegion() {
         guard captureKind == .screenRegion, let source = selectedSource else { return }
         regionSelector.select(on: source.frame) { [weak self] rect in
@@ -858,6 +977,50 @@ final class AppModel: ObservableObject {
         if source.kind == .display { spec.displayID = source.id } else { spec.windowID = source.id }
         if captureKind == .screenRegion || captureKind == .windowRegion { spec.region = CodableRect(CGRect(x: regionX, y: regionY, width: regionWidth, height: regionHeight)) }
         return spec
+    }
+
+    private func validateCurrentRecordingSettings(source: CaptureSourceOption) throws {
+        guard captureFPS.isFinite, (1...240).contains(captureFPS) else {
+            throw AgentTrainerError.invalidConfiguration("Capture FPS must be from 1 through 240.")
+        }
+        guard recordingTrimStart.isFinite, recordingTrimEnd.isFinite,
+              recordingTrimStart >= 0, recordingTrimEnd >= 0 else {
+            throw AgentTrainerError.invalidConfiguration("Recording trim values must be finite and non-negative.")
+        }
+        if captureKind == .screenRegion || captureKind == .windowRegion {
+            guard [regionX, regionY, regionWidth, regionHeight].allSatisfy(\.isFinite),
+                  regionWidth > 0, regionHeight > 0 else {
+                throw AgentTrainerError.invalidConfiguration("The capture region must have finite coordinates and positive width and height.")
+            }
+        }
+        let rect = effectiveCaptureRect(source)
+        guard !rect.isNull, !rect.isEmpty,
+              [rect.minX, rect.minY, rect.width, rect.height].allSatisfy(\.isFinite) else {
+            throw AgentTrainerError.invalidConfiguration("The selected capture source and region do not produce a usable area.")
+        }
+    }
+
+    private func currentRecordingPreset(id: UUID, name: String, createdAt: Date) -> RecordingPreset {
+        RecordingPreset(
+            id: id,
+            name: name,
+            createdAt: createdAt,
+            captureKind: captureKind,
+            selectedSourceID: selectedSourceID,
+            destinationFolderID: recordingDestinationFolderID,
+            captureFPS: captureFPS,
+            showsCursor: showsCursor,
+            region: CodableRect(CGRect(x: regionX, y: regionY, width: regionWidth, height: regionHeight)),
+            trimStart: recordingTrimStart,
+            trimEnd: recordingTrimEnd,
+            excludedKeyCodes: recordingExcludedKeyCodes
+        )
+    }
+
+    private func persistRecordingPresets() {
+        if let data = try? JSONEncoder().encode(recordingPresets) {
+            UserDefaults.standard.set(data, forKey: "AgentTrainer.RecordingPresets")
+        }
     }
 
     private func effectiveCaptureRect(_ source: CaptureSourceOption) -> CGRect {

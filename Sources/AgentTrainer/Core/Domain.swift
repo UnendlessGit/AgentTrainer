@@ -59,6 +59,49 @@ struct CaptureSpec: Codable, Hashable, Sendable {
     var showsCursor = false
 }
 
+/// A user-owned snapshot of the complete Record-page configuration. Source and
+/// destination identifiers are retained when they still exist, while portable
+/// capture values (FPS, region, trimming, cursor, and input exclusions) always
+/// remain applicable on another display or after a library move.
+struct RecordingPreset: Codable, Hashable, Identifiable, Sendable {
+    var id: UUID
+    var name: String
+    var createdAt: Date
+    var captureKind: CaptureKind
+    var selectedSourceID: UInt32? = nil
+    var destinationFolderID: UUID? = nil
+    var captureFPS: Double
+    var showsCursor: Bool
+    var region: CodableRect
+    var trimStart: Double
+    var trimEnd: Double
+    var excludedKeyCodes: Set<UInt16>
+
+    func validated() throws -> Self {
+        var value = self
+        value.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.name.isEmpty else {
+            throw AgentTrainerError.invalidConfiguration("Recording preset names cannot be empty.")
+        }
+        guard captureFPS.isFinite, (1...240).contains(captureFPS) else {
+            throw AgentTrainerError.invalidConfiguration("Recording presets require an FPS from 1 through 240.")
+        }
+        guard trimStart.isFinite, trimEnd.isFinite, trimStart >= 0, trimEnd >= 0 else {
+            throw AgentTrainerError.invalidConfiguration("Recording preset trim values must be finite and non-negative.")
+        }
+        let rect = region.cgRect
+        guard rect.origin.x.isFinite, rect.origin.y.isFinite,
+              rect.width.isFinite, rect.height.isFinite else {
+            throw AgentTrainerError.invalidConfiguration("Recording presets require finite region values.")
+        }
+        if captureKind == .screenRegion || captureKind == .windowRegion,
+           (rect.width <= 0 || rect.height <= 0) {
+            throw AgentTrainerError.invalidConfiguration("Region recording presets require a positive width and height.")
+        }
+        return value
+    }
+}
+
 enum ColorMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case grayscale = "Grayscale"
     case color = "Color"
@@ -216,10 +259,10 @@ enum ModelContract {
 /// a data-only correction can invalidate caches/checkpoints without needlessly
 /// changing tensor shapes. Policy v5 itself is an intentional weight break.
 enum TrainingDataContract {
-    /// Version 8 stores full- and reduced-resolution copies of each perception,
-    /// causal frame-sequence mappings, and complete per-frame controls. Version
-    /// 7's sub-tick tap and modifier ownership semantics remain unchanged.
-    static let schemaVersion = 8
+    /// Version 9 samples held/static video at the configured perception cadence
+    /// instead of letting ScreenCaptureKit idle gaps collapse temporal context.
+    /// Version 8's causal frame/control layout remains unchanged.
+    static let schemaVersion = 9
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -919,10 +962,17 @@ struct AgentSafetyPolicy: Codable, Hashable, Sendable {
 struct HotkeyBinding: Codable, Hashable, Sendable {
     var keyCode: UInt32
     var carbonModifiers: UInt32
+    /// Nil is a keyboard shortcut. A value is the zero-based macOS mouse-button
+    /// number, including middle and additional side buttons.
+    var mouseButton: UInt8? = nil
 
     static let panic = HotkeyBinding(keyCode: 53, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
     static let record = HotkeyBinding(keyCode: 15, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
     static let run = HotkeyBinding(keyCode: 0, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
+
+    static func mouse(_ button: UInt8, carbonModifiers: UInt32 = 0) -> Self {
+        HotkeyBinding(keyCode: 0, carbonModifiers: carbonModifiers, mouseButton: button)
+    }
 }
 
 struct HotkeySettings: Codable, Hashable, Sendable {

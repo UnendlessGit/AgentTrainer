@@ -20,6 +20,7 @@ struct CaptureResult: Sendable {
     let width: Int
     let height: Int
     let firstFrameHostNanos: UInt64
+    let droppedFrameCount: Int
 }
 
 enum CaptureFrameDisposition: Equatable, Sendable {
@@ -80,10 +81,17 @@ final class CaptureService: NSObject, @unchecked Sendable {
             throw AgentTrainerError.invalidConfiguration("Capture dimensions must be finite, positive, and no larger than 16,384 pixels per side.")
         }
         let config = SCStreamConfiguration()
-        config.width = max(1, Int(outputWidth))
-        config.height = max(1, Int(outputHeight))
+        let roundedWidth = max(1, Int(outputWidth.rounded()))
+        let roundedHeight = max(1, Int(outputHeight.rounded()))
+        // Hardware HEVC encoders require an even luma grid on some Apple-silicon
+        // generations. Normalize only saved video; exact model capture remains at
+        // its immutable requested dimensions.
+        config.width = recordingURL == nil ? roundedWidth : max(2, roundedWidth - roundedWidth % 2)
+        config.height = recordingURL == nil ? roundedHeight : max(2, roundedHeight - roundedHeight % 2)
         config.minimumFrameInterval = CMTime(seconds: 1 / spec.requestedFPS, preferredTimescale: 1_000_000_000)
-        config.queueDepth = max(1, queueDepth)
+        // ScreenCaptureKit documents eight surfaces as the practical upper
+        // bound. Keeping the queue bounded avoids runaway IOSurface retention.
+        config.queueDepth = min(8, max(1, queueDepth))
         config.showsCursor = spec.showsCursor
         config.capturesAudio = false
         config.pixelFormat = kCVPixelFormatType_32BGRA
@@ -112,7 +120,7 @@ final class CaptureService: NSObject, @unchecked Sendable {
     }
 
     func stop() async throws -> CaptureResult {
-        guard isRunning, let stream else { return CaptureResult(duration: 0, deliveredFPS: 0, frameCount: 0, width: Int(activeDimensions.width), height: Int(activeDimensions.height), firstFrameHostNanos: 0) }
+        guard isRunning, let stream else { return CaptureResult(duration: 0, deliveredFPS: 0, frameCount: 0, width: Int(activeDimensions.width), height: Int(activeDimensions.height), firstFrameHostNanos: 0, droppedFrameCount: 0) }
         var stopError: Error?
         do { try await stream.stopCapture() } catch { stopError = error }
         if let output { try? stream.removeStreamOutput(output, type: .screen) }
@@ -120,6 +128,7 @@ final class CaptureService: NSObject, @unchecked Sendable {
         isRunning = false
         self.stream = nil
         let firstFrameHostNanos = output?.firstFrameHostNanos ?? 0
+        let droppedCaptureFrames = output?.droppedFrames ?? 0
         self.output = nil
         let dimensions = activeDimensions
         activeDimensions = .zero
@@ -128,12 +137,18 @@ final class CaptureService: NSObject, @unchecked Sendable {
             // failed encoder cannot leave this CaptureService half-stopped.
             self.writer = nil
             let result = try await writer.finish()
-            if let stopError { throw stopError }
-            return CaptureResult(duration: result.duration, deliveredFPS: result.deliveredFPS, frameCount: result.frames, width: Int(dimensions.width), height: Int(dimensions.height), firstFrameHostNanos: firstFrameHostNanos)
+            if let stopError {
+                // A ScreenCaptureKit interruption can still leave a complete,
+                // finalized HEVC asset. Preserve that recording and surface the
+                // interruption through the delegate/log instead of deleting all
+                // data received before it.
+                AppLog.write(.warning, category: "Capture", "Capture stop reported an error after video finalization", details: stopError.localizedDescription)
+            }
+            return CaptureResult(duration: result.duration, deliveredFPS: result.deliveredFPS, frameCount: result.frames, width: Int(dimensions.width), height: Int(dimensions.height), firstFrameHostNanos: firstFrameHostNanos, droppedFrameCount: droppedCaptureFrames + writer.droppedFrameCount)
         }
         self.writer = nil
         if let stopError { throw stopError }
-        return CaptureResult(duration: 0, deliveredFPS: 0, frameCount: 0, width: Int(dimensions.width), height: Int(dimensions.height), firstFrameHostNanos: firstFrameHostNanos)
+        return CaptureResult(duration: 0, deliveredFPS: 0, frameCount: 0, width: Int(dimensions.width), height: Int(dimensions.height), firstFrameHostNanos: firstFrameHostNanos, droppedFrameCount: droppedCaptureFrames)
     }
 
     private func makeFilterAndGeometry(spec: CaptureSpec, content: SCShareableContent) throws -> (filter: SCContentFilter, pixelSize: CGSize, sourceRect: CGRect?) {
@@ -198,7 +213,8 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @u
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sampleBuffer.isValid else { return }
+        guard type == .screen else { return }
+        guard sampleBuffer.isValid else { droppedFrames += 1; return }
         let status = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])
             .flatMap { $0.first?[.status] as? Int }
             .flatMap(SCFrameStatus.init(rawValue:))

@@ -437,6 +437,65 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(try InputEventReader.read(url: url), [expected])
     }
 
+    func testInputEventWriterKeepsConcurrentHostTimesMonotonic() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("events-monotonic-\(UUID().uuidString).atrevents")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = try InputEventWriter(url: url)
+        writer.append(InputSample(timestampNanos: 20, kind: .key, keyCode: 49, isDown: true))
+        writer.append(InputSample(timestampNanos: 19, kind: .key, keyCode: 49, isDown: false))
+        _ = try writer.finish()
+        XCTAssertEqual(try InputEventReader.read(url: url).map(\.timestampNanos), [20, 20])
+    }
+
+    func testInputEventFilePreservesEveryKeyAndExtendedMouseInputField() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("all-inputs-\(UUID().uuidString).atrevents")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = try InputEventWriter(url: url)
+        var expected: [InputSample] = []
+        var timestamp: UInt64 = 1
+        for keyCode in UInt16(0)..<128 {
+            expected.append(InputSample(timestampNanos: timestamp, kind: .key, keyCode: keyCode, isDown: true))
+            timestamp += 1
+            expected.append(InputSample(timestampNanos: timestamp, kind: .key, keyCode: keyCode, isDown: false))
+            timestamp += 1
+        }
+        let modifierSamples = [
+            InputSample(timestampNanos: timestamp, kind: .flags, keyCode: 56, modifiers: CGEventFlags.maskShift.rawValue, isDown: true),
+            InputSample(timestampNanos: timestamp + 1, kind: .flags, keyCode: 56, modifiers: 0, isDown: false)
+        ]
+        expected += modifierSamples
+        timestamp += 2
+        for button in UInt8(0)..<32 {
+            expected.append(InputSample(timestampNanos: timestamp, kind: .mouseButton, x: 100, y: 200, button: button, isDown: true))
+            timestamp += 1
+            expected.append(InputSample(timestampNanos: timestamp, kind: .mouseButton, x: 101, y: 201, button: button, isDown: false))
+            timestamp += 1
+        }
+        expected.append(InputSample(timestampNanos: timestamp, kind: .mouseMove, x: 300, y: 400, deltaX: -12, deltaY: 9))
+        expected.append(InputSample(timestampNanos: timestamp + 1, kind: .scroll, x: 300, y: 400, scrollX: 1.25, scrollY: -6.5))
+        for sample in expected { writer.append(sample) }
+        XCTAssertEqual(try writer.finish(), expected.count)
+        XCTAssertEqual(try InputEventReader.read(url: url), expected)
+    }
+
+    func testRecordingPresetValidationAndLegacyKeyboardHotkeyDecoding() throws {
+        let preset = RecordingPreset(
+            id: UUID(), name: "  Gameplay  ", createdAt: Date(), captureKind: .screenRegion,
+            captureFPS: 120, showsCursor: false,
+            region: CodableRect(CGRect(x: 10, y: 20, width: 800, height: 450)),
+            trimStart: 0.25, trimEnd: 0.5, excludedKeyCodes: [49, 56]
+        )
+        XCTAssertEqual(try preset.validated().name, "Gameplay")
+        var invalid = preset
+        invalid.captureFPS = .nan
+        XCTAssertThrowsError(try invalid.validated())
+
+        let legacy = Data("{\"keyCode\":15,\"carbonModifiers\":6400}".utf8)
+        let binding = try JSONDecoder().decode(HotkeyBinding.self, from: legacy)
+        XCTAssertNil(binding.mouseButton)
+        XCTAssertEqual(binding.keyCode, 15)
+    }
+
     func testInputEventReaderRejectsUnsupportedAndTruncatedFiles() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("invalid-events-\(UUID().uuidString).atrevents")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -598,6 +657,35 @@ final class DomainTests: XCTestCase {
         let foldersAfter = await store.listRecordingFolders()
         XCTAssertTrue(recordingsAfter.isEmpty)
         XCTAssertTrue(foldersAfter.isEmpty)
+    }
+
+    func testBulkRecordingMoveAndDeletionAreAllOrNothingAtTheLibraryBoundary() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("workspace-bulk-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let source = RecordingFolder(id: UUID(), name: "Source", createdAt: Date())
+        let destination = RecordingFolder(id: UUID(), name: "Destination", createdAt: Date().addingTimeInterval(1))
+        try await store.saveRecordingFolder(source)
+        try await store.saveRecordingFolder(destination)
+        var created: [RecordingItem] = []
+        for index in 0..<3 {
+            let id = UUID()
+            let directory = try await store.createRecordingDirectory(id: id)
+            let manifest = RecordingManifest(
+                id: id, name: "Recording \(index)", createdAt: Date(), hostStartNanos: 1, duration: 1,
+                capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 100, height: 100)),
+                pixelWidth: 100, pixelHeight: 100, deliveredFPS: 60, eventCount: 0, folderID: source.id
+            )
+            try await store.writeRecording(manifest, to: directory)
+            created.append(RecordingItem(manifest: manifest, directory: directory))
+        }
+        try await store.assignRecordings(created, to: destination.id)
+        let moved = await store.listRecordings()
+        XCTAssertEqual(Set(moved.compactMap { $0.manifest.folderID }), [destination.id])
+        try await store.deleteRecordings(moved)
+        let remaining = await store.listRecordings()
+        XCTAssertTrue(remaining.isEmpty)
     }
 
     func testLegacyInvalidRecordingIsRecoveredBeforeStrictLibraryScanWithoutTouchingSources() async throws {
@@ -1163,6 +1251,301 @@ final class DomainTests: XCTestCase {
         let normalKey = InputSample(timestampNanos: 10, kind: .key, keyCode: 0, modifiers: control, isDown: true)
         XCTAssertTrue(filter.process(normalFlags).isEmpty)
         XCTAssertEqual(filter.process(normalKey), [normalFlags, normalKey])
+    }
+
+    func testMouseSideButtonHotkeyAndItsModifiersAreRemovedFromCapture() {
+        let control = UInt32(1 << 12)
+        let binding = HotkeyBinding.mouse(4, carbonModifiers: control)
+        var filter = HotkeyInputFilter(bindings: [binding])
+        let flags = CGEventFlags.maskControl.rawValue
+        let samples = [
+            InputSample(timestampNanos: 1, kind: .flags, modifiers: flags),
+            InputSample(timestampNanos: 2, kind: .mouseButton, button: 4, modifiers: flags, isDown: true),
+            InputSample(timestampNanos: 3, kind: .mouseButton, button: 4, modifiers: flags, isDown: false),
+            InputSample(timestampNanos: 4, kind: .flags, modifiers: 0)
+        ]
+        XCTAssertTrue(samples.flatMap { filter.process($0) }.isEmpty)
+        XCTAssertEqual(binding.displayName, "Mouse 5")
+    }
+
+    func testGlobalShortcutSuppressionEndsWithItsPhysicalLifecycleAndPreservesForeignInput() {
+        let suppression = HotkeySuppression()
+        let binding = HotkeyBinding.record
+        let shortcutModifiers = binding.cgEventModifiers
+        let shift = CGEventFlags.maskShift.rawValue
+        let trigger = UInt16(binding.keyCode)
+
+        suppression.activate(binding)
+        XCTAssertEqual(
+            suppression.process(InputSample(timestampNanos: 1, kind: .key, keyCode: trigger, modifiers: shortcutModifiers, isDown: true)),
+            .suppress(binding)
+        )
+        let foreignFlags = suppression.process(InputSample(
+            timestampNanos: 2,
+            kind: .flags,
+            keyCode: 56,
+            modifiers: shortcutModifiers | shift,
+            isDown: true
+        ))
+        guard case let .pass(sanitizedFlags) = foreignFlags else {
+            return XCTFail("Shift must survive shortcut-modifier suppression")
+        }
+        XCTAssertEqual(sanitizedFlags.modifiers & HotkeyBinding.cgModifierMask, shift)
+
+        let foreignKey = suppression.process(InputSample(
+            timestampNanos: 3,
+            kind: .key,
+            keyCode: 0,
+            modifiers: shortcutModifiers | shift,
+            isDown: true
+        ))
+        guard case let .pass(sanitizedKey) = foreignKey else {
+            return XCTFail("An unrelated key must not be suppressed")
+        }
+        XCTAssertEqual(sanitizedKey.modifiers & HotkeyBinding.cgModifierMask, shift)
+
+        XCTAssertEqual(
+            suppression.process(InputSample(timestampNanos: 4, kind: .key, keyCode: trigger, modifiers: shortcutModifiers | shift, isDown: false)),
+            .suppress(binding)
+        )
+        guard case let .pass(remainingShift) = suppression.process(InputSample(
+            timestampNanos: 5,
+            kind: .flags,
+            keyCode: 55,
+            modifiers: shift
+        )) else {
+            return XCTFail("The foreign held modifier must be preserved")
+        }
+        XCTAssertEqual(remainingShift.modifiers & HotkeyBinding.cgModifierMask, shift)
+
+        // The shortcut is now fully released. A later standalone Shift release
+        // occurs inside the old one-second window but must pass untouched.
+        let shiftRelease = InputSample(timestampNanos: 6, kind: .flags, keyCode: 56, modifiers: 0)
+        XCTAssertEqual(suppression.process(shiftRelease), .pass(shiftRelease))
+
+        let mouseSuppression = HotkeySuppression()
+        let mouseBinding = HotkeyBinding.mouse(15)
+        mouseSuppression.activate(mouseBinding)
+        XCTAssertEqual(mouseSuppression.process(InputSample(timestampNanos: 7, kind: .mouseButton, button: 15, isDown: true)), .suppress(mouseBinding))
+        XCTAssertEqual(mouseSuppression.process(InputSample(timestampNanos: 8, kind: .mouseButton, button: 15, isDown: false)), .suppress(mouseBinding))
+        XCTAssertEqual(mouseSuppression.process(shiftRelease), .pass(shiftRelease))
+    }
+
+    func testShortcutFilteringPreservesASeparatelyHeldModifierAcrossTheShortcut() {
+        let binding = HotkeyBinding.record
+        let shortcut = binding.cgEventModifiers
+        let shift = CGEventFlags.maskShift.rawValue
+        var filter = HotkeyInputFilter(bindings: [binding])
+        let shiftDown = InputSample(timestampNanos: 1, kind: .flags, keyCode: 56, modifiers: shift, isDown: true)
+        XCTAssertTrue(filter.process(shiftDown).isEmpty)
+        XCTAssertTrue(filter.process(InputSample(timestampNanos: 2, kind: .flags, modifiers: shift | CGEventFlags.maskControl.rawValue)).isEmpty)
+        XCTAssertTrue(filter.process(InputSample(timestampNanos: 3, kind: .flags, modifiers: shift | shortcut)).isEmpty)
+
+        let triggerDown = InputSample(
+            timestampNanos: 4,
+            kind: .key,
+            keyCode: UInt16(binding.keyCode),
+            modifiers: shift | shortcut,
+            isDown: true
+        )
+        let preserved = filter.processGloballySuppressed(triggerDown, shortcut: binding)
+        XCTAssertEqual(preserved.count, 1)
+        XCTAssertEqual(preserved[0].timestampNanos, shiftDown.timestampNanos)
+        XCTAssertEqual(preserved[0].modifiers & HotkeyBinding.cgModifierMask, shift)
+
+        let triggerUp = InputSample(
+            timestampNanos: 5,
+            kind: .key,
+            keyCode: UInt16(binding.keyCode),
+            modifiers: shift | shortcut,
+            isDown: false
+        )
+        XCTAssertTrue(filter.processGloballySuppressed(triggerUp, shortcut: binding).isEmpty)
+        XCTAssertTrue(filter.processGloballySuppressed(
+            InputSample(timestampNanos: 6, kind: .flags, modifiers: shift),
+            shortcut: binding
+        ).isEmpty)
+        let shiftUp = InputSample(timestampNanos: 7, kind: .flags, keyCode: 56, modifiers: 0, isDown: false)
+        XCTAssertEqual(filter.process(shiftUp), [shiftUp])
+    }
+
+    func testImmediateInputStateTracksEveryKeyModifierAndMouseControl() {
+        var timestamp: UInt64 = 1
+        var tracker = InputStateTracker()
+        let modifierCodes: Set<UInt16> = PhysicalInputSnapshot.modifierKeyCodes
+
+        for keyCode in UInt16(0)..<128 where !modifierCodes.contains(keyCode) {
+            XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .key, keyCode: keyCode, isDown: true)))
+            XCTAssertTrue(tracker.state.keys.contains(keyCode), "Key \(keyCode) did not enter held state")
+            timestamp += 1
+            XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .key, keyCode: keyCode, isDown: false)))
+            XCTAssertFalse(tracker.state.keys.contains(keyCode), "Key \(keyCode) remained held")
+            timestamp += 1
+        }
+
+        let modifierPairs: [([UInt16], UInt64)] = [
+            ([56, 60], CGEventFlags.maskShift.rawValue),
+            ([59, 62], CGEventFlags.maskControl.rawValue),
+            ([58, 61], CGEventFlags.maskAlternate.rawValue),
+            ([55, 54], CGEventFlags.maskCommand.rawValue)
+        ]
+        for (codes, mask) in modifierPairs {
+            XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .flags, keyCode: codes[0], modifiers: mask, isDown: true)))
+            XCTAssertTrue(tracker.state.keys.contains(codes[0]))
+            timestamp += 1
+            XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .flags, keyCode: codes[1], modifiers: mask, isDown: true)))
+            XCTAssertTrue(tracker.state.keys.isSuperset(of: codes))
+            timestamp += 1
+            XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .flags, keyCode: codes[0], modifiers: mask, isDown: false)))
+            XCTAssertFalse(tracker.state.keys.contains(codes[0]))
+            XCTAssertTrue(tracker.state.keys.contains(codes[1]))
+            timestamp += 1
+            XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .flags, keyCode: codes[1], modifiers: 0, isDown: false)))
+            XCTAssertTrue(tracker.state.keys.isDisjoint(with: codes))
+            timestamp += 1
+        }
+
+        for button in UInt8(0)..<32 {
+            XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .mouseButton, x: 20, y: 30, button: button, isDown: true)))
+            XCTAssertTrue(tracker.state.buttons.contains(button), "Mouse button \(button) did not enter held state")
+            timestamp += 1
+            XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .mouseButton, x: 20, y: 30, button: button, isDown: false)))
+            XCTAssertFalse(tracker.state.buttons.contains(button), "Mouse button \(button) remained held")
+            timestamp += 1
+        }
+
+        XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .mouseMove, x: 50, y: 60, deltaX: 4, deltaY: -3)))
+        XCTAssertEqual(tracker.state.mouseDelta, CGSize(width: 4, height: -3))
+        XCTAssertEqual(tracker.pointer, CGPoint(x: 50, y: 60))
+        timestamp += 1
+        XCTAssertTrue(tracker.consume(InputSample(timestampNanos: timestamp, kind: .scroll, x: 51, y: 61, scrollX: 2.5, scrollY: -7.5)))
+        XCTAssertEqual(tracker.state.mouseDelta, .zero)
+        XCTAssertEqual(tracker.state.scrollDelta, CGSize(width: 2.5, height: -7.5))
+        XCTAssertTrue(tracker.clearTransientDeltas())
+        XCTAssertEqual(tracker.state.scrollDelta, .zero)
+
+        let stale = InputSample(timestampNanos: timestamp - 1, kind: .key, keyCode: 49, isDown: true)
+        XCTAssertFalse(tracker.consume(stale))
+        XCTAssertFalse(tracker.state.keys.contains(49))
+    }
+
+    func testFlagOnlyKeyboardEventsNormalizeWithoutLosingCapsLockOrFn() {
+        let shift = InputCaptureService.normalizedFlagsChangedSamples(
+            timestampNanos: 10,
+            keyCode: 56,
+            modifiers: CGEventFlags.maskShift.rawValue,
+            isPhysicallyDown: true
+        )
+        XCTAssertEqual(shift.count, 1)
+        XCTAssertEqual(shift[0].kind, .flags)
+        XCTAssertTrue(shift[0].isDown)
+
+        let caps = InputCaptureService.normalizedFlagsChangedSamples(
+            timestampNanos: 20,
+            keyCode: 57,
+            modifiers: CGEventFlags.maskAlphaShift.rawValue,
+            isPhysicallyDown: true
+        )
+        XCTAssertEqual(caps.map(\.kind), [.key, .key])
+        XCTAssertEqual(caps.map(\.keyCode), [57, 57])
+        XCTAssertEqual(caps.map(\.isDown), [true, false])
+        XCTAssertEqual(caps.map(\.timestampNanos), [20, 21])
+
+        let function = InputCaptureService.normalizedFlagsChangedSamples(
+            timestampNanos: 30,
+            keyCode: 63,
+            modifiers: CGEventFlags.maskSecondaryFn.rawValue,
+            isPhysicallyDown: true
+        )
+        XCTAssertEqual(function.count, 1)
+        XCTAssertEqual(function[0].kind, .key)
+        XCTAssertEqual(function[0].keyCode, 63)
+        XCTAssertTrue(function[0].isDown)
+    }
+
+    func testLiveModifierStateIsImmediateWhilePersistedShortcutDecisionRemainsLossless() {
+        let shift = CGEventFlags.maskShift.rawValue
+        let shiftDown = InputSample(timestampNanos: 1, kind: .flags, keyCode: 56, modifiers: shift, isDown: true)
+        let keyDown = InputSample(timestampNanos: 2, kind: .key, keyCode: 0, modifiers: shift, isDown: true)
+        let keyUp = InputSample(timestampNanos: 3, kind: .key, keyCode: 0, modifiers: shift, isDown: false)
+        let shiftUp = InputSample(timestampNanos: 4, kind: .flags, keyCode: 56, modifiers: 0, isDown: false)
+
+        var live = InputStateTracker()
+        var persisted = HotkeyInputFilter(bindings: [.record])
+        XCTAssertTrue(live.consume(shiftDown))
+        XCTAssertTrue(live.state.keys.contains(56), "The live HUD must show Shift on key-down, not key-up")
+        XCTAssertTrue(persisted.process(shiftDown).isEmpty, "Persistence may delay a modifier while deciding whether it starts a shortcut")
+        XCTAssertEqual(persisted.process(keyDown), [shiftDown, keyDown])
+        XCTAssertEqual(persisted.process(keyUp), [keyUp])
+        XCTAssertEqual(persisted.process(shiftUp), [shiftUp])
+        XCTAssertTrue(live.consume(shiftUp))
+        XCTAssertFalse(live.state.keys.contains(56))
+
+        var seededPersistence = HotkeyInputFilter(bindings: [.record])
+        seededPersistence.primePersistedModifiers(shift)
+        XCTAssertEqual(seededPersistence.process(shiftUp), [shiftUp], "A modifier seeded at the first frame must release at its real timestamp")
+    }
+
+    func testTerminalReleaseBalancingCoversKeysModifiersAndExtraMouseButtons() {
+        let shift = CGEventFlags.maskShift.rawValue
+        var tracker = InputStateTracker()
+        tracker.consume(InputSample(timestampNanos: 10, kind: .flags, keyCode: 56, modifiers: shift, isDown: true))
+        tracker.consume(InputSample(timestampNanos: 11, kind: .key, keyCode: 49, modifiers: shift, isDown: true))
+        tracker.consume(InputSample(timestampNanos: 12, kind: .mouseButton, x: 80, y: 90, button: 15, modifiers: shift, isDown: true))
+        let releases = tracker.terminalReleaseSamples(at: 20)
+        XCTAssertEqual(Set(releases.map(\.timestampNanos)), [20])
+        XCTAssertTrue(releases.contains { $0.kind == .key && $0.keyCode == 49 && !$0.isDown })
+        XCTAssertTrue(releases.contains { $0.kind == .mouseButton && $0.button == 15 && !$0.isDown && $0.x == 80 && $0.y == 90 })
+        XCTAssertTrue(releases.contains { $0.kind == .flags && $0.modifiers & HotkeyBinding.cgModifierMask == 0 })
+
+        var missedModifierRelease = InputStateTracker()
+        missedModifierRelease.consume(InputSample(timestampNanos: 30, kind: .flags, keyCode: 56, modifiers: shift, isDown: true))
+        missedModifierRelease.consume(InputSample(timestampNanos: 31, kind: .mouseMove, modifiers: 0))
+        XCTAssertTrue(missedModifierRelease.terminalReleaseSamples(at: 40).contains {
+            $0.kind == .flags && $0.modifiers & HotkeyBinding.cgModifierMask == 0
+        })
+    }
+
+    func testPhysicalStateReconciliationRepairsMissedKeyButtonAndModifierReleases() {
+        let shift = CGEventFlags.maskShift.rawValue
+        var state = PhysicalInputState()
+        state.consume(InputSample(timestampNanos: 10, kind: .flags, modifiers: shift))
+        state.consume(InputSample(timestampNanos: 11, kind: .key, keyCode: 49, modifiers: shift, isDown: true))
+        state.consume(InputSample(timestampNanos: 12, kind: .mouseButton, button: 3, modifiers: shift, isDown: true))
+
+        let releases = state.reconcile(
+            to: PhysicalInputSnapshot(keys: [], buttons: [], modifiers: 0, pointer: CGPoint(x: 50, y: 40)),
+            timestampNanos: 20
+        )
+        XCTAssertTrue(releases.contains { $0.kind == .key && $0.keyCode == 49 && !$0.isDown })
+        XCTAssertTrue(releases.contains { $0.kind == .mouseButton && $0.button == 3 && !$0.isDown })
+        XCTAssertTrue(releases.contains { $0.kind == .flags && $0.modifiers == 0 })
+        XCTAssertTrue(state.reconcile(to: PhysicalInputSnapshot(keys: [], buttons: [], modifiers: 0, pointer: .zero), timestampNanos: 21).isEmpty)
+
+        // A later mouse/key event may already carry the new modifier bits even
+        // when the actual flagsChanged event was lost. It must not mask the
+        // reconciliation pass that emits the missing modifier release.
+        var missedFlagsState = PhysicalInputState()
+        missedFlagsState.consume(InputSample(timestampNanos: 30, kind: .flags, modifiers: shift))
+        missedFlagsState.consume(InputSample(timestampNanos: 31, kind: .mouseMove, modifiers: 0))
+        let repairedFlags = missedFlagsState.reconcile(
+            to: PhysicalInputSnapshot(keys: [], buttons: [], modifiers: 0, pointer: .zero),
+            timestampNanos: 40
+        )
+        XCTAssertTrue(repairedFlags.contains { $0.kind == .flags && $0.modifiers == 0 })
+
+        var seededState = PhysicalInputState()
+        seededState.seed(
+            from: PhysicalInputSnapshot(keys: [49], buttons: [15], modifiers: shift, pointer: .zero),
+            timestampNanos: 100
+        )
+        seededState.consume(InputSample(timestampNanos: 99, kind: .key, keyCode: 49, isDown: false))
+        let seededReleases = seededState.reconcile(
+            to: PhysicalInputSnapshot(keys: [], buttons: [], modifiers: 0, pointer: .zero),
+            timestampNanos: 110
+        )
+        XCTAssertTrue(seededReleases.contains { $0.kind == .key && $0.keyCode == 49 && !$0.isDown })
+        XCTAssertTrue(seededReleases.contains { $0.kind == .mouseButton && $0.button == 15 && !$0.isDown })
     }
 
     func testRecordingKeyBlacklistDropsKeysAndSanitizesModifiers() {
@@ -2416,6 +2799,37 @@ final class DomainTests: XCTestCase {
             ).asArray(Float.self).contains { $0 != 0 },
             "Frame-aligned controls should retain short demonstrated inputs instead of storing only model outputs."
         )
+    }
+
+    func testSparseStaticVideoIsSampledAtConfiguredPerceptionCadence() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("static-video-cache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let recordingID = UUID()
+        let directory = try await store.createRecordingDirectory(id: recordingID)
+        try await writeTestMovie(to: directory.appendingPathComponent("capture.mov"), width: 16, height: 16, frameCount: 2, fps: 1)
+        let eventWriter = try InputEventWriter(url: directory.appendingPathComponent("events.atrevents"))
+        eventWriter.append(InputSample(timestampNanos: 1_000_000_000, kind: .mouseMove, x: 8, y: 8))
+        let eventCount = try eventWriter.finish()
+        let manifest = RecordingManifest(
+            id: recordingID, name: "Static", createdAt: Date(), hostStartNanos: 1_000_000_000, duration: 1,
+            capture: CaptureSpec(requestedFPS: 1), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
+            pixelWidth: 16, pixelHeight: 16, deliveredFPS: 1, eventCount: eventCount
+        )
+        try await store.writeRecording(manifest, to: directory)
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        profile.training.perceptionFPS = 10
+        profile.training.actionFPS = 20
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 1, downsampleFactor: 2)
+
+        let dataset = try await DatasetCacheBuilder(workspace: store).cache(
+            for: profile,
+            recordings: [RecordingItem(manifest: manifest, directory: directory)]
+        ) { _, _ in }
+        XCTAssertGreaterThanOrEqual(dataset.manifest.observationCount, 10)
+        XCTAssertGreaterThan(dataset.count, dataset.manifest.observationCount)
     }
 
     func testPositiveClassWeightsUseOnlyRequestedRowsAndRespectRestrictions() throws {

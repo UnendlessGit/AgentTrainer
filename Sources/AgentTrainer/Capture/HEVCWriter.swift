@@ -14,7 +14,9 @@ final class HEVCWriter: @unchecked Sendable {
     private var started = false
     private var firstPTS: CMTime?
     private var lastPTS: CMTime?
+    private var sessionEndPTS: CMTime?
     private(set) var frameCount = 0
+    private(set) var droppedFrameCount = 0
 
     init(url: URL, width: Int, height: Int, fps: Double) throws {
         self.url = url
@@ -50,7 +52,10 @@ final class HEVCWriter: @unchecked Sendable {
     }
 
     func append(_ sampleBuffer: CMSampleBuffer) {
-        guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        guard CMSampleBufferDataIsReady(sampleBuffer) else {
+            droppedFrameCount += 1
+            return
+        }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if !started {
             guard writer.startWriting() else { return }
@@ -58,10 +63,16 @@ final class HEVCWriter: @unchecked Sendable {
             firstPTS = pts
             started = true
         }
-        guard input.isReadyForMoreMediaData else { return }
+        guard input.isReadyForMoreMediaData else {
+            droppedFrameCount += 1
+            lastPTS = pts
+            return
+        }
         if input.append(sampleBuffer) {
             frameCount += 1
             lastPTS = pts
+        } else {
+            droppedFrameCount += 1
         }
     }
 
@@ -73,15 +84,30 @@ final class HEVCWriter: @unchecked Sendable {
             writer.cancelWriting()
             return (0, 0, 0)
         }
+        if writer.status == .failed {
+            throw writer.error ?? AgentTrainerError.capture("HEVC encoding failed before finalization.")
+        }
+        // ScreenCaptureKit intentionally emits no complete frames while the
+        // selected content is static. Ending the writer session at the current
+        // host time makes the final encoded frame persist for the real recording
+        // duration instead of collapsing a long idle recording to one frame.
+        let hostEnd = CMClockGetTime(CMClockGetHostTimeClock())
+        if let firstPTS, hostEnd.isNumeric, CMTimeCompare(hostEnd, firstPTS) > 0 {
+            writer.endSession(atSourceTime: hostEnd)
+            sessionEndPTS = hostEnd
+        }
         input.markAsFinished()
         await writer.finishWriting()
         if writer.status == .failed { throw writer.error ?? AgentTrainerError.capture("HEVC encoding failed.") }
         let duration: Double
-        if let firstPTS, let lastPTS {
+        if let firstPTS, let sessionEndPTS {
+            duration = max(0, CMTimeGetSeconds(sessionEndPTS - firstPTS))
+        } else if let firstPTS, let lastPTS {
             let span = max(0, CMTimeGetSeconds(lastPTS - firstPTS))
             let finalFrameDuration = frameCount > 1 ? span / Double(frameCount - 1) : 1 / max(1, requestedFPS)
             duration = span + finalFrameDuration
         } else { duration = 0 }
         return (duration, duration > 0 ? Double(frameCount) / duration : 0, frameCount)
     }
+
 }
