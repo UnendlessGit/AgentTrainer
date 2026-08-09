@@ -359,6 +359,46 @@ final class AgentPolicy: Module, @unchecked Sendable {
         )
     }
 
+    func currentOnlyTemporalFeatures(
+        currentImages: MLXArray,
+        sampleToVision: MLXArray? = nil
+    ) -> MLXArray {
+        currentOnlyTemporalFeatures(
+            currentVisualEmbedding: visualEmbedding(
+                visualFeatures: visualActivations(images: currentImages).last!
+            ),
+            sampleToVision: sampleToVision
+        )
+    }
+
+    func currentOnlyTemporalFeatures(
+        currentVisualFeatures: MLXArray,
+        sampleToVision: MLXArray? = nil
+    ) -> MLXArray {
+        currentOnlyTemporalFeatures(
+            currentVisualEmbedding: visualEmbedding(visualFeatures: currentVisualFeatures),
+            sampleToVision: sampleToVision
+        )
+    }
+
+    private func currentOnlyTemporalFeatures(
+        currentVisualEmbedding: MLXArray,
+        sampleToVision: MLXArray?
+    ) -> MLXArray {
+        var current = currentVisualEmbedding
+        if let sampleToVision {
+            precondition(sampleToVision.ndim == 1, "The current-frame row map must be one-dimensional.")
+            if sampleToVision.dim(0) != current.dim(0) {
+                current = current.take(sampleToVision, axis: 0)
+            }
+        }
+        let emptyTemporalState = MLXArray.zeros(
+            [current.dim(0), profile.training.architecture.recurrentWidth],
+            dtype: dtype
+        )
+        return concatenated([current, emptyTemporalState], axis: -1)
+    }
+
     func temporalFeatures(
         currentVisualFeatures: MLXArray,
         pastImages: MLXArray,
@@ -382,12 +422,18 @@ final class AgentPolicy: Module, @unchecked Sendable {
         visionToPast: MLXArray? = nil,
         sampleToVision: MLXArray? = nil
     ) -> MLXArray {
+        let temporal = profile.training.effectiveTemporalVision
+        if temporal.pastFrameCount == 0 {
+            return currentOnlyTemporalFeatures(
+                currentVisualEmbedding: currentVisualEmbedding,
+                sampleToVision: sampleToVision
+            )
+        }
         precondition(pastControls.ndim == 3, "Past controls must have shape [batch, frames, controls].")
         var currentVisualEmbedding = currentVisualEmbedding
         var controls = pastControls.asType(dtype)
         let visionCount = currentVisualEmbedding.dim(0)
         let frameCount = pastControls.dim(1)
-        let temporal = profile.training.effectiveTemporalVision
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         precondition(
             frameCount == temporal.pastFrameCount
@@ -549,6 +595,12 @@ final class AgentPolicy: Module, @unchecked Sendable {
             currentImages: currentImages,
             pastImages: pastImages,
             pastControls: pastControls
+        ))
+    }
+
+    func currentOnlyPredictions(currentImages: MLXArray) -> MLXArray {
+        activatedPredictions(logits: logits(
+            temporalFeatures: currentOnlyTemporalFeatures(currentImages: currentImages)
         ))
     }
 

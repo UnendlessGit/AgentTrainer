@@ -125,6 +125,73 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(CaptureFrameDisposition.classify(.stopped), .drop)
     }
 
+    func testOptimizedHEVCBitrateScalesWithWorkloadAndStaysFarBelowRawLikeTargets() async throws {
+        let hd30 = HEVCEncodingConfiguration.targetBitRate(width: 1_920, height: 1_080, fps: 30)
+        let hd60 = HEVCEncodingConfiguration.targetBitRate(width: 1_920, height: 1_080, fps: 60)
+        let uhd60 = HEVCEncodingConfiguration.targetBitRate(width: 3_840, height: 2_160, fps: 60)
+        XCTAssertGreaterThan(hd60, hd30)
+        XCTAssertGreaterThan(uhd60, hd60)
+        let formerUHDTarget = 3_840 * 2_160 * 8
+        XCTAssertLessThan(uhd60 * 3, formerUHDTarget)
+        XCTAssertLessThanOrEqual(uhd60, 45_000_000)
+        XCTAssertEqual(HEVCEncodingConfiguration.targetBitRate(width: 0, height: 0, fps: .nan), 1_500_000)
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("optimized-hevc-\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = try HEVCWriter(url: url, width: 1_920, height: 1_080, fps: 60)
+        let empty = try await writer.finish()
+        XCTAssertEqual(empty.frames, 0)
+    }
+
+    func testRecordingMetricsUseExactFramesBytesAndFolderSeconds() {
+        let exact = RecordingManifest(
+            id: UUID(), name: "Exact", createdAt: Date(), hostStartNanos: 1, duration: 12.5,
+            capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 100, height: 100)),
+            pixelWidth: 100, pixelHeight: 100, deliveredFPS: 60, frameCount: 731, eventCount: 0
+        )
+        var legacy = exact
+        legacy.id = UUID()
+        legacy.name = "Legacy"
+        legacy.duration = 10
+        legacy.deliveredFPS = 2.5
+        legacy.frameCount = nil
+        XCTAssertEqual(legacy.encodedFrameCount, 25)
+
+        let metrics = RecordingCollectionMetrics.total(for: [
+            RecordingItem(manifest: exact, directory: URL(fileURLWithPath: "/tmp/exact"), storageBytes: 1_250_000_000),
+            RecordingItem(manifest: legacy, directory: URL(fileURLWithPath: "/tmp/legacy"), storageBytes: 250_000_000)
+        ])
+        XCTAssertEqual(metrics.recordingCount, 2)
+        XCTAssertEqual(metrics.frameCount, 756)
+        XCTAssertEqual(metrics.storageBytes, 1_500_000_000)
+        XCTAssertEqual(metrics.durationSeconds, 22.5, accuracy: 0.000_001)
+    }
+
+    func testTrainingIdentityIgnoresLibraryPresentationButTracksSamplingChanges() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("recording-identity-\(UUID().uuidString).atrrecord", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data([1, 2, 3]).write(to: directory.appendingPathComponent("capture.mov"))
+        try Data("ATREVT01".utf8).write(to: directory.appendingPathComponent("events.atrevents"))
+        var manifest = RecordingManifest(
+            id: UUID(), name: "Before", createdAt: Date(), hostStartNanos: 1, duration: 2,
+            capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 100, height: 100)),
+            pixelWidth: 100, pixelHeight: 100, deliveredFPS: 30, frameCount: 60, eventCount: 0,
+            folderID: UUID(), thumbnailFile: "thumbnail.jpg"
+        )
+        let original = try RecordingTrainingIdentity(recording: RecordingItem(manifest: manifest, directory: directory))
+        manifest.name = "After"
+        manifest.createdAt = Date().addingTimeInterval(100)
+        manifest.folderID = UUID()
+        manifest.thumbnailFile = nil
+        manifest.frameCount = 999
+        let presentationOnly = try RecordingTrainingIdentity(recording: RecordingItem(manifest: manifest, directory: directory))
+        XCTAssertEqual(original, presentationOnly)
+        manifest.trimStart = 0.25
+        let changedSampling = try RecordingTrainingIdentity(recording: RecordingItem(manifest: manifest, directory: directory))
+        XCTAssertNotEqual(original, changedSampling)
+    }
+
     func testInputMonitorSessionsJoinBeforeTheyCanRestart() async throws {
         let monitor = InputCaptureService()
         do {
@@ -197,6 +264,48 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(input.pastControlValues, 146)
         XCTAssertEqual(input.valuesPerDecision, 209)
         XCTAssertEqual(input.nominalBytesPerDecision, 209 * 4)
+    }
+
+    func testZeroPastFramesIsAValidatedCurrentOnlyContract() throws {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 5, height: 3, colorMode: .grayscale)
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 0,
+            frameSpacing: 240,
+            downsampleFactor: 8
+        )
+        XCTAssertNoThrow(try profile.training.effectiveTemporalVision.validated(current: profile.preprocessing))
+
+        let input = NeuralInputSizing.summary(for: profile)
+        XCTAssertEqual(input.pastFrameCount, 0)
+        XCTAssertEqual(input.pastControlValues, 0)
+        XCTAssertEqual(input.frameSpacingSeconds, 0)
+        XCTAssertEqual(input.temporalLookbackSeconds, 0)
+        XCTAssertEqual(input.totalPackedVisionValues, input.currentPackedVisionValues)
+        XCTAssertEqual(input.valuesPerDecision, input.currentFirstConvolutionValues)
+
+        profile.training.architecture = .small
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+        let current = MLXArray.zeros([1, 3, 5, 1], dtype: .float32)
+        let predictions = model.currentOnlyPredictions(currentImages: current)
+        let genericPredictions = model.predictions(
+            currentImages: current,
+            pastImages: MLXArray.zeros([1, 1, 1, 1, 1], dtype: .float32),
+            pastControls: MLXArray.zeros([1, 1, ActionLayout.count], dtype: .float32)
+        )
+        let loss = model.loss(
+            currentImages: current,
+            pastImages: MLXArray.zeros([1, 1, 1, 1, 1], dtype: .float32),
+            pastControls: MLXArray.zeros([1, 1, ActionLayout.count], dtype: .float32),
+            targets: MLXArray.zeros([1, ActionLayout.count], dtype: .float32)
+        )
+        MLX.eval(predictions, genericPredictions, loss)
+        XCTAssertEqual(predictions.shape, [1, ActionLayout.count])
+        XCTAssertTrue(predictions.asArray(Float.self).allSatisfy(\.isFinite))
+        XCTAssertEqual(genericPredictions.asArray(Float.self), predictions.asArray(Float.self))
+        XCTAssertTrue(loss.item(Float.self).isFinite)
     }
 
     func testNeuralInputCapacityGuideUsesSimpleConservativeBands() {
@@ -649,6 +758,32 @@ final class DomainTests: XCTestCase {
         }
 
         XCTAssertEqual(actual, expected)
+
+        let currentSpec = PreprocessingSpec(
+            width: 23,
+            height: 13,
+            colorMode: .color,
+            bitDepth: 8,
+            chroma: .yuv420,
+            resizePolicy: .fit
+        )
+        let pastSpec = PreprocessingSpec(
+            width: 7,
+            height: 5,
+            colorMode: .grayscale,
+            bitDepth: 4,
+            chroma: .yuv420,
+            resizePolicy: .fill
+        )
+        let expectedPair = [
+            try synchronous.process(buffers[2], spec: currentSpec),
+            try synchronous.process(buffers[2], spec: pastSpec)
+        ]
+        let paired = try pipelined.submit(buffers[2], specs: [currentSpec, pastSpec])
+        let actualPair = try paired.map { frame in
+            try frame.withPackedBytes { Data($0) }
+        }
+        XCTAssertEqual(actualPair, expectedPair)
     }
 
     func testNativeVideoRangePreprocessingMatchesBGRAWithoutQualityLoss() throws {
@@ -710,6 +845,7 @@ final class DomainTests: XCTestCase {
         try await store.writeRecording(manifest, to: directory)
         let before = await store.listRecordings()
         XCTAssertEqual(before.first?.manifest.folderID, folder.id)
+        XCTAssertGreaterThan(before.first?.storageBytes ?? 0, 0)
         try await store.deleteRecordingFolder(folder, includingRecordings: true)
         let recordingsAfter = await store.listRecordings()
         let foldersAfter = await store.listRecordingFolders()
@@ -1249,6 +1385,8 @@ final class DomainTests: XCTestCase {
         profile.training.learningRate = 0.00001
         profile.training.actionFPS = 120
         XCTAssertEqual(profile.learnedBrainContract, original)
+        profile.training.architecture.dropout = 0.5
+        XCTAssertEqual(profile.learnedBrainContract, original, "Dropout must preserve every learned tensor and existing brain weight.")
         profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 8, frameSpacing: 2, downsampleFactor: 2)
         XCTAssertNotEqual(profile.learnedBrainContract, original)
         profile.training.temporalVision = original.temporalVision
@@ -2958,6 +3096,70 @@ final class DomainTests: XCTestCase {
             ).asArray(Float.self).contains { $0 != 0 },
             "Frame-aligned controls should retain short demonstrated inputs instead of storing only model outputs."
         )
+    }
+
+    func testRealVideoCacheSupportsCurrentOnlyProfilesWithoutPastArtifacts() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("current-only-video-cache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let recordingID = UUID()
+        let directory = try await store.createRecordingDirectory(id: recordingID)
+        try await writeTestMovie(
+            to: directory.appendingPathComponent("capture.mov"),
+            width: 16,
+            height: 16,
+            frameCount: 4,
+            fps: 20
+        )
+
+        let base: UInt64 = 2_000_000_000
+        let eventWriter = try InputEventWriter(url: directory.appendingPathComponent("events.atrevents"))
+        eventWriter.append(InputSample(timestampNanos: base, kind: .mouseMove, x: 8, y: 8))
+        eventWriter.append(InputSample(timestampNanos: base + 50_000_000, kind: .key, keyCode: 13, isDown: true))
+        eventWriter.append(InputSample(timestampNanos: base + 100_000_000, kind: .key, keyCode: 13, isDown: false))
+        let eventCount = try eventWriter.finish()
+        let manifest = RecordingManifest(
+            id: recordingID,
+            name: "Current only",
+            createdAt: Date(),
+            hostStartNanos: base,
+            duration: 0.2,
+            capture: CaptureSpec(requestedFPS: 20),
+            globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
+            pixelWidth: 16,
+            pixelHeight: 16,
+            deliveredFPS: 20,
+            frameCount: 4,
+            eventCount: eventCount
+        )
+        try await store.writeRecording(manifest, to: directory)
+
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        profile.training.actionFPS = 40
+        profile.training.perceptionFPS = 20
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 0,
+            frameSpacing: 240,
+            downsampleFactor: 8
+        )
+        let dataset = try await DatasetCacheBuilder(workspace: store).cache(
+            for: profile,
+            recordings: [RecordingItem(manifest: manifest, directory: directory)]
+        ) { _, _ in }
+
+        XCTAssertGreaterThan(dataset.count, 0)
+        XCTAssertEqual(dataset.manifest.temporalVision.pastFrameCount, 0)
+        XCTAssertEqual(dataset.manifest.pastObservationBytesPerSample, 0)
+        XCTAssertEqual(dataset.pastPackedObservations(at: [0]).count, 0)
+        XCTAssertEqual(dataset.pastControlBatch(at: [0]).count, 0)
+        let batch = dataset.trainingBatch(at: Array(0..<min(3, dataset.count)))
+        XCTAssertEqual(batch.packedCurrentObservations.count, batch.count * profile.preprocessing.sampleByteCount)
+        XCTAssertTrue(batch.packedPastObservations.isEmpty)
+        XCTAssertTrue(batch.pastControlRows.isEmpty)
+        XCTAssertEqual(batch.actionRows.count, batch.count * 2 * ActionLayout.count * MemoryLayout<Float>.size)
+        XCTAssertTrue(dataset.demonstratedKeyCodes().contains(13))
     }
 
     func testSparseStaticVideoIsSampledAtConfiguredPerceptionCadence() async throws {

@@ -3,6 +3,55 @@ import CoreGraphics
 import CryptoKit
 import Foundation
 
+/// Only fields and artifact metadata that can change sampled pixels, event
+/// timing, or target normalization participate in cache/checkpoint identity.
+/// Renaming or moving a recording in the Library therefore keeps expensive
+/// packed caches and exact optimizer state reusable.
+struct RecordingTrainingIdentity: Codable, Hashable, Sendable {
+    struct ArtifactFingerprint: Codable, Hashable, Sendable {
+        let size: Int64
+        let modifiedAt: Date?
+    }
+
+    let id: UUID
+    let hostStartNanos: UInt64
+    let duration: Double
+    let globalRect: CodableRect
+    let trimStart: Double
+    let trimEnd: Double?
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let eventCount: Int
+    let videoFile: String
+    let eventFile: String
+    let video: ArtifactFingerprint
+    let events: ArtifactFingerprint
+
+    init(recording: RecordingItem) throws {
+        let manifest = recording.manifest
+        func fingerprint(_ url: URL) throws -> ArtifactFingerprint {
+            let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+            guard let size = values.fileSize, size >= 0 else {
+                throw AgentTrainerError.storage("A recording artifact is unavailable while preparing training data.")
+            }
+            return ArtifactFingerprint(size: Int64(size), modifiedAt: values.contentModificationDate)
+        }
+        id = manifest.id
+        hostStartNanos = manifest.hostStartNanos
+        duration = manifest.duration
+        globalRect = manifest.globalRect
+        trimStart = manifest.trimStart
+        trimEnd = manifest.trimEnd
+        pixelWidth = manifest.pixelWidth
+        pixelHeight = manifest.pixelHeight
+        eventCount = manifest.eventCount
+        videoFile = manifest.videoFile
+        eventFile = manifest.eventFile
+        video = try fingerprint(recording.directory.appendingPathComponent(manifest.videoFile))
+        events = try fingerprint(recording.directory.appendingPathComponent(manifest.eventFile))
+    }
+}
+
 enum ActionLayout {
     static let absoluteMouse = 0..<2
     static let relativeMouse = 2..<4
@@ -192,6 +241,9 @@ final class CachedDataset: @unchecked Sendable {
         _ = try decoded.temporalVision.validated(current: decoded.preprocessing)
         _ = try decoded.pastPreprocessing.validated()
         let expectedPastSpec = decoded.temporalVision.pastFrameSpec(from: decoded.preprocessing)
+        let expectedPastBytes = decoded.temporalVision.pastFrameCount > 0
+            ? decoded.pastPreprocessing.sampleByteCount
+            : 0
         guard decoded.sampleCount >= 0,
               decoded.observationCount >= 0,
               decoded.sampleCount == 0 || decoded.observationCount > 0,
@@ -200,9 +252,9 @@ final class CachedDataset: @unchecked Sendable {
               decoded.perceptionFPS.isFinite, decoded.perceptionFPS > 0,
               decoded.pastPreprocessing == expectedPastSpec,
               decoded.currentObservationBytesPerSample == decoded.preprocessing.sampleByteCount,
-              decoded.pastObservationBytesPerSample == decoded.pastPreprocessing.sampleByteCount,
+              decoded.pastObservationBytesPerSample == expectedPastBytes,
               decoded.currentObservationBytesPerSample > 0,
-              decoded.pastObservationBytesPerSample > 0,
+              decoded.pastObservationBytesPerSample >= 0,
               decoded.actionValuesPerSample == ActionLayout.count else {
             throw AgentTrainerError.storage("The dataset cache manifest is invalid.")
         }
@@ -213,7 +265,10 @@ final class CachedDataset: @unchecked Sendable {
         let mappingSize = mappingValueCount.partialValue.multipliedReportingOverflow(by: MemoryLayout<UInt32>.size)
         let actionValueCount = decoded.sampleCount.multipliedReportingOverflow(by: decoded.actionValuesPerSample)
         let actionSize = actionValueCount.partialValue.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
-        let frameActionValueCount = decoded.observationCount.multipliedReportingOverflow(by: decoded.actionValuesPerSample)
+        let retainedFrameActionCount = decoded.temporalVision.pastFrameCount > 0
+            ? decoded.observationCount
+            : 0
+        let frameActionValueCount = retainedFrameActionCount.multipliedReportingOverflow(by: decoded.actionValuesPerSample)
         let frameActionSize = frameActionValueCount.partialValue.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
         guard !currentObservationSize.overflow, !pastObservationSize.overflow,
               !mappingValueCount.overflow, !mappingSize.overflow,
@@ -579,6 +634,15 @@ final class CachedDataset: @unchecked Sendable {
         precondition(pastDestination.count == pastObservationIndices.count * pastBytes)
         precondition(controlDestination.count == observationSequences.count * pastFrameCount * actionRowBytes)
         precondition(actionDestination.count == batchCount * 2 * actionRowBytes)
+        if pastFrameCount == 0 {
+            populateCurrentOnlyTrainingBatch(
+                at: indices,
+                observationSequences: observationSequences,
+                packedCurrentObservations: currentDestination,
+                actionRows: actionDestination
+            )
+            return
+        }
         if let controlBase = controlDestination.baseAddress {
             memset(controlBase, 0, controlDestination.count)
         }
@@ -640,6 +704,58 @@ final class CachedDataset: @unchecked Sendable {
                 if sampleIndex > segmentStart(for: sampleIndex) {
                     memcpy(
                         destinationBase.advanced(by: (batchRow * 2 + 1) * actionRowBytes),
+                        sourceBase.advanced(by: (sampleIndex - 1) * actionRowBytes),
+                        actionRowBytes
+                    )
+                }
+            }
+        }
+    }
+
+    /// Current-frame-only profiles avoid allocating, mapping, and copying
+    /// reduced vision or frame-control rows. The action layout remains exactly
+    /// the same, including the real immediately preceding target.
+    func populateCurrentOnlyTrainingBatch(
+        at indices: [Int],
+        observationSequences suppliedSequences: [CachedObservationSequence]? = nil,
+        packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
+        actionRows actionDestination: UnsafeMutableRawBufferPointer
+    ) {
+        let sequences = suppliedSequences ?? indices.map(observationSequence(at:))
+        let currentBytes = manifest.currentObservationBytesPerSample
+        let actionRowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
+        precondition(manifest.temporalVision.pastFrameCount == 0)
+        precondition(sequences.count <= indices.count)
+        precondition(currentDestination.count == sequences.count * currentBytes)
+        precondition(actionDestination.count == indices.count * 2 * actionRowBytes)
+        if let actionBase = actionDestination.baseAddress {
+            memset(actionBase, 0, actionDestination.count)
+        }
+        currentObservations.withUnsafeBytes { source in
+            guard let destinationBase = currentDestination.baseAddress,
+                  let sourceBase = source.baseAddress else { return }
+            for (row, sequence) in sequences.enumerated() {
+                precondition(sequence.indices.count == 1)
+                let current = Int(sequence.indices[0])
+                memcpy(
+                    destinationBase.advanced(by: row * currentBytes),
+                    sourceBase.advanced(by: current * currentBytes),
+                    currentBytes
+                )
+            }
+        }
+        actions.withUnsafeBytes { source in
+            guard let destinationBase = actionDestination.baseAddress,
+                  let sourceBase = source.baseAddress else { return }
+            for (row, sampleIndex) in indices.enumerated() {
+                memcpy(
+                    destinationBase.advanced(by: row * 2 * actionRowBytes),
+                    sourceBase.advanced(by: sampleIndex * actionRowBytes),
+                    actionRowBytes
+                )
+                if sampleIndex > segmentStart(for: sampleIndex) {
+                    memcpy(
+                        destinationBase.advanced(by: (row * 2 + 1) * actionRowBytes),
                         sourceBase.advanced(by: (sampleIndex - 1) * actionRowBytes),
                         actionRowBytes
                     )
@@ -1062,7 +1178,7 @@ actor DatasetCacheBuilder {
                 sampleCount: sampleCount,
                 observationCount: observationCount,
                 currentObservationBytesPerSample: profile.preprocessing.sampleByteCount,
-                pastObservationBytesPerSample: pastSpec.sampleByteCount,
+                pastObservationBytesPerSample: temporal.pastFrameCount > 0 ? pastSpec.sampleByteCount : 0,
                 actionValuesPerSample: ActionLayout.count,
                 segments: segments
             )
@@ -1087,10 +1203,11 @@ actor DatasetCacheBuilder {
             let temporalVision: TemporalVisionConfiguration
             let actionFPS: Double
             let perceptionFPS: Double
-            let recordings: [RecordingManifest]
+            let recordings: [RecordingTrainingIdentity]
         }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]; encoder.dateEncodingStrategy = .iso8601
-        let identity = Identity(cacheSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, temporalVision: profile.training.effectiveTemporalVision, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, recordings: recordings.map(\.manifest))
+        let recordingIdentities = try recordings.map(RecordingTrainingIdentity.init(recording:))
+        let identity = Identity(cacheSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, temporalVision: profile.training.effectiveTemporalVision, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, recordings: recordingIdentities)
         let digest = SHA256.hash(data: try encoder.encode(identity))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
@@ -1141,29 +1258,53 @@ actor DatasetCacheBuilder {
         let usableDuration = trainingEnd - trainingStart
         let progressInterval = max(2, usableDuration / 100)
         var nextProgressTime = trainingStart
+        let hasTemporalMemory = temporal.pastFrameCount > 0
+        let sharesPackedRepresentation = hasTemporalMemory && pastSpec == profile.preprocessing
         let maximumPackedPipelineBytes = 64 * 1_024 * 1_024
-        let bytesPerPendingObservation = profile.preprocessing.sampleByteCount + pastSpec.sampleByteCount
+        let bytesPerPendingObservation = profile.preprocessing.sampleByteCount
+            + (hasTemporalMemory && !sharesPackedRepresentation ? pastSpec.sampleByteCount : 0)
         let packedPipelineDepth = max(
             1,
-            min(3, maximumPackedPipelineBytes / max(1, bytesPerPendingObservation))
+            min(8, maximumPackedPipelineBytes / max(1, bytesPerPendingObservation))
         )
-        var pendingPackedFrames: [(current: VisionPreprocessor.PendingPackedFrame, past: VisionPreprocessor.PendingPackedFrame)] = []
+        var pendingPackedFrames: [(
+            current: VisionPreprocessor.PendingPackedFrame,
+            past: VisionPreprocessor.PendingPackedFrame?,
+            repetitions: Int
+        )] = []
         pendingPackedFrames.reserveCapacity(packedPipelineDepth)
         func writeOldestPackedFrame() throws {
             let frame = pendingPackedFrames.removeFirst()
-            try frame.current.withPackedBytes { try currentObservations.append($0) }
-            try frame.past.withPackedBytes { try pastObservations.append($0) }
+            try frame.current.withPackedBytes { bytes in
+                for _ in 0..<frame.repetitions { try currentObservations.append(bytes) }
+                if sharesPackedRepresentation {
+                    for _ in 0..<frame.repetitions { try pastObservations.append(bytes) }
+                }
+            }
+            if let past = frame.past {
+                try past.withPackedBytes { bytes in
+                    for _ in 0..<frame.repetitions { try pastObservations.append(bytes) }
+                }
+            }
         }
 
-        func appendObservation(_ buffer: CVPixelBuffer, at time: Double) throws {
+        func appendPackedObservations(_ buffer: CVPixelBuffer, repetitions: Int) throws {
+            guard repetitions > 0 else { return }
+            let requestedSpecs = hasTemporalMemory && !sharesPackedRepresentation
+                ? [profile.preprocessing, pastSpec]
+                : [profile.preprocessing]
+            let jobs = try preprocessor.submit(buffer, specs: requestedSpecs)
+            guard let current = jobs.first else {
+                throw AgentTrainerError.model("The vision preprocessing pipeline returned no current frame.")
+            }
             pendingPackedFrames.append((
-                current: try preprocessor.submit(buffer, spec: profile.preprocessing),
-                past: try preprocessor.submit(buffer, spec: pastSpec)
+                current: current,
+                past: jobs.count > 1 ? jobs[1] : nil,
+                repetitions: repetitions
             ))
             if pendingPackedFrames.count >= packedPipelineDepth {
                 try writeOldestPackedFrame()
             }
-            observationTimes.append(min(trainingEnd, max(trainingStart, time)))
         }
 
         var lastDecodedBuffer: CVPixelBuffer?
@@ -1182,30 +1323,41 @@ actor DatasetCacheBuilder {
                 // decoded frame's PTS. Materialize every configured perception
                 // interval in that gap from the held frame. This is essential for
                 // static screens, where ScreenCaptureKit may emit only idle status.
+                let heldStart = observationTimes.count
                 while nextPerception < min(trainingEnd, t) - 0.000_001 {
-                    try appendObservation(previous, at: nextPerception)
+                    observationTimes.append(min(trainingEnd, max(trainingStart, nextPerception)))
                     nextPerception += perceptionInterval
                 }
+                try appendPackedObservations(
+                    previous,
+                    repetitions: observationTimes.count - heldStart
+                )
             }
             if nextPerception <= min(trainingEnd, t) + 0.000_001 {
-                try appendObservation(buffer, at: nextPerception)
+                observationTimes.append(min(trainingEnd, max(trainingStart, nextPerception)))
+                try appendPackedObservations(buffer, repetitions: 1)
                 nextPerception += perceptionInterval
             }
             lastDecodedBuffer = buffer
         }
         if reader.status == .failed { throw reader.error ?? AgentTrainerError.storage("Video decoding failed while building the cache.") }
         if let lastDecodedBuffer {
+            let heldStart = observationTimes.count
             while nextPerception <= trainingEnd + 0.000_001 {
-                try appendObservation(lastDecodedBuffer, at: nextPerception)
+                observationTimes.append(min(trainingEnd, max(trainingStart, nextPerception)))
                 nextPerception += perceptionInterval
             }
+            try appendPackedObservations(
+                lastDecodedBuffer,
+                repetitions: observationTimes.count - heldStart
+            )
         }
         while !pendingPackedFrames.isEmpty { try writeOldestPackedFrame() }
         guard !observationTimes.isEmpty else { progress(1); return (0, 0) }
 
         let initialPointer = events.first { $0.kind == .mouseMove || $0.kind == .mouseButton || $0.kind == .scroll }
         let trainingStartNanos = try absoluteHostNanos(recording.manifest, seconds: trainingStart)
-        func primedAccumulator() -> (ActionAccumulator, Int) {
+        func makePrimedAccumulator() -> (ActionAccumulator, Int) {
             var accumulator = ActionAccumulator(manifest: recording.manifest, initialPointer: initialPointer)
             var eventIndex = 0
             while eventIndex < events.count, events[eventIndex].timestampNanos <= trainingStartNanos {
@@ -1218,27 +1370,31 @@ actor DatasetCacheBuilder {
             return (accumulator, eventIndex)
         }
 
-        // Build one comprehensive control row for every perception interval.
-        // These rows include held state, sub-frame taps, mouse deltas, buttons,
-        // scroll, keys, and modifiers and are later paired with past frames.
-        var (frameAccumulator, frameEventIndex) = primedAccumulator()
-        for observation in observationTimes.indices {
-            let intervalEnd = observation + 1 < observationTimes.count
-                ? min(trainingEnd, observationTimes[observation + 1])
-                : trainingEnd
-            let endNanos = try absoluteHostNanos(recording.manifest, seconds: intervalEnd)
-            while frameEventIndex < events.count, events[frameEventIndex].timestampNanos < endNanos {
-                frameAccumulator.consume(events[frameEventIndex])
-                frameEventIndex += 1
+        let primed = makePrimedAccumulator()
+        if hasTemporalMemory {
+            // Build one comprehensive control row for every perception
+            // interval only when a temporal branch can consume it.
+            var frameAccumulator = primed.0
+            var frameEventIndex = primed.1
+            for observation in observationTimes.indices {
+                let intervalEnd = observation + 1 < observationTimes.count
+                    ? min(trainingEnd, observationTimes[observation + 1])
+                    : trainingEnd
+                let endNanos = try absoluteHostNanos(recording.manifest, seconds: intervalEnd)
+                while frameEventIndex < events.count, events[frameEventIndex].timestampNanos < endNanos {
+                    frameAccumulator.consume(events[frameEventIndex])
+                    frameEventIndex += 1
+                }
+                try frameAccumulator.withActionBytes { try frameActions.append($0) }
+                frameAccumulator.endTick()
             }
-            try frameAccumulator.withActionBytes { try frameActions.append($0) }
-            frameAccumulator.endTick()
         }
 
         // Action targets retain their independently configured rate. Every row
         // maps its current perception plus the exact requested causal frame
         // spacing; unavailable leading slots use the reserved sentinel.
-        var (targetAccumulator, targetEventIndex) = primedAccumulator()
+        var targetAccumulator = primed.0
+        var targetEventIndex = primed.1
         var nextAction = trainingStart
         var currentLocalObservation = 0
         var sampleCount = 0

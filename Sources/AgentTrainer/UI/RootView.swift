@@ -41,8 +41,19 @@ struct RootView: View {
             await model.checkForUpdatesAtLaunch()
         }
         .onAppear { model.isAppActive = NSApplication.shared.isActive }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.isAppActive = true }
+        .onChange(of: model.selection) { _, section in
+            if section == .record || section == .run {
+                model.captureEnvironmentDidChange()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.isAppActive = true
+            model.captureEnvironmentDidChange()
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in model.isAppActive = false }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in model.captureEnvironmentDidChange() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in model.captureEnvironmentDidChange() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { _ in model.captureEnvironmentDidChange() }
         .alert(
             "AgentTrainer",
             isPresented: Binding(

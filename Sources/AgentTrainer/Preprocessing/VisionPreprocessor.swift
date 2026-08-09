@@ -97,7 +97,19 @@ final class VisionPreprocessor: @unchecked Sendable {
     /// small ordered queue of these jobs so VideoToolbox decoding, Metal resize
     /// and color packing, and sequential file writes overlap safely.
     func submit(_ pixelBuffer: CVPixelBuffer, spec: PreprocessingSpec) throws -> PendingPackedFrame {
-        let spec = try spec.validated()
+        guard let result = try submit(pixelBuffer, specs: [spec]).first else {
+            throw AgentTrainerError.model("The vision preprocessing workload was empty.")
+        }
+        return result
+    }
+
+    /// Packs multiple output resolutions from one source mapping and one Metal
+    /// command buffer. Training caches always need the current image and, when
+    /// temporal memory is enabled, a reduced past image; sharing setup removes
+    /// duplicate CVMetalTexture creation and command submission per perception.
+    func submit(_ pixelBuffer: CVPixelBuffer, specs requestedSpecs: [PreprocessingSpec]) throws -> [PendingPackedFrame] {
+        guard !requestedSpecs.isEmpty else { return [] }
+        let specs = try requestedSpecs.map { try $0.validated() }
         lock.lock()
         defer { lock.unlock() }
         guard let textureCache else { throw AgentTrainerError.model("The Metal texture cache is unavailable.") }
@@ -126,45 +138,59 @@ final class VisionPreprocessor: @unchecked Sendable {
         let chromaTexture = cvChroma.flatMap(CVMetalTextureGetTexture)
         if sourceFormat != 0, chromaTexture == nil { throw AgentTrainerError.model("The decoded video chroma texture is unavailable.") }
 
-        let output: any MTLBuffer
-        if let index = reusableOutputs.firstIndex(where: { $0.length >= spec.sampleByteCount }) {
-            output = reusableOutputs.remove(at: index)
-            reusableOutputBytes -= output.length
-        } else if let allocated = device.makeBuffer(length: spec.sampleByteCount, options: .storageModeShared) {
-            output = allocated
-        } else {
-            throw AgentTrainerError.model("Metal could not allocate the preprocessing output buffer.")
+        var outputs: [any MTLBuffer] = []
+        outputs.reserveCapacity(specs.count)
+        for spec in specs {
+            if let index = reusableOutputs.firstIndex(where: { $0.length >= spec.sampleByteCount }) {
+                let output = reusableOutputs.remove(at: index)
+                reusableOutputBytes -= output.length
+                outputs.append(output)
+            } else if let allocated = device.makeBuffer(length: spec.sampleByteCount, options: .storageModeShared) {
+                outputs.append(allocated)
+            } else {
+                outputs.forEach(storeReusableOutput)
+                throw AgentTrainerError.model("Metal could not allocate the preprocessing output buffer.")
+            }
         }
-        guard let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else {
-            storeReusableOutput(output)
+        guard let command = queue.makeCommandBuffer() else {
+            outputs.forEach(storeReusableOutput)
             throw AgentTrainerError.model("Metal could not allocate the preprocessing workload.")
         }
-
-        var params = KernelParameters(
-            sourceWidth: UInt32(sourceWidth), sourceHeight: UInt32(sourceHeight),
-            outputWidth: UInt32(spec.width), outputHeight: UInt32(spec.height),
-            bitDepth: UInt32(spec.bitDepth), mode: spec.colorMode == .grayscale ? 0 : 1,
-            chroma: UInt32(spec.chroma == .yuv420 ? 0 : spec.chroma == .yuv422 ? 1 : 2),
-            resize: UInt32(spec.resizePolicy == .fit ? 0 : spec.resizePolicy == .fill ? 1 : 2),
-            sourceFormat: sourceFormat, sourceMatrix: Self.sourceMatrix(for: pixelBuffer)
-        )
-        encoder.setComputePipelineState(pipeline)
-        encoder.setTexture(lumaTexture, index: 0)
-        encoder.setTexture(chromaTexture, index: 1)
-        encoder.setBuffer(output, offset: 0, index: 0)
-        encoder.setBytes(&params, length: MemoryLayout<KernelParameters>.stride, index: 1)
-        let threads = MTLSize(width: 16, height: 16, depth: 1)
-        encoder.dispatchThreads(MTLSize(width: spec.width, height: spec.height, depth: 1), threadsPerThreadgroup: threads)
-        encoder.endEncoding()
+        let sourceMatrix = Self.sourceMatrix(for: pixelBuffer)
+        for (spec, output) in zip(specs, outputs) {
+            guard let encoder = command.makeComputeCommandEncoder() else {
+                outputs.forEach(storeReusableOutput)
+                throw AgentTrainerError.model("Metal could not encode the preprocessing workload.")
+            }
+            var params = KernelParameters(
+                sourceWidth: UInt32(sourceWidth), sourceHeight: UInt32(sourceHeight),
+                outputWidth: UInt32(spec.width), outputHeight: UInt32(spec.height),
+                bitDepth: UInt32(spec.bitDepth), mode: spec.colorMode == .grayscale ? 0 : 1,
+                chroma: UInt32(spec.chroma == .yuv420 ? 0 : spec.chroma == .yuv422 ? 1 : 2),
+                resize: UInt32(spec.resizePolicy == .fit ? 0 : spec.resizePolicy == .fill ? 1 : 2),
+                sourceFormat: sourceFormat, sourceMatrix: sourceMatrix
+            )
+            encoder.setComputePipelineState(pipeline)
+            encoder.setTexture(lumaTexture, index: 0)
+            encoder.setTexture(chromaTexture, index: 1)
+            encoder.setBuffer(output, offset: 0, index: 0)
+            encoder.setBytes(&params, length: MemoryLayout<KernelParameters>.stride, index: 1)
+            let threads = MTLSize(width: 16, height: 16, depth: 1)
+            encoder.dispatchThreads(MTLSize(width: spec.width, height: spec.height, depth: 1), threadsPerThreadgroup: threads)
+            encoder.endEncoding()
+        }
         command.commit()
-        return PendingPackedFrame(
-            owner: self,
-            command: command,
-            output: output,
-            byteCount: spec.sampleByteCount,
-            pixelBuffer: pixelBuffer,
-            textures: [cvLuma, cvChroma].compactMap { $0 }
-        )
+        let retainedTextures = [cvLuma, cvChroma].compactMap { $0 }
+        return zip(specs, outputs).map { spec, output in
+            PendingPackedFrame(
+                owner: self,
+                command: command,
+                output: output,
+                byteCount: spec.sampleByteCount,
+                pixelBuffer: pixelBuffer,
+                textures: retainedTextures
+            )
+        }
     }
 
     private func recycle(_ output: any MTLBuffer) {

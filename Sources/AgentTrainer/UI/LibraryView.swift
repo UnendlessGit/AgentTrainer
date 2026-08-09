@@ -42,10 +42,6 @@ struct LibraryView: View {
         return result
     }
 
-    private func recordings(in folder: RecordingFolder) -> [RecordingItem] {
-        visibleRecordings.filter { $0.manifest.folderID == folder.id }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
             header
@@ -111,12 +107,15 @@ struct LibraryView: View {
     }
 
     private var folderBrowser: some View {
-        OLEDCard(padding: 12) {
+        let visible = visibleRecordings
+        let visibleByFolder = Dictionary(grouping: visible, by: { $0.manifest.folderID })
+        let allByFolder = Dictionary(grouping: model.recordings, by: { $0.manifest.folderID })
+        return OLEDCard(padding: 12) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Label("Recording folders", systemImage: "folder.fill").font(.headline).foregroundStyle(ATColor.violet)
                     Spacer()
-                    Text("\(visibleRecordings.count) recording\(visibleRecordings.count == 1 ? "" : "s")").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Text("\(visible.count) recording\(visible.count == 1 ? "" : "s")").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
                 HStack {
                     TextField("New folder", text: $folderName).textFieldStyle(.roundedBorder)
@@ -129,7 +128,10 @@ struct LibraryView: View {
                 Divider()
                 List {
                     ForEach(model.recordingFolders) { folder in
-                        let items = recordings(in: folder)
+                        let items = visibleByFolder[folder.id] ?? []
+                        let folderMetrics = RecordingCollectionMetrics.total(
+                            for: allByFolder[folder.id] ?? []
+                        )
                         DisclosureGroup(isExpanded: Binding(
                             get: { expandedFolderIDs.contains(folder.id) || !search.isEmpty },
                             set: { expanded in if expanded { expandedFolderIDs.insert(folder.id) } else { expandedFolderIDs.remove(folder.id) } }
@@ -159,8 +161,13 @@ struct LibraryView: View {
                         } label: {
                             HStack(spacing: 8) {
                                 Image(systemName: "folder.fill").foregroundStyle(ATColor.violet)
-                                Text(folder.name).font(.headline).lineLimit(1)
-                                Text("\(model.recordings.count { $0.manifest.folderID == folder.id })").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(folder.name).font(.headline).lineLimit(1)
+                                    Text(folderMetricSummary(folderMetrics))
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
                                 Spacer()
                                 Menu {
                                     Button("Use for new recordings") { model.recordingDestinationFolderID = folder.id }
@@ -174,7 +181,7 @@ struct LibraryView: View {
                     if model.recordingFolders.isEmpty {
                         ContentUnavailableView("No recording folders", systemImage: "folder.badge.plus")
                     }
-                    if !search.isEmpty && visibleRecordings.isEmpty {
+                    if !search.isEmpty && visible.isEmpty {
                         ContentUnavailableView("No matching recordings", systemImage: "magnifyingglass")
                     }
                 }
@@ -197,6 +204,7 @@ struct LibraryView: View {
                         TextField("Recording name", text: $renameText).font(.title3.bold()).textFieldStyle(.plain)
                             .onSubmit { Task { await model.renameRecording(item, name: renameText) } }
                         HStack { StatusPill(text: durationString(effectiveDuration(item)), color: ATColor.cyan); StatusPill(text: "\(item.manifest.pixelWidth)×\(item.manifest.pixelHeight)", color: ATColor.violet); StatusPill(text: "\(Int(item.manifest.deliveredFPS.rounded())) FPS", color: ATColor.green) }
+                        HStack { StatusPill(text: "\(item.manifest.encodedFrameCount.formatted()) frames", color: ATColor.amber); StatusPill(text: storageString(item.storageBytes), color: ATColor.violet); Spacer() }
                         HStack { Label("\(item.manifest.eventCount) inputs", systemImage: "cursorarrow.click.2"); Spacer(); Label(item.manifest.capture.kind.rawValue, systemImage: "viewfinder") }.font(.caption).foregroundStyle(.secondary)
                         if item.manifest.trimStart > 0 || (item.manifest.trimEnd ?? item.manifest.duration) < item.manifest.duration {
                             Label("Uses \(item.manifest.trimStart.formatted(.number.precision(.fractionLength(2))))s – \((item.manifest.trimEnd ?? item.manifest.duration).formatted(.number.precision(.fractionLength(2))))s", systemImage: "scissors").font(.caption).foregroundStyle(ATColor.amber)
@@ -267,13 +275,14 @@ struct LibraryView: View {
         let folderIDs = Set(items.compactMap { $0.manifest.folderID })
         let commonFolderID = folderIDs.count == 1 && items.allSatisfy({ $0.manifest.folderID != nil }) ? folderIDs.first : nil
         let totalDuration = items.reduce(0) { $0 + effectiveDuration($1) }
+        let metrics = RecordingCollectionMetrics.total(for: items)
         return OLEDCard(padding: 13) {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     Image(systemName: "checkmark.circle.fill").font(.title2).foregroundStyle(ATColor.cyan)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("\(items.count) recordings selected").font(.title3.bold())
-                        Text("\(durationString(totalDuration)) total • \(items.reduce(0) { $0 + $1.manifest.eventCount }.formatted()) input events")
+                        Text("\(durationString(totalDuration)) usable • \(metrics.frameCount.formatted()) frames • \(storageString(metrics.storageBytes)) • \(items.reduce(0) { $0 + $1.manifest.eventCount }.formatted()) input events")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -355,9 +364,10 @@ struct LibraryView: View {
     }
 
     private var displayedRecordingIDs: [UUID] {
-        model.recordingFolders.flatMap { folder in
+        let visibleByFolder = Dictionary(grouping: visibleRecordings, by: { $0.manifest.folderID })
+        return model.recordingFolders.flatMap { folder in
             let expanded = expandedFolderIDs.contains(folder.id) || !search.isEmpty
-            return expanded ? recordings(in: folder).map(\.id) : []
+            return expanded ? (visibleByFolder[folder.id] ?? []).map(\.id) : []
         }
     }
 
@@ -390,6 +400,10 @@ struct LibraryView: View {
 
     private func effectiveDuration(_ item: RecordingItem) -> Double { max(0, (item.manifest.trimEnd ?? item.manifest.duration) - item.manifest.trimStart) }
     private func durationString(_ seconds: Double) -> String { let value = Int(ceil(seconds)); return String(format: "%d:%02d", value / 60, value % 60) }
+    private func storageString(_ bytes: Int64) -> String { RecordingMetricFormatter.storage(bytes) }
+    private func folderMetricSummary(_ metrics: RecordingCollectionMetrics) -> String {
+        "\(metrics.recordingCount.formatted()) recording\(metrics.recordingCount == 1 ? "" : "s") • \(metrics.frameCount.formatted()) frames • \(storageString(metrics.storageBytes)) • \(metrics.durationSeconds.formatted(.number.precision(.fractionLength(1)))) seconds"
+    }
     private func eventLabel(_ event: InputSample) -> String { switch event.kind { case .key: "\(KeyNames.name(for: event.keyCode)) \(event.isDown ? "down" : "up")"; case .mouseButton: "Mouse \(Int(event.button) + 1) \(event.isDown ? "down" : "up")"; case .mouseMove: "Mouse Δ\(Int(event.deltaX)), \(Int(event.deltaY))"; case .scroll: "Scroll \(Int(event.scrollY))"; case .flags: "Modifiers" } }
     private func eventTime(_ event: InputSample, manifest: RecordingManifest) -> String { guard event.timestampNanos >= manifest.hostStartNanos else { return "—" }; return String(format: "%.3fs", Double(event.timestampNanos - manifest.hostStartNanos) / 1e9) }
 }
@@ -409,6 +423,10 @@ private struct LibraryRecordingRow: View {
                 HStack(spacing: 10) {
                     Label(duration, systemImage: "clock")
                     Label("\(item.manifest.pixelWidth)×\(item.manifest.pixelHeight)", systemImage: "rectangle.inset.filled")
+                }.font(.caption2).foregroundStyle(.secondary)
+                HStack(spacing: 10) {
+                    Label("\(item.manifest.encodedFrameCount.formatted()) frames", systemImage: "film.stack")
+                    Label(RecordingMetricFormatter.storage(item.storageBytes), systemImage: "internaldrive")
                     Label("\(item.manifest.eventCount)", systemImage: "cursorarrow.click.2")
                 }.font(.caption2).foregroundStyle(.secondary)
             }
@@ -422,4 +440,15 @@ private struct LibraryRecordingRow: View {
     }
 
     private var duration: String { let seconds = Int(ceil(max(0, (item.manifest.trimEnd ?? item.manifest.duration) - item.manifest.trimStart))); return String(format: "%d:%02d", seconds / 60, seconds % 60) }
+}
+
+private enum RecordingMetricFormatter {
+    static func storage(_ rawBytes: Int64) -> String {
+        let bytes = Double(max(0, rawBytes))
+        let gigabyte = 1_000_000_000.0
+        if bytes >= gigabyte {
+            return String(format: bytes < 10 * gigabyte ? "%.2f GB" : "%.1f GB", bytes / gigabyte)
+        }
+        return String(format: "%.1f MB", bytes / 1_000_000)
+    }
 }

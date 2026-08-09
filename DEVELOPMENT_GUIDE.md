@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 1.9.9. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.0.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -66,6 +66,12 @@ Recording transfer is producer-neutral. Import accepts a native `.atrrecord` dir
 
 Capture status matters: complete/started frames are usable, idle frames may reuse the last good frame, and blank/suspended/stopped frames are dropped.
 
+New saved video requests a bi-planar video-range 4:2:0 ScreenCaptureKit surface and passes it directly to the required hardware HEVC Main encoder. The resolution/FPS-aware bitrate, six-second GOP, temporal compression, and frame reordering are a high-quality lossy storage contract; do not restore the former near-lossless-sized bitrate or force a full-resolution BGRA conversion without measurement. Live model capture remains BGRA because it is consumed directly rather than encoded. Existing/imported recording artifacts remain byte-preserving and are never migrated implicitly.
+
+Current recording manifests persist the exact successfully encoded frame count. The field is optional for compatibility; Library presentation estimates a missing legacy count from duration and delivered FPS. Package size is the logical recursive byte total collected once during the workspace scan, never a per-row filesystem walk.
+
+Capture-source discovery is a live list, not a one-shot bootstrap result. Refresh it on app activation, display topology changes, application launch/termination, and through a bounded two-second poll while a source picker is visible. Publish only changed, stably sorted snapshots, discard stale overlapping results, and do not disturb an active capture.
+
 The input event tap is backed by a low-rate physical-state reconciliation pass. If macOS disables the tap or drops a transition, the next pass emits only the missing key, modifier, or mouse-button edges. Recording shutdown appends balanced releases for every logical control still held. The first complete screen frame seeds controls that were already held during asynchronous startup. Shortcut and blacklist filters apply to both ordinary and reconciled input.
 
 Live HUD state and persisted recording state are intentionally separate. The HUD reduces blacklist-sanitized physical samples immediately, so a held modifier or mouse button is visible on its down edge; monotonic state revisions prevent cross-thread UI delivery from restoring an older state. The event file may briefly buffer modifier transitions to determine whether they belong to a global shortcut, but it preserves their original timestamps and separately held modifiers. Global shortcut suppression ends with the trigger/modifier release lifecycle; it must never consume an unrelated input merely because it occurs inside an expiry window. Caps Lock is normalized to a tap and Fn/Globe retains physical key edges so both remain in the ordinary keyboard action space.
@@ -81,7 +87,7 @@ Packed observations are `UInt8`:
 
 MLX expands each packed image independently to dense RGB-like channels at its native configured size. The visual encoder appends generated X/Y coordinate planes internally.
 
-Temporal vision is an explicit three-part input:
+Temporal vision is either current-only or an explicit three-part input:
 
 1. one current frame at the exact configured `PreprocessingSpec`
 2. `pastFrameCount` real causal frames at `pastFrameSpec`, ordered oldest to newest
@@ -89,15 +95,17 @@ Temporal vision is an explicit three-part input:
 
 `TemporalVisionConfiguration` owns past-frame count, spacing in Perception FPS intervals, and linear downscale. Its displayed seconds are nominal values derived from configured Perception FPS; dropped or delayed live perceptions can increase wall-clock separation. The reduced specification must copy color mode, chroma layout, bit detail, and resize policy from the current frame. Width and height use the same scale, with only unavoidable integer-pixel rounding. Never resize past images back to current resolution and never synthesize difference, optical-flow, or motion channels.
 
-The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 1–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context.
+The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context. Zero frames disables the temporal branch: runtime and training consume only current vision and do not allocate past-image or past-control input buffers.
 
-`TrainingDataContract.schemaVersion` is 9. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, or target meaning changes. A cache has:
+`TrainingDataContract.schemaVersion` is 10. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, or target meaning changes. A cache has:
 
 - `current-observations.bin` — one full-resolution packed image per perception
 - `past-observations.bin` — one reduced packed image of the same perception
 - `observation-indices.bin` — current plus configured past indices for every action row; unavailable segment-leading frames use `UInt32.max`
 - `frame-actions.bin` — one complete control row per perception interval
 - `actions.bin` — action-rate targets; the immediately preceding target remains separate for transition weighting
+
+For a current-only profile, each observation-index row contains only its current index; `past-observations.bin` and `frame-actions.bin` remain zero-byte compatibility placeholders, and their manifest byte stride is zero. No synthetic zero-sized Metal buffer is created.
 
 One action row has 146 values:
 
@@ -119,6 +127,8 @@ Every frame-control row includes normalized absolute cursor position, raw relati
 
 A runnable version is immutable. Runtime current vision, temporal vision, architecture, precision, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
 
+Dropout is stochastic training regularization, not part of the learned tensor layout. It is normalized out of `LearnedBrainContract`: editing only dropout must preserve the active brain and load its weights into the next run. Because the stochastic objective changed, the exact optimizer/checkpoint signature still includes dropout and begins a fresh optimizer sequence rather than claiming an invalid exact resume.
+
 Current Policy v5 combines:
 
 - one shared convolutional encoder for the real current and past images
@@ -134,7 +144,8 @@ Training uses class/transition weighting, focal binary loss, anti-shortcut frame
 
 The performance path preserves those semantics:
 
-- VideoToolbox decode, Metal resize/color packing, and cache writes overlap through a bounded ordered pipeline.
+- VideoToolbox decodes directly into native video-range YUV. One CVMetalTexture mapping and Metal command buffer produce both configured output resolutions, while decode, resize/color packing, and cache writes overlap through a bounded ordered pipeline of up to eight observations within a 64 MB cap.
+- When one decoded frame remains causal across many configured perception ticks, Metal packs it once and the cache writer repeats those exact packed bytes. Observation cadence, indices, controls, and every action label remain unchanged.
 - Dataset files are required memory mappings with adaptive VM advice. Epochs randomize small collections of temporally local lanes rather than every row globally, so each optimizer batch remains diverse while macOS can read ahead the contiguous mapped pages inside each lane. A batch gathers packed vision, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
 - Current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those deterministic embeddings to their exact frame slots. Training gathers visual embeddings back to action-row shape *before* control masking, the recurrent network, and dropout, preserving one independent stochastic path per label. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
 - Above the measured workload crossover, the coordinate contribution to the first convolution is evaluated once per batch and the established GroupNorm layout uses MLX's fused Metal layer-normalization kernel. Small tensors retain the lower-overhead kernels.
@@ -212,6 +223,8 @@ The app owns a solid top bar and sidebar for consistent macOS 15+ rendering. Exp
 Theme controls are bounded and global. Motion honors Reduce Motion, can be disabled, and pauses when the app is inactive. Charts keep bounded histories and downsample while preserving extrema.
 
 User-facing technical values must be derived from shared contract helpers such as `NeuralInputSizing` and `ModelSizing`, not duplicated formulas.
+
+Library recording rows and inspectors expose encoded frames plus logical package MB/GB. Folder headers aggregate every recording in that folder—not only search results—and show total recordings, frames, logical bytes, and full recorded seconds. Newly created manifests use exact frame counts; legacy estimates must remain compatible and non-destructive.
 
 Recording presets are user-owned, editable snapshots of Record-page settings. Applying a preset must tolerate an unavailable source or deleted destination without inventing an identifier. Library range selection follows the visible folder/search order; bulk manifest moves roll back as a set, and bulk deletion stages all recording directories before cleanup. Global shortcuts may use keyboard keys or any macOS mouse-button number, including additional side buttons, and must remain excluded from recording and human-input safety hooks.
 

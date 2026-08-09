@@ -161,6 +161,7 @@ struct PreprocessingSpec: Codable, Hashable, Sendable {
 /// frames keep the current frame's color mode, chroma layout, bit detail, and
 /// resize policy; only their pixel dimensions are reduced.
 struct TemporalVisionConfiguration: Codable, Hashable, Sendable {
+    static let minimumPastFrameCount = 0
     static let defaultPastFrameCount = 4
     static let defaultFrameSpacing = 2
     static let defaultDownsampleFactor = 2
@@ -189,7 +190,7 @@ struct TemporalVisionConfiguration: Codable, Hashable, Sendable {
     }
 
     func spacingSeconds(perceptionFPS: Double) -> Double {
-        guard perceptionFPS.isFinite, perceptionFPS > 0 else { return 0 }
+        guard pastFrameCount > 0, perceptionFPS.isFinite, perceptionFPS > 0 else { return 0 }
         return Double(frameSpacing) / perceptionFPS
     }
 
@@ -198,11 +199,11 @@ struct TemporalVisionConfiguration: Codable, Hashable, Sendable {
     }
 
     func validated(current: PreprocessingSpec) throws -> Self {
-        guard (1...Self.maximumPastFrameCount).contains(pastFrameCount),
+        guard (Self.minimumPastFrameCount...Self.maximumPastFrameCount).contains(pastFrameCount),
               (1...Self.maximumFrameSpacing).contains(frameSpacing),
               (1...Self.maximumDownsampleFactor).contains(downsampleFactor) else {
             throw AgentTrainerError.invalidConfiguration(
-                "Temporal vision supports 1–\(Self.maximumPastFrameCount) past frames, spacing of 1–\(Self.maximumFrameSpacing) perception frames, and a 1×–\(Self.maximumDownsampleFactor)× past-frame downscale."
+                "Temporal vision supports 0–\(Self.maximumPastFrameCount) past frames, spacing of 1–\(Self.maximumFrameSpacing) perception frames, and a 1×–\(Self.maximumDownsampleFactor)× past-frame downscale. Zero past frames disables temporal memory."
             )
         }
         let past = try pastFrameSpec(from: current).validated()
@@ -259,10 +260,10 @@ enum ModelContract {
 /// a data-only correction can invalidate caches/checkpoints without needlessly
 /// changing tensor shapes. Policy v5 itself is an intentional weight break.
 enum TrainingDataContract {
-    /// Version 9 samples held/static video at the configured perception cadence
-    /// instead of letting ScreenCaptureKit idle gaps collapse temporal context.
-    /// Version 8's causal frame/control layout remains unchanged.
-    static let schemaVersion = 9
+    /// Version 10 adds a current-frame-only cache layout for disabled temporal
+    /// memory. Version 9's causal cadence remains unchanged when past frames are
+    /// enabled.
+    static let schemaVersion = 10
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -347,6 +348,15 @@ struct ArchitectureSpec: Codable, Hashable, Sendable {
     static let small = ArchitectureSpec(convolutionChannels: [24, 48, 72, 96], visualEmbedding: 192, recurrentWidth: 128, fusionWidths: [256, 192], visualPooling: .attention, attentionHeads: 6)
     static let balanced = ArchitectureSpec()
     static let large = ArchitectureSpec(convolutionChannels: [48, 96, 160, 224], visualEmbedding: 384, recurrentWidth: 256, fusionWidths: [512, 384], dropout: 0.12, visualPooling: .attention, attentionHeads: 12)
+
+    /// Dropout changes stochastic training regularization but does not add,
+    /// remove, or reinterpret a learned tensor. Normalizing it out lets an
+    /// existing brain warm-start safely when only dropout changes.
+    var weightLayout: Self {
+        var value = self
+        value.dropout = 0
+        return value
+    }
 }
 
 struct CNNLayerGeometry: Hashable, Sendable {
@@ -582,6 +592,10 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
     var pixelWidth: Int
     var pixelHeight: Int
     var deliveredFPS: Double
+    /// Exact number of encoded video samples for recordings created by current
+    /// versions. Older manifests derive the same value from duration and the
+    /// persisted delivered-frame rate.
+    var frameCount: Int? = nil
     var eventCount: Int
     var videoFile = "capture.mov"
     var eventFile = "events.atrevents"
@@ -602,17 +616,51 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
             && rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite
             && pixelWidth > 0 && pixelHeight > 0 && pixelWidth <= 32_768 && pixelHeight <= 32_768
             && deliveredFPS.isFinite && deliveredFPS >= 0 && deliveredFPS <= 1_000
+            && (frameCount.map { $0 >= 0 } ?? true)
             && eventCount >= 0
             && trimStart.isFinite && trimStart >= 0 && trimStart <= duration
             && end.isFinite && end >= trimStart && end <= duration
             && safeFileNames.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0") }
+    }
+
+    var encodedFrameCount: Int64 {
+        if let frameCount { return Int64(max(0, frameCount)) }
+        let estimate = duration * deliveredFPS
+        guard estimate.isFinite, estimate > 0 else { return 0 }
+        return Int64(min(Double(Int64.max), estimate.rounded()))
     }
 }
 
 struct RecordingItem: Identifiable, Hashable, Sendable {
     var manifest: RecordingManifest
     var directory: URL
+    /// Logical package bytes, collected once by the workspace scan so SwiftUI
+    /// never walks the file system while laying out library rows.
+    var storageBytes: Int64 = 0
     var id: UUID { manifest.id }
+}
+
+struct RecordingCollectionMetrics: Hashable, Sendable {
+    var recordingCount = 0
+    var frameCount: Int64 = 0
+    var storageBytes: Int64 = 0
+    var durationSeconds = 0.0
+
+    static func total<S: Sequence>(for recordings: S) -> Self where S.Element == RecordingItem {
+        recordings.reduce(into: Self()) { result, recording in
+            result.recordingCount += 1
+            result.frameCount = saturatedAdd(result.frameCount, recording.manifest.encodedFrameCount)
+            result.storageBytes = saturatedAdd(result.storageBytes, max(0, recording.storageBytes))
+            if recording.manifest.duration.isFinite {
+                result.durationSeconds += max(0, recording.manifest.duration)
+            }
+        }
+    }
+
+    private static func saturatedAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        let value = lhs.addingReportingOverflow(rhs)
+        return value.overflow ? Int64.max : value.partialValue
+    }
 }
 
 struct RecordingFolder: Codable, Hashable, Identifiable, Sendable {
@@ -807,7 +855,7 @@ struct AIProfile: Codable, Hashable, Identifiable, Sendable {
         LearnedBrainContract(
             preprocessing: preprocessing,
             temporalVision: training.effectiveTemporalVision,
-            architecture: training.architecture
+            architecture: training.architecture.weightLayout
         )
     }
 
@@ -1156,7 +1204,7 @@ enum NeuralInputSizing {
         let pastCoordinates = multiply(pastCounts.pixels, 2)
         let currentConvolution = add(currentExpanded, currentCoordinates)
         let pastConvolution = add(pastExpanded, pastCoordinates)
-        let pastFrameCount = Int64(max(1, temporal.pastFrameCount))
+        let pastFrameCount = Int64(max(0, temporal.pastFrameCount))
         let actionValues = Int64(ActionLayout.count)
         let controls = multiply(pastFrameCount, actionValues)
         let pastVision = multiply(pastFrameCount, pastConvolution)

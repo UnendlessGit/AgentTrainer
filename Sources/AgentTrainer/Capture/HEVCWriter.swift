@@ -3,6 +3,22 @@ import CoreMedia
 import Foundation
 import VideoToolbox
 
+enum HEVCEncodingConfiguration {
+    /// A high-quality HEVC target expressed in bits per source pixel. Frame
+    /// rates above 30 scale sublinearly because screen recordings commonly
+    /// contain repeated regions and the encoder can spend bits where motion
+    /// actually occurs. The bounds keep tiny captures useful and extreme
+    /// displays from returning to near-lossless-sized files.
+    static func targetBitRate(width: Int, height: Int, fps: Double) -> Int {
+        guard width > 0, height > 0, fps.isFinite, fps > 0 else { return 1_500_000 }
+        let pixels = Double(width) * Double(height)
+        let boundedFPS = min(240, max(1, fps))
+        let effectiveFPS = min(30, boundedFPS) + max(0, boundedFPS - 30) * 0.5
+        let visuallyTransparentTarget = pixels * effectiveFPS * 0.055
+        return Int(min(45_000_000, max(1_500_000, visuallyTransparentTarget.rounded())))
+    }
+}
+
 final class HEVCWriter: @unchecked Sendable {
     let url: URL
     let width: Int
@@ -26,16 +42,20 @@ final class HEVCWriter: @unchecked Sendable {
         try? FileManager.default.removeItem(at: url)
         writer = try AVAssetWriter(outputURL: url, fileType: .mov)
 
-        let bitrate = max(2_000_000, min(120_000_000, width * height * 8))
+        let bitrate = HEVCEncodingConfiguration.targetBitRate(width: width, height: height, fps: fps)
         let encoderSpecification: [String: Any] = [
             kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true,
             kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true
         ]
         let compression: [String: Any] = [
-            AVVideoAverageBitRateKey: bitrate,
+            kVTCompressionPropertyKey_AverageBitRate as String: bitrate,
             AVVideoExpectedSourceFrameRateKey: fps,
-            AVVideoMaxKeyFrameIntervalDurationKey: 2,
-            AVVideoAllowFrameReorderingKey: false,
+            AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main_AutoLevel,
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration as String: 6,
+            kVTCompressionPropertyKey_AllowTemporalCompression as String: true,
+            kVTCompressionPropertyKey_AllowFrameReordering as String: true,
+            kVTCompressionPropertyKey_AllowOpenGOP as String: true,
+            kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String: false,
             kVTCompressionPropertyKey_RealTime as String: true
         ]
         let settings: [String: Any] = [

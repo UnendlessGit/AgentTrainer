@@ -276,21 +276,29 @@ private struct ProfileEditor: View {
                         VStack(alignment: .leading, spacing: 9) {
                             HStack {
                                 Text("Temporal frame context").font(.subheadline.bold()).foregroundStyle(ATColor.cyan)
-                                InfoTip("Each decision uses the full-resolution current frame plus real lower-resolution past frames. Every past frame is paired with all controls demonstrated during its perception interval: cursor position and movement, mouse buttons, scroll, keyboard, Shift, Control, Option, and Command. No motion-difference image is generated.")
+                                InfoTip("Set Past frames to 0 for current-frame-only vision. Otherwise each decision adds real lower-resolution past frames paired with all controls demonstrated during their perception intervals. No motion-difference image is generated.")
                                 Spacer()
                             }
-                            HStack {
-                                IntField("Past frames", value: temporalIntBinding(\.pastFrameCount), help: "Number of causal screen frames supplied before the current frame (1–\(TemporalVisionConfiguration.maximumPastFrameCount)).")
-                                IntField("Frames apart", value: temporalIntBinding(\.frameSpacing), help: "Distance between selected frames in Perception FPS intervals (1–\(TemporalVisionConfiguration.maximumFrameSpacing)). 1 means consecutive perceptions.")
-                                IntField("Past downscale", value: temporalIntBinding(\.downsampleFactor), help: "Linear resolution reduction for every past frame (1×–\(TemporalVisionConfiguration.maximumDownsampleFactor)×). 2 means half width and half height while preserving aspect, color mode, chroma, and bit detail.")
-                            }
                             let temporal = draft.training.effectiveTemporalVision
+                            HStack {
+                                IntField("Past frames", value: temporalIntBinding(\.pastFrameCount), help: "Number of causal screen frames supplied before the current frame (0–\(TemporalVisionConfiguration.maximumPastFrameCount)). Zero disables temporal memory.")
+                                IntField("Frames apart", value: temporalIntBinding(\.frameSpacing), help: "Distance between selected frames in Perception FPS intervals (1–\(TemporalVisionConfiguration.maximumFrameSpacing)). 1 means consecutive perceptions.")
+                                    .disabled(temporal.pastFrameCount == 0)
+                                IntField("Past downscale", value: temporalIntBinding(\.downsampleFactor), help: "Linear resolution reduction for every past frame (1×–\(TemporalVisionConfiguration.maximumDownsampleFactor)×). 2 means half width and half height while preserving aspect, color mode, chroma, and bit detail.")
+                                    .disabled(temporal.pastFrameCount == 0)
+                            }
                             let pastSpec = temporal.pastFrameSpec(from: draft.preprocessing)
                             HStack(spacing: 10) {
                                 StatusPill(text: "Current \(draft.preprocessing.width) × \(draft.preprocessing.height)", color: ATColor.green)
-                                StatusPill(text: "Past \(pastSpec.width) × \(pastSpec.height)", color: ATColor.cyan)
-                                Text("nominally every \(temporal.spacingSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.precision(.fractionLength(3))))s • \(temporal.lookbackSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.precision(.fractionLength(3))))s total lookback")
-                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                if temporal.pastFrameCount == 0 {
+                                    StatusPill(text: "Temporal memory off", color: ATColor.amber)
+                                    Text("Only the exact current frame is cached, trained, and used at runtime.")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                } else {
+                                    StatusPill(text: "Past \(pastSpec.width) × \(pastSpec.height)", color: ATColor.cyan)
+                                    Text("nominally every \(temporal.spacingSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.precision(.fractionLength(3))))s • \(temporal.lookbackSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.precision(.fractionLength(3))))s total lookback")
+                                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                }
                                 Spacer()
                             }
                             Text(temporalFormatDetail)
@@ -322,7 +330,7 @@ private struct ProfileEditor: View {
                         }
                         HStack { InfoTip("The shared encoder sees the current frame and each real reduced-resolution past frame with screen coordinates. The temporal encoder then reads every past visual embedding together with the controls tied to that frame."); Spacer() }
                         HStack { IntArrayField("Conv channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
-                        HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
+                        HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs. Changing it keeps existing brain weights and starts a fresh optimizer sequence when training resumes."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
                     }
                 }
                 NeuralNetworkInputOverview(profile: draft)
@@ -407,6 +415,9 @@ private struct ProfileEditor: View {
     }
 
     private var temporalFormatDetail: String {
+        if draft.training.effectiveTemporalVision.pastFrameCount == 0 {
+            return "Temporal payloads are omitted; compatibility cache placeholders stay empty and the network receives current vision only."
+        }
         let colorDetail = draft.preprocessing.colorMode == .color
             ? "color mode and \(draft.preprocessing.chroma.rawValue) chroma"
             : "grayscale luminance"
@@ -649,6 +660,9 @@ private struct NeuralNetworkInputOverview: View {
     }
 
     private func pastPackedVisionDetail(_ input: NeuralInputSummary) -> String {
+        if input.pastFrameCount == 0 {
+            return "Disabled • no past-image or frame-control payload"
+        }
         let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
         let colorDetail = profile.preprocessing.colorMode == .color
             ? "color/\(profile.preprocessing.chroma.rawValue)"
