@@ -599,13 +599,22 @@ actor WorkspaceStore {
     }
 
     func listRecordings() -> [RecordingItem] {
-        guard let urls = try? FileManager.default.contentsOfDirectory(at: recordingsRoot, includingPropertiesForKeys: nil) else { return [] }
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: recordingsRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
         return urls.compactMap { directory in
+            guard directory.pathExtension == "atrrecord" else { return nil }
             let manifestURL = directory.appendingPathComponent("manifest.json")
             guard let data = try? Data(contentsOf: manifestURL),
                   let manifest = try? decoder.decode(RecordingManifest.self, from: data),
                   manifest.isStructurallyValid else { return nil }
-            return RecordingItem(manifest: manifest, directory: directory)
+            return RecordingItem(
+                manifest: manifest,
+                directory: directory,
+                storageBytes: contentSummary(at: directory).bytes
+            )
         }.sorted { $0.manifest.createdAt > $1.manifest.createdAt }
     }
 

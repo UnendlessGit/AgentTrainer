@@ -58,6 +58,18 @@ final class CaptureService: NSObject, @unchecked Sendable {
         result += content.windows.filter { $0.isOnScreen && $0.windowLayer == 0 && $0.frame.width > 40 && $0.frame.height > 40 && $0.owningApplication?.bundleIdentifier != Bundle.main.bundleIdentifier }.map {
             CaptureSourceOption(id: $0.windowID, kind: .window, name: $0.title.flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled Window", detail: $0.owningApplication?.applicationName ?? "Application", frame: $0.frame)
         }
+        result.sort { lhs, rhs in
+            switch (lhs.kind, rhs.kind) {
+            case (.display, .window): return true
+            case (.window, .display): return false
+            case (.display, .display): return lhs.id < rhs.id
+            case (.window, .window):
+                let applicationOrder = lhs.detail.localizedStandardCompare(rhs.detail)
+                if applicationOrder != .orderedSame { return applicationOrder == .orderedAscending }
+                let nameOrder = lhs.name.localizedStandardCompare(rhs.name)
+                return nameOrder == .orderedSame ? lhs.id < rhs.id : nameOrder == .orderedAscending
+            }
+        }
         return result
     }
 
@@ -94,7 +106,13 @@ final class CaptureService: NSObject, @unchecked Sendable {
         config.queueDepth = min(8, max(1, queueDepth))
         config.showsCursor = spec.showsCursor
         config.capturesAudio = false
-        config.pixelFormat = kCVPixelFormatType_32BGRA
+        // Saved video goes straight from ScreenCaptureKit's bi-planar 4:2:0
+        // surface into the hardware HEVC encoder. Avoiding an intermediate
+        // 32-bit BGRA surface cuts capture bandwidth and removes a redundant
+        // full-resolution color conversion without changing displayed size.
+        config.pixelFormat = recordingURL == nil
+            ? kCVPixelFormatType_32BGRA
+            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.scalesToFit = exactOutputSize != nil
         config.preservesAspectRatio = exactOutputSize == nil
         if let sourceRect = selection.sourceRect { config.sourceRect = sourceRect }

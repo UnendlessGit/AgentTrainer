@@ -109,6 +109,8 @@ final class AppModel: ObservableObject {
     private var agentLaunchRevision: UInt64 = 0
     private var lastEventClock = RecordingClock()
     private var profileAutosaveTask: Task<Void, Never>?
+    private var captureSourceMonitorTask: Task<Void, Never>?
+    private var captureSourceRefreshRevision: UInt64 = 0
     private var isRestoringWorkflowSettings = true
     private var updateCheckStarted = false
     private var autoTrainingProfileID: UUID?
@@ -160,7 +162,9 @@ final class AppModel: ObservableObject {
         input.ignoredHotkeys = [hotkeys.panic, hotkeys.record, hotkeys.run]
         reenactor.onFinish = { [weak self] reason in Task { @MainActor in self?.isReplaying = false; self?.activityStatus = reason ?? "Reenactment complete" } }
         AppLog.write(category: "Lifecycle", "Application model initialized")
-        panicHotkey.start(); recordHotkey.start(); runHotkey.start(); Task { await bootstrap() }
+        panicHotkey.start(); recordHotkey.start(); runHotkey.start()
+        startCaptureSourceMonitoring()
+        Task { await bootstrap() }
     }
 
     func bootstrap() async {
@@ -258,13 +262,43 @@ final class AppModel: ObservableObject {
     }
 
     func refreshSources() async {
+        await refreshSources(reportFailure: true)
+    }
+
+    private func refreshSources(reportFailure: Bool) async {
+        captureSourceRefreshRevision &+= 1
+        let refreshRevision = captureSourceRefreshRevision
         do {
-            captureSources = try await CaptureService.availableSources()
+            let available = try await CaptureService.availableSources()
+            guard refreshRevision == captureSourceRefreshRevision else { return }
+            if captureSources != available { captureSources = available }
             if selectedSource == nil { selectedSourceID = captureSources.first(where: sourceMatchesKind)?.id }
         } catch {
+            guard refreshRevision == captureSourceRefreshRevision else { return }
+            guard reportFailure else { return }
             captureSources = []
             activityStatus = "Grant Screen Recording permission in Settings"
             AppLog.write(.warning, category: "Capture", "Capture sources unavailable", details: error.localizedDescription)
+        }
+    }
+
+    func captureEnvironmentDidChange() {
+        guard isAppActive, selection == .record || selection == .run,
+              !recordingIsActiveOrStarting, !agentIsActiveOrStarting else { return }
+        Task { await refreshSources(reportFailure: false) }
+    }
+
+    private func startCaptureSourceMonitoring() {
+        captureSourceMonitorTask?.cancel()
+        captureSourceMonitorTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, let self else { return }
+                let sourcePickerIsVisible = self.selection == .record || self.selection == .run
+                guard self.isAppActive, sourcePickerIsVisible,
+                      !self.recordingIsActiveOrStarting, !self.agentIsActiveOrStarting else { continue }
+                await self.refreshSources(reportFailure: false)
+            }
         }
     }
 
@@ -413,11 +447,13 @@ final class AppModel: ObservableObject {
             var trimStart = min(duration, max(0, recordingTrimStart))
             var trimEnd = max(trimStart, duration - max(0, recordingTrimEnd))
             if trimEnd <= trimStart { trimStart = 0; trimEnd = duration }
-            let manifest = RecordingManifest(id: id, name: "Recording \(Date().formatted(date: .abbreviated, time: .shortened))", createdAt: Date(), hostStartNanos: hostStart, duration: duration, capture: captureSpec, globalRect: CodableRect(captureRect), pixelWidth: result.width, pixelHeight: result.height, deliveredFPS: result.deliveredFPS, eventCount: eventCount, trimStart: trimStart, trimEnd: trimEnd, folderID: destinationFolderID, thumbnailFile: "thumbnail.jpg", excludedKeyCodes: activeRecordingExcludedKeyCodes)
+            let manifest = RecordingManifest(id: id, name: "Recording \(Date().formatted(date: .abbreviated, time: .shortened))", createdAt: Date(), hostStartNanos: hostStart, duration: duration, capture: captureSpec, globalRect: CodableRect(captureRect), pixelWidth: result.width, pixelHeight: result.height, deliveredFPS: result.deliveredFPS, frameCount: result.frameCount, eventCount: eventCount, trimStart: trimStart, trimEnd: trimEnd, folderID: destinationFolderID, thumbnailFile: "thumbnail.jpg", excludedKeyCodes: activeRecordingExcludedKeyCodes)
             try await WorkspaceStore.shared.writeRecording(manifest, to: directory)
             await createThumbnail(for: directory.appendingPathComponent("capture.mov"), at: max(0, min(duration * 0.25, 2)), destination: directory.appendingPathComponent("thumbnail.jpg"))
             activityStatus = "Recording saved"
-            AppLog.write(category: "Recording", "Recording saved", details: "\(eventCount) input events, \(result.width)×\(result.height), \(duration.formatted(.number.precision(.fractionLength(2)))) seconds")
+            let videoBytes = (try? directory.appendingPathComponent("capture.mov").resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+            let size = ByteCountFormatter.string(fromByteCount: videoBytes, countStyle: .file)
+            AppLog.write(category: "Recording", "Recording saved", details: "\(result.frameCount) frames, \(eventCount) input events, \(result.width)×\(result.height), \(duration.formatted(.number.precision(.fractionLength(2)))) seconds, \(size)")
             if result.droppedFrameCount > 0 {
                 AppLog.write(.warning, category: "Recording", "Skipped unusable or backpressured capture frames", details: "\(result.droppedFrameCount) frames; input timing and the remaining HEVC timeline were preserved")
             }

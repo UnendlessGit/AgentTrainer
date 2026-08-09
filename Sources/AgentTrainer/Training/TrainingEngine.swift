@@ -806,10 +806,37 @@ final class TrainingEngine: @unchecked Sendable {
         reusesVisionFeatures: Bool
     ) throws -> [MLXArray] {
         let temporal = profile.training.effectiveTemporalVision
-        let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         let count = indices.count
         let visionPlan = reusesVisionFeatures ? dataset.visionBatchPlan(at: indices) : nil
         let visionCount = visionPlan?.uniqueSequences.count ?? count
+        if temporal.pastFrameCount == 0 {
+            var descriptors: [MetalArrayBufferPool.Descriptor] = [
+                .init([visionCount, profile.preprocessing.sampleByteCount], dtype: .uint8)
+            ]
+            if reusesVisionFeatures { descriptors.append(.init([count], dtype: .int32)) }
+            descriptors.append(.init([count, 2, ActionLayout.count], dtype: .float32))
+            return try inputBufferPool.makeArrays(descriptors) { destinations in
+                let actionDestination = destinations[reusesVisionFeatures ? 2 : 1]
+                dataset.populateCurrentOnlyTrainingBatch(
+                    at: indices,
+                    observationSequences: visionPlan?.uniqueSequences,
+                    packedCurrentObservations: destinations[0],
+                    actionRows: actionDestination
+                )
+                if let visionPlan {
+                    visionPlan.sampleToVision.withUnsafeBytes {
+                        destinations[1].copyMemory(from: $0)
+                    }
+                }
+                ActionLayout.sanitizeTrainingRows(
+                    actionDestination.bindMemory(to: Float.self),
+                    rowCount: count * 2,
+                    channels: profile.channels,
+                    restrictions: profile.effectiveRestrictions
+                )
+            }
+        }
+        let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         let pastVisionCount = visionPlan?.uniquePastObservations.count
             ?? visionCount * temporal.pastFrameCount
         var descriptors: [MetalArrayBufferPool.Descriptor] = [
@@ -872,7 +899,24 @@ final class TrainingEngine: @unchecked Sendable {
         profile: AIProfile,
         reusesVisionFeatures: Bool
     ) -> ExpandedTrainingBatch {
-        let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+        let temporal = profile.training.effectiveTemporalVision
+        if temporal.pastFrameCount == 0 {
+            let actions = arrays[reusesVisionFeatures ? 2 : 1]
+            let visionCount = arrays[0].dim(0)
+            return ExpandedTrainingBatch(
+                currentImages: VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
+                pastImages: MLXArray.zeros(
+                    [visionCount, 1, 1, 1, profile.preprocessing.channelCount],
+                    dtype: .float32
+                ),
+                pastControls: MLXArray.zeros([visionCount, 1, ActionLayout.count], dtype: .float32),
+                visionToPast: nil,
+                sampleToVision: reusesVisionFeatures ? arrays[1] : nil,
+                targets: actions[0..., 0, 0...],
+                previousTargets: actions[0..., 1, 0...]
+            )
+        }
+        let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         let actions = arrays[reusesVisionFeatures ? 5 : 3]
         return ExpandedTrainingBatch(
             currentImages: VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
@@ -1308,7 +1352,7 @@ final class TrainingEngine: @unchecked Sendable {
             let preprocessing: PreprocessingSpec
             let channels: ActionChannels
             let training: TrainingConfiguration
-            let recordings: [RecordingManifest]
+            let recordings: [RecordingTrainingIdentity]
             let folderIDs: [UUID]
             let restrictions: ActionRestrictions
         }
@@ -1322,8 +1366,10 @@ final class TrainingEngine: @unchecked Sendable {
         var normalizedChannels = profile.channels
         normalizedChannels.absoluteMouse = profile.channels.mouseMovement
         normalizedChannels.relativeMouse = profile.channels.mouseMovement
-        let manifests = recordings.map(\.manifest).sorted { $0.id.uuidString < $1.id.uuidString }
-        let identity = TrainingIdentity(trainingDataSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, channels: normalizedChannels, training: resumeCompatibleTraining, recordings: manifests, folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString }, restrictions: profile.effectiveRestrictions)
+        let recordingIdentities = try recordings
+            .map { try RecordingTrainingIdentity(recording: $0) }
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+        let identity = TrainingIdentity(trainingDataSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, channels: normalizedChannels, training: resumeCompatibleTraining, recordings: recordingIdentities, folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString }, restrictions: profile.effectiveRestrictions)
         return SHA256.hash(data: try encoder.encode(identity)).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -1483,7 +1529,7 @@ final class TrainingEngine: @unchecked Sendable {
            let version = await WorkspaceStore.shared.version(profileID: profile.id, versionID: versionID),
            version.schemaVersion == ModelContract.schemaVersion,
            version.preprocessing == profile.preprocessing,
-           version.training.architecture == profile.training.architecture {
+           version.training.architecture.weightLayout == profile.training.architecture.weightLayout {
             let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: versionID)
             try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
             state.epoch = max(0, version.epoch ?? 0)

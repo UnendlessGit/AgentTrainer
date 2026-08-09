@@ -159,13 +159,19 @@ final class AgentRuntime: @unchecked Sendable {
         let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
         model.train(false)
-        let pastSpec = runtimeProfile.training.effectiveTemporalVision.pastFrameSpec(from: runtimeProfile.preprocessing)
+        let temporal = runtimeProfile.training.effectiveTemporalVision
+        let hasTemporalMemory = temporal.pastFrameCount > 0
+        let pastSpec = temporal.pastFrameSpec(from: runtimeProfile.preprocessing)
         let predictionFunction: VisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            [model.predictions(
-                currentImages: VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing),
-                pastImages: VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec),
-                pastControls: inputs[2]
-            )]
+            let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
+            if hasTemporalMemory {
+                return [model.predictions(
+                    currentImages: currentImages,
+                    pastImages: VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec),
+                    pastControls: inputs[2]
+                )]
+            }
+            return [model.currentOnlyPredictions(currentImages: currentImages)]
         }
         // Diagnostic graphs are lazy: creating these closures does not execute
         // or materialize an extra tensor. The selected graph first compiles only
@@ -173,38 +179,62 @@ final class AgentRuntime: @unchecked Sendable {
         let activationVisualizationFunctions: [VisualizationFunction] = (0..<max(1, model.convolutions.count)).map { selectedLayer in
             compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
                 let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
-                let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
                 let layers = model.visualActivations(images: currentImages)
-                let logits = model.logits(currentVisualFeatures: layers.last!, pastImages: pastImages, pastControls: inputs[2])
+                let temporalFeatures = hasTemporalMemory
+                    ? model.temporalFeatures(
+                        currentVisualFeatures: layers.last!,
+                        pastImages: VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec),
+                        pastControls: inputs[2]
+                    )
+                    : model.currentOnlyTemporalFeatures(currentVisualFeatures: layers.last!)
+                let logits = model.logits(temporalFeatures: temporalFeatures)
                 let map = model.sampledForVisualization(layers[selectedLayer]).mean(axis: -1, keepDims: true)
                 return [model.activatedPredictions(logits: logits), map]
             }
         }
         let channelVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
             let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
-            let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
             let layers = model.visualActivations(images: currentImages)
-            let logits = model.logits(currentVisualFeatures: layers.last!, pastImages: pastImages, pastControls: inputs[2])
+            let temporalFeatures = hasTemporalMemory
+                ? model.temporalFeatures(
+                    currentVisualFeatures: layers.last!,
+                    pastImages: VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec),
+                    pastControls: inputs[2]
+                )
+                : model.currentOnlyTemporalFeatures(currentVisualFeatures: layers.last!)
+            let logits = model.logits(temporalFeatures: temporalFeatures)
             return [model.activatedPredictions(logits: logits), model.strongestChannelsForVisualization(layers.last!)]
         }
         let saliencyVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
             let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
-            let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
             let layers = model.visualActivations(images: currentImages)
-            let logits = model.logits(currentVisualFeatures: layers.last!, pastImages: pastImages, pastControls: inputs[2])
+            let temporalFeatures = hasTemporalMemory
+                ? model.temporalFeatures(
+                    currentVisualFeatures: layers.last!,
+                    pastImages: VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec),
+                    pastControls: inputs[2]
+                )
+                : model.currentOnlyTemporalFeatures(currentVisualFeatures: layers.last!)
+            let logits = model.logits(temporalFeatures: temporalFeatures)
             // Keep the exact final tensor on GPU for the post-CNN gradient.
             // This graph intentionally omits the channel ranking used by the
             // separate feature-grid view.
             return [model.activatedPredictions(logits: logits), layers.last!]
         }
         let saliencyGradient = grad({ (inputs: [MLXArray]) -> MLXArray in
-            let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+            if hasTemporalMemory {
+                let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+                let logits = model.logits(
+                    currentVisualFeatures: inputs[0],
+                    pastImages: pastImages,
+                    pastControls: inputs[2]
+                )
+                return (logits * inputs[3].asType(model.dtype)).sum()
+            }
             let logits = model.logits(
-                currentVisualFeatures: inputs[0],
-                pastImages: pastImages,
-                pastControls: inputs[2]
+                temporalFeatures: model.currentOnlyTemporalFeatures(currentVisualFeatures: inputs[0])
             )
-            return (logits * inputs[3].asType(model.dtype)).sum()
+            return (logits * inputs[1].asType(model.dtype)).sum()
         }, argumentNumbers: [0])
         let accepted = lock.withLock { () -> Bool in
             guard launchRevision == launchToken, starting, stopped else { return false }
@@ -426,24 +456,44 @@ final class AgentRuntime: @unchecked Sendable {
         let began = CACurrentMediaTime()
         do {
             let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
-            // Submit both sizes before waiting so Metal can process the full
-            // current frame and the reduced copy retained for future context.
-            let currentJob = try preprocessor.submit(buffer, spec: profile.preprocessing)
-            let pastJob = try preprocessor.submit(buffer, spec: pastSpec)
+            let hasTemporalMemory = temporal.pastFrameCount > 0
+            let sharesPackedRepresentation = hasTemporalMemory && pastSpec == profile.preprocessing
+            let requestedSpecs = hasTemporalMemory && !sharesPackedRepresentation
+                ? [profile.preprocessing, pastSpec]
+                : [profile.preprocessing]
+            // One source mapping and command buffer produces every resolution
+            // needed by this perception.
+            let jobs = try preprocessor.submit(buffer, specs: requestedSpecs)
+            guard let currentJob = jobs.first else {
+                throw AgentTrainerError.model("The live vision pipeline returned no current frame.")
+            }
             let packed = try currentJob.withPackedBytes { Data($0) }
-            let packedPastFrame = try pastJob.withPackedBytes { Data($0) }
+            let packedPastFrame: Data
+            if !hasTemporalMemory {
+                packedPastFrame = Data()
+            } else if sharesPackedRepresentation {
+                packedPastFrame = packed
+            } else if jobs.indices.contains(1) {
+                packedPastFrame = try jobs[1].withPackedBytes { Data($0) }
+            } else {
+                throw AgentTrainerError.model("The live vision pipeline returned no temporal frame.")
+            }
             let zeroControls = [Float](repeating: 0, count: ActionLayout.count)
             let selectedFrames: [TemporalFrame] = selectedPriorFrames.map { frame in
                 frame ?? TemporalFrame(packed: packedPastFrame, controls: zeroControls)
             }
-            let inferenceInputs = try inferenceInputBuffers.makeArrays([
-                .init([1, profile.preprocessing.sampleByteCount], dtype: .uint8),
-                .init([1, temporal.pastFrameCount, pastSpec.sampleByteCount], dtype: .uint8),
-                .init([1, temporal.pastFrameCount, ActionLayout.count], dtype: .float32)
-            ]) { destinations in
+            var descriptors: [MetalArrayBufferPool.Descriptor] = [
+                .init([1, profile.preprocessing.sampleByteCount], dtype: .uint8)
+            ]
+            if hasTemporalMemory {
+                descriptors.append(.init([1, temporal.pastFrameCount, pastSpec.sampleByteCount], dtype: .uint8))
+                descriptors.append(.init([1, temporal.pastFrameCount, ActionLayout.count], dtype: .float32))
+            }
+            let inferenceInputs = try inferenceInputBuffers.makeArrays(descriptors) { destinations in
                 packed.withUnsafeBytes { source in
                     destinations[0].copyMemory(from: source)
                 }
+                guard hasTemporalMemory else { return }
                 let controlRowBytes = ActionLayout.count * MemoryLayout<Float>.size
                 for (frame, selected) in selectedFrames.enumerated() {
                     selected.packed.withUnsafeBytes { source in
@@ -473,7 +523,10 @@ final class AgentRuntime: @unchecked Sendable {
                     guard let saliencyVisualizationFunction, let saliencyGradientFunction else { return predictionFunction(inferenceInputs) }
                     let forward = saliencyVisualizationFunction(inferenceInputs)
                     guard forward.count >= 2 else { return predictionFunction(inferenceInputs) }
-                    let gradients = saliencyGradientFunction([forward[1], inferenceInputs[1], inferenceInputs[2], selector])
+                    let gradientInputs = hasTemporalMemory
+                        ? [forward[1], inferenceInputs[1], inferenceInputs[2], selector]
+                        : [forward[1], selector]
+                    let gradients = saliencyGradientFunction(gradientInputs)
                     let weights = gradients.mean(axes: [1, 2], keepDims: true)
                     let saliency = relu((forward[1] * weights).sum(axis: -1, keepDims: true))
                     return [forward[0], model.sampledForVisualization(saliency)]
@@ -522,11 +575,13 @@ final class AgentRuntime: @unchecked Sendable {
                 outputPermissions: outputPermissions,
                 shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
             )
-            let retainedFrameCount = temporal.pastFrameCount * temporal.frameSpacing
-            temporalFrames.append(
-                TemporalFrame(packed: packedPastFrame, controls: frameControls),
-                capacity: retainedFrameCount
-            )
+            if hasTemporalMemory {
+                let retainedFrameCount = temporal.pastFrameCount * temporal.frameSpacing
+                temporalFrames.append(
+                    TemporalFrame(packed: packedPastFrame, controls: frameControls),
+                    capacity: retainedFrameCount
+                )
+            }
             predictionLatch.publish(values)
             metrics.frameCount += 1
             let elapsed = max(0.001, CACurrentMediaTime() - startedAt)
