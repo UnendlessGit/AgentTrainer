@@ -2832,6 +2832,249 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(optimizerA.step, optimizerB.step)
     }
 
+    func testOrderedCompiledStepQueueMatchesPerStepSynchronization() throws {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(
+            width: 12,
+            height: 8,
+            colorMode: .grayscale,
+            bitDepth: 8
+        )
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 1,
+            frameSpacing: 1,
+            downsampleFactor: 2
+        )
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0.1
+        profile.training.generalization = .disabled
+        profile.training.precision = .float32
+        let synchronizedModel = AgentPolicy(profile: profile)
+        let queuedModel = AgentPolicy(profile: profile)
+        synchronizedModel.train(true)
+        queuedModel.train(true)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("queued-steps-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let weights = directory.appendingPathComponent("initial.safetensors")
+        try synchronizedModel.saveWeights(to: weights)
+        try queuedModel.loadWeights(from: weights)
+        let synchronizedOptimizer = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01)
+        let queuedOptimizer = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01)
+        let synchronizedRandomState = MLXRandom.RandomState(seed: 81_551)
+        let queuedRandomState = MLXRandom.RandomState(seed: 81_551)
+        synchronizedOptimizer.initialize(model: synchronizedModel)
+        queuedOptimizer.initialize(model: queuedModel)
+        let inputs = temporalModelInputs(profile: profile, batch: 2, value: 0.25)
+        let targets = MLXArray(
+            [Float](repeating: 0, count: 2 * ActionLayout.count),
+            [2, ActionLayout.count]
+        )
+
+        func compiledStep(
+            model: AgentPolicy,
+            optimizer: ResumableAdamW,
+            randomState: MLXRandom.RandomState
+        ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+            withRandomState(randomState) {
+                compile(
+                    inputs: [model, optimizer, randomState],
+                    outputs: [model, optimizer, randomState]
+                ) { arrays in
+                    let result = valueAndGrad(model: model) { candidate, values in
+                        [candidate.loss(
+                            currentImages: values[0],
+                            pastImages: values[1],
+                            pastControls: values[2],
+                            targets: values[3]
+                        )]
+                    }(model, arrays)
+                    optimizer.update(
+                        model: model,
+                        gradients: result.1,
+                        targetType: model.dtype,
+                        maxGradientNorm: 1
+                    )
+                    return [result.0[0]]
+                }
+            }
+        }
+
+        let synchronizedStep = compiledStep(
+            model: synchronizedModel,
+            optimizer: synchronizedOptimizer,
+            randomState: synchronizedRandomState
+        )
+        let queuedStep = compiledStep(
+            model: queuedModel,
+            optimizer: queuedOptimizer,
+            randomState: queuedRandomState
+        )
+        let stepInputs = [inputs.current, inputs.past, inputs.controls, targets]
+        var synchronizedLosses: [MLXArray] = []
+        var queuedLosses: [MLXArray] = []
+        for _ in 0..<4 {
+            let loss = withRandomState(synchronizedRandomState) {
+                synchronizedStep(stepInputs)[0]
+            }
+            MLX.eval(
+                loss,
+                synchronizedModel.parameters(),
+                synchronizedOptimizer.stateArrays(),
+                synchronizedRandomState.innerState()
+            )
+            synchronizedLosses.append(loss)
+        }
+        for _ in 0..<4 {
+            let loss = withRandomState(queuedRandomState) {
+                queuedStep(stepInputs)[0]
+            }
+            MLX.asyncEval(
+                loss,
+                queuedModel.parameters(),
+                queuedOptimizer.stateArrays(),
+                queuedRandomState.innerState()
+            )
+            queuedLosses.append(loss)
+        }
+        MLX.eval(
+            queuedLosses,
+            queuedModel.parameters(),
+            queuedOptimizer.stateArrays(),
+            queuedRandomState.innerState()
+        )
+
+        XCTAssertEqual(
+            synchronizedLosses.map { $0.item(Float.self) },
+            queuedLosses.map { $0.item(Float.self) }
+        )
+        let synchronizedParameters = synchronizedModel.parameters().flattened().sorted { $0.0 < $1.0 }
+        let queuedParameters = queuedModel.parameters().flattened().sorted { $0.0 < $1.0 }
+        XCTAssertEqual(synchronizedParameters.map(\.0), queuedParameters.map(\.0))
+        for (expected, actual) in zip(synchronizedParameters, queuedParameters) {
+            XCTAssertEqual(expected.1.asArray(Float.self), actual.1.asArray(Float.self), expected.0)
+        }
+        XCTAssertEqual(synchronizedOptimizer.stateArrays().count, queuedOptimizer.stateArrays().count)
+        for (expected, actual) in zip(
+            synchronizedOptimizer.stateArrays(),
+            queuedOptimizer.stateArrays()
+        ) {
+            XCTAssertEqual(expected.asArray(Float.self), actual.asArray(Float.self))
+        }
+        XCTAssertEqual(
+            synchronizedRandomState.innerState().map { $0.asArray(UInt32.self) },
+            queuedRandomState.innerState().map { $0.asArray(UInt32.self) }
+        )
+    }
+
+    func testOptimizerPipelineDepthUsesAvailableUnifiedMemoryConservatively() {
+        var profile = AIProfile.fresh()
+        profile.training.precision = .float32
+        let workingSet = UInt64(ModelSizing.estimatedTrainingWorkingSet(profile))
+        XCTAssertEqual(
+            TrainingEngine.recommendedOptimizerPipelineDepth(
+                profile: profile,
+                physicalMemory: workingSet * 6
+            ),
+            4
+        )
+        XCTAssertEqual(
+            TrainingEngine.recommendedOptimizerPipelineDepth(
+                profile: profile,
+                physicalMemory: workingSet * 3
+            ),
+            3
+        )
+        XCTAssertEqual(
+            TrainingEngine.recommendedOptimizerPipelineDepth(
+                profile: profile,
+                physicalMemory: workingSet * 2
+            ),
+            2
+        )
+        XCTAssertEqual(
+            TrainingEngine.recommendedOptimizerPipelineDepth(
+                profile: profile,
+                physicalMemory: max(1, workingSet - 1)
+            ),
+            1
+        )
+    }
+
+    func testPackingConcurrencyUsesCPUAndUnifiedMemoryBounds() {
+        let gibibyte = UInt64(1 << 30)
+        XCTAssertEqual(
+            DatasetCacheBuilder.recommendedPackingConcurrency(
+                recordingCount: 1,
+                largestDecodedFrameBytes: 64 * 1_024 * 1_024,
+                physicalMemory: 64 * gibibyte,
+                processorCount: 16
+            ),
+            1
+        )
+        XCTAssertEqual(
+            DatasetCacheBuilder.recommendedPackingConcurrency(
+                recordingCount: 8,
+                largestDecodedFrameBytes: 16 * 1_024 * 1_024,
+                physicalMemory: 64 * gibibyte,
+                processorCount: 16
+            ),
+            4
+        )
+        XCTAssertEqual(
+            DatasetCacheBuilder.recommendedPackingConcurrency(
+                recordingCount: 8,
+                largestDecodedFrameBytes: 16 * 1_024 * 1_024,
+                physicalMemory: 64 * gibibyte,
+                processorCount: 6
+            ),
+            3
+        )
+        XCTAssertEqual(
+            DatasetCacheBuilder.recommendedPackingConcurrency(
+                recordingCount: 8,
+                largestDecodedFrameBytes: 64 * 1_024 * 1_024,
+                physicalMemory: 512 * 1_024 * 1_024,
+                processorCount: 16
+            ),
+            1
+        )
+    }
+
+    func testPackedShardWriterRepeatsBytesAndRebasesOnlyRealIndices() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("packed-shard-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let repeatedURL = directory.appendingPathComponent("repeated.bin")
+        let repeated = try BufferedFileWriter(url: repeatedURL, capacity: 64 * 1_024)
+        let frame = Data([0, 7, 128, 255, 42])
+        try frame.withUnsafeBytes { try repeated.appendRepeated($0, count: 2_000) }
+        try repeated.finish()
+        var expected = Data()
+        expected.reserveCapacity(frame.count * 2_000)
+        for _ in 0..<2_000 { expected.append(frame) }
+        XCTAssertEqual(try Data(contentsOf: repeatedURL), expected)
+
+        let indicesURL = directory.appendingPathComponent("indices.bin")
+        let indices = try BufferedFileWriter(url: indicesURL, capacity: 64 * 1_024)
+        var raw = Data()
+        for value in [UInt32(0), 2, .max, 9] {
+            var little = value.littleEndian
+            Swift.withUnsafeBytes(of: &little) { raw.append(contentsOf: $0) }
+        }
+        try indices.appendRebasedObservationIndices(raw, observationBase: 17)
+        try indices.finish()
+        let rebased = try Data(contentsOf: indicesURL).withUnsafeBytes { bytes in
+            stride(from: 0, to: bytes.count, by: MemoryLayout<UInt32>.size).map {
+                bytes.loadUnaligned(fromByteOffset: $0, as: UInt32.self).littleEndian
+            }
+        }
+        XCTAssertEqual(rebased, [17, 19, UInt32.max, 26])
+    }
+
     func testCompiledTrainingThroughputAndActiveMemoryStayBounded() {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale, bitDepth: 8)
@@ -3917,6 +4160,45 @@ final class DomainTests: XCTestCase {
         XCTAssertLessThanOrEqual(predictionDelta, 0.02)
         XCTAssertLessThanOrEqual(relativeGradientError, 0.03)
         XCTAssertGreaterThanOrEqual(gradientCosine, 0.999)
+    }
+
+    func testCombinedActionHeadsMatchSeparateAffineHeadsAndGradients() {
+        MLXRandom.seed(731_904)
+        var profile = AIProfile.fresh()
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+        let featureWidth = profile.training.architecture.visualEmbedding
+            + profile.training.architecture.recurrentWidth
+        let features = MLXRandom.uniform(low: -1, high: 1, [7, featureWidth])
+        let selector = MLXRandom.uniform(low: -1, high: 1, [7, ActionLayout.count])
+
+        let combined = model.logits(temporalFeatures: features)
+        let reference = model.referenceLogits(temporalFeatures: features)
+        let combinedGradient = valueAndGrad(model: model) { candidate, arrays in
+            [(candidate.logits(temporalFeatures: arrays[0]) * arrays[1]).sum()]
+        }(model, [features, selector]).1
+        let referenceGradient = valueAndGrad(model: model) { candidate, arrays in
+            [(candidate.referenceLogits(temporalFeatures: arrays[0]) * arrays[1]).sum()]
+        }(model, [features, selector]).1
+        MLX.eval(combined, reference, combinedGradient, referenceGradient)
+
+        let outputDelta = zip(combined.asArray(Float.self), reference.asArray(Float.self))
+            .reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        XCTAssertLessThanOrEqual(outputDelta, 0.000_01)
+        let expectedGradients = Dictionary(uniqueKeysWithValues: referenceGradient.flattened())
+        let actualGradients = Dictionary(uniqueKeysWithValues: combinedGradient.flattened())
+        XCTAssertEqual(expectedGradients.keys.sorted(), actualGradients.keys.sorted())
+        for name in expectedGradients.keys {
+            let expected = expectedGradients[name]!.asArray(Float.self)
+            let actual = actualGradients[name]!.asArray(Float.self)
+            let delta = zip(expected, actual).reduce(Float(0)) {
+                max($0, abs($1.0 - $1.1))
+            }
+            XCTAssertLessThanOrEqual(delta, 0.000_01, name)
+        }
     }
 
     func testTemporalHistoryCorruptionIsIndependentOfFeatureDropout() {

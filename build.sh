@@ -13,6 +13,10 @@ VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT
 DMG="$OUTPUTS/AgentTrainer-$VERSION.dmg"
 SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-}"
 SIGN_KEYCHAIN="${CODE_SIGN_KEYCHAIN:-}"
+SWIFTPM_SANDBOX_FLAGS=()
+if [[ "${AGENTTRAINER_DISABLE_SWIFTPM_SANDBOX:-0}" == "1" ]]; then
+  SWIFTPM_SANDBOX_FLAGS+=(--disable-sandbox)
+fi
 
 if [[ "$APP" != *.app || "$APP_PARENT" == "/" ]]; then
   echo "APP_PATH must name a specific application bundle in a normal folder." >&2
@@ -87,20 +91,27 @@ sign_app_bundle() {
   codesign --force --options runtime --timestamp=none "${SIGN_KEYCHAIN_ARGUMENTS[@]}" --sign "$SIGN_IDENTITY" "$bundle"
 }
 
-# Xcode runs MLX's Metal shader plugin. SwiftPM then builds the shipped release
-# executable without Xcode package-scheme coverage instrumentation.
-xcodebuild \
-  -skipPackagePluginValidation \
-  -scheme AgentTrainer \
-  -destination 'platform=macOS,arch=arm64' \
-  -configuration "$CONFIGURATION" \
-  -derivedDataPath "$BUILD_ROOT" \
-  CLANG_ENABLE_CODE_COVERAGE=NO \
-  GCC_GENERATE_TEST_COVERAGE_FILES=NO \
-  GCC_INSTRUMENT_PROGRAM_FLOW_ARCS=NO \
-  build
+# Xcode runs MLX's Metal shader plugin. Its output depends on the pinned MLX
+# package, not AgentTrainer sources, so preserve a current metallib across app
+# rebuilds instead of recompiling the dependency's complete shader library.
+METALLIB="$BUILD_ROOT/Build/Products/$CONFIGURATION/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"
+if [[ ! -f "$METALLIB" || "$ROOT/Package.resolved" -nt "$METALLIB" ]]; then
+  xcodebuild \
+    -skipPackagePluginValidation \
+    -scheme AgentTrainer \
+    -destination 'platform=macOS,arch=arm64' \
+    -configuration "$CONFIGURATION" \
+    -derivedDataPath "$BUILD_ROOT" \
+    CLANG_ENABLE_CODE_COVERAGE=NO \
+    GCC_GENERATE_TEST_COVERAGE_FILES=NO \
+    GCC_INSTRUMENT_PROGRAM_FLOW_ARCS=NO \
+    build
+fi
 
-swift build -c "$CONFIGURATION"
+# SwiftPM builds the shipped release executable without Xcode package-scheme
+# coverage instrumentation.
+
+swift build "${SWIFTPM_SANDBOX_FLAGS[@]}" -c "$CONFIGURATION"
 BIN="$ROOT/.build/$CONFIGURATION/AgentTrainer"
 if [[ ! -x "$BIN" ]]; then
   BIN="$(find "$ROOT/.build" -type f -path "*/$CONFIGURATION/AgentTrainer" -perm +111 ! -path '*/xcode/*' | head -1)"
@@ -125,7 +136,6 @@ if [[ "$PLIST_MINIMUM_OS" != "15.0" ]]; then
   exit 1
 fi
 
-METALLIB="$BUILD_ROOT/Build/Products/$CONFIGURATION/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"
 if [[ ! -f "$METALLIB" ]]; then
   METALLIB="$(find "$BUILD_ROOT/Build/Products" -type f \( -name 'default.metallib' -o -name 'mlx.metallib' \) | head -1)"
 fi
@@ -140,20 +150,36 @@ fi
 ICON_DOCUMENT="$ROOT/Resources/AppIcon.icon"
 ASSET_CATALOG_OUTPUT="$BUILD_ROOT/AppIconAssets"
 ASSET_CATALOG_PLIST="$ASSET_CATALOG_OUTPUT/asset-info.plist"
+GENERATED_ICON="$ASSET_CATALOG_OUTPUT/AppIcon.icns"
+GENERATED_ASSETS="$ASSET_CATALOG_OUTPUT/Assets.car"
 if [[ ! -d "$ICON_DOCUMENT" ]]; then
   echo "AppIcon.icon is unavailable." >&2
   exit 1
 fi
-rm -rf "$ASSET_CATALOG_OUTPUT"
 mkdir -p "$ASSET_CATALOG_OUTPUT"
-actool --compile "$ASSET_CATALOG_OUTPUT" \
-  --output-partial-info-plist "$ASSET_CATALOG_PLIST" \
-  "$ICON_DOCUMENT" \
-  --platform macosx \
-  --minimum-deployment-target 15.0 \
-  --app-icon AppIcon
-GENERATED_ICON="$ASSET_CATALOG_OUTPUT/AppIcon.icns"
-GENERATED_ASSETS="$ASSET_CATALOG_OUTPUT/Assets.car"
+# Icon Composer output depends only on AppIcon.icon. Reuse a current compiled
+# catalog across source-only rebuilds; actool otherwise starts Xcode's complete
+# platform service stack even for this macOS-only package.
+if [[ ! -f "$GENERATED_ICON" || ! -f "$GENERATED_ASSETS" ]]; then
+  PREVIOUS_ICON="$STAGED_APP/Contents/Resources/AppIcon.icns"
+  PREVIOUS_ASSETS="$STAGED_APP/Contents/Resources/Assets.car"
+  if [[ -f "$PREVIOUS_ICON" && -f "$PREVIOUS_ASSETS" \
+        && -z "$(find "$ICON_DOCUMENT" -type f -newer "$PREVIOUS_ICON" -print -quit)" ]]; then
+    /bin/cp "$PREVIOUS_ICON" "$GENERATED_ICON"
+    /bin/cp "$PREVIOUS_ASSETS" "$GENERATED_ASSETS"
+  fi
+fi
+if [[ ! -f "$GENERATED_ICON" || ! -f "$GENERATED_ASSETS" \
+      || -n "$(find "$ICON_DOCUMENT" -type f -newer "$GENERATED_ICON" -print -quit)" ]]; then
+  rm -rf "$ASSET_CATALOG_OUTPUT"
+  mkdir -p "$ASSET_CATALOG_OUTPUT"
+  actool --compile "$ASSET_CATALOG_OUTPUT" \
+    --output-partial-info-plist "$ASSET_CATALOG_PLIST" \
+    "$ICON_DOCUMENT" \
+    --platform macosx \
+    --minimum-deployment-target 15.0 \
+    --app-icon AppIcon
+fi
 if [[ ! -f "$GENERATED_ICON" || ! -f "$GENERATED_ASSETS" ]]; then
   echo "Xcode did not compile the AppIcon assets." >&2
   exit 1
@@ -230,25 +256,37 @@ xcrun strip -x -S "$DMG_APP/Contents/MacOS/AgentTrainer"
 sign_app_bundle "$DMG_APP"
 codesign --verify --deep --strict --verbose=2 "$DMG_APP"
 ln -s /Applications "$DMG_STAGE/Applications"
-hdiutil create -quiet -volname "AgentTrainer $VERSION" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG"
-if [[ "$SIGN_IDENTITY" != "-" ]]; then
-  codesign --force --timestamp=none "${SIGN_KEYCHAIN_ARGUMENTS[@]}" --sign "$SIGN_IDENTITY" "$DMG"
+if [[ "${SKIP_DMG:-0}" == "1" ]]; then
+  # Restricted/headless builders may not expose DiskImages.framework's helper
+  # service. Preserve the same stripped, signed app as a resource-safe zip so
+  # app verification and handoff can still complete without a stale old DMG.
+  DISTRIBUTION_ARTIFACT="$OUTPUTS/AgentTrainer-$VERSION.app.zip"
+  rm -f "$DMG" "$DISTRIBUTION_ARTIFACT"
+  /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$DMG_APP" "$DISTRIBUTION_ARTIFACT"
+  DISTRIBUTION_DESCRIPTION="Application archive"
+else
+  hdiutil create -quiet -volname "AgentTrainer $VERSION" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG"
+  if [[ "$SIGN_IDENTITY" != "-" ]]; then
+    codesign --force --timestamp=none "${SIGN_KEYCHAIN_ARGUMENTS[@]}" --sign "$SIGN_IDENTITY" "$DMG"
+  fi
+  hdiutil verify -quiet "$DMG"
+  DISTRIBUTION_ARTIFACT="$DMG"
+  DISTRIBUTION_DESCRIPTION="Disk image"
 fi
-hdiutil verify -quiet "$DMG"
-DMG_BYTES="$(stat -f %z "$DMG")"
-if (( DMG_BYTES >= 10000000 )); then
-  echo "DMG is $DMG_BYTES bytes; the required limit is below 10,000,000 bytes." >&2
+DISTRIBUTION_BYTES="$(stat -f %z "$DISTRIBUTION_ARTIFACT")"
+if (( DISTRIBUTION_BYTES >= 10000000 )); then
+  echo "$DISTRIBUTION_DESCRIPTION is $DISTRIBUTION_BYTES bytes; the required limit is below 10,000,000 bytes." >&2
   exit 1
 fi
 
-for old in "$OUTPUTS"/AgentTrainer-*.dmg(N) "$OUTPUTS"/AgentTrainer-*.dmg.zip(N); do
-  if [[ "$old" != "$DMG" ]]; then rm -f "$old"; fi
+for old in "$OUTPUTS"/AgentTrainer-*.dmg(N) "$OUTPUTS"/AgentTrainer-*.dmg.zip(N) "$OUTPUTS"/AgentTrainer-*.app.zip(N); do
+  if [[ "$old" != "$DISTRIBUTION_ARTIFACT" ]]; then rm -f "$old"; fi
 done
 
-CHECKSUM_INPUTS=("${DMG:t}" "${SOURCE_ARCHIVE:t}")
+CHECKSUM_INPUTS=("${DISTRIBUTION_ARTIFACT:t}" "${SOURCE_ARCHIVE:t}")
 (cd "$OUTPUTS" && shasum -a 256 "${CHECKSUM_INPUTS[@]}" > SHA256SUMS.txt)
 
 echo "Installed app: $APP"
-echo "Disk image: $DMG ($DMG_BYTES bytes)"
+echo "$DISTRIBUTION_DESCRIPTION: $DISTRIBUTION_ARTIFACT ($DISTRIBUTION_BYTES bytes)"
 echo "Installation: $([[ "$APP_WAS_PRESENT" == "1" ]] && echo 'replaced transactionally' || echo 'created')"
 echo "Signed with: $SIGN_IDENTITY"

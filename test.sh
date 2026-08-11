@@ -3,6 +3,10 @@ set -euo pipefail
 
 ROOT="${0:A:h}"
 cd "$ROOT"
+SWIFTPM_SANDBOX_FLAGS=()
+if [[ "${AGENTTRAINER_DISABLE_SWIFTPM_SANDBOX:-0}" == "1" ]]; then
+  SWIFTPM_SANDBOX_FLAGS+=(--disable-sandbox)
+fi
 
 # Xcode produces MLX's required Metal library. Refresh it when dependency
 # resolution changes, without touching the installed app or release artifacts.
@@ -28,7 +32,7 @@ if [[ -z "$METALLIB" || ! -f "$METALLIB" ]]; then
   exit 1
 fi
 
-swift test -c debug list >/dev/null
+swift test "${SWIFTPM_SANDBOX_FLAGS[@]}" -c debug list >/dev/null
 TEST_BUNDLE="$(find "$ROOT/.build" -type d -path '*/debug/AgentTrainerPackageTests.xctest' ! -path '*/xcode/*' | head -1)"
 if [[ -z "$TEST_BUNDLE" || ! -d "$TEST_BUNDLE/Contents/MacOS" ]]; then
   echo "SwiftPM did not produce the AgentTrainer test bundle." >&2
@@ -36,4 +40,4 @@ if [[ -z "$TEST_BUNDLE" || ! -d "$TEST_BUNDLE/Contents/MacOS" ]]; then
 fi
 TEST_MACOS="$TEST_BUNDLE/Contents/MacOS"
 cp "$METALLIB" "$TEST_MACOS/mlx.metallib"
-swift test -c debug
+swift test "${SWIFTPM_SANDBOX_FLAGS[@]}" -c debug

@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.1.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.2.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -138,7 +138,7 @@ Current Policy v6 combines:
 - fusion of the current visual embedding with the final temporal state
 - per-head bounded activations
 
-Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling remains decodable for profile repair/tests but is no longer offered by the 2.1 editor; it needs distinct projections when spatial dimensions differ.
+Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling remains decodable for profile repair/tests but is no longer offered by the current editor; it needs distinct projections when spatial dimensions differ.
 
 `GeneralizationConfiguration` owns five training-only defenses. Structured YUV luminance/contrast/chroma variation and small neutral rectangles alter pixels without moving absolute pointer geometry. Per-value control-history dropout, rare binary flips, and bounded continuous noise simulate imperfect prior outputs. Temporal-token dropout trains startup/missing-history behavior. Small binary label smoothing reduces brittle confidence while validation retains exact targets. Visual-embedding and fusion dropout occur only after unique visual work is gathered back to action rows, preserving an independent stochastic path per label. Inference applies none of these perturbations.
 
@@ -147,16 +147,19 @@ Training uses class/transition weighting, focal binary loss, the v6 generalizati
 The performance path preserves those semantics:
 
 - VideoToolbox decodes directly into native video-range YUV. One CVMetalTexture mapping and Metal command buffer produce both configured output resolutions, while decode, resize/color packing, and cache writes overlap through a bounded ordered pipeline of up to eight observations within a 64 MB cap.
-- When one decoded frame remains causal across many configured perception ticks, Metal packs it once and the cache writer repeats those exact packed bytes. Observation cadence, indices, controls, and every action label remain unchanged.
+- Multiple recordings use up to four parallel decode/packing workers, bounded by active CPU count and a conservative half-of-unified-memory budget. Each worker produces a local shard; the builder merges shards in the user's original recording order and rebases only non-sentinel observation indices. Cache bytes, segment boundaries, and sample order remain deterministic.
+- When one decoded frame remains causal across many configured perception ticks, Metal packs it once and the cache writer repeats those exact packed bytes in large buffered writes. Observation cadence, indices, controls, and every action label remain unchanged. Temporary shards skip redundant durability barriers; the final cache files are synchronized before their atomic directory move.
 - Dataset files are required memory mappings with adaptive VM advice. Epochs randomize small collections of temporally local lanes rather than every row globally, so each optimizer batch remains diverse while macOS can read ahead the contiguous mapped pages inside each lane. A batch gathers packed vision, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
 - Current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those embeddings to their exact frame slots. Training-only pixel augmentation is sampled per unique encoded observation; visual-feature dropout and history corruption occur only after action-row gathering, preserving one independent post-encoder stochastic path per label. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
 - Above the measured workload crossover, the coordinate contribution to the first convolution is evaluated once per batch and the established GroupNorm layout uses MLX's fused Metal layer-normalization kernel. Small tensors retain the lower-overhead kernels.
+- The six affine action heads retain their named Policy v6 tensors but concatenate those tensors into one Metal matrix multiplication. Reference tests compare both predictions and gradients against the six-call form.
+- AdamW concatenates parameters, finite gradients, and both moment sets during the compiled update so identical elementwise work is issued as a few large kernels. Save/load splits moments back into the established checkpoint keys and shapes; the schedule, clipping rule, decay rule, and missing-gradient behavior are unchanged.
 - Validation shares deterministic temporal work and head logits before gathering them back to every held-out label, then derives loss and predictions from that one compiled forward graph.
-- CPU gathering of the next batch overlaps the current Metal graph. Every optimizer step still evaluates the complete model, AdamW moments, scheduler, and MLX random state before advancing the checkpoint cursor.
+- CPU gathering overlaps a bounded queue of one to four strictly ordered Metal updates. Each compiled invocation consumes the lazy weights, AdamW moments, scheduler step, and MLX random state produced by the preceding invocation. The queue is unified-memory-aware, never crosses an epoch/autosave/run limit, stops growing on pause, and is fully evaluated before the checkpoint cursor advances.
 - Live inference encodes the full current frame plus one current reduced frame. It returns that reduced embedding with the prediction, stores only the compact Float32 embedding and sanitized control row in the circular history, and feeds cached embeddings directly into later temporal steps. Visual-encoder work is therefore independent of `pastFrameCount`.
 - Live diagnostics publish a rolling pipelined-step time, mapped-input time, peak-throughput retention, MLX active/cache/peak memory, and macOS thermal pressure. Metrics are rate-limited and chart histories are presentation-bounded so observing a run does not grow UI work with optimizer-step count.
 
-Do not queue stateful optimizer steps merely to improve a benchmark. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
+Do not add asynchronous stateful work unless its production path is covered by ordered-update parity tests and bounded at every persistence boundary. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
 
 Performance work may change graph operation order, grouped sample order, and low-bit numerical trajectories. “No quality loss” is evaluated by matched-update training loss, held-out validation loss, and per-head validation behavior—not byte-identical weights or predictions. The hardware benchmark gates relative validation-loss drift at 1%, while focused tests compare the optimized objective and gradients to the reference graph. Never obtain speed by silently reducing vision resolution, precision, model capacity, labels, loss terms, or update count.
 
@@ -245,4 +248,4 @@ Before release:
 8. Verify the DMG and `SHA256SUMS.txt` in `outputs`.
 9. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
 
-`build.sh` creates a fully signed staging bundle, transactionally installs it into `/Applications/AgentTrainer.app` by default, and then packages the DMG/source/checksums. Override the install path with `APP_PATH`; override signing with `CODE_SIGN_IDENTITY` and optionally `CODE_SIGN_KEYCHAIN`.
+`build.sh` creates a fully signed staging bundle, transactionally installs it into `/Applications/AgentTrainer.app` by default, and then packages the DMG/source/checksums. Override the install path with `APP_PATH`; override signing with `CODE_SIGN_IDENTITY` and optionally `CODE_SIGN_KEYCHAIN`. Restricted builders without the macOS disk-image helper may set `SKIP_DMG=1` to emit a resource-safe signed `.app.zip`; public releases must still use and verify the DMG path.

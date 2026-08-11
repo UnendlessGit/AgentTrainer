@@ -788,6 +788,18 @@ final class AgentPolicy: Module, @unchecked Sendable {
     }
 
     func logits(temporalFeatures: MLXArray) -> MLXArray {
+        actionLogits(fusedFeatures(temporalFeatures), combineHeads: true)
+    }
+
+    /// Reference form retained for objective/parity tests and the opt-in
+    /// hardware benchmark. Production combines all six affine action heads
+    /// into one Metal matrix multiplication while preserving every named
+    /// weight and bias tensor in the model/checkpoint contract.
+    func referenceLogits(temporalFeatures: MLXArray) -> MLXArray {
+        actionLogits(fusedFeatures(temporalFeatures), combineHeads: false)
+    }
+
+    private func fusedFeatures(_ temporalFeatures: MLXArray) -> MLXArray {
         var fused = temporalFeatures
         for (index, layer) in fusion.enumerated() {
             fused = layer(fused)
@@ -796,10 +808,23 @@ final class AgentPolicy: Module, @unchecked Sendable {
             }
             fused = dropout(silu(fused))
         }
-        return concatenated([
-            absoluteMouseHead(fused), relativeMouseHead(fused), buttonHead(fused),
-            scrollHead(fused), keyboardHead(fused), modifierHead(fused)
-        ], axis: -1)
+        return fused
+    }
+
+    private func actionLogits(_ fused: MLXArray, combineHeads: Bool) -> MLXArray {
+        let heads = [
+            absoluteMouseHead, relativeMouseHead, buttonHead,
+            scrollHead, keyboardHead, modifierHead
+        ]
+        guard combineHeads else {
+            return concatenated(heads.map { $0(fused) }, axis: -1)
+        }
+        let weight = concatenated(heads.map(\.weight), axis: 0)
+        let biases = heads.compactMap(\.bias)
+        if biases.count == heads.count {
+            return addMM(concatenated(biases), fused, weight.T)
+        }
+        return matmul(fused, weight.T)
     }
 
     func logits(
@@ -1000,6 +1025,12 @@ final class AgentPolicy: Module, @unchecked Sendable {
 }
 
 final class ResumableAdamW: Updatable, @unchecked Sendable {
+    private struct ParameterSlice {
+        let name: String
+        let shape: [Int]
+        let range: Range<Int>
+    }
+
     var learningRate: Float
     var weightDecay: Float
     private(set) var warmupSteps: Int
@@ -1011,9 +1042,13 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     let epsilon: Float = 1e-8
     private var stepArray = MLXArray(0, dtype: .float32)
     private var learningRateScaleArray = MLXArray(1, dtype: .float32)
-    private var firstMoments: [String: MLXArray] = [:]
-    private var secondMoments: [String: MLXArray] = [:]
-    private var parameterNames: [String] = []
+    // Adam's operations are identical for every scalar. Keeping moments in two
+    // contiguous vectors lets MLX fuse what used to be dozens of tiny per-layer
+    // update kernels. Model parameters retain their original named shapes and
+    // checkpoint files are split back into the established per-parameter keys.
+    private var firstMomentVector = MLXArray.zeros([0], dtype: .float32)
+    private var secondMomentVector = MLXArray.zeros([0], dtype: .float32)
+    private var parameterSlices: [ParameterSlice] = []
 
     var step: Int { MLX.eval(stepArray); return Int(stepArray.item(Float.self).rounded()) }
     var learningRateScale: Float {
@@ -1038,15 +1073,22 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     }
 
     func initialize(model: Module) {
-        guard parameterNames.isEmpty else { return }
-        parameterNames = model.parameters().flattened().map(\.0).sorted()
-        let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
-        for name in parameterNames {
-            guard let parameter = parameters[name] else { continue }
-            let value = parameter.asType(.float32)
-            firstMoments[name] = MLXArray.zeros(like: value)
-            secondMoments[name] = MLXArray.zeros(like: value)
+        guard parameterSlices.isEmpty else { return }
+        let parameters = model.parameters().flattened().sorted { $0.0 < $1.0 }
+        var offset = 0
+        parameterSlices.reserveCapacity(parameters.count)
+        for (name, parameter) in parameters {
+            let end = offset.addingReportingOverflow(parameter.size)
+            precondition(!end.overflow, "The optimizer parameter vector exceeds this Mac's addressable memory.")
+            parameterSlices.append(ParameterSlice(
+                name: name,
+                shape: parameter.shape,
+                range: offset..<end.partialValue
+            ))
+            offset = end.partialValue
         }
+        firstMomentVector = MLXArray.zeros([offset], dtype: .float32)
+        secondMomentVector = MLXArray.zeros([offset], dtype: .float32)
     }
 
     func update(
@@ -1089,35 +1131,63 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         let correction1 = 1 - pow(beta1, stepArray)
         let correction2 = 1 - pow(beta2, stepArray)
         let decayScale = 1 - scheduledLearningRate * weightDecay
+        let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
         let gradientMap = Dictionary(uniqueKeysWithValues: gradients.flattened())
-        let clipping: (condition: MLXArray, normalizer: MLXArray)?
-        if let gradientNorm, let maxGradientNorm {
-            clipping = (
-                gradientNorm .< maxGradientNorm,
-                maxGradientNorm / (gradientNorm + 1e-6)
-            )
-        } else {
-            clipping = nil
+        let parameterParts = parameterSlices.map { slice -> MLXArray in
+            guard let parameter = parameters[slice.name] else {
+                preconditionFailure("The model parameter layout changed after optimizer initialization.")
+            }
+            return parameter.asType(.float32).flattened()
         }
-        var updated: [(String, MLXArray)] = []
-        for (name, parameter) in model.parameters().flattened() {
-            guard let gradient = gradientMap[name] else { updated.append((name, parameter)); continue }
-            let p = parameter.asType(.float32)
-            let clipped = clipping.map {
-                which($0.condition, gradient, gradient * $0.normalizer)
-            } ?? gradient
+        let gradientParts = parameterSlices.map { slice -> MLXArray in
+            guard let gradient = gradientMap[slice.name] else {
+                return MLXArray.zeros([slice.range.count], dtype: .float32)
+            }
             // A non-finite derivative must never poison Adam's persistent
-            // moments. The global-norm path below already excludes these rare
-            // values; mirror that policy here so a transient backend anomaly
-            // drops only the affected derivative instead of destroying the
-            // entire brain and every later checkpoint.
-            let g = nanToNum(clipped.asType(.float32))
-            let m = beta1 * (firstMoments[name] ?? MLXArray.zeros(like: p)) + (1 - beta1) * g
-            let v = beta2 * (secondMoments[name] ?? MLXArray.zeros(like: p)) + (1 - beta2) * square(g)
-            firstMoments[name] = m
-            secondMoments[name] = v
-            let update = (m / correction1) / (sqrt(v / correction2) + epsilon)
-            updated.append((name, (p * decayScale - scheduledLearningRate * update).asType(targetType)))
+            // moments. Sanitize once before both clipping and the update.
+            return nanToNum(gradient.asType(.float32)).flattened()
+        }
+        guard !parameterParts.isEmpty else { return }
+        let parameterVector = concatenated(parameterParts)
+        var gradientVector = concatenated(gradientParts)
+        if let maxGradientNorm {
+            let norm = gradientNorm ?? Self.globalGradientNorm(gradientVector)
+            let normalizer = maxGradientNorm / (norm + 1e-6)
+            gradientVector = which(norm .< maxGradientNorm, gradientVector, gradientVector * normalizer)
+        }
+
+        var nextFirstMoment = beta1 * firstMomentVector + (1 - beta1) * gradientVector
+        var nextSecondMoment = beta2 * secondMomentVector + (1 - beta2) * square(gradientVector)
+        let hasEveryGradient = parameterSlices.allSatisfy { gradientMap[$0.name] != nil }
+        let activeMask: MLXArray?
+        if hasEveryGradient {
+            activeMask = nil
+        } else {
+            var values = [Float](repeating: 0, count: parameterVector.size)
+            for slice in parameterSlices where gradientMap[slice.name] != nil {
+                values.replaceSubrange(
+                    slice.range,
+                    with: repeatElement(Float(1), count: slice.range.count)
+                )
+            }
+            let mask = MLXArray(values)
+            activeMask = mask
+            nextFirstMoment = which(mask .> 0, nextFirstMoment, firstMomentVector)
+            nextSecondMoment = which(mask .> 0, nextSecondMoment, secondMomentVector)
+        }
+        firstMomentVector = nextFirstMoment
+        secondMomentVector = nextSecondMoment
+        let adamUpdate = (nextFirstMoment / correction1)
+            / (sqrt(nextSecondMoment / correction2) + epsilon)
+        var nextParameters = parameterVector * decayScale - scheduledLearningRate * adamUpdate
+        if let activeMask {
+            nextParameters = which(activeMask .> 0, nextParameters, parameterVector)
+        }
+        let updated = parameterSlices.map { slice in
+            (
+                slice.name,
+                nextParameters[slice.range].reshaped(slice.shape).asType(targetType)
+            )
         }
         model.update(parameters: ModuleParameters.unflattened(updated))
     }
@@ -1128,23 +1198,24 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     /// explicitly materializing the finite, scaled derivatives also prevents a
     /// backend fusion from turning a valid first update into `infinity`.
     static func globalGradientNorm(_ gradients: ModuleParameters) -> MLXArray {
-        let values = gradients.flattened().map { nanToNum($0.1.asType(.float32)) }
+        let values = gradients.flattened().map { nanToNum($0.1.asType(.float32)).flattened() }
         guard !values.isEmpty else { return MLXArray(0, dtype: .float32) }
-        let maximumMagnitude = values.reduce(MLXArray(0, dtype: .float32)) {
-            maximum($0, abs($1).max())
-        }
+        return globalGradientNorm(concatenated(values))
+    }
+
+    private static func globalGradientNorm(_ flattenedGradient: MLXArray) -> MLXArray {
+        let maximumMagnitude = abs(flattenedGradient).max()
         let scale = maximum(maximumMagnitude, MLXArray(1e-12, dtype: .float32))
-        let scaledSquares = values.reduce(MLXArray(0, dtype: .float32)) {
-            $0 + square($1 / scale).sum()
-        }
-        return maximumMagnitude * sqrt(scaledSquares)
+        return maximumMagnitude * sqrt(square(flattenedGradient / scale).sum())
     }
 
     func save(to url: URL) throws {
         MLX.eval(innerState())
         var arrays: [String: MLXArray] = [:]
-        for (key, value) in firstMoments { arrays["m.\(key)"] = value }
-        for (key, value) in secondMoments { arrays["v.\(key)"] = value }
+        for slice in parameterSlices {
+            arrays["m.\(slice.name)"] = firstMomentVector[slice.range].reshaped(slice.shape)
+            arrays["v.\(slice.name)"] = secondMomentVector[slice.range].reshaped(slice.shape)
+        }
         try MLX.save(
             arrays: arrays,
             metadata: [
@@ -1166,7 +1237,7 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     }
 
     func innerState() -> [MLXArray] {
-        [stepArray, learningRateScaleArray] + parameterNames.flatMap { name in [firstMoments[name], secondMoments[name]].compactMap { $0 } }
+        [stepArray, learningRateScaleArray, firstMomentVector, secondMomentVector]
     }
 
     /// Reduces the cosine envelope after a measured plateau. The mutable scalar
@@ -1210,8 +1281,10 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         let restoredFirst = Dictionary(uniqueKeysWithValues: loaded.0.compactMap { key, value in key.hasPrefix("m.") ? (String(key.dropFirst(2)), value) : nil })
         let restoredSecond = Dictionary(uniqueKeysWithValues: loaded.0.compactMap { key, value in key.hasPrefix("v.") ? (String(key.dropFirst(2)), value) : nil })
         let restoredNames = Set(restoredFirst.keys)
-        let expectedNames = Set(parameterNames)
-        let expectedShapes = firstMoments.mapValues(\.shape)
+        let expectedNames = Set(parameterSlices.map(\.name))
+        let expectedShapes = Dictionary(uniqueKeysWithValues: parameterSlices.map {
+            ($0.name, $0.shape)
+        })
         guard !restoredNames.isEmpty,
               restoredNames == Set(restoredSecond.keys),
               expectedNames.isEmpty || restoredNames == expectedNames,
@@ -1221,9 +1294,26 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
               }) else {
             throw AgentTrainerError.model("The optimizer checkpoint is incomplete or does not match this model.")
         }
-        firstMoments = restoredFirst
-        secondMoments = restoredSecond
-        parameterNames = restoredNames.sorted()
+        if parameterSlices.isEmpty {
+            var offset = 0
+            parameterSlices = restoredNames.sorted().map { name in
+                let array = restoredFirst[name]!
+                let end = offset.addingReportingOverflow(array.size)
+                precondition(!end.overflow, "The restored optimizer exceeds this Mac's addressable memory.")
+                defer { offset = end.partialValue }
+                return ParameterSlice(
+                    name: name,
+                    shape: array.shape,
+                    range: offset..<end.partialValue
+                )
+            }
+        }
+        firstMomentVector = concatenated(parameterSlices.map {
+            restoredFirst[$0.name]!.asType(.float32).flattened()
+        })
+        secondMomentVector = concatenated(parameterSlices.map {
+            restoredSecond[$0.name]!.asType(.float32).flattened()
+        })
         guard let restoredStep = loaded.1["step"].flatMap(Int.init), restoredStep >= 0,
               let restoredLearningRate = loaded.1["learningRate"].flatMap(Float.init),
               restoredLearningRate.isFinite, restoredLearningRate > 0,

@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 import MLXNN
 import XCTest
@@ -10,6 +11,10 @@ final class TrainingPerformanceTests: XCTestCase {
     func testCompiledMetalDataPathPreservesOrderedUpdatesAndMeasuresThroughput() throws {
         guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_PERFORMANCE_TESTS"] == "1" else {
             throw XCTSkip("Set AGENTTRAINER_RUN_PERFORMANCE_TESTS=1 to run the local Metal benchmark.")
+        }
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            XCTFail("The release benchmark requires an exposed Apple-silicon Metal device.")
+            return
         }
 
         try Device.withDefaultDevice(.gpu) {
@@ -294,10 +299,15 @@ final class TrainingPerformanceTests: XCTestCase {
             ) -> @Sendable ([MLXArray]) -> [MLXArray] {
                 compile(inputs: [model, optimizer], outputs: [model, optimizer]) { arrays in
                     let result = valueAndGrad(model: model) { model, inputs in
-                        [model.loss(
+                        let temporalFeatures = model.temporalFeatures(
                             currentImages: inputs[0],
                             pastImages: inputs[1],
-                            pastControls: inputs[2],
+                            pastControls: inputs[2]
+                        )
+                        return [model.loss(
+                            logits: model.referenceLogits(
+                                temporalFeatures: temporalFeatures
+                            ),
                             targets: inputs[3],
                             positiveWeights: positiveWeights,
                             previousTargets: inputs[4]
@@ -307,7 +317,6 @@ final class TrainingPerformanceTests: XCTestCase {
                         model: model,
                         gradients: result.1,
                         targetType: model.dtype,
-                        gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
                         maxGradientNorm: 1
                     )
                     return [result.0[0]]
@@ -341,7 +350,6 @@ final class TrainingPerformanceTests: XCTestCase {
                         model: model,
                         gradients: result.1,
                         targetType: model.dtype,
-                        gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
                         maxGradientNorm: 1
                     )
                     return [result.0[0]]
@@ -381,7 +389,6 @@ final class TrainingPerformanceTests: XCTestCase {
                         model: model,
                         gradients: result.1,
                         targetType: model.dtype,
-                        gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
                         maxGradientNorm: 1
                     )
                     return [result.0[0]]
@@ -458,12 +465,68 @@ final class TrainingPerformanceTests: XCTestCase {
                     + "optimized_samples_per_second=\(Double(iterations * batchSize) / reusedSeconds)"
             )
 
+            // Exercise the same bounded synchronization policy as production.
+            // Ordered-update equivalence is asserted independently with exact
+            // model and optimizer arrays in DomainTests; this section measures
+            // the host-fence and CPU/GPU overlap gain on real hardware.
+            let pipelineDepth = TrainingEngine.recommendedOptimizerPipelineDepth(
+                profile: profile,
+                physicalMemory: ProcessInfo.processInfo.physicalMemory
+            )
+            func runPipelineGroup(_ count: Int) -> (seconds: Double, losses: [Float]) {
+                let start = ContinuousClock.now
+                var losses: [MLXArray] = []
+                losses.reserveCapacity(count)
+                for _ in 0..<count {
+                    let loss = reusedStep(reusedInputs())[0]
+                    MLX.asyncEval(
+                        loss,
+                        reusedTemporalModel.parameters(),
+                        reusedTemporalOptimizer.stateArrays()
+                    )
+                    losses.append(loss)
+                }
+                MLX.eval(
+                    losses,
+                    reusedTemporalModel.parameters(),
+                    reusedTemporalOptimizer.stateArrays()
+                )
+                return (
+                    start.duration(to: .now).benchmarkSeconds,
+                    losses.map { $0.item(Float.self) }
+                )
+            }
+            for _ in 0..<2 { _ = runPipelineGroup(pipelineDepth) }
+            let pipelineGroups = max(3, (iterations + pipelineDepth - 1) / pipelineDepth)
+            var pipelineSeconds = 0.0
+            var pipelineSteps = 0
+            for _ in 0..<pipelineGroups {
+                let result = runPipelineGroup(pipelineDepth)
+                XCTAssertTrue(result.losses.allSatisfy(\.isFinite))
+                pipelineSeconds += result.seconds
+                pipelineSteps += result.losses.count
+            }
+            let sequentialSecondsPerStep = reusedSeconds / Double(iterations)
+            let pipelinedSecondsPerStep = pipelineSeconds / Double(max(1, pipelineSteps))
+            print(
+                "ORDERED_PIPELINE_BENCHMARK profile=\(profileName) depth=\(pipelineDepth) "
+                    + "sequential_seconds_per_step=\(sequentialSecondsPerStep) "
+                    + "pipelined_seconds_per_step=\(pipelinedSecondsPerStep) "
+                    + "speedup=\(sequentialSecondsPerStep / max(0.000_001, pipelinedSecondsPerStep)) "
+                    + "pipelined_samples_per_second=\(Double(pipelineSteps * batchSize) / pipelineSeconds)"
+            )
+
             let validationModel = reusedTemporalModel
             validationModel.train(false)
             func legacyValidation() -> [MLXArray] {
                 let inputs = baselineInputs()
-                let logits = validationModel.callAsFunction(
-                    currentImages: inputs[0], pastImages: inputs[1], pastControls: inputs[2]
+                let temporalFeatures = validationModel.temporalFeatures(
+                    currentImages: inputs[0],
+                    pastImages: inputs[1],
+                    pastControls: inputs[2]
+                )
+                let logits = validationModel.referenceLogits(
+                    temporalFeatures: temporalFeatures
                 )
                 return [
                     validationModel.loss(
@@ -540,11 +603,14 @@ final class TrainingPerformanceTests: XCTestCase {
                         images: current,
                         acceleratedOperators: accelerated
                     ).last!
-                    let logits = validationModel.logits(
+                    let temporalFeatures = validationModel.temporalFeatures(
                         currentVisualFeatures: currentFeatures,
                         pastImages: past,
                         pastControls: arrays[2]
                     )
+                    let logits = accelerated
+                        ? validationModel.logits(temporalFeatures: temporalFeatures)
+                        : validationModel.referenceLogits(temporalFeatures: temporalFeatures)
                     return [validationModel.activatedPredictions(logits: logits)]
                 }
             }

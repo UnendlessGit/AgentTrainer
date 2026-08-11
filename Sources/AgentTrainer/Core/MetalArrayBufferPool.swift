@@ -90,10 +90,16 @@ final class MetalArrayBufferPool: @unchecked Sendable {
 
     private func acquire(byteCount: Int) -> (any MTLBuffer)? {
         if let reused = lock.withLock({ () -> (any MTLBuffer)? in
-            let candidates = available.indices.filter { available[$0].length >= byteCount }
-            guard let index = candidates.min(by: { available[$0].length < available[$1].length }) else {
-                return nil
+            var bestIndex: Int?
+            var bestLength = Int.max
+            for index in available.indices {
+                let length = available[index].length
+                if length >= byteCount, length < bestLength {
+                    bestIndex = index
+                    bestLength = length
+                }
             }
+            guard let index = bestIndex else { return nil }
             let buffer = available.remove(at: index)
             cachedBytes -= buffer.length
             return buffer

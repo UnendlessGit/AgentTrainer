@@ -404,7 +404,6 @@ final class TrainingEngine: @unchecked Sendable {
                 model: model,
                 gradients: result.1,
                 targetType: model.dtype,
-                gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
                 maxGradientNorm: 1
             )
             return [result.0[0]]
@@ -487,6 +486,10 @@ final class TrainingEngine: @unchecked Sendable {
         var lastMetricsPublish = CACurrentMediaTime() - 1
         var performance = TrainingPerformanceWindow()
         var lastPerformanceLimit: String?
+        let optimizerPipelineDepth = Self.recommendedOptimizerPipelineDepth(
+            profile: profile,
+            physicalMemory: ProcessInfo.processInfo.physicalMemory
+        )
 
         trainingLoop: for epoch in state.epoch..<targetEpoch {
             let epochSeed = profile.training.seed &+ UInt64(epoch) &* 0x9E3779B97F4A7C15
@@ -524,87 +527,93 @@ final class TrainingEngine: @unchecked Sendable {
             var offset = epoch == state.epoch ? state.batchOffset : 0
             var epochWeightedLoss = offset > 0 ? state.currentEpochWeightedLoss ?? 0 : 0
             var epochSampleCount = offset > 0 ? state.currentEpochSampleCount ?? 0 : 0
-            var prefetchedBatch: (arrays: [MLXArray], preparation: Double)?
             while offset < order.count {
                 try Task.checkCancellation()
                 if lock.withLock({ stopRequested }) { throw CancellationError() }
-                let end = min(order.count, offset + batchSize)
-                let batch = Array(order[offset..<end])
-                let prepared: (arrays: [MLXArray], preparation: Double)
-                if let prefetchedBatch {
-                    prepared = prefetchedBatch
-                } else {
+                let stepsUntilAutosave = max(1, nextAutosaveStep - state.globalStep)
+                let stepsUntilRunLimit = configuredMaximum > 0
+                    ? max(1, runStepTarget - state.globalStep)
+                    : Int.max
+                let queueLimit = min(
+                    optimizerPipelineDepth,
+                    stepsUntilAutosave,
+                    stepsUntilRunLimit
+                )
+                var scheduled: [ScheduledTrainingStep] = []
+                scheduled.reserveCapacity(queueLimit)
+                var schedulingOffset = offset
+                let queueStarted = CACurrentMediaTime()
+                while schedulingOffset < order.count, scheduled.count < queueLimit {
+                    try Task.checkCancellation()
+                    if lock.withLock({ stopRequested }) { throw CancellationError() }
+                    let end = min(order.count, schedulingOffset + batchSize)
+                    let batch = Array(order[schedulingOffset..<end])
                     let preparationStarted = CACurrentMediaTime()
-                    prepared = (
-                        try makeBatch(
-                            dataset: dataset,
-                            indices: batch,
-                            profile: profile,
-                            inputBufferPool: inputBufferPool,
-                            reusesVisionFeatures: reusesVisionFeatures
-                        ),
-                        CACurrentMediaTime() - preparationStarted
+                    let arrays = try makeBatch(
+                        dataset: dataset,
+                        indices: batch,
+                        profile: profile,
+                        inputBufferPool: inputBufferPool,
+                        reusesVisionFeatures: reusesVisionFeatures
                     )
-                }
-                prefetchedBatch = nil
-                let stepStarted = CACurrentMediaTime()
-                let result: (
-                    loss: Double,
-                    next: (arrays: [MLXArray], preparation: Double)?
-                ) = try autoreleasepool {
-                    let arrays = prepared.arrays
+                    let preparationSeconds = CACurrentMediaTime() - preparationStarted
                     let lossArray = trainingStep(arrays)[0]
-                    let modelState = model.parameters()
-                    let optimizerState = optimizer.stateArrays()
-                    // Start Metal immediately, then gather and materialize the
-                    // next mapped batch while the current optimizer graph is
-                    // executing. The final eval still waits for every model and
-                    // optimizer output, so numerical order and exact-resume
-                    // semantics are unchanged.
-                    MLX.asyncEval(lossArray, modelState, optimizerState)
-                    let next: (arrays: [MLXArray], preparation: Double)?
-                    if end < order.count {
-                        let nextEnd = min(order.count, end + batchSize)
-                        let preparationStarted = CACurrentMediaTime()
-                        let arrays = try makeBatch(
-                            dataset: dataset,
-                            indices: Array(order[end..<nextEnd]),
-                            profile: profile,
-                            inputBufferPool: inputBufferPool,
-                            reusesVisionFeatures: reusesVisionFeatures
-                        )
-                        next = (arrays, CACurrentMediaTime() - preparationStarted)
-                    } else {
-                        next = nil
-                    }
-                    MLX.eval(lossArray, modelState, optimizerState)
-                    return (Double(lossArray.item(Float.self)), next)
+                    // Each compiled invocation observes the lazy state produced
+                    // by the preceding invocation. Start it immediately so CPU
+                    // mapped-data gathering for the next batch overlaps Metal,
+                    // then synchronize the bounded ordered queue once.
+                    MLX.asyncEval(
+                        lossArray,
+                        model.parameters(),
+                        optimizer.stateArrays(),
+                        randomState.innerState()
+                    )
+                    scheduled.append(ScheduledTrainingStep(
+                        loss: lossArray,
+                        sampleCount: batch.count,
+                        endOffset: end,
+                        preparationSeconds: preparationSeconds
+                    ))
+                    schedulingOffset = end
+                    if lock.withLock({ pauseRequested }) { break }
                 }
-                let loss = result.loss
-                guard loss.isFinite else {
+                MLX.eval(
+                    scheduled.map(\.loss),
+                    model.parameters(),
+                    optimizer.stateArrays(),
+                    randomState.innerState()
+                )
+                let losses = scheduled.map { Double($0.loss.item(Float.self)) }
+                guard losses.allSatisfy(\.isFinite) else {
                     throw AgentTrainerError.model("Training became numerically unstable before this step could be saved. Lower the learning rate or reset this brain's learning state.")
                 }
-                prefetchedBatch = result.next
-                let stepSeconds = max(0.000_001, CACurrentMediaTime() - stepStarted)
-                performance.record(
-                    samples: batch.count,
-                    stepSeconds: stepSeconds,
-                    preparationSeconds: prepared.preparation
+                let secondsPerStep = max(
+                    0.000_001,
+                    (CACurrentMediaTime() - queueStarted) / Double(max(1, scheduled.count))
                 )
-                guard state.globalStep < Int.max else {
-                    throw AgentTrainerError.model("The restored optimizer step counter is invalid and cannot be advanced safely.")
+                for (scheduledStep, loss) in zip(scheduled, losses) {
+                    performance.record(
+                        samples: scheduledStep.sampleCount,
+                        stepSeconds: secondsPerStep,
+                        preparationSeconds: scheduledStep.preparationSeconds
+                    )
+                    guard state.globalStep < Int.max else {
+                        throw AgentTrainerError.model("The restored optimizer step counter is invalid and cannot be advanced safely.")
+                    }
+                    state.globalStep += 1
+                    state.experienceSeconds = (state.experienceSeconds ?? 0)
+                        + Double(scheduledStep.sampleCount) / max(0.0001, dataset.manifest.actionFPS)
+                    offset = scheduledStep.endOffset
+                    state.epoch = epoch
+                    state.batchOffset = offset
+                    state.lossHistory.append(loss)
+                    if state.lossHistory.count > 8_192 { state.lossHistory.removeFirst(4_096) }
+                    epochWeightedLoss += loss * Double(scheduledStep.sampleCount)
+                    epochSampleCount += scheduledStep.sampleCount
                 }
-                state.globalStep += 1
-                state.experienceSeconds = (state.experienceSeconds ?? 0) + Double(batch.count) / max(0.0001, dataset.manifest.actionFPS)
-                offset = end
-                state.epoch = epoch
-                state.batchOffset = offset
-                state.lossHistory.append(loss)
-                if state.lossHistory.count > 8_192 { state.lossHistory.removeFirst(4_096) }
-                epochWeightedLoss += loss * Double(batch.count)
-                epochSampleCount += batch.count
                 state.currentEpochWeightedLoss = epochWeightedLoss
                 state.currentEpochSampleCount = epochSampleCount
+                let loss = losses.last ?? 0
 
                 let now = CACurrentMediaTime()
                 if now - lastMetricsPublish >= Self.metricsPublishInterval || offset == order.count {
@@ -668,7 +677,8 @@ final class TrainingEngine: @unchecked Sendable {
                     }
                     metrics(
                         report,
-                        performanceLimit ?? "Pipelined training on Apple-silicon GPU\(visionStatus)"
+                        performanceLimit
+                            ?? "Ordered \(optimizerPipelineDepth)-step MLX pipeline on Apple-silicon GPU\(visionStatus)"
                     )
                 }
 
@@ -1018,6 +1028,24 @@ final class TrainingEngine: @unchecked Sendable {
         let diversity = min(8_192, max(1, min(128, segmentCount)) * 64)
         let statistical = min(8_192, Int(Double(total).squareRoot() * 32))
         return min(total, max(baseline, diversity, statistical))
+    }
+
+    /// Queues a few strictly ordered compiled updates before synchronizing the
+    /// unified GPU. This removes a host fence per batch without accumulating an
+    /// unbounded lazy graph. The conservative working-set estimate includes
+    /// parameters, gradients, Adam moments, inputs, activations, and compiler
+    /// temporaries; large Float32 stress profiles therefore choose less depth.
+    static func recommendedOptimizerPipelineDepth(
+        profile: AIProfile,
+        physicalMemory: UInt64
+    ) -> Int {
+        let physical = Int64(min(physicalMemory, UInt64(Int64.max)))
+        let workingSet = max(1, ModelSizing.estimatedTrainingWorkingSet(profile))
+        guard physical > 0, workingSet < Int64.max else { return 1 }
+        if workingSet <= physical / 5 { return 4 }
+        if workingSet <= physical / 3 { return 3 }
+        if workingSet <= physical / 2 { return 2 }
+        return 1
     }
 
     static func adaptivePlateauUpdate(
@@ -1631,6 +1659,13 @@ private struct ExpandedTrainingBatch {
     let sampleToVision: MLXArray?
     let targets: MLXArray
     let previousTargets: MLXArray
+}
+
+private struct ScheduledTrainingStep {
+    let loss: MLXArray
+    let sampleCount: Int
+    let endOffset: Int
+    let preparationSeconds: Double
 }
 
 private struct ValidationEvaluation {

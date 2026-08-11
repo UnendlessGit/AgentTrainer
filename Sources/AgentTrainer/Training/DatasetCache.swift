@@ -455,20 +455,44 @@ final class CachedDataset: @unchecked Sendable {
         }
         var uniqueSequences: [CachedObservationSequence] = []
         uniqueSequences.reserveCapacity(indices.count)
-        var sequenceToIndex: [CachedObservationSequence: Int32] = [:]
-        sequenceToIndex.reserveCapacity(indices.count)
+        // Observation indices are global across all cache segments, so the
+        // current observation is a compact unique key for its complete causal
+        // sequence. Hashing a freshly allocated [UInt32] for every action row
+        // was measurable CPU work at high action rates, especially when two or
+        // more labels share the same perception. Read the mapped index file in
+        // one scope and materialize the full sequence only on first use.
+        var currentToSequence: [UInt32: Int32] = [:]
+        currentToSequence.reserveCapacity(indices.count)
         var sampleToVision: [Int32] = []
         sampleToVision.reserveCapacity(indices.count)
-        for sampleIndex in indices {
-            let sequence = observationSequence(at: sampleIndex)
-            if let existing = sequenceToIndex[sequence] {
-                sampleToVision.append(existing)
-            } else {
-                precondition(uniqueSequences.count < Int(Int32.max), "A vision batch has too many distinct frame sequences.")
-                let index = Int32(uniqueSequences.count)
-                uniqueSequences.append(sequence)
-                sequenceToIndex[sequence] = index
-                sampleToVision.append(index)
+        observationIndices.withUnsafeBytes { raw in
+            let valuesPerSample = manifest.observationIndexValuesPerSample
+            for sampleIndex in indices {
+                let byteOffset = sampleIndex * valuesPerSample * MemoryLayout<UInt32>.size
+                let current = raw.loadUnaligned(
+                    fromByteOffset: byteOffset,
+                    as: UInt32.self
+                ).littleEndian
+                if let existing = currentToSequence[current] {
+                    sampleToVision.append(existing)
+                    continue
+                }
+                precondition(
+                    uniqueSequences.count < Int(Int32.max),
+                    "A vision batch has too many distinct frame sequences."
+                )
+                var sequenceValues: [UInt32] = []
+                sequenceValues.reserveCapacity(valuesPerSample)
+                for slot in 0..<valuesPerSample {
+                    sequenceValues.append(raw.loadUnaligned(
+                        fromByteOffset: byteOffset + slot * MemoryLayout<UInt32>.size,
+                        as: UInt32.self
+                    ).littleEndian)
+                }
+                let sequenceIndex = Int32(uniqueSequences.count)
+                uniqueSequences.append(CachedObservationSequence(indices: sequenceValues))
+                currentToSequence[current] = sequenceIndex
+                sampleToVision.append(sequenceIndex)
             }
         }
         let pastFrameCount = manifest.temporalVision.pastFrameCount
@@ -539,7 +563,7 @@ final class CachedDataset: @unchecked Sendable {
         pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
         actionRows actionDestination: UnsafeMutableRawBufferPointer
     ) {
-        let sequences = indices.map(observationSequence(at:))
+        let sequences = observationSequences(at: indices)
         populateTrainingBatch(
             at: indices,
             observationSequences: sequences,
@@ -1089,14 +1113,75 @@ final class CachedDataset: @unchecked Sendable {
 
     private func observationSequence(at sample: Int) -> CachedObservationSequence {
         observationIndices.withUnsafeBytes { raw in
-            let base = sample * manifest.observationIndexValuesPerSample * MemoryLayout<UInt32>.size
-            return CachedObservationSequence(indices: (0..<manifest.observationIndexValuesPerSample).map { slot in
-                raw.loadUnaligned(
-                    fromByteOffset: base + slot * MemoryLayout<UInt32>.size,
-                    as: UInt32.self
-                ).littleEndian
-            })
+            observationSequence(at: sample, bytes: raw)
         }
+    }
+
+    private func observationSequences(at samples: [Int]) -> [CachedObservationSequence] {
+        observationIndices.withUnsafeBytes { raw in
+            samples.map { observationSequence(at: $0, bytes: raw) }
+        }
+    }
+
+    private func observationSequence(
+        at sample: Int,
+        bytes raw: UnsafeRawBufferPointer
+    ) -> CachedObservationSequence {
+        let base = sample * manifest.observationIndexValuesPerSample * MemoryLayout<UInt32>.size
+        return CachedObservationSequence(indices: (0..<manifest.observationIndexValuesPerSample).map { slot in
+            raw.loadUnaligned(
+                fromByteOffset: base + slot * MemoryLayout<UInt32>.size,
+                as: UInt32.self
+            ).littleEndian
+        })
+    }
+}
+
+private struct PackedRecordingSegment: Sendable {
+    let index: Int
+    let recordingID: UUID
+    let directory: URL
+    let samples: Int
+    let observations: Int
+}
+
+private final class DatasetPackingProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private let names: [String]
+    private let durations: [Double]
+    private let totalDuration: Double
+    private let progress: @Sendable (Double, String) -> Void
+    private var fractions: [Double]
+    private var lastOverall = 0.0
+
+    init(
+        recordings: [RecordingItem],
+        usableDurations: [Double],
+        totalUsableDuration: Double,
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) {
+        names = recordings.map { $0.manifest.name }
+        durations = usableDurations
+        totalDuration = totalUsableDuration
+        self.progress = progress
+        fractions = [Double](repeating: 0, count: recordings.count)
+    }
+
+    func update(index: Int, fraction rawFraction: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard fractions.indices.contains(index) else { return }
+        let fraction = rawFraction.isFinite ? min(1, max(0, rawFraction)) : 0
+        fractions[index] = max(fractions[index], fraction)
+        let completed = zip(fractions, durations).reduce(0.0) {
+            $0 + $1.0 * $1.1
+        }
+        let overall = max(lastOverall, min(0.999, completed / totalDuration))
+        lastOverall = overall
+        progress(
+            overall,
+            "Packing \(names[index]) in parallel • \(Int((overall * 100).rounded()))%"
+        )
     }
 }
 
@@ -1129,42 +1214,132 @@ actor DatasetCacheBuilder {
         var segments: [CacheSegment] = []
         var sampleCount = 0
         var observationCount = 0
+        guard let packingPreprocessor = preprocessor else {
+            throw AgentTrainerError.model("Metal preprocessing is unavailable.")
+        }
         let usableDurations = recordings.map { recording in
             let start = max(0, min(recording.manifest.duration, recording.manifest.trimStart))
             let end = max(start, min(recording.manifest.duration, recording.manifest.trimEnd ?? recording.manifest.duration))
             return end - start
         }
         let totalUsableDuration = max(0.000_001, usableDurations.reduce(0, +))
-        var completedDuration = 0.0
         do {
-            for (recordingIndex, recording) in recordings.enumerated() {
-                try Task.checkCancellation()
-                let recordingDuration = usableDurations[recordingIndex]
-                progress(completedDuration / totalUsableDuration, "Packing \(recording.manifest.name) • \(Int((completedDuration / totalUsableDuration * 100).rounded()))%")
-                let start = sampleCount
-                let appended = try await appendRecording(
+            if recordings.count == 1, let recording = recordings.first {
+                progress(0, "Packing \(recording.manifest.name) • 0%")
+                let appended = try await Self.appendRecording(
                     recording,
                     profile: profile,
-                    observationBase: observationCount,
+                    preprocessor: packingPreprocessor,
+                    observationBase: 0,
                     currentObservations: currentObservations,
                     pastObservations: pastObservations,
                     observationIndices: observationIndices,
                     frameActions: frameActions,
                     actions: actions,
-                    progress: { recordingFraction in
-                        let overall = min(0.999, (completedDuration + recordingDuration * recordingFraction) / totalUsableDuration)
-                        progress(overall, "Packing \(recording.manifest.name) • \(Int((overall * 100).rounded()))%")
+                    progress: { fraction in
+                        let overall = min(0.999, max(0, fraction))
+                        progress(
+                            overall,
+                            "Packing \(recording.manifest.name) • \(Int((overall * 100).rounded()))%"
+                        )
                     }
                 )
-                completedDuration += recordingDuration
-                observationCount += appended.observations
-                sampleCount += appended.samples
+                sampleCount = appended.samples
+                observationCount = appended.observations
                 if appended.samples > 0 {
-                    segments.append(CacheSegment(recordingID: recording.id, start: start, count: appended.samples))
+                    segments.append(CacheSegment(
+                        recordingID: recording.id,
+                        start: 0,
+                        count: appended.samples
+                    ))
                 }
+            } else {
+                let segmentRoot = temporary.appendingPathComponent("segments", isDirectory: true)
+                try FileManager.default.createDirectory(
+                    at: segmentRoot,
+                    withIntermediateDirectories: true
+                )
+                let tracker = DatasetPackingProgress(
+                    recordings: recordings,
+                    usableDurations: usableDurations,
+                    totalUsableDuration: totalUsableDuration,
+                    progress: progress
+                )
+                let concurrency = Self.recommendedPackingConcurrency(
+                    recordings: recordings,
+                    physicalMemory: ProcessInfo.processInfo.physicalMemory,
+                    processorCount: ProcessInfo.processInfo.activeProcessorCount
+                )
+                try await withThrowingTaskGroup(of: PackedRecordingSegment.self) { group in
+                    let initialCount = min(concurrency, recordings.count)
+                    for index in 0..<initialCount {
+                        let recording = recordings[index]
+                        group.addTask(priority: .userInitiated) {
+                            try await Self.packRecordingSegment(
+                                index: index,
+                                recording: recording,
+                                profile: profile,
+                                preprocessor: packingPreprocessor,
+                                root: segmentRoot,
+                                progress: { tracker.update(index: index, fraction: $0) }
+                            )
+                        }
+                    }
+                    var nextSubmission = initialCount
+                    var nextMerge = 0
+                    var pending: [Int: PackedRecordingSegment] = [:]
+                    while let result = try await group.next() {
+                        pending[result.index] = result
+                        while let segment = pending.removeValue(forKey: nextMerge) {
+                            let start = sampleCount
+                            try Self.mergePackedRecordingSegment(
+                                segment,
+                                observationBase: observationCount,
+                                currentObservations: currentObservations,
+                                pastObservations: pastObservations,
+                                observationIndices: observationIndices,
+                                frameActions: frameActions,
+                                actions: actions
+                            )
+                            observationCount += segment.observations
+                            sampleCount += segment.samples
+                            if segment.samples > 0 {
+                                segments.append(CacheSegment(
+                                    recordingID: segment.recordingID,
+                                    start: start,
+                                    count: segment.samples
+                                ))
+                            }
+                            try FileManager.default.removeItem(at: segment.directory)
+                            nextMerge += 1
+                        }
+                        if nextSubmission < recordings.count {
+                            let index = nextSubmission
+                            let recording = recordings[index]
+                            group.addTask(priority: .userInitiated) {
+                                try await Self.packRecordingSegment(
+                                    index: index,
+                                    recording: recording,
+                                    profile: profile,
+                                    preprocessor: packingPreprocessor,
+                                    root: segmentRoot,
+                                    progress: { tracker.update(index: index, fraction: $0) }
+                                )
+                            }
+                            nextSubmission += 1
+                        }
+                    }
+                    guard nextMerge == recordings.count, pending.isEmpty else {
+                        throw AgentTrainerError.storage("Parallel recording packing did not produce a complete ordered dataset.")
+                    }
+                }
+                try? FileManager.default.removeItem(at: segmentRoot)
             }
-            try currentObservations.finish(); try pastObservations.finish()
-            try observationIndices.finish(); try frameActions.finish(); try actions.finish()
+            try currentObservations.finish()
+            try pastObservations.finish()
+            try observationIndices.finish()
+            try frameActions.finish()
+            try actions.finish()
             let temporal = profile.training.effectiveTemporalVision
             let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
             let manifest = DatasetCacheManifest(
@@ -1182,15 +1357,25 @@ actor DatasetCacheBuilder {
                 actionValuesPerSample: ActionLayout.count,
                 segments: segments
             )
-            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.dateEncodingStrategy = .iso8601
-            try encoder.encode(manifest).write(to: temporary.appendingPathComponent("manifest.json"), options: .atomic)
-            if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(manifest).write(
+                to: temporary.appendingPathComponent("manifest.json"),
+                options: .atomic
+            )
+            if FileManager.default.fileExists(atPath: directory.path) {
+                try FileManager.default.removeItem(at: directory)
+            }
             try FileManager.default.moveItem(at: temporary, to: directory)
             progress(1, "Dataset cache ready")
             return try CachedDataset(directory: directory)
         } catch {
-            try? currentObservations.finish(); try? pastObservations.finish()
-            try? observationIndices.finish(); try? frameActions.finish(); try? actions.finish()
+            try? currentObservations.finish()
+            try? pastObservations.finish()
+            try? observationIndices.finish()
+            try? frameActions.finish()
+            try? actions.finish()
             try? FileManager.default.removeItem(at: temporary)
             throw error
         }
@@ -1205,25 +1390,172 @@ actor DatasetCacheBuilder {
             let perceptionFPS: Double
             let recordings: [RecordingTrainingIdentity]
         }
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]; encoder.dateEncodingStrategy = .iso8601
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
         let recordingIdentities = try recordings.map(RecordingTrainingIdentity.init(recording:))
-        let identity = Identity(cacheSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, temporalVision: profile.training.effectiveTemporalVision, actionFPS: profile.training.actionFPS, perceptionFPS: profile.training.perceptionFPS, recordings: recordingIdentities)
+        let identity = Identity(
+            cacheSchema: TrainingDataContract.schemaVersion,
+            preprocessing: profile.preprocessing,
+            temporalVision: profile.training.effectiveTemporalVision,
+            actionFPS: profile.training.actionFPS,
+            perceptionFPS: profile.training.perceptionFPS,
+            recordings: recordingIdentities
+        )
         let digest = SHA256.hash(data: try encoder.encode(identity))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    private func appendRecording(
+    nonisolated static func recommendedPackingConcurrency(
+        recordings: [RecordingItem],
+        physicalMemory: UInt64,
+        processorCount: Int
+    ) -> Int {
+        let largestDecodedFrame = recordings.reduce(UInt64(1)) { current, recording in
+            let width = UInt64(max(1, recording.manifest.pixelWidth))
+            let height = UInt64(max(1, recording.manifest.pixelHeight))
+            let product = width.multipliedReportingOverflow(by: height)
+            let pixels = product.overflow ? UInt64.max : product.partialValue
+            // Native 4:2:0 is nominally 1.5 bytes/pixel. Two bytes/pixel is a
+            // conservative allowance for row alignment and decoder surfaces.
+            let bytes = pixels.multipliedReportingOverflow(by: 2)
+            return max(current, bytes.overflow ? UInt64.max : bytes.partialValue)
+        }
+        return recommendedPackingConcurrency(
+            recordingCount: recordings.count,
+            largestDecodedFrameBytes: largestDecodedFrame,
+            physicalMemory: physicalMemory,
+            processorCount: processorCount
+        )
+    }
+
+    nonisolated static func recommendedPackingConcurrency(
+        recordingCount: Int,
+        largestDecodedFrameBytes: UInt64,
+        physicalMemory: UInt64,
+        processorCount: Int
+    ) -> Int {
+        guard recordingCount > 1 else { return 1 }
+        let mebibyte = UInt64(1 << 20)
+        let decodedSurfaces = largestDecodedFrameBytes.multipliedReportingOverflow(by: 12)
+        let surfaceAllowance = decodedSurfaces.overflow
+            ? UInt64.max
+            : decodedSurfaces.partialValue
+        let base = max(192 * mebibyte, surfaceAllowance)
+        let withOutputs = base.addingReportingOverflow(64 * mebibyte)
+        let perWorker = withOutputs.overflow ? UInt64.max : withOutputs.partialValue
+        let memoryBudget = max(perWorker, physicalMemory / 2)
+        let memoryBound = max(1, Int(min(UInt64(Int.max), memoryBudget / max(1, perWorker))))
+        let cpuBound = max(1, min(4, max(1, processorCount) / 2))
+        return min(recordingCount, cpuBound, memoryBound)
+    }
+
+    private nonisolated static func packRecordingSegment(
+        index: Int,
+        recording: RecordingItem,
+        profile: AIProfile,
+        preprocessor: VisionPreprocessor,
+        root: URL,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> PackedRecordingSegment {
+        let directory = root.appendingPathComponent(
+            String(format: "%06d-%@", index, UUID().uuidString),
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let currentObservations = try BufferedFileWriter(
+            url: directory.appendingPathComponent("current-observations.bin"),
+            capacity: 8 * 1_024 * 1_024
+        )
+        let pastObservations = try BufferedFileWriter(
+            url: directory.appendingPathComponent("past-observations.bin"),
+            capacity: 8 * 1_024 * 1_024
+        )
+        let observationIndices = try BufferedFileWriter(
+            url: directory.appendingPathComponent("observation-indices.bin"),
+            capacity: 1 * 1_024 * 1_024
+        )
+        let frameActions = try BufferedFileWriter(
+            url: directory.appendingPathComponent("frame-actions.bin"),
+            capacity: 1 * 1_024 * 1_024
+        )
+        let actions = try BufferedFileWriter(
+            url: directory.appendingPathComponent("actions.bin"),
+            capacity: 1 * 1_024 * 1_024
+        )
+        do {
+            let result = try await appendRecording(
+                recording,
+                profile: profile,
+                preprocessor: preprocessor,
+                observationBase: 0,
+                currentObservations: currentObservations,
+                pastObservations: pastObservations,
+                observationIndices: observationIndices,
+                frameActions: frameActions,
+                actions: actions,
+                progress: progress
+            )
+            try currentObservations.finish(synchronize: false)
+            try pastObservations.finish(synchronize: false)
+            try observationIndices.finish(synchronize: false)
+            try frameActions.finish(synchronize: false)
+            try actions.finish(synchronize: false)
+            return PackedRecordingSegment(
+                index: index,
+                recordingID: recording.id,
+                directory: directory,
+                samples: result.samples,
+                observations: result.observations
+            )
+        } catch {
+            try? currentObservations.finish(synchronize: false)
+            try? pastObservations.finish(synchronize: false)
+            try? observationIndices.finish(synchronize: false)
+            try? frameActions.finish(synchronize: false)
+            try? actions.finish(synchronize: false)
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    private nonisolated static func mergePackedRecordingSegment(
+        _ segment: PackedRecordingSegment,
+        observationBase: Int,
+        currentObservations: BufferedFileWriter,
+        pastObservations: BufferedFileWriter,
+        observationIndices: BufferedFileWriter,
+        frameActions: BufferedFileWriter,
+        actions: BufferedFileWriter
+    ) throws {
+        func mapped(_ name: String) throws -> Data {
+            try Data(
+                contentsOf: segment.directory.appendingPathComponent(name),
+                options: .alwaysMapped
+            )
+        }
+        try currentObservations.append(mapped("current-observations.bin"))
+        try pastObservations.append(mapped("past-observations.bin"))
+        try observationIndices.appendRebasedObservationIndices(
+            mapped("observation-indices.bin"),
+            observationBase: observationBase
+        )
+        try frameActions.append(mapped("frame-actions.bin"))
+        try actions.append(mapped("actions.bin"))
+    }
+
+    private nonisolated static func appendRecording(
         _ recording: RecordingItem,
         profile: AIProfile,
+        preprocessor: VisionPreprocessor,
         observationBase: Int,
         currentObservations: BufferedFileWriter,
         pastObservations: BufferedFileWriter,
         observationIndices: BufferedFileWriter,
         frameActions: BufferedFileWriter,
         actions: BufferedFileWriter,
-        progress: (Double) -> Void
+        progress: @escaping @Sendable (Double) -> Void
     ) async throws -> (samples: Int, observations: Int) {
-        guard let preprocessor else { throw AgentTrainerError.model("Metal preprocessing is unavailable.") }
         guard recording.manifest.isStructurallyValid, recording.manifest.hostStartNanos > 0 else {
             throw AgentTrainerError.storage("\(recording.manifest.name) has an invalid recording timeline or manifest.")
         }
@@ -1279,14 +1611,14 @@ actor DatasetCacheBuilder {
         func writeOldestPackedFrame() throws {
             let frame = pendingPackedFrames.removeFirst()
             try frame.current.withPackedBytes { bytes in
-                for _ in 0..<frame.repetitions { try currentObservations.append(bytes) }
+                try currentObservations.appendRepeated(bytes, count: frame.repetitions)
                 if sharesPackedRepresentation {
-                    for _ in 0..<frame.repetitions { try pastObservations.append(bytes) }
+                    try pastObservations.appendRepeated(bytes, count: frame.repetitions)
                 }
             }
             if let past = frame.past {
                 try past.withPackedBytes { bytes in
-                    for _ in 0..<frame.repetitions { try pastObservations.append(bytes) }
+                    try pastObservations.appendRepeated(bytes, count: frame.repetitions)
                 }
             }
         }
@@ -1356,7 +1688,10 @@ actor DatasetCacheBuilder {
             )
         }
         while !pendingPackedFrames.isEmpty { try writeOldestPackedFrame() }
-        guard !observationTimes.isEmpty else { progress(1); return (0, 0) }
+        guard !observationTimes.isEmpty else {
+            progress(1)
+            return (0, 0)
+        }
 
         let initialPointer = events.first { $0.kind == .mouseMove || $0.kind == .mouseButton || $0.kind == .scroll }
         let trainingStartNanos = try absoluteHostNanos(recording.manifest, seconds: trainingStart)
@@ -1438,7 +1773,7 @@ actor DatasetCacheBuilder {
         return (sampleCount, observationTimes.count)
     }
 
-    private func absoluteHostNanos(_ manifest: RecordingManifest, seconds: Double) throws -> UInt64 {
+    private nonisolated static func absoluteHostNanos(_ manifest: RecordingManifest, seconds: Double) throws -> UInt64 {
         let nanos = seconds * 1_000_000_000
         guard seconds.isFinite, seconds >= 0, nanos < Double(UInt64.max - manifest.hostStartNanos) else {
             throw AgentTrainerError.storage("\(manifest.name) has a recording timestamp outside the supported range.")
@@ -1526,7 +1861,7 @@ struct ActionAccumulator {
 /// observation and 584-byte action row. This bounded writer turns hundreds of
 /// thousands of tiny syscalls into sequential multi-megabyte writes without
 /// changing a single cache byte.
-private final class BufferedFileWriter {
+final class BufferedFileWriter {
     private let handle: FileHandle
     private let capacity: Int
     private var buffer: Data
@@ -1541,7 +1876,12 @@ private final class BufferedFileWriter {
     }
 
     func append(_ data: Data) throws {
-        try data.withUnsafeBytes { try append($0) }
+        guard !closed else { throw AgentTrainerError.storage("The dataset cache writer was already closed.") }
+        if buffer.isEmpty, data.count >= capacity {
+            try handle.write(contentsOf: data)
+        } else {
+            try data.withUnsafeBytes { try append($0) }
+        }
     }
 
     func append(_ bytes: UnsafeRawBufferPointer) throws {
@@ -1550,15 +1890,73 @@ private final class BufferedFileWriter {
         if buffer.count >= capacity { try flush() }
     }
 
+    func appendRepeated(_ bytes: UnsafeRawBufferPointer, count repetitions: Int) throws {
+        guard !closed else { throw AgentTrainerError.storage("The dataset cache writer was already closed.") }
+        guard repetitions > 0, !bytes.isEmpty else { return }
+        var remaining = repetitions
+        while remaining > 0 {
+            if buffer.count + bytes.count > capacity, !buffer.isEmpty { try flush() }
+            if bytes.count >= capacity {
+                try handle.write(contentsOf: Data(bytes))
+                remaining -= 1
+                continue
+            }
+            let copies = min(remaining, max(1, (capacity - buffer.count) / bytes.count))
+            let destinationOffset = buffer.count
+            buffer.count += copies * bytes.count
+            buffer.withUnsafeMutableBytes { destination in
+                guard let destinationBase = destination.baseAddress,
+                      let sourceBase = bytes.baseAddress else { return }
+                for copy in 0..<copies {
+                    memcpy(
+                        destinationBase.advanced(by: destinationOffset + copy * bytes.count),
+                        sourceBase,
+                        bytes.count
+                    )
+                }
+            }
+            remaining -= copies
+            if buffer.count >= capacity { try flush() }
+        }
+    }
+
+    func appendRebasedObservationIndices(_ data: Data, observationBase: Int) throws {
+        guard data.count.isMultiple(of: MemoryLayout<UInt32>.size),
+              let base = UInt32(exactly: observationBase) else {
+            throw AgentTrainerError.storage("A packed recording has an invalid observation index file.")
+        }
+        var adjusted = Data(data)
+        try adjusted.withUnsafeMutableBytes { raw in
+            for offset in stride(from: 0, to: raw.count, by: MemoryLayout<UInt32>.size) {
+                let value = raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian
+                guard value != UInt32.max else { continue }
+                let rebased = value.addingReportingOverflow(base)
+                guard !rebased.overflow, rebased.partialValue != UInt32.max else {
+                    throw AgentTrainerError.storage("The dataset contains too many perception frames for its index format.")
+                }
+                raw.storeBytes(
+                    of: rebased.partialValue.littleEndian,
+                    toByteOffset: offset,
+                    as: UInt32.self
+                )
+            }
+        }
+        try append(adjusted)
+    }
+
     func appendLittleEndian<T: FixedWidthInteger>(_ value: T) throws {
         var little = value.littleEndian
         try Swift.withUnsafeBytes(of: &little) { try append($0) }
     }
 
-    func finish() throws {
+    func finish(synchronize: Bool = true) throws {
         guard !closed else { return }
         try flush()
-        try handle.synchronize()
+        // Per-recording shard files are immediately merged into the durable
+        // cache and then removed. Avoiding five redundant fsyncs per shard
+        // keeps parallel packing throughput high; the final cache writers are
+        // still synchronized before the atomic directory move.
+        if synchronize { try handle.synchronize() }
         try handle.close()
         closed = true
     }
