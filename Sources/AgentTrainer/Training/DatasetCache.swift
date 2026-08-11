@@ -1227,7 +1227,10 @@ actor DatasetCacheBuilder {
         guard recording.manifest.isStructurallyValid, recording.manifest.hostStartNanos > 0 else {
             throw AgentTrainerError.storage("\(recording.manifest.name) has an invalid recording timeline or manifest.")
         }
-        let temporal = try profile.training.effectiveTemporalVision.validated(current: profile.preprocessing)
+        let temporal = try profile.training.effectiveTemporalVision.validated(
+            current: profile.preprocessing,
+            cachedEmbeddingWidth: profile.training.architecture.visualEmbedding
+        )
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         let events = try InputEventReader.mapped(url: recording.directory.appendingPathComponent(recording.manifest.eventFile))
         let asset = AVURLAsset(url: recording.directory.appendingPathComponent(recording.manifest.videoFile))

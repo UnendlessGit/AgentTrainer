@@ -239,8 +239,11 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(input.frameSpacingSeconds, 0.2, accuracy: 0.000_001)
         XCTAssertEqual(input.temporalLookbackSeconds, 0.8, accuracy: 0.000_001)
         XCTAssertEqual(input.valuesPerDecision, 75 + 4 * (30 + 146))
-        XCTAssertEqual(input.runtimeValuesPerSecond, 10 * (75 + 4 * (30 + 146)))
-        XCTAssertEqual(input.packedVisionBytesPerSecond, 670)
+        XCTAssertEqual(input.runtimeEncodedVisionValues, 75 + 30)
+        XCTAssertEqual(input.runtimeCachedVisualValues, 4 * 256)
+        XCTAssertEqual(input.runtimeValuesPerDecision, 75 + 30 + 4 * (256 + 146))
+        XCTAssertEqual(input.runtimeValuesPerSecond, 10 * (75 + 30 + 4 * (256 + 146)))
+        XCTAssertEqual(input.packedVisionBytesPerSecond, 370)
         XCTAssertEqual(input.valuesPerTrainingBatch, 2 * (75 + 4 * (30 + 146)))
         XCTAssertEqual(input.quantizationLevels, 4)
         XCTAssertEqual(input.effectivePackedBits, 67 * 2)
@@ -283,6 +286,9 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(input.temporalLookbackSeconds, 0)
         XCTAssertEqual(input.totalPackedVisionValues, input.currentPackedVisionValues)
         XCTAssertEqual(input.valuesPerDecision, input.currentFirstConvolutionValues)
+        XCTAssertEqual(input.runtimeEncodedVisionValues, input.currentFirstConvolutionValues)
+        XCTAssertEqual(input.runtimeCachedVisualValues, 0)
+        XCTAssertEqual(input.runtimeValuesPerDecision, input.currentFirstConvolutionValues)
 
         profile.training.architecture = .small
         profile.training.precision = .float32
@@ -306,6 +312,24 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(predictions.asArray(Float.self).allSatisfy(\.isFinite))
         XCTAssertEqual(genericPredictions.asArray(Float.self), predictions.asArray(Float.self))
         XCTAssertTrue(loss.item(Float.self).isFinite)
+    }
+
+    func testTemporalValidationBudgetsCachedFeaturesInsteadOfHistoricalPixels() throws {
+        let current = PreprocessingSpec(
+            width: 8_192,
+            height: 4_096,
+            colorMode: .grayscale,
+            bitDepth: 8,
+            chroma: .yuv420,
+            resizePolicy: .fit
+        )
+        let temporal = TemporalVisionConfiguration(
+            pastFrameCount: TemporalVisionConfiguration.maximumPastFrameCount,
+            frameSpacing: TemporalVisionConfiguration.maximumFrameSpacing,
+            downsampleFactor: 1
+        )
+        XCTAssertNoThrow(try temporal.validated(current: current, cachedEmbeddingWidth: 256))
+        XCTAssertThrowsError(try temporal.validated(current: current, cachedEmbeddingWidth: 100_000))
     }
 
     func testNeuralInputCapacityGuideUsesSimpleConservativeBands() {
@@ -360,18 +384,63 @@ final class DomainTests: XCTestCase {
             XCTAssertTrue(architecture.fusionWidths.allSatisfy { $0 > 0 })
             XCTAssertEqual(architecture.effectiveVisualPooling, .attention)
             XCTAssertGreaterThan(architecture.effectiveAttentionHeads, 0)
+            XCTAssertGreaterThan(architecture.effectiveControlEmbedding, 0)
+            XCTAssertEqual(architecture.convolutionChannels.last, architecture.convolutionChannels.dropLast().last)
         }
-        XCTAssertEqual(CNNGeometry.layer(0, architecture: .balanced), CNNLayerGeometry(kernelSize: 7, effectiveStride: 4, receptiveField: 7))
-        XCTAssertEqual(CNNGeometry.layer(1, architecture: .balanced), CNNLayerGeometry(kernelSize: 3, effectiveStride: 8, receptiveField: 15))
-        XCTAssertEqual(CNNGeometry.layer(2, architecture: .balanced), CNNLayerGeometry(kernelSize: 3, effectiveStride: 16, receptiveField: 31))
-        XCTAssertEqual(CNNGeometry.layer(3, architecture: .balanced), CNNLayerGeometry(kernelSize: 3, effectiveStride: 32, receptiveField: 63))
-        XCTAssertEqual(CNNGeometry.outputSize(width: 32, height: 24, architecture: .small).width, 1)
-        XCTAssertEqual(CNNGeometry.outputSize(width: 32, height: 24, architecture: .small).height, 1)
-        XCTAssertEqual(CNNGeometry.outputSize(width: 640, height: 360, architecture: .balanced).width, 20)
-        XCTAssertEqual(CNNGeometry.outputSize(width: 640, height: 360, architecture: .balanced).height, 12)
+        XCTAssertEqual(CNNGeometry.layer(0, architecture: .balanced), CNNLayerGeometry(kernelSize: 5, effectiveStride: 2, receptiveField: 5))
+        XCTAssertEqual(CNNGeometry.layer(1, architecture: .balanced), CNNLayerGeometry(kernelSize: 3, effectiveStride: 4, receptiveField: 9))
+        XCTAssertEqual(CNNGeometry.layer(2, architecture: .balanced), CNNLayerGeometry(kernelSize: 3, effectiveStride: 8, receptiveField: 17))
+        XCTAssertEqual(CNNGeometry.layer(3, architecture: .balanced), CNNLayerGeometry(kernelSize: 3, effectiveStride: 16, receptiveField: 33))
+        XCTAssertEqual(CNNGeometry.layer(4, architecture: .balanced), CNNLayerGeometry(kernelSize: 3, effectiveStride: 16, receptiveField: 65))
+        XCTAssertEqual(CNNGeometry.outputSize(width: 32, height: 24, architecture: .small).width, 2)
+        XCTAssertEqual(CNNGeometry.outputSize(width: 32, height: 24, architecture: .small).height, 2)
+        XCTAssertEqual(CNNGeometry.outputSize(width: 640, height: 360, architecture: .balanced).width, 40)
+        XCTAssertEqual(CNNGeometry.outputSize(width: 640, height: 360, architecture: .balanced).height, 23)
         var convolutionFree = ArchitectureSpec.balanced
         convolutionFree.convolutionChannels = []
         XCTAssertEqual(CNNGeometry.layer(-1, architecture: convolutionFree), CNNLayerGeometry(kernelSize: 1, effectiveStride: 1, receptiveField: 1))
+    }
+
+    func testEfficientBackboneAndTemporalCacheCutRedundantCompute() {
+        let profile = AIProfile.fresh()
+        let architecture = profile.training.architecture
+        let efficient = ModelSizing.visualBackboneMultiplyAdds(
+            width: profile.preprocessing.width,
+            height: profile.preprocessing.height,
+            inputChannels: profile.preprocessing.channelCount,
+            architecture: architecture
+        )
+        var width = profile.preprocessing.width
+        var height = profile.preprocessing.height
+        var input = profile.preprocessing.channelCount + 2
+        var denseReference: Int64 = 0
+        for index in architecture.convolutionChannels.indices {
+            let output = architecture.convolutionChannels[index]
+            let kernel = architecture.kernelSizes[index]
+            let stride = architecture.strides[index]
+            width = (width + 2 * (kernel / 2) - kernel) / stride + 1
+            height = (height + 2 * (kernel / 2) - kernel) / stride + 1
+            denseReference += Int64(width * height * input * output * kernel * kernel)
+            input = output
+        }
+        XCTAssertLessThan(efficient * 2, denseReference)
+
+        let temporal = profile.training.effectiveTemporalVision
+        let past = temporal.pastFrameSpec(from: profile.preprocessing)
+        let currentWork = efficient
+        let pastWork = ModelSizing.visualBackboneMultiplyAdds(
+            width: past.width,
+            height: past.height,
+            inputChannels: past.channelCount,
+            architecture: architecture
+        )
+        let uncachedRuntimeWork = currentWork + Int64(temporal.pastFrameCount) * pastWork
+        XCTAssertEqual(ModelSizing.runtimeVisualBackboneMultiplyAdds(profile), currentWork + pastWork)
+        XCTAssertLessThan(ModelSizing.runtimeVisualBackboneMultiplyAdds(profile), uncachedRuntimeWork)
+
+        var currentOnly = profile
+        currentOnly.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 0)
+        XCTAssertLessThan(ModelSizing.parameterCount(currentOnly), ModelSizing.parameterCount(profile))
     }
 
     func testAttentionPoolingIsResolutionStableAndMuchSmallerThanLegacyFlattening() {
@@ -399,9 +468,11 @@ final class DomainTests: XCTestCase {
         object.removeValue(forKey: "plateauPatience")
         object.removeValue(forKey: "minimumLearningRateRatio")
         object.removeValue(forKey: "binaryFocalGamma")
+        object.removeValue(forKey: "generalization")
         var architecture = try XCTUnwrap(object["architecture"] as? [String: Any])
         architecture.removeValue(forKey: "visualPooling")
         architecture.removeValue(forKey: "attentionHeads")
+        architecture.removeValue(forKey: "controlEmbedding")
         object["architecture"] = architecture
         let legacyData = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         let legacy = try JSONDecoder().decode(TrainingConfiguration.self, from: legacyData)
@@ -409,13 +480,17 @@ final class DomainTests: XCTestCase {
         XCTAssertNil(legacy.learningRateSchedule)
         XCTAssertEqual(legacy.effectiveLearningRateSchedule, .legacyInverseSquareRoot)
         XCTAssertEqual(legacy.effectiveBinaryFocalGamma, 0)
+        XCTAssertNil(legacy.generalization)
         XCTAssertNil(legacy.architecture.visualPooling)
         XCTAssertEqual(legacy.architecture.effectiveVisualPooling, .flattened)
+        XCTAssertEqual(legacy.architecture.effectiveControlEmbedding, 64)
+        XCTAssertEqual(legacy.effectiveGeneralization, GeneralizationConfiguration())
         XCTAssertEqual(TrainingConfiguration().effectiveLearningRateSchedule, .adaptiveCosine)
         XCTAssertEqual(TrainingConfiguration().architecture.effectiveVisualPooling, .attention)
 
         let roundTripped = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? [String: Any])
         XCTAssertNil(roundTripped["learningRateSchedule"], "Nil compatibility fields must remain absent so legacy checkpoint signatures stay stable.")
+        XCTAssertNil(roundTripped["generalization"])
         let roundTrippedArchitecture = try XCTUnwrap(roundTripped["architecture"] as? [String: Any])
         XCTAssertNil(roundTrippedArchitecture["visualPooling"])
     }
@@ -1387,9 +1462,20 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(profile.learnedBrainContract, original)
         profile.training.architecture.dropout = 0.5
         XCTAssertEqual(profile.learnedBrainContract, original, "Dropout must preserve every learned tensor and existing brain weight.")
+        profile.training.generalization = GeneralizationConfiguration(
+            visionAugmentationStrength: 0.12,
+            randomErasingProbability: 0.15,
+            controlHistoryDropout: 0.18,
+            temporalFrameDropout: 0.08,
+            binaryLabelSmoothing: 0.01
+        )
+        XCTAssertEqual(profile.learnedBrainContract, original, "Training-only augmentation must preserve the learned tensor layout.")
         profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 8, frameSpacing: 2, downsampleFactor: 2)
         XCTAssertNotEqual(profile.learnedBrainContract, original)
         profile.training.temporalVision = original.temporalVision
+        profile.training.architecture.controlEmbedding = profile.training.architecture.effectiveControlEmbedding + 1
+        XCTAssertNotEqual(profile.learnedBrainContract, original)
+        profile.training.architecture.controlEmbedding = original.architecture.controlEmbedding
         profile.training.architecture.recurrentWidth += 1
         XCTAssertNotEqual(profile.learnedBrainContract, original)
         profile.training.architecture.recurrentWidth -= 1
@@ -2484,7 +2570,7 @@ final class DomainTests: XCTestCase {
         let overlay = CNNVisualizationImageRenderer.render(CNNVisualizationFrame(packed: packed, spec: spec, settings: settings, tensors: [overlayTensor], timestamp: 0))
         let overlayImage = try XCTUnwrap(overlay.image)
         XCTAssertEqual(overlayImage.size, NSSize(width: 80, height: 45))
-        XCTAssertTrue(overlay.detail.contains("Conv 3"))
+        XCTAssertTrue(overlay.detail.contains("Stage 3"))
 
         settings.mode = .featureChannels
         settings.featureChannelCount = 4
@@ -2600,6 +2686,46 @@ final class DomainTests: XCTestCase {
         XCTAssertThrowsError(try ResumableAdamW(learningRate: 0.001, weightDecay: 0.01).load(from: url))
     }
 
+    func testGlobalGradientNormDoesNotOverflowWhenTheTrueNormIsFinite() {
+        let gradients = ModuleParameters.unflattened([
+            "large": MLXArray([Float(1e20), Float(-1e20)])
+        ])
+
+        let norm = ResumableAdamW.globalGradientNorm(gradients)
+        MLX.eval(norm)
+        let value = norm.item(Float.self)
+
+        XCTAssertTrue(value.isFinite)
+        XCTAssertEqual(value / 1e20, Float(2).squareRoot(), accuracy: 0.0001)
+    }
+
+    func testOptimizerDropsNonFiniteDerivativesWithoutPoisoningPersistentState() {
+        let model = Linear(2, 2)
+        let optimizer = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01)
+        optimizer.initialize(model: model)
+        let gradients = model.mapParameters {
+            MLXArray.ones($0.shape) * Float.nan
+        }
+        let norm = ResumableAdamW.globalGradientNorm(gradients)
+
+        optimizer.update(
+            model: model,
+            gradients: gradients,
+            targetType: .float32,
+            gradientNorm: norm,
+            maxGradientNorm: 1
+        )
+        MLX.eval(model.parameters(), optimizer.stateArrays(), norm)
+
+        XCTAssertEqual(norm.item(Float.self), 0)
+        for (_, parameter) in model.parameters().flattened() {
+            XCTAssertTrue(parameter.asArray(Float.self).allSatisfy(\.isFinite))
+        }
+        for state in optimizer.stateArrays() {
+            XCTAssertTrue(state.asArray(Float.self).allSatisfy(\.isFinite))
+        }
+    }
+
     func testIntegratedGlobalGradientClipExactlyMatchesCanonicalClipping() throws {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 16, height: 12, colorMode: .grayscale)
@@ -2662,6 +2788,7 @@ final class DomainTests: XCTestCase {
         profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
+        profile.training.generalization = .disabled
         profile.training.precision = .float32
         let modelA = AgentPolicy(profile: profile), modelB = AgentPolicy(profile: profile)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("compiled-\(UUID().uuidString)", isDirectory: true)
@@ -3478,6 +3605,55 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(sharedPredictions.asArray(Float.self), expectedPredictions.asArray(Float.self))
     }
 
+    func testCachedTemporalEmbeddingsExactlyMatchImageHistoryInference() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 32, height: 24, colorMode: .grayscale)
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 3,
+            frameSpacing: 2,
+            downsampleFactor: 2
+        )
+        profile.training.architecture = .small
+        profile.training.precision = .float32
+        profile.training.generalization = .disabled
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+        let inputs = temporalModelInputs(profile: profile, batch: 2, value: 0.375)
+        let imagePredictions = model.predictions(
+            currentImages: inputs.current,
+            pastImages: inputs.past,
+            pastControls: inputs.controls
+        )
+
+        let temporal = profile.training.effectiveTemporalVision
+        let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
+        let currentEmbedding = model.visualEmbedding(
+            visualFeatures: model.visualActivations(images: inputs.current).last!
+        )
+        let flattenedPast = inputs.past.reshaped([
+            2 * temporal.pastFrameCount,
+            pastSpec.height,
+            pastSpec.width,
+            pastSpec.channelCount
+        ])
+        let cachedPast = model.pastVisualEmbedding(
+            visualFeatures: model.pastVisualActivations(images: flattenedPast).last!
+        ).reshaped([
+            2,
+            temporal.pastFrameCount,
+            profile.training.architecture.visualEmbedding
+        ])
+        let cachedPredictions = model.activatedPredictions(logits: model.logits(
+            temporalFeatures: model.temporalFeatures(
+                currentVisualEmbedding: currentEmbedding,
+                pastVisualEmbeddings: cachedPast,
+                pastControls: inputs.controls
+            )
+        ))
+        MLX.eval(imagePredictions, cachedPredictions)
+        XCTAssertEqual(imagePredictions.asArray(Float.self), cachedPredictions.asArray(Float.self))
+    }
+
     func testAcceleratedGroupNormMatchesEstablishedGroupingAndGradient() {
         MLXRandom.seed(88_201)
         let normalization = GroupNorm(groupCount: 8, dimensions: 32)
@@ -3574,6 +3750,7 @@ final class DomainTests: XCTestCase {
         profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0.15
+        profile.training.generalization = .disabled
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
         model.train(true)
@@ -3742,48 +3919,132 @@ final class DomainTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(gradientCosine, 0.999)
     }
 
-    func testPastControlShortcutMaskStillAppliesWhenFeatureDropoutIsZero() {
+    func testTemporalHistoryCorruptionIsIndependentOfFeatureDropout() {
         MLXRandom.seed(7_015)
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale, bitDepth: 8)
         profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
+        profile.training.generalization = GeneralizationConfiguration(
+            visionAugmentationStrength: 0,
+            randomErasingProbability: 0,
+            controlHistoryDropout: 0.5,
+            temporalFrameDropout: 0,
+            binaryLabelSmoothing: 0
+        )
         profile.training.precision = .float32
         let model = AgentPolicy(profile: profile)
         let batch = 32
-        let inputs = temporalModelInputs(profile: profile, batch: batch, value: 0)
         var controlValues = [Float](repeating: 0, count: batch * ActionLayout.count)
         for row in 0..<batch { controlValues[row * ActionLayout.count + ActionLayout.keyboard.lowerBound + 13] = 1 }
         let controls = MLXArray(controlValues, [batch, 1, ActionLayout.count])
+        let embeddings = MLXArray.ones([
+            batch,
+            1,
+            profile.training.architecture.visualEmbedding
+        ])
 
         model.train(false)
-        let inference = model.predictions(currentImages: inputs.current, pastImages: inputs.past, pastControls: controls)
-        let maskedInference = model.predictions(currentImages: inputs.current, pastImages: inputs.past, pastControls: MLXArray.zeros(like: controls))
-        MLX.eval(inference, maskedInference)
-        let inferenceValues = inference.asArray(Float.self)
-        let maskedInferenceValues = maskedInference.asArray(Float.self)
-        let firstInferenceRow = Array(inferenceValues[0..<ActionLayout.count])
-        let firstMaskedRow = Array(maskedInferenceValues[0..<ActionLayout.count])
-        for row in 1..<batch {
-            XCTAssertEqual(Array(inferenceValues[row * ActionLayout.count..<(row + 1) * ActionLayout.count]), firstInferenceRow)
-        }
+        let inference = model.regularizedTemporalHistory(
+            pastVisualEmbeddings: embeddings,
+            pastControls: controls
+        )
+        MLX.eval(inference.embeddings, inference.controls)
+        XCTAssertEqual(inference.embeddings.asArray(Float.self), embeddings.asArray(Float.self))
+        XCTAssertEqual(inference.controls.asArray(Float.self), controls.asArray(Float.self))
 
         model.train(true)
-        let training = model.predictions(currentImages: inputs.current, pastImages: inputs.past, pastControls: controls)
-        MLX.eval(training)
-        let trainingValues = training.asArray(Float.self)
-        var keptRows = 0, maskedRows = 0
-        for row in 0..<batch {
-            let values = trainingValues[row * ActionLayout.count..<(row + 1) * ActionLayout.count]
-            let matchesKept = zip(values, firstInferenceRow).allSatisfy { abs($0 - $1) < 0.000_01 }
-            let matchesMasked = zip(values, firstMaskedRow).allSatisfy { abs($0 - $1) < 0.000_01 }
-            XCTAssertTrue(matchesKept || matchesMasked, "Kept frame controls must retain inference-time magnitude instead of being doubled like ordinary dropout.")
-            keptRows += matchesKept ? 1 : 0
-            maskedRows += matchesMasked ? 1 : 0
-        }
-        XCTAssertGreaterThan(keptRows, 0)
-        XCTAssertGreaterThan(maskedRows, 0, "Anti-shortcut frame-control masking must not depend on ordinary feature dropout.")
+        let training = model.regularizedTemporalHistory(
+            pastVisualEmbeddings: embeddings,
+            pastControls: controls
+        )
+        MLX.eval(training.embeddings, training.controls)
+        let trainingControlValues = training.controls.asArray(Float.self)
+        let keyValues = stride(
+            from: ActionLayout.keyboard.lowerBound + 13,
+            to: batch * ActionLayout.count,
+            by: ActionLayout.count
+        ).map { trainingControlValues[$0] }
+        XCTAssertTrue(keyValues.contains(0), "Historical controls must sometimes be hidden even when feature dropout is zero.")
+        XCTAssertTrue(keyValues.contains(1), "History corruption must preserve some exact evidence without dropout rescaling.")
+        XCTAssertEqual(training.embeddings.asArray(Float.self), embeddings.asArray(Float.self))
+    }
+
+    func testVisionAugmentationIsStochasticOnlyDuringTraining() {
+        MLXRandom.seed(91_004)
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 24, height: 16, colorMode: .color)
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 0)
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.precision = .float32
+        profile.training.generalization = GeneralizationConfiguration(
+            visionAugmentationStrength: 0.25,
+            randomErasingProbability: 0.5,
+            controlHistoryDropout: 0,
+            temporalFrameDropout: 0,
+            binaryLabelSmoothing: 0
+        )
+        let model = AgentPolicy(profile: profile)
+        let images = MLXRandom.uniform(low: 0, high: 1, [2, 16, 24, 3])
+
+        model.train(false)
+        let inferenceA = model.currentOnlyPredictions(currentImages: images)
+        let inferenceB = model.currentOnlyPredictions(currentImages: images)
+        MLX.eval(inferenceA, inferenceB)
+        XCTAssertEqual(inferenceA.asArray(Float.self), inferenceB.asArray(Float.self))
+
+        model.train(true)
+        let trainingA = model.currentOnlyPredictions(currentImages: images)
+        let trainingB = model.currentOnlyPredictions(currentImages: images)
+        MLX.eval(trainingA, trainingB)
+        let first = trainingA.asArray(Float.self)
+        let second = trainingB.asArray(Float.self)
+        XCTAssertTrue(zip(first, second).contains { abs($0 - $1) > 0.000_001 })
+        XCTAssertTrue(first.allSatisfy(\.isFinite))
+        XCTAssertTrue(second.allSatisfy(\.isFinite))
+    }
+
+    func testBinaryLabelSmoothingIsTrainingOnly() {
+        var smoothProfile = AIProfile.fresh()
+        smoothProfile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        smoothProfile.channels = ActionChannels(
+            absoluteMouse: false,
+            relativeMouse: false,
+            buttons: true,
+            scroll: false,
+            keyboard: false,
+            modifiers: false
+        )
+        smoothProfile.training.architecture = .small
+        smoothProfile.training.generalization = GeneralizationConfiguration(
+            visionAugmentationStrength: 0,
+            randomErasingProbability: 0,
+            controlHistoryDropout: 0,
+            temporalFrameDropout: 0,
+            binaryLabelSmoothing: 0.1
+        )
+        var exactProfile = smoothProfile
+        exactProfile.training.generalization = .disabled
+        let smooth = AgentPolicy(profile: smoothProfile)
+        let exact = AgentPolicy(profile: exactProfile)
+        let logits = MLXArray([Float](repeating: -10, count: ActionLayout.count), [1, ActionLayout.count])
+        let targets = MLXArray.zeros([1, ActionLayout.count])
+
+        smooth.train(true)
+        exact.train(true)
+        let smoothedTrainingLoss = smooth.loss(logits: logits, targets: targets)
+        let exactTrainingLoss = exact.loss(logits: logits, targets: targets)
+        smooth.train(false)
+        let smoothedValidationLoss = smooth.loss(logits: logits, targets: targets)
+        MLX.eval(smoothedTrainingLoss, exactTrainingLoss, smoothedValidationLoss)
+        XCTAssertGreaterThan(smoothedTrainingLoss.item(Float.self), exactTrainingLoss.item(Float.self))
+        XCTAssertEqual(
+            smoothedValidationLoss.item(Float.self),
+            exactTrainingLoss.item(Float.self),
+            accuracy: 0.000_001
+        )
     }
 
     func testTransitionLossUsesTheRealImmediatelyPreviousAction() {
@@ -3834,6 +4095,7 @@ final class DomainTests: XCTestCase {
             convolutionChannels: [8, 12, 16, 24], kernelSizes: [7, 3, 3, 3], strides: [4, 2, 2, 2],
             visualEmbedding: 32, recurrentKind: .gru, recurrentWidth: 16, fusionWidths: [32], dropout: 0
         )
+        profile.training.generalization = .disabled
         let model = AgentPolicy(profile: profile)
         let optimizer = ResumableAdamW(learningRate: 0.003, weightDecay: 0)
         optimizer.initialize(model: model)
@@ -3976,7 +4238,7 @@ final class DomainTests: XCTestCase {
         let currentImages = VisionPreprocessor.mlxTensor(packedCurrent, spec: currentSpec)
 
         let layers = model.visualActivations(images: currentImages)
-        XCTAssertEqual(layers.map(\.shape), [[1, 6, 8, 24], [1, 3, 4, 48], [1, 2, 2, 72], [1, 1, 1, 96]])
+        XCTAssertEqual(layers.map(\.shape), [[1, 6, 8, 24], [1, 3, 4, 48], [1, 2, 2, 72], [1, 1, 1, 96], [1, 1, 1, 96]])
 
         let standard = compile(inputs: [model]) { current, past, controls in
             model.predictions(
@@ -4043,7 +4305,7 @@ final class DomainTests: XCTestCase {
         let saliencyResult = [saliencyForward[0], saliencyMap]
         MLX.eval(expected, activityResults.flatMap { $0 }, channelResult, saliencyForward, saliencyResult)
 
-        XCTAssertEqual(activityResults.map { $0[1].shape }, [[1, 6, 8, 1], [1, 3, 4, 1], [1, 2, 2, 1], [1, 1, 1, 1]])
+        XCTAssertEqual(activityResults.map { $0[1].shape }, [[1, 6, 8, 1], [1, 3, 4, 1], [1, 2, 2, 1], [1, 1, 1, 1], [1, 1, 1, 1]])
         XCTAssertEqual(channelResult[1].shape, [1, 1, 1, 16])
         XCTAssertEqual(saliencyForward[1].shape, [1, 1, 1, 96])
         XCTAssertEqual(saliencyResult[1].shape, [1, 1, 1, 1])
@@ -4060,6 +4322,7 @@ final class DomainTests: XCTestCase {
         profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 1, frameSpacing: 1, downsampleFactor: 2)
         profile.training.architecture = .small
         profile.training.architecture.dropout = 0
+        profile.training.generalization = .disabled
         profile.training.precision = .float32
         let modelA = AgentPolicy(profile: profile)
         let optimizerA = ResumableAdamW(learningRate: 0.001, weightDecay: 0.01)

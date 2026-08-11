@@ -14,14 +14,21 @@ final class AgentPolicy: Module, @unchecked Sendable {
     private let _pastCoordinateGrid: MLXArray
     private let _poolCoordinates: MLXArray?
     private let _pastPoolCoordinates: MLXArray?
+    private let _binaryControlMask: MLXArray
 
+    /// Stage zero is the dense coordinate-aware stem. Later entries are 1x1
+    /// channel mixers paired with the depthwise spatial filters below.
     @ModuleInfo var convolutions: [Conv2d]
     @ModuleInfo var convolutionNormalizations: [GroupNorm]
+    @ModuleInfo var spatialConvolutions: [Conv2d]
+    @ModuleInfo var spatialNormalizations: [GroupNorm]
     @ModuleInfo var spatialAttention: Linear?
     @ModuleInfo var visualProjection: Linear
     @ModuleInfo var visualNormalization: LayerNorm
     @ModuleInfo var pastVisualProjection: Linear?
     @ModuleInfo var pastVisualNormalization: LayerNorm?
+    @ModuleInfo var controlProjection: Linear?
+    @ModuleInfo var controlNormalization: LayerNorm?
     @ModuleInfo var gru: GRU?
     @ModuleInfo var lstm: LSTM?
     @ModuleInfo var fusion: [Linear]
@@ -33,6 +40,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
     @ModuleInfo var keyboardHead: Linear
     @ModuleInfo var modifierHead: Linear
     @ModuleInfo var dropout: Dropout
+    @ModuleInfo var featureDropout: Dropout
 
     init(profile: AIProfile) {
         self.profile = profile
@@ -45,23 +53,62 @@ final class AgentPolicy: Module, @unchecked Sendable {
         let width = max(1, profile.preprocessing.width)
         let height = max(1, profile.preprocessing.height)
         let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+        let hasTemporalMemory = profile.training.effectiveTemporalVision.pastFrameCount > 0
         _coordinateGrid = Self.coordinateGrid(width: width, height: height, dtype: dtype)
         _pastCoordinateGrid = Self.coordinateGrid(width: pastSpec.width, height: pastSpec.height, dtype: dtype)
+        var binaryControlMask = [Float](repeating: 0, count: ActionLayout.count)
+        for index in ActionLayout.buttons { binaryControlMask[index] = 1 }
+        for index in ActionLayout.keyboard { binaryControlMask[index] = 1 }
+        for index in ActionLayout.modifiers { binaryControlMask[index] = 1 }
+        _binaryControlMask = MLXArray(binaryControlMask, [1, 1, ActionLayout.count]).asType(dtype)
         // Real color planes plus explicit X/Y. Current and past images use the
         // same weights and never include a synthetic difference channel.
         var inputChannels = profile.preprocessing.channelCount + 2
         var convs: [Conv2d] = []
-        var convolutionNormalizations: [GroupNorm] = []
+        var outputNormalizations: [GroupNorm] = []
+        var spatialConvs: [Conv2d] = []
+        var spatialNorms: [GroupNorm] = []
         for i in architecture.convolutionChannels.indices {
-            let output = architecture.convolutionChannels[i]
+            let output = max(1, architecture.convolutionChannels[i])
             let kernel = architecture.kernelSizes.indices.contains(i) ? max(1, architecture.kernelSizes[i]) : 3
             let stride = architecture.strides.indices.contains(i) ? max(1, architecture.strides[i]) : 2
-            convs.append(Conv2d(inputChannels: inputChannels, outputChannels: output, kernelSize: .init(kernel), stride: .init(stride), padding: .init(kernel / 2), bias: false))
-            convolutionNormalizations.append(GroupNorm(groupCount: Self.normalizationGroups(for: output), dimensions: output))
+            if i == 0 {
+                convs.append(Conv2d(
+                    inputChannels: inputChannels,
+                    outputChannels: output,
+                    kernelSize: .init(kernel),
+                    stride: .init(stride),
+                    padding: .init(kernel / 2),
+                    bias: false
+                ))
+            } else {
+                spatialConvs.append(Conv2d(
+                    inputChannels: inputChannels,
+                    outputChannels: inputChannels,
+                    kernelSize: .init(kernel),
+                    stride: .init(stride),
+                    padding: .init(kernel / 2),
+                    groups: inputChannels,
+                    bias: false
+                ))
+                spatialNorms.append(GroupNorm(
+                    groupCount: Self.normalizationGroups(for: inputChannels),
+                    dimensions: inputChannels
+                ))
+                convs.append(Conv2d(
+                    inputChannels: inputChannels,
+                    outputChannels: output,
+                    kernelSize: 1,
+                    bias: false
+                ))
+            }
+            outputNormalizations.append(GroupNorm(groupCount: Self.normalizationGroups(for: output), dimensions: output))
             inputChannels = output
         }
         convolutions = convs
-        self.convolutionNormalizations = convolutionNormalizations
+        convolutionNormalizations = outputNormalizations
+        spatialConvolutions = spatialConvs
+        spatialNormalizations = spatialNorms
         let visualSize = CNNGeometry.outputSize(width: width, height: height, architecture: architecture)
         let pastVisualSize = CNNGeometry.outputSize(width: pastSpec.width, height: pastSpec.height, architecture: architecture)
         let visualProjectionInput: Int
@@ -69,7 +116,9 @@ final class AgentPolicy: Module, @unchecked Sendable {
             let heads = architecture.effectiveAttentionHeads
             spatialAttention = Linear(inputChannels, heads)
             _poolCoordinates = Self.poolCoordinates(size: visualSize, dtype: dtype)
-            _pastPoolCoordinates = Self.poolCoordinates(size: pastVisualSize, dtype: dtype)
+            _pastPoolCoordinates = hasTemporalMemory
+                ? Self.poolCoordinates(size: pastVisualSize, dtype: dtype)
+                : nil
             visualProjectionInput = heads * (inputChannels + 2) + 2 * inputChannels
         } else {
             spatialAttention = nil
@@ -79,7 +128,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         }
         visualProjection = Linear(visualProjectionInput, architecture.visualEmbedding)
         visualNormalization = LayerNorm(dimensions: architecture.visualEmbedding)
-        if architecture.effectiveVisualPooling == .flattened {
+        if hasTemporalMemory && architecture.effectiveVisualPooling == .flattened {
             let pastProjectionInput = max(1, pastVisualSize.width * pastVisualSize.height * inputChannels)
             pastVisualProjection = Linear(pastProjectionInput, architecture.visualEmbedding)
             pastVisualNormalization = LayerNorm(dimensions: architecture.visualEmbedding)
@@ -87,16 +136,26 @@ final class AgentPolicy: Module, @unchecked Sendable {
             pastVisualProjection = nil
             pastVisualNormalization = nil
         }
-        if architecture.recurrentKind == .gru {
-            gru = GRU(inputSize: architecture.visualEmbedding + ActionLayout.count, hiddenSize: architecture.recurrentWidth)
+        if !hasTemporalMemory {
+            controlProjection = nil
+            controlNormalization = nil
+            gru = nil
             lstm = nil
         } else {
-            gru = nil
-            lstm = LSTM(inputSize: architecture.visualEmbedding + ActionLayout.count, hiddenSize: architecture.recurrentWidth)
+            let controlWidth = architecture.effectiveControlEmbedding
+            controlProjection = Linear(ActionLayout.count, controlWidth)
+            controlNormalization = LayerNorm(dimensions: controlWidth)
+            if architecture.recurrentKind == .gru {
+                gru = GRU(inputSize: architecture.visualEmbedding + controlWidth, hiddenSize: architecture.recurrentWidth)
+                lstm = nil
+            } else {
+                gru = nil
+                lstm = LSTM(inputSize: architecture.visualEmbedding + controlWidth, hiddenSize: architecture.recurrentWidth)
+            }
         }
         var fusionLayers: [Linear] = []
         var fusionNormalizations: [LayerNorm] = []
-        var fusionInput = architecture.visualEmbedding + architecture.recurrentWidth
+        var fusionInput = architecture.visualEmbedding + (hasTemporalMemory ? architecture.recurrentWidth : 0)
         for width in architecture.fusionWidths {
             fusionLayers.append(Linear(fusionInput, max(1, width)))
             fusionNormalizations.append(LayerNorm(dimensions: max(1, width)))
@@ -111,6 +170,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         keyboardHead = Linear(fusionInput, 128)
         modifierHead = Linear(fusionInput, 4)
         dropout = Dropout(p: Float(min(0.999, max(0, architecture.dropout))))
+        featureDropout = Dropout(p: Float(min(0.5, max(0, architecture.dropout * 0.5))))
         super.init()
         if dtype != .float32 { update(parameters: mapParameters { $0.asType(self.dtype) }) }
     }
@@ -134,6 +194,80 @@ final class AgentPolicy: Module, @unchecked Sendable {
     private static func poolCoordinates(size: (width: Int, height: Int), dtype: DType) -> MLXArray {
         coordinateGrid(width: size.width, height: size.height, dtype: dtype)
             .reshaped([1, size.width * size.height, 2])
+    }
+
+    /// Applies inexpensive, label-preserving YUV perturbations. Spatial warps
+    /// are deliberately excluded because absolute pointer targets would need the
+    /// identical transform; brightness, chroma, structured noise, and small
+    /// neutral occlusions improve robustness without changing action geometry.
+    private func augmentedVision(_ input: MLXArray, coordinateGrid: MLXArray) -> MLXArray {
+        let configuration = profile.training.effectiveGeneralization
+        let strength = Float(min(0.5, max(0, configuration.visionAugmentationStrength)))
+        let eraseProbability = Float(min(0.5, max(0, configuration.randomErasingProbability)))
+        guard training, strength > 0 || eraseProbability > 0 else { return input.asType(dtype) }
+
+        let batch = input.dim(0)
+        var result = input.asType(dtype)
+        if strength > 0 {
+            let contrast = MLXRandom.uniform(
+                low: 1 - strength,
+                high: 1 + strength,
+                [batch, 1, 1, 1]
+            ).asType(dtype)
+            let brightness = MLXRandom.uniform(
+                low: -0.5 * strength,
+                high: 0.5 * strength,
+                [batch, 1, 1, 1]
+            ).asType(dtype)
+            let rowNoise = MLXRandom.uniform(
+                low: -0.04 * strength,
+                high: 0.04 * strength,
+                [batch, result.dim(1), 1, 1]
+            ).asType(dtype)
+            let columnNoise = MLXRandom.uniform(
+                low: -0.04 * strength,
+                high: 0.04 * strength,
+                [batch, 1, result.dim(2), 1]
+            ).asType(dtype)
+            let luma = clip(
+                (result[.ellipsis, 0..<1] - 0.5) * contrast + 0.5 + brightness + rowNoise + columnNoise,
+                min: 0,
+                max: 1
+            )
+            if result.dim(-1) > 1 {
+                let saturation = MLXRandom.uniform(
+                    low: 1 - strength,
+                    high: 1 + strength,
+                    [batch, 1, 1, 1]
+                ).asType(dtype)
+                let chromaShift = MLXRandom.uniform(
+                    low: -0.2 * strength,
+                    high: 0.2 * strength,
+                    [batch, 1, 1, result.dim(-1) - 1]
+                ).asType(dtype)
+                let chroma = clip(
+                    (result[.ellipsis, 1...] - 0.5) * saturation + 0.5 + chromaShift,
+                    min: 0,
+                    max: 1
+                )
+                result = concatenated([luma, chroma], axis: -1)
+            } else {
+                result = luma
+            }
+        }
+
+        if eraseProbability > 0 {
+            let centerX = MLXRandom.uniform(low: -0.8, high: 0.8, [batch, 1, 1, 1]).asType(dtype)
+            let centerY = MLXRandom.uniform(low: -0.8, high: 0.8, [batch, 1, 1, 1]).asType(dtype)
+            let halfWidth = MLXRandom.uniform(low: 0.05, high: 0.18, [batch, 1, 1, 1]).asType(dtype)
+            let halfHeight = MLXRandom.uniform(low: 0.05, high: 0.18, [batch, 1, 1, 1]).asType(dtype)
+            let selected = MLXRandom.bernoulli(eraseProbability, [batch, 1, 1, 1])
+            let erase = (abs(coordinateGrid[.ellipsis, 0..<1] - centerX) .< halfWidth)
+                .&& (abs(coordinateGrid[.ellipsis, 1..<2] - centerY) .< halfHeight)
+                .&& selected
+            result = which(erase, MLXArray(0.5, dtype: dtype), result)
+        }
+        return result
     }
 
     /// Returns every normalized post-SiLU spatial stage without changing the
@@ -198,7 +332,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         height: Int,
         acceleratedOperators: Bool
     ) -> [MLXArray] {
-        var vision = images.asType(dtype)
+        var vision = augmentedVision(images, coordinateGrid: coordinateGrid)
         var activations: [MLXArray] = []
         activations.reserveCapacity(max(1, convolutions.count))
         for (index, convolution) in convolutions.enumerated() {
@@ -211,15 +345,43 @@ final class AgentPolicy: Module, @unchecked Sendable {
                     coordinates: coordinateGrid,
                     convolution: convolution
                 )
-            } else {
-                if index == 0 {
-                    let coordinates = broadcast(
-                        coordinateGrid,
-                        to: [images.dim(0), height, width, 2]
-                    )
-                    vision = concatenated([vision, coordinates], axis: -1)
-                }
+            } else if index == 0 {
+                let coordinates = broadcast(
+                    coordinateGrid,
+                    to: [images.dim(0), height, width, 2]
+                )
+                vision = concatenated([vision, coordinates], axis: -1)
                 vision = convolution(vision)
+            } else {
+                let residual = vision
+                let spatial = spatialConvolutions[index - 1]
+                vision = spatial(vision)
+                if spatialNormalizations.indices.contains(index - 1) {
+                    let normalization = spatialNormalizations[index - 1]
+                    vision = acceleratedOperators
+                        ? Self.acceleratedGroupNorm(vision, normalization: normalization)
+                        : normalization(vision)
+                }
+                vision = silu(vision)
+                vision = convolution(vision)
+                if convolutionNormalizations.indices.contains(index) {
+                    let normalization = convolutionNormalizations[index]
+                    vision = acceleratedOperators
+                        ? Self.acceleratedGroupNorm(vision, normalization: normalization)
+                        : normalization(vision)
+                }
+                let stride = profile.training.architecture.strides.indices.contains(index)
+                    ? max(1, profile.training.architecture.strides[index])
+                    : 2
+                let isResidual = stride == 1
+                    && residual.dim(1) == vision.dim(1)
+                    && residual.dim(2) == vision.dim(2)
+                    && residual.dim(-1) == vision.dim(-1)
+                vision = isResidual
+                    ? silu(residual + vision)
+                    : silu(vision)
+                activations.append(vision)
+                continue
             }
             if convolutionNormalizations.indices.contains(index) {
                 let normalization = convolutionNormalizations[index]
@@ -392,11 +554,9 @@ final class AgentPolicy: Module, @unchecked Sendable {
                 current = current.take(sampleToVision, axis: 0)
             }
         }
-        let emptyTemporalState = MLXArray.zeros(
-            [current.dim(0), profile.training.architecture.recurrentWidth],
-            dtype: dtype
-        )
-        return concatenated([current, emptyTemporalState], axis: -1)
+        // Policy v6 omits the recurrent module and its unused fusion columns for
+        // a current-only brain instead of concatenating a permanent zero state.
+        return featureDropout(current)
     }
 
     func temporalFeatures(
@@ -430,8 +590,6 @@ final class AgentPolicy: Module, @unchecked Sendable {
             )
         }
         precondition(pastControls.ndim == 3, "Past controls must have shape [batch, frames, controls].")
-        var currentVisualEmbedding = currentVisualEmbedding
-        var controls = pastControls.asType(dtype)
         let visionCount = currentVisualEmbedding.dim(0)
         let frameCount = pastControls.dim(1)
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
@@ -493,10 +651,49 @@ final class AgentPolicy: Module, @unchecked Sendable {
             ])
         }
 
-        // CNN features are deterministic and safe to share. During training we
-        // gather them back to action-row shape before control masking and the
-        // recurrent/fusion stack. This retains one independent mask and one
-        // dropout path per label, matching the canonical stochastic objective.
+        return temporalFeatures(
+            currentVisualEmbedding: currentVisualEmbedding,
+            pastVisualEmbeddings: pastEmbedding,
+            pastControls: pastControls,
+            sampleToVision: sampleToVision
+        )
+    }
+
+    /// Fuses precomputed visual embeddings with historical controls. Runtime
+    /// uses this path to reuse embeddings from prior perceptions; training uses
+    /// it after the cache's unique-frame encoder pass.
+    func temporalFeatures(
+        currentVisualEmbedding: MLXArray,
+        pastVisualEmbeddings: MLXArray,
+        pastControls: MLXArray,
+        sampleToVision: MLXArray? = nil
+    ) -> MLXArray {
+        let temporal = profile.training.effectiveTemporalVision
+        if temporal.pastFrameCount == 0 {
+            return currentOnlyTemporalFeatures(
+                currentVisualEmbedding: currentVisualEmbedding,
+                sampleToVision: sampleToVision
+            )
+        }
+        precondition(
+            pastVisualEmbeddings.ndim == 3
+                && pastControls.ndim == 3
+                && pastVisualEmbeddings.dim(0) == currentVisualEmbedding.dim(0)
+                && pastVisualEmbeddings.dim(1) == temporal.pastFrameCount
+                && pastVisualEmbeddings.dim(2) == profile.training.architecture.visualEmbedding
+                && pastControls.dim(0) == currentVisualEmbedding.dim(0)
+                && pastControls.dim(1) == temporal.pastFrameCount
+                && pastControls.dim(2) == ActionLayout.count,
+            "Cached temporal embeddings and controls do not match this brain's immutable contract."
+        )
+        var current = currentVisualEmbedding
+        var past = pastVisualEmbeddings.asType(dtype)
+        var controls = pastControls.asType(dtype)
+        let visionCount = current.dim(0)
+
+        // The visual encoder evaluates each unique causal observation once.
+        // Gather compact features back to action-row shape before stochastic
+        // history corruption and fusion, preserving one perturbation per label.
         if let sampleToVision {
             precondition(
                 sampleToVision.ndim == 1,
@@ -506,22 +703,22 @@ final class AgentPolicy: Module, @unchecked Sendable {
             // row count proves this map is the identity and avoids three
             // otherwise redundant Metal gathers at equal action/perception FPS.
             if sampleToVision.dim(0) != visionCount {
-                currentVisualEmbedding = currentVisualEmbedding.take(sampleToVision, axis: 0)
-                pastEmbedding = pastEmbedding.take(sampleToVision, axis: 0)
+                current = current.take(sampleToVision, axis: 0)
+                past = past.take(sampleToVision, axis: 0)
                 controls = controls.take(sampleToVision, axis: 0)
             }
         }
-        let batch = currentVisualEmbedding.dim(0)
-        // Complete frame-aligned controls are useful temporal evidence, but
-        // held keys and buttons are still an easy shortcut. Mask only the
-        // control half for half of training samples; past vision always remains
-        // visible and inference always receives the full paired sequence.
-        if training {
-            let keepProbability: Float = 0.5
-            let mask = MLXRandom.bernoulli(keepProbability, [batch, 1, 1]).asType(dtype)
-            controls = controls * mask
+        current = featureDropout(current)
+        past = featureDropout(past)
+        let regularized = regularizedTemporalHistory(pastVisualEmbeddings: past, pastControls: controls)
+        let encodedControls: MLXArray
+        if let controlProjection, let controlNormalization {
+            encodedControls = silu(controlNormalization(controlProjection(regularized.controls)))
+        } else {
+            encodedControls = regularized.controls
         }
-        let temporalSteps = concatenated([pastEmbedding, controls], axis: -1)
+        let temporalSteps = concatenated([regularized.embeddings, encodedControls], axis: -1)
+        let batch = current.dim(0)
         let recurrent: MLXArray
         if let gru {
             recurrent = gru(temporalSteps)[.ellipsis, -1, 0...]
@@ -533,7 +730,61 @@ final class AgentPolicy: Module, @unchecked Sendable {
                 dtype: dtype
             )
         }
-        return concatenated([currentVisualEmbedding, recurrent], axis: -1)
+        return concatenated([current, recurrent], axis: -1)
+    }
+
+    /// Corrupts historical state without dropout rescaling, because the goal is
+    /// to simulate missing or imperfect prior predictions rather than preserve
+    /// activation expectation. This is intentionally internal for deterministic
+    /// contract tests and is a no-op during inference.
+    func regularizedTemporalHistory(
+        pastVisualEmbeddings: MLXArray,
+        pastControls: MLXArray
+    ) -> (embeddings: MLXArray, controls: MLXArray) {
+        guard training else { return (pastVisualEmbeddings, pastControls) }
+        let configuration = profile.training.effectiveGeneralization
+        let controlDropout = Float(min(0.8, max(0, configuration.controlHistoryDropout)))
+        let frameDropout = Float(min(0.5, max(0, configuration.temporalFrameDropout)))
+        var embeddings = pastVisualEmbeddings
+        var controls = pastControls
+
+        if controlDropout > 0 {
+            let keep = MLXRandom.bernoulli(1 - controlDropout, controls.shape).asType(dtype)
+            controls = controls * keep
+
+            // Rare flips expose the temporal encoder to both false negatives and
+            // false positives from its own previous thresholded predictions.
+            let flipProbability = min(0.025, controlDropout * 0.05)
+            let flips = MLXRandom.bernoulli(flipProbability, controls.shape)
+                .&& (_binaryControlMask .> 0)
+            controls = which(flips, 1 - controls, controls)
+
+            // Small bounded noise covers cursor/camera/scroll prediction error.
+            let noiseMagnitude = 0.08 * controlDropout
+            let noise = MLXRandom.uniform(
+                low: -noiseMagnitude,
+                high: noiseMagnitude,
+                controls.shape
+            ).asType(dtype) * (1 - _binaryControlMask)
+            let noisy = controls + noise
+            controls = concatenated([
+                clip(noisy[.ellipsis, ActionLayout.absoluteMouse], min: 0, max: 1),
+                clip(noisy[.ellipsis, ActionLayout.relativeMouse], min: -1, max: 1),
+                noisy[.ellipsis, ActionLayout.buttons],
+                clip(noisy[.ellipsis, ActionLayout.scroll], min: -1, max: 1),
+                noisy[.ellipsis, ActionLayout.keyboard],
+                noisy[.ellipsis, ActionLayout.modifiers]
+            ], axis: -1)
+        }
+        if frameDropout > 0 {
+            let keep = MLXRandom.bernoulli(
+                1 - frameDropout,
+                [embeddings.dim(0), embeddings.dim(1), 1]
+            ).asType(dtype)
+            embeddings = embeddings * keep
+            controls = controls * keep
+        }
+        return (embeddings, controls)
     }
 
     func logits(temporalFeatures: MLXArray) -> MLXArray {
@@ -701,7 +952,13 @@ final class AgentPolicy: Module, @unchecked Sendable {
         previous: MLXArray,
         positiveWeights: MLXArray?
     ) -> MLXArray {
-        let raw = binaryCrossEntropy(logits: logits, targets: targets, reduction: .none)
+        let smoothing = training
+            ? Float(min(0.2, max(0, profile.training.effectiveGeneralization.binaryLabelSmoothing)))
+            : 0
+        let lossTargets = smoothing > 0
+            ? targets * (1 - 2 * smoothing) + smoothing
+            : targets
+        let raw = binaryCrossEntropy(logits: logits, targets: lossTargets, reduction: .none)
         let classWeights: MLXArray
         if let positiveWeights {
             let learnedOutput = (positiveWeights .> 0).asType(dtype)
@@ -849,7 +1106,12 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
             let clipped = clipping.map {
                 which($0.condition, gradient, gradient * $0.normalizer)
             } ?? gradient
-            let g = clipped.asType(.float32)
+            // A non-finite derivative must never poison Adam's persistent
+            // moments. The global-norm path below already excludes these rare
+            // values; mirror that policy here so a transient backend anomaly
+            // drops only the affected derivative instead of destroying the
+            // entire brain and every later checkpoint.
+            let g = nanToNum(clipped.asType(.float32))
             let m = beta1 * (firstMoments[name] ?? MLXArray.zeros(like: p)) + (1 - beta1) * g
             let v = beta2 * (secondMoments[name] ?? MLXArray.zeros(like: p)) + (1 - beta2) * square(g)
             firstMoments[name] = m
@@ -860,10 +1122,22 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         model.update(parameters: ModuleParameters.unflattened(updated))
     }
 
-    /// Mirrors MLXOptimizers' canonical global norm calculation, but returns
-    /// only its shared scalar, avoiding a temporary clipped parameter tree.
+    /// Computes the global norm with max scaling before squaring. A direct sum
+    /// of squared derivatives can overflow even when every derivative and the
+    /// mathematically correct norm are finite. In compiled stochastic graphs,
+    /// explicitly materializing the finite, scaled derivatives also prevents a
+    /// backend fusion from turning a valid first update into `infinity`.
     static func globalGradientNorm(_ gradients: ModuleParameters) -> MLXArray {
-        sqrt(gradients.reduce(MLXArray(0)) { $0 + $1.square().sum() })
+        let values = gradients.flattened().map { nanToNum($0.1.asType(.float32)) }
+        guard !values.isEmpty else { return MLXArray(0, dtype: .float32) }
+        let maximumMagnitude = values.reduce(MLXArray(0, dtype: .float32)) {
+            maximum($0, abs($1).max())
+        }
+        let scale = maximum(maximumMagnitude, MLXArray(1e-12, dtype: .float32))
+        let scaledSquares = values.reduce(MLXArray(0, dtype: .float32)) {
+            $0 + square($1 / scale).sum()
+        }
+        return maximumMagnitude * sqrt(scaledSquares)
     }
 
     func save(to url: URL) throws {

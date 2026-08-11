@@ -318,19 +318,38 @@ private struct ProfileEditor: View {
                             Spacer()
                             InfoTip("Changing scheduler or loss settings keeps the active brain weights but safely starts a new optimizer sequence. Older profiles remain on their exact legacy schedule until you explicitly select Adaptive Cosine + Plateau.")
                         }
+                        VStack(alignment: .leading, spacing: 9) {
+                            HStack {
+                                Text("Generalization and anti-memorization").font(.subheadline.bold()).foregroundStyle(ATColor.amber)
+                                InfoTip("These perturbations run only while training. They preserve cursor geometry, make pixels and prior actions less exact, and force the brain to use stable visual evidence. Held-out validation and live inference remain unmodified.")
+                                Spacer()
+                                Button("Recommended") { draft.training.generalization = GeneralizationConfiguration() }.primaryButton(color: ATColor.amber)
+                                Button("Disable") { draft.training.generalization = .disabled }.primaryButton()
+                            }
+                            HStack {
+                                DoubleField("Vision variation", value: generalizationDoubleBinding(\.visionAugmentationStrength), help: "Luminance, contrast, chroma, and structured sensor variation from 0–0.5. It never moves pixels or pointer labels.")
+                                DoubleField("Random erasing", value: generalizationDoubleBinding(\.randomErasingProbability), help: "Chance from 0–0.5 of covering a small neutral rectangle, preventing reliance on one exact pixel patch.")
+                                DoubleField("History dropout", value: generalizationDoubleBinding(\.controlHistoryDropout), help: "Chance from 0–0.8 of hiding each prior control. Rare derived bit flips and bounded continuous noise model imperfect self-predictions.")
+                                    .disabled(draft.training.effectiveTemporalVision.pastFrameCount == 0)
+                                DoubleField("Frame dropout", value: generalizationDoubleBinding(\.temporalFrameDropout), help: "Chance from 0–0.5 of hiding an entire historical visual/control token, including missing startup context.")
+                                    .disabled(draft.training.effectiveTemporalVision.pastFrameCount == 0)
+                                DoubleField("Label smoothing", value: generalizationDoubleBinding(\.binaryLabelSmoothing), help: "Training-only binary target smoothing from 0–0.2. Small values reduce brittle overconfidence; validation targets remain exact.")
+                            }
+                        }
+                        .padding(11)
+                        .raisedGlassSurface(cornerRadius: 11, tint: ATColor.amber)
                         HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives and records a new screen perception. Temporal spacing is measured in these frame intervals. It cannot exceed Action FPS."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the AI may update mouse, keyboard, button, and scroll output."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
                         HStack { Text("Architecture preset").foregroundStyle(.secondary); Button("Small") { draft.training.architecture = .small }.primaryButton(); Button("Balanced") { draft.training.architecture = .balanced }.primaryButton(); Button("Large") { draft.training.architecture = .large }.primaryButton() }
-                        HStack { IntField("Visual width", value: $draft.training.architecture.visualEmbedding, help: "How much visual information is kept after the shared current/past convolution layers."); IntField("Recurrent width", value: $draft.training.architecture.recurrentWidth, help: "Capacity used to integrate the paired past-frame visual embeddings and controls."); Picker("Temporal encoder", selection: $draft.training.architecture.recurrentKind) { ForEach(RecurrentKind.allCases) { Text($0.rawValue).tag($0) } } }
+                        HStack { IntField("Visual width", value: $draft.training.architecture.visualEmbedding, help: "How much visual information is kept after the shared efficient visual stages."); IntField("Control history width", value: Binding(get: { draft.training.architecture.effectiveControlEmbedding }, set: { draft.training.architecture.controlEmbedding = $0 }), help: "Compresses the sparse 146-value historical action row before temporal processing, reducing compute and shortcut capacity.").disabled(draft.training.effectiveTemporalVision.pastFrameCount == 0); IntField("Recurrent width", value: $draft.training.architecture.recurrentWidth, help: "Capacity used to integrate paired past-frame embeddings and compressed controls.").disabled(draft.training.effectiveTemporalVision.pastFrameCount == 0); Picker("Temporal encoder", selection: $draft.training.architecture.recurrentKind) { ForEach(RecurrentKind.allCases) { Text($0.rawValue).tag($0) } }.disabled(draft.training.effectiveTemporalVision.pastFrameCount == 0) }
                         HStack {
-                            Picker("Spatial pooling", selection: Binding(get: { draft.training.architecture.effectiveVisualPooling }, set: { draft.training.architecture.visualPooling = $0 })) { ForEach(VisualPoolingKind.allCases) { Text($0.rawValue).tag($0) } }
+                            LabeledContent("Spatial pooling", value: "Attention Keypoints")
                             IntField("Attention keypoints", value: Binding(get: { draft.training.architecture.effectiveAttentionHeads }, set: { draft.training.architecture.attentionHeads = $0 }), help: "Independent learned spatial queries. Each retains visual features and exact X/Y while global mean/max preserve whole-screen context.")
-                                .disabled(draft.training.architecture.effectiveVisualPooling != .attention)
                             Spacer()
-                            InfoTip("Attention Keypoints preserves spatial position with a compact learned pool whose dense parameter count barely changes with resolution. Flattened Grid is retained only for exact compatibility with older brains.")
+                            InfoTip("Policy v6 uses a dense coordinate-aware stem, depthwise spatial filters, pointwise channel mixing, and a same-width residual stage. Attention pooling preserves exact X/Y with a compact projection whose parameter count barely changes with resolution.")
                         }
-                        HStack { InfoTip("The shared encoder sees the current frame and each real reduced-resolution past frame with screen coordinates. The temporal encoder then reads every past visual embedding together with the controls tied to that frame."); Spacer() }
-                        HStack { IntArrayField("Conv channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
-                        HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs. Changing it keeps existing brain weights and starts a fresh optimizer sequence when training resumes."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
+                        HStack { InfoTip("Training encodes real current and reduced causal frames. Live inference caches each reduced visual embedding when first seen, so history length no longer multiplies visual-encoder work."); Spacer() }
+                        HStack { IntArrayField("Stage channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Spatial kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Stage strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
+                        HStack { DoubleField("Feature dropout", value: $draft.training.architecture.dropout, help: "Randomly hides fusion features and, at half strength, visual-embedding features during training. Inference disables it completely."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft).formatted()) • runtime visual MACs: \(ModelSizing.runtimeVisualBackboneMultiplyAdds(draft).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
                     }
                 }
                 NeuralNetworkInputOverview(profile: draft)
@@ -414,9 +433,22 @@ private struct ProfileEditor: View {
         )
     }
 
+    private func generalizationDoubleBinding(
+        _ keyPath: WritableKeyPath<GeneralizationConfiguration, Double>
+    ) -> Binding<Double> {
+        Binding(
+            get: { draft.training.effectiveGeneralization[keyPath: keyPath] },
+            set: { value in
+                var configuration = draft.training.effectiveGeneralization
+                configuration[keyPath: keyPath] = value
+                draft.training.generalization = configuration
+            }
+        )
+    }
+
     private var temporalFormatDetail: String {
         if draft.training.effectiveTemporalVision.pastFrameCount == 0 {
-            return "Temporal payloads are omitted; compatibility cache placeholders stay empty and the network receives current vision only."
+            return "Temporal payloads and recurrent parameters are omitted entirely; the network receives current vision only."
         }
         let colorDetail = draft.preprocessing.colorMode == .color
             ? "color mode and \(draft.preprocessing.chroma.rawValue) chroma"
@@ -579,7 +611,7 @@ private struct NeuralNetworkInputOverview: View {
             }
             HStack(spacing: 8) {
                 Image(systemName: "speedometer").foregroundStyle(ATColor.green)
-                Text("At \(profile.training.perceptionFPS.formatted()) Perception FPS: up to \(input.runtimeValuesPerSecond.formatted()) input values/s from \(bytes(input.packedVisionBytesPerSecond)) of packed vision/s")
+                Text("Live cache at \(profile.training.perceptionFPS.formatted()) Perception FPS: \(input.runtimeEncodedVisionValues.formatted()) newly encoded vision values + \(input.runtimeCachedVisualValues.formatted()) cached visual features + \(input.pastControlValues.formatted()) controls per decision • \(input.runtimeValuesPerSecond.formatted()) graph values/s from \(bytes(input.packedVisionBytesPerSecond)) packed vision/s")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 Spacer()
             }
@@ -1061,7 +1093,7 @@ struct TrainingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                SectionTitle("Training", "Compiled MLX training uses compact spatial attention, native multi-frame temporal vision, frame-aligned controls with anti-shortcut control masking, focal class balance, transition-balanced batches, adaptive cosine scheduling, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
+                SectionTitle("Training", "Compiled MLX training uses an efficient residual vision encoder, causal temporal memory, pixel and history perturbations, focal class balance, transition-balanced batches, recording-disjoint validation when possible, purged causal validation otherwise, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
                 HStack {
                     if model.isTraining, let profile = displayedProfile {
                         Text(profile.name).font(.title2.bold())
@@ -1360,7 +1392,7 @@ struct RunView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                SectionTitle("Run", "A persistent ScreenCaptureKit stream sees the exact training resolution while action execution runs independently.")
+                SectionTitle("Run", "A persistent ScreenCaptureKit stream sees the exact training resolution while cached temporal embeddings and independent action execution keep response latency low.")
                 OLEDCard {
                     HStack {
                         Picker("AI to run", selection: $model.selectedProfileID) {
@@ -1390,7 +1422,7 @@ struct RunView: View {
                             if model.captureKind == .screenRegion || model.captureKind == .windowRegion {
                                 HStack { LabeledNumber("X", value: $model.regionX); LabeledNumber("Y", value: $model.regionY); LabeledNumber("Width", value: $model.regionWidth); LabeledNumber("Height", value: $model.regionHeight); if model.captureKind == .screenRegion { Button("Draw Region") { model.selectScreenRegion() }.primaryButton(color: ATColor.cyan) } }
                             }
-                            Text("The persistent stream is preprocessed to the model's exact \(profile.preprocessing.width) × \(profile.preprocessing.height) vision contract. AgentTrainer and its floating HUD are excluded.").font(.caption).foregroundStyle(.secondary)
+                                Text("The persistent stream is preprocessed to the model's exact \(profile.preprocessing.width) × \(profile.preprocessing.height) vision contract. Reduced historical frames are encoded once and reused as compact embeddings. AgentTrainer and its floating HUD are excluded.").font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     HStack(alignment: .top, spacing: 14) {
@@ -1427,9 +1459,9 @@ struct RunView: View {
                                     switch model.cnnVisualizationSettings.mode {
                                     case .activationOverlay:
                                         HStack {
-                                            Picker("Layer", selection: $model.cnnVisualizationSettings.convolutionLayer) {
-                                                Text(profile.training.architecture.convolutionChannels.isEmpty ? "Vision input" : "Final convolution").tag(-1)
-                                                ForEach(profile.training.architecture.convolutionChannels.indices, id: \.self) { index in Text("Conv \(index + 1)").tag(index) }
+                                            Picker("Stage", selection: $model.cnnVisualizationSettings.convolutionLayer) {
+                                                Text(profile.training.architecture.convolutionChannels.isEmpty ? "Vision input" : "Final visual stage").tag(-1)
+                                                ForEach(profile.training.architecture.convolutionChannels.indices, id: \.self) { index in Text("Stage \(index + 1)").tag(index) }
                                             }
                                             CNNOverlayOpacityControl(value: $model.cnnVisualizationSettings.overlayOpacity)
                                         }

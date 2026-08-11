@@ -162,7 +162,7 @@ enum CNNVisualizationImageRenderer {
     }
 
     private static func stageLabel(_ tensor: CNNFeatureTensor) -> String {
-        tensor.convolutionLayer >= 0 ? "Conv \(tensor.convolutionLayer + 1)" : "Vision input"
+        tensor.convolutionLayer >= 0 ? "Stage \(tensor.convolutionLayer + 1)" : "Vision input"
     }
 
     private static func boundedSize(width: Int, height: Int) -> (width: Int, height: Int) {

@@ -1,4 +1,4 @@
-# AgentTrainer 2.0.0
+# AgentTrainer 2.1.0
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -28,6 +28,20 @@ Training and another already-trained AI may run at the same time when they use d
 
 The capture-source picker refreshes while Record or Run is visible, and reacts immediately when apps launch or quit, displays change, or AgentTrainer becomes active again. A closed window is removed and the picker falls back to another valid source of the same kind.
 
+## Policy 2.1
+
+AgentTrainer 2.1 intentionally introduces a new brain format. Existing recordings remain reusable, while older weights and checkpoints are moved into the recovery archive instead of being attached to a different tensor layout.
+
+The 2.1 policy is designed around both useful capacity and bounded local compute:
+
+- a coordinate-aware dense stem is followed by depthwise spatial filters, pointwise channel mixing, and a same-width residual stage
+- learned spatial keypoints retain layout while global mean/max context protects against narrow attention failures
+- the sparse 146-value control history is compressed before the GRU/LSTM, reducing temporal work and limiting direct action-history shortcuts
+- current-only profiles omit the recurrent network and its unused fusion parameters entirely
+- live temporal inference encodes each reduced frame once, caches its compact visual embedding, and reuses that embedding when the frame enters later causal windows
+
+Training has independent, configurable anti-memorization controls for label-preserving vision variation, small random neutral occlusions, control-history dropout/noise, whole temporal-token dropout, and binary label smoothing. These perturbations are disabled for validation and live inference. Recording-disjoint validation where possible, purged causal validation otherwise, per-head metrics, and best-held-out-brain activation remain the primary generalization checks.
+
 ## Recording efficiency
 
 New recordings use the Apple-silicon hardware HEVC encoder with a direct 8-bit 4:2:0 capture surface, a high-quality resolution/FPS-aware bitrate, and efficient temporal compression. This is intentionally visually transparent lossy storage rather than near-lossless capture: dimensions, timing, and input synchronization are preserved while typical files are several times smaller than the former high-bitrate preset. Existing and imported recordings are never silently transcoded or rewritten.
@@ -45,7 +59,7 @@ Every decision uses one exact-resolution current frame. Temporal memory can be d
 - remain ordinary images; AgentTrainer does not synthesize motion or difference channels
 - carry the complete controls from their own perception interval: cursor position and raw movement, mouse buttons, scroll, keyboard, Shift, Control, Option, and Command
 
-The default context is four past frames, two perception intervals apart, at half width and half height. The current frame always remains at the exact configured model resolution. Changing temporal vision creates a new model contract, and older incompatible brains are archived while recordings remain available for retraining. Changing dropout does not change learned tensor shapes, so existing brain weights are retained; the next training run starts a fresh optimizer sequence for the new regularization setting.
+The default context is four past frames, two perception intervals apart, at half width and half height. The current frame always remains at the exact configured model resolution. Training reads the real causal images; live inference reuses the compact embeddings created when those images were first seen. Changing temporal vision creates a new model contract, and older incompatible brains are archived while recordings remain available for retraining. Changing training-only regularization does not change learned tensor shapes, so existing 2.1 brain weights are retained; the next run starts a fresh optimizer sequence for the new stochastic objective.
 
 ## Safety
 
@@ -97,7 +111,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.0.0.dmg`
+- `AgentTrainer-2.1.0.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

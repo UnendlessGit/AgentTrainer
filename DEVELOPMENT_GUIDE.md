@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.0.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.1.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -21,7 +21,7 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Storage/InputEventFile.swift` — fixed-width binary event writer and validated mapped reader
 - `Preprocessing/VisionPreprocessor.swift` — Metal resize, color conversion, packing, and MLX expansion
 - `Training/DatasetCache.swift` — causal frame/action pairing and memory-mapped datasets
-- `Training/PolicyNetwork.swift` — Policy v5 and resumable AdamW
+- `Training/PolicyNetwork.swift` — Policy v6 and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
 - `Agent/AgentRuntime.swift` — capture, inference scheduling, prediction latching, and teardown
@@ -95,7 +95,7 @@ Temporal vision is either current-only or an explicit three-part input:
 
 `TemporalVisionConfiguration` owns past-frame count, spacing in Perception FPS intervals, and linear downscale. Its displayed seconds are nominal values derived from configured Perception FPS; dropped or delayed live perceptions can increase wall-clock separation. The reduced specification must copy color mode, chroma layout, bit detail, and resize policy from the current frame. Width and height use the same scale, with only unavoidable integer-pixel rounding. Never resize past images back to current resolution and never synthesize difference, optical-flow, or motion channels.
 
-The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context. Zero frames disables the temporal branch: runtime and training consume only current vision and do not allocate past-image or past-control input buffers.
+The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of compact cached embeddings plus controls. Packed historical images are not retained at runtime. Zero frames disables the temporal branch: runtime and training consume only current vision, and Policy v6 omits the recurrent/control-projection parameters and unused fusion columns.
 
 `TrainingDataContract.schemaVersion` is 10. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, or target meaning changes. A cache has:
 
@@ -123,34 +123,37 @@ Every frame-control row includes normalized absolute cursor position, raw relati
 
 ## Model and training contracts
 
-`ModelContract.schemaVersion` is 5 and the weight format is `AgentTrainer.Policy.v5`.
+`ModelContract.schemaVersion` is 6 and the weight format is `AgentTrainer.Policy.v6`. This is an intentional weight break. The migration archives older versions and checkpoints, resets the profile to the closest v6 preset, and keeps recordings available for cache reuse/retraining.
 
 A runnable version is immutable. Runtime current vision, temporal vision, architecture, precision, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
 
-Dropout is stochastic training regularization, not part of the learned tensor layout. It is normalized out of `LearnedBrainContract`: editing only dropout must preserve the active brain and load its weights into the next run. Because the stochastic objective changed, the exact optimizer/checkpoint signature still includes dropout and begins a fresh optimizer sequence rather than claiming an invalid exact resume.
+Dropout and `GeneralizationConfiguration` are stochastic training regularization, not part of the learned tensor layout. Editing only these values must preserve the active v6 brain and load its weights into the next run. Because the objective changed, the exact optimizer/checkpoint signature still includes them and begins a fresh optimizer sequence rather than claiming an invalid exact resume.
 
-Current Policy v5 combines:
+Current Policy v6 combines:
 
-- one shared convolutional encoder for the real current and past images
+- one shared efficient visual encoder for real current and past images: a dense coordinate-aware stem, depthwise spatial stages, pointwise channel mixers, and a final compatible residual stage
 - independent X/Y coordinate planes at each image's native resolution
 - attention or legacy flattened visual pooling
-- a GRU/LSTM sequence over each past visual embedding concatenated with that frame's 146 controls
+- a learned projection that compresses each sparse 146-value frame-control row before a GRU/LSTM sequence over the paired past visual/control embeddings
 - fusion of the current visual embedding with the final temporal state
 - per-head bounded activations
 
-Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. Past control rows are masked for half of training samples while past images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
+Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling remains decodable for profile repair/tests but is no longer offered by the 2.1 editor; it needs distinct projections when spatial dimensions differ.
 
-Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced locality order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Do not change those semantics without updating tests and the relevant schema.
+`GeneralizationConfiguration` owns five training-only defenses. Structured YUV luminance/contrast/chroma variation and small neutral rectangles alter pixels without moving absolute pointer geometry. Per-value control-history dropout, rare binary flips, and bounded continuous noise simulate imperfect prior outputs. Temporal-token dropout trains startup/missing-history behavior. Small binary label smoothing reduces brittle confidence while validation retains exact targets. Visual-embedding and fusion dropout occur only after unique visual work is gathered back to action rows, preserving an independent stochastic path per label. Inference applies none of these perturbations.
+
+Training uses class/transition weighting, focal binary loss, the v6 generalization pipeline, deterministic salience-balanced locality order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Do not change those semantics without updating tests and the relevant schema.
 
 The performance path preserves those semantics:
 
 - VideoToolbox decodes directly into native video-range YUV. One CVMetalTexture mapping and Metal command buffer produce both configured output resolutions, while decode, resize/color packing, and cache writes overlap through a bounded ordered pipeline of up to eight observations within a 64 MB cap.
 - When one decoded frame remains causal across many configured perception ticks, Metal packs it once and the cache writer repeats those exact packed bytes. Observation cadence, indices, controls, and every action label remain unchanged.
 - Dataset files are required memory mappings with adaptive VM advice. Epochs randomize small collections of temporally local lanes rather than every row globally, so each optimizer batch remains diverse while macOS can read ahead the contiguous mapped pages inside each lane. A batch gathers packed vision, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
-- Current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those deterministic embeddings to their exact frame slots. Training gathers visual embeddings back to action-row shape *before* control masking, the recurrent network, and dropout, preserving one independent stochastic path per label. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
+- Current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those embeddings to their exact frame slots. Training-only pixel augmentation is sampled per unique encoded observation; visual-feature dropout and history corruption occur only after action-row gathering, preserving one independent post-encoder stochastic path per label. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
 - Above the measured workload crossover, the coordinate contribution to the first convolution is evaluated once per batch and the established GroupNorm layout uses MLX's fused Metal layer-normalization kernel. Small tensors retain the lower-overhead kernels.
 - Validation shares deterministic temporal work and head logits before gathering them back to every held-out label, then derives loss and predictions from that one compiled forward graph.
 - CPU gathering of the next batch overlaps the current Metal graph. Every optimizer step still evaluates the complete model, AdamW moments, scheduler, and MLX random state before advancing the checkpoint cursor.
+- Live inference encodes the full current frame plus one current reduced frame. It returns that reduced embedding with the prediction, stores only the compact Float32 embedding and sanitized control row in the circular history, and feeds cached embeddings directly into later temporal steps. Visual-encoder work is therefore independent of `pastFrameCount`.
 - Live diagnostics publish a rolling pipelined-step time, mapped-input time, peak-throughput retention, MLX active/cache/peak memory, and macOS thermal pressure. Metrics are rate-limited and chart histories are presentation-bounded so observing a run does not grow UI work with optimizer-step count.
 
 Do not queue stateful optimizer steps merely to improve a benchmark. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
@@ -178,7 +181,7 @@ The final executable action is the intersection of:
 
 Predictions must contain 146 finite values. Held keys/buttons may persist between fresh predictions, but cursor deltas and scroll are transient. The prediction latch consumes transient outputs once.
 
-At runtime, every successfully inferred perception stores its reduced packed image with the sanitized controls predicted for that interval. Exact spaced frames are selected from a fixed-capacity circular buffer; unavailable startup slots duplicate the current reduced image with zero controls. This matches training padding without target leakage and keeps sampling/appending O(1).
+At runtime, every successfully inferred perception stores its compact reduced-frame visual embedding with the sanitized controls predicted for that interval. Exact spaced entries are selected from a fixed-capacity circular buffer. Unavailable startup slots use zero embeddings and controls; training's whole-token dropout explicitly covers that state. Sampling/appending remains O(1), and historical images are never re-encoded.
 
 All synthetic events carry `agentTrainerSyntheticTag`; input safety monitors ignore that tag. Panic and normal stop both drain action work and release held state.
 

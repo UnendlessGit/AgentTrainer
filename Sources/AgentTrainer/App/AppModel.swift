@@ -1214,15 +1214,24 @@ final class AppModel: ObservableObject {
         }
         _ = try profile.preprocessing.validated()
         let training = profile.training
-        _ = try training.effectiveTemporalVision.validated(current: profile.preprocessing)
+        _ = try training.effectiveTemporalVision.validated(
+            current: profile.preprocessing,
+            cachedEmbeddingWidth: training.architecture.visualEmbedding
+        )
         let cycleEpochs = training.cosineCycleEpochs ?? 8
         let plateauPatience = training.plateauPatience ?? 5
         let minimumLearningRateRatio = training.minimumLearningRateRatio ?? 0.05
         let binaryFocalGamma = training.binaryFocalGamma ?? 0
+        let generalization = training.effectiveGeneralization
         guard training.learningRate.isFinite, training.weightDecay.isFinite,
               training.perceptionFPS.isFinite, training.actionFPS.isFinite,
               training.validationSplit.isFinite, minimumLearningRateRatio.isFinite,
               binaryFocalGamma.isFinite,
+              generalization.visionAugmentationStrength.isFinite,
+              generalization.randomErasingProbability.isFinite,
+              generalization.controlHistoryDropout.isFinite,
+              generalization.temporalFrameDropout.isFinite,
+              generalization.binaryLabelSmoothing.isFinite,
               (1...1_000_000).contains(training.epochs),
               (1...4_096).contains(training.batchSize),
               (1...10_000).contains(cycleEpochs),
@@ -1234,8 +1243,13 @@ final class AppModel: ObservableObject {
               training.perceptionFPS <= 240, training.actionFPS <= 240,
               training.validationSplit >= 0, training.validationSplit < 1,
               minimumLearningRateRatio >= 0.001, minimumLearningRateRatio <= 0.5,
-              binaryFocalGamma >= 0, binaryFocalGamma <= 4 else {
-            throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, cosine cycles 1–10,000 epochs, plateau patience 1–1,000, minimum learning-rate ratio 0.001–0.5, focal gamma 0–4, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
+              binaryFocalGamma >= 0, binaryFocalGamma <= 4,
+              (0...0.5).contains(generalization.visionAugmentationStrength),
+              (0...0.5).contains(generalization.randomErasingProbability),
+              (0...0.8).contains(generalization.controlHistoryDropout),
+              (0...0.5).contains(generalization.temporalFrameDropout),
+              (0...0.2).contains(generalization.binaryLabelSmoothing) else {
+            throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, cosine cycles 1–10,000 epochs, plateau patience 1–1,000, minimum learning-rate ratio 0.001–0.5, focal gamma 0–4, augmentation/erasing/frame dropout 0–0.5, control-history dropout 0–0.8, label smoothing 0–0.2, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
         }
         let architecture = training.architecture
         guard architecture.dropout.isFinite,
@@ -1250,8 +1264,9 @@ final class AppModel: ObservableObject {
               architecture.fusionWidths.count <= 16,
               architecture.fusionWidths.allSatisfy({ (1...16_384).contains($0) }),
               (1...64).contains(architecture.attentionHeads ?? 8),
+              (8...1_024).contains(architecture.controlEmbedding ?? 64),
               architecture.dropout >= 0, architecture.dropout <= 0.5 else {
-            throw AgentTrainerError.invalidConfiguration("Use 1–8 convolution stages with one kernel and stride per stage, positive bounded widths, 1–64 attention keypoints, and dropout from 0 through 0.5.")
+            throw AgentTrainerError.invalidConfiguration("Use 1–8 efficient visual stages with one kernel and stride per stage, positive bounded widths, 1–64 attention keypoints, a control embedding from 8–1,024, and dropout from 0 through 0.5.")
         }
         let channels = profile.channels
         guard channels.mouseMovement || channels.buttons || channels.scroll || channels.keyboard || channels.modifiers else { throw AgentTrainerError.invalidConfiguration("Enable at least one control channel before training.") }

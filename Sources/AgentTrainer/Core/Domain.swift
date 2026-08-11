@@ -198,7 +198,7 @@ struct TemporalVisionConfiguration: Codable, Hashable, Sendable {
         spacingSeconds(perceptionFPS: perceptionFPS) * Double(pastFrameCount)
     }
 
-    func validated(current: PreprocessingSpec) throws -> Self {
+    func validated(current: PreprocessingSpec, cachedEmbeddingWidth: Int? = nil) throws -> Self {
         guard (Self.minimumPastFrameCount...Self.maximumPastFrameCount).contains(pastFrameCount),
               (1...Self.maximumFrameSpacing).contains(frameSpacing),
               (1...Self.maximumDownsampleFactor).contains(downsampleFactor) else {
@@ -206,14 +206,22 @@ struct TemporalVisionConfiguration: Codable, Hashable, Sendable {
                 "Temporal vision supports 0–\(Self.maximumPastFrameCount) past frames, spacing of 1–\(Self.maximumFrameSpacing) perception frames, and a 1×–\(Self.maximumDownsampleFactor)× past-frame downscale. Zero past frames disables temporal memory."
             )
         }
-        let past = try pastFrameSpec(from: current).validated()
-        let retainedFrameCount = pastFrameCount.multipliedReportingOverflow(by: frameSpacing)
-        let retainedBytes = retainedFrameCount.partialValue.multipliedReportingOverflow(by: past.sampleByteCount)
-        guard !retainedFrameCount.overflow, !retainedBytes.overflow,
-              retainedBytes.partialValue <= Self.maximumRuntimeTemporalBytes else {
-            throw AgentTrainerError.invalidConfiguration(
-                "This temporal spacing would retain more than 512 MB of past vision while running. Reduce past frames, spacing, resolution, color detail, or increase the past-frame downscale."
-            )
+        _ = try pastFrameSpec(from: current).validated()
+        if pastFrameCount > 0, let cachedEmbeddingWidth {
+            let retainedFrameCount = pastFrameCount.multipliedReportingOverflow(by: frameSpacing)
+            let cachedValuesPerFrame = max(1, cachedEmbeddingWidth)
+                .addingReportingOverflow(ActionLayout.count)
+            let retainedValues = retainedFrameCount.partialValue
+                .multipliedReportingOverflow(by: cachedValuesPerFrame.partialValue)
+            let retainedBytes = retainedValues.partialValue
+                .multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+            guard !retainedFrameCount.overflow, !cachedValuesPerFrame.overflow,
+                  !retainedValues.overflow, !retainedBytes.overflow,
+                  retainedBytes.partialValue <= Self.maximumRuntimeTemporalBytes else {
+                throw AgentTrainerError.invalidConfiguration(
+                    "This temporal spacing would retain more than 512 MB of cached visual features and controls while running. Reduce past frames, spacing, or the visual embedding width."
+                )
+            }
         }
         return self
     }
@@ -248,17 +256,17 @@ enum MouseControlMode: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 enum ModelContract {
-    /// Version 5 replaces signed frame differencing and free-running action
-    /// history with native current vision plus lower-resolution causal frames,
-    /// each paired with the complete controls demonstrated for that frame.
-    static let schemaVersion = 5
-    static let weightFormat = "AgentTrainer.Policy.v5"
+    /// Version 6 replaces the dense visual stack with an efficient residual
+    /// encoder, compresses frame-control history before temporal fusion, and
+    /// supports cached visual embeddings during live inference.
+    static let schemaVersion = 6
+    static let weightFormat = "AgentTrainer.Policy.v6"
 }
 
 /// Version of the causal pairing between a captured frame and the controls the
 /// model should perform next. This remains separate from the weight format so
 /// a data-only correction can invalidate caches/checkpoints without needlessly
-/// changing tensor shapes. Policy v5 itself is an intentional weight break.
+/// changing tensor shapes. Policy v6 itself is an intentional weight break.
 enum TrainingDataContract {
     /// Version 10 adds a current-frame-only cache layout for disabled temporal
     /// memory. Version 9's causal cadence remains unchanged when past frames are
@@ -323,13 +331,13 @@ enum VisualPoolingKind: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 struct ArchitectureSpec: Codable, Hashable, Sendable {
-    /// The stride-four stem cuts the dominant high-resolution convolution cost,
-    /// while the extra stage expands the receptive field before spatial
-    /// features are flattened. This is both faster and substantially more
-    /// expressive than three stride-two layers followed by a global mean.
-    var convolutionChannels: [Int] = [32, 64, 96, 128]
-    var kernelSizes: [Int] = [7, 3, 3, 3]
-    var strides: [Int] = [4, 2, 2, 2]
+    /// Policy v6 uses a dense stride-two stem followed by depthwise spatial
+    /// filters and pointwise channel mixing. The final same-width stage is a
+    /// true residual block: it expands receptive field without reducing the
+    /// spatial grid or paying for another dense convolution.
+    var convolutionChannels: [Int] = [32, 64, 96, 128, 128]
+    var kernelSizes: [Int] = [5, 3, 3, 3, 3]
+    var strides: [Int] = [2, 2, 2, 2, 1]
     var visualEmbedding = 256
     var recurrentKind: RecurrentKind = .gru
     var recurrentWidth = 192
@@ -341,13 +349,39 @@ struct ArchitectureSpec: Codable, Hashable, Sendable {
     /// projection; newly created profiles use efficient attention pooling.
     var visualPooling: VisualPoolingKind? = .attention
     var attentionHeads: Int? = 8
+    /// Compressing the sparse 146-value action row before recurrent processing
+    /// reduces temporal compute and discourages direct key-history shortcuts.
+    /// Optional keeps profile JSON decodable across the v6 migration boundary.
+    var controlEmbedding: Int? = 64
 
     var effectiveVisualPooling: VisualPoolingKind { visualPooling ?? .flattened }
     var effectiveAttentionHeads: Int { min(64, max(1, attentionHeads ?? 8)) }
+    var effectiveControlEmbedding: Int { min(1_024, max(8, controlEmbedding ?? 64)) }
 
-    static let small = ArchitectureSpec(convolutionChannels: [24, 48, 72, 96], visualEmbedding: 192, recurrentWidth: 128, fusionWidths: [256, 192], visualPooling: .attention, attentionHeads: 6)
+    static let small = ArchitectureSpec(
+        convolutionChannels: [24, 48, 72, 96, 96],
+        kernelSizes: [5, 3, 3, 3, 3],
+        strides: [2, 2, 2, 2, 1],
+        visualEmbedding: 192,
+        recurrentWidth: 128,
+        fusionWidths: [256, 192],
+        visualPooling: .attention,
+        attentionHeads: 6,
+        controlEmbedding: 48
+    )
     static let balanced = ArchitectureSpec()
-    static let large = ArchitectureSpec(convolutionChannels: [48, 96, 160, 224], visualEmbedding: 384, recurrentWidth: 256, fusionWidths: [512, 384], dropout: 0.12, visualPooling: .attention, attentionHeads: 12)
+    static let large = ArchitectureSpec(
+        convolutionChannels: [48, 96, 160, 224, 224],
+        kernelSizes: [5, 3, 3, 3, 3],
+        strides: [2, 2, 2, 2, 1],
+        visualEmbedding: 384,
+        recurrentWidth: 256,
+        fusionWidths: [512, 384],
+        dropout: 0.12,
+        visualPooling: .attention,
+        attentionHeads: 12,
+        controlEmbedding: 96
+    )
 
     /// Dropout changes stochastic training regularization but does not add,
     /// remove, or reinterpret a learned tensor. Normalizing it out lets an
@@ -357,6 +391,31 @@ struct ArchitectureSpec: Codable, Hashable, Sendable {
         value.dropout = 0
         return value
     }
+}
+
+/// Training-only perturbations that make exact replay of demonstrations an
+/// unreliable shortcut. Every value is explicit and checkpoint-signatured;
+/// inference never applies these transforms.
+struct GeneralizationConfiguration: Codable, Hashable, Sendable {
+    /// Structured luminance/chroma jitter, contrast variation, and light noise.
+    var visionAugmentationStrength = 0.12
+    /// Probability of replacing one small random rectangle with a neutral patch.
+    var randomErasingProbability = 0.15
+    /// Probability of hiding an individual historical control value. A much
+    /// smaller derived bit-flip rate also simulates imperfect prior predictions.
+    var controlHistoryDropout = 0.18
+    /// Probability of removing an entire historical visual/control token.
+    var temporalFrameDropout = 0.08
+    /// Softens only the training BCE target; held-out validation stays exact.
+    var binaryLabelSmoothing = 0.01
+
+    static let disabled = GeneralizationConfiguration(
+        visionAugmentationStrength: 0,
+        randomErasingProbability: 0,
+        controlHistoryDropout: 0,
+        temporalFrameDropout: 0,
+        binaryLabelSmoothing: 0
+    )
 }
 
 struct CNNLayerGeometry: Hashable, Sendable {
@@ -503,6 +562,10 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     var plateauPatience: Int? = 5
     var minimumLearningRateRatio: Double? = 0.05
     var binaryFocalGamma: Double? = 1.5
+    /// Optional preserves decoding of profiles written before 2.1. Missing
+    /// values intentionally adopt the stronger v6 defaults after old brains are
+    /// archived by the model-contract migration.
+    var generalization: GeneralizationConfiguration? = GeneralizationConfiguration()
 
     var effectiveMaximumSteps: Int { maximumSteps ?? 10_000 }
     var effectiveTemporalVision: TemporalVisionConfiguration {
@@ -518,6 +581,9 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     var effectiveBinaryFocalGamma: Double {
         let value = binaryFocalGamma ?? 0
         return value.isFinite ? min(4, max(0, value)) : 0
+    }
+    var effectiveGeneralization: GeneralizationConfiguration {
+        generalization ?? GeneralizationConfiguration()
     }
 }
 
@@ -1049,16 +1115,25 @@ enum ModelSizing {
     static func parameterCount(_ profile: AIProfile) -> Int64 {
         let architecture = profile.training.architecture
         var total: Int64 = 0
-        // Current and past frames share the same convolutional weights. Each
+        // Current and past frames share the same efficient visual weights. Each
         // carries its real color planes plus generated X/Y coordinates; there
-        // are no synthetic motion-difference channels in Policy v5.
+        // are no synthetic motion-difference channels in Policy v6.
         var input = profile.preprocessing.channelCount + 2
         for i in architecture.convolutionChannels.indices {
             let output = max(1, architecture.convolutionChannels[i])
             let kernel = architecture.kernelSizes.indices.contains(i) ? max(1, architecture.kernelSizes[i]) : 3
-            total = add(total, multiply(Int64(output), multiply(multiply(Int64(input), Int64(kernel)), Int64(kernel))))
-            // Affine GroupNorm scale and bias.
-            total = add(total, multiply(2, Int64(output)))
+            if i == 0 {
+                // Dense coordinate-aware stem.
+                total = add(total, multiply(Int64(output), multiply(multiply(Int64(input), Int64(kernel)), Int64(kernel))))
+                total = add(total, multiply(2, Int64(output)))
+            } else {
+                // Depthwise spatial filter + affine GroupNorm, then a 1x1
+                // pointwise channel mixer + affine GroupNorm.
+                total = add(total, multiply(Int64(input), multiply(Int64(kernel), Int64(kernel))))
+                total = add(total, multiply(2, Int64(input)))
+                total = add(total, multiply(Int64(input), Int64(output)))
+                total = add(total, multiply(2, Int64(output)))
+            }
             input = output
         }
         let currentOutput = CNNGeometry.outputSize(width: profile.preprocessing.width, height: profile.preprocessing.height, architecture: architecture)
@@ -1077,7 +1152,8 @@ enum ModelSizing {
         }
         total = add(total, multiply(add(visualProjectionInput, 1), Int64(max(1, architecture.visualEmbedding))))
         total = add(total, multiply(2, Int64(max(1, architecture.visualEmbedding))))
-        if architecture.effectiveVisualPooling == .flattened {
+        if profile.training.effectiveTemporalVision.pastFrameCount > 0,
+           architecture.effectiveVisualPooling == .flattened {
             // Legacy flattened pooling cannot share a projection between the
             // full-resolution current grid and the smaller past-frame grid.
             let pastSpec = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
@@ -1086,14 +1162,20 @@ enum ModelSizing {
             total = add(total, multiply(add(pastProjectionInput, 1), Int64(max(1, architecture.visualEmbedding))))
             total = add(total, multiply(2, Int64(max(1, architecture.visualEmbedding))))
         }
-        let recurrent = max(1, architecture.recurrentWidth)
-        let gates = architecture.recurrentKind == .gru ? 3 : 4
-        let temporalStepWidth = add(Int64(max(1, architecture.visualEmbedding)), Int64(ActionLayout.count))
-        total = add(total, multiply(multiply(Int64(gates), Int64(recurrent)), add(add(temporalStepWidth, Int64(recurrent)), 1)))
-        // MLX's GRU has the usual three-gate bias plus a separate hidden-state
-        // candidate bias (`bhn`) of one value per hidden unit. LSTM uses only
-        // its four-gate bias, which is already included above.
-        if architecture.recurrentKind == .gru { total = add(total, Int64(recurrent)) }
+        let hasTemporalMemory = profile.training.effectiveTemporalVision.pastFrameCount > 0
+        let recurrent = hasTemporalMemory ? max(1, architecture.recurrentWidth) : 0
+        if hasTemporalMemory {
+            let controlEmbedding = architecture.effectiveControlEmbedding
+            total = add(total, multiply(Int64(ActionLayout.count + 1), Int64(controlEmbedding)))
+            total = add(total, multiply(2, Int64(controlEmbedding)))
+            let gates = architecture.recurrentKind == .gru ? 3 : 4
+            let temporalStepWidth = add(Int64(max(1, architecture.visualEmbedding)), Int64(controlEmbedding))
+            total = add(total, multiply(multiply(Int64(gates), Int64(recurrent)), add(add(temporalStepWidth, Int64(recurrent)), 1)))
+            // MLX's GRU has the usual three-gate bias plus a separate hidden-state
+            // candidate bias (`bhn`) of one value per hidden unit. LSTM uses only
+            // its four-gate bias, which is already included above.
+            if architecture.recurrentKind == .gru { total = add(total, Int64(recurrent)) }
+        }
         var fusionInput = max(1, architecture.visualEmbedding) + recurrent
         for width in architecture.fusionWidths {
             total = add(total, multiply(add(Int64(fusionInput), 1), Int64(max(1, width))))
@@ -1102,6 +1184,57 @@ enum ModelSizing {
         }
         total = add(total, multiply(add(Int64(fusionInput), 1), Int64(ActionLayout.count)))
         return total
+    }
+
+    /// Approximate multiply-adds for the shared visual backbone only. This is a
+    /// stable architecture comparison, not a wall-clock promise: attention,
+    /// normalization, activation, and memory traffic are intentionally omitted.
+    static func visualBackboneMultiplyAdds(width rawWidth: Int, height rawHeight: Int, inputChannels rawInputChannels: Int, architecture: ArchitectureSpec) -> Int64 {
+        var width = max(1, rawWidth)
+        var height = max(1, rawHeight)
+        var input = max(1, rawInputChannels) + 2
+        var total: Int64 = 0
+        for index in architecture.convolutionChannels.indices {
+            let output = max(1, architecture.convolutionChannels[index])
+            let kernel = architecture.kernelSizes.indices.contains(index) ? max(1, architecture.kernelSizes[index]) : 3
+            let stride = architecture.strides.indices.contains(index) ? max(1, architecture.strides[index]) : 2
+            let padding = kernel / 2
+            let paddedWidth = width.addingReportingOverflow(2 * padding)
+            let paddedHeight = height.addingReportingOverflow(2 * padding)
+            guard !paddedWidth.overflow, !paddedHeight.overflow else { return Int64.max }
+            width = max(1, (max(0, paddedWidth.partialValue - kernel) / stride) + 1)
+            height = max(1, (max(0, paddedHeight.partialValue - kernel) / stride) + 1)
+            let locations = multiply(Int64(width), Int64(height))
+            let kernelSquared = multiply(Int64(kernel), Int64(kernel))
+            if index == 0 {
+                total = add(total, multiply(locations, multiply(Int64(output), multiply(Int64(input), kernelSquared))))
+            } else {
+                let depthwise = multiply(Int64(input), kernelSquared)
+                let pointwise = multiply(Int64(input), Int64(output))
+                total = add(total, multiply(locations, add(depthwise, pointwise)))
+            }
+            input = output
+        }
+        return total
+    }
+
+    /// Policy v6 runtime encodes the full current frame plus one reduced frame
+    /// to append to its temporal cache, independent of history length.
+    static func runtimeVisualBackboneMultiplyAdds(_ profile: AIProfile) -> Int64 {
+        let current = visualBackboneMultiplyAdds(
+            width: profile.preprocessing.width,
+            height: profile.preprocessing.height,
+            inputChannels: profile.preprocessing.channelCount,
+            architecture: profile.training.architecture
+        )
+        guard profile.training.effectiveTemporalVision.pastFrameCount > 0 else { return current }
+        let past = profile.training.effectiveTemporalVision.pastFrameSpec(from: profile.preprocessing)
+        return add(current, visualBackboneMultiplyAdds(
+            width: past.width,
+            height: past.height,
+            inputChannels: past.channelCount,
+            architecture: profile.training.architecture
+        ))
     }
 
     /// Conservative peak budget for compiled forward/backward training. AdamW
@@ -1144,6 +1277,9 @@ struct NeuralInputSummary: Hashable, Sendable {
     var frameSpacingSeconds: Double
     var temporalLookbackSeconds: Double
     var valuesPerDecision: Int64
+    var runtimeEncodedVisionValues: Int64
+    var runtimeCachedVisualValues: Int64
+    var runtimeValuesPerDecision: Int64
     var runtimeValuesPerSecond: Int64
     var packedVisionBytesPerSecond: Int64
     var batchSize: Int64
@@ -1210,9 +1346,23 @@ enum NeuralInputSizing {
         let pastVision = multiply(pastFrameCount, pastConvolution)
         let perDecision = add(currentConvolution, add(pastVision, controls))
         let perceptionFPS = profile.training.perceptionFPS.isFinite ? max(0, profile.training.perceptionFPS) : 0
-        let runtimeValuesPerSecond = rate(perDecision, fps: perceptionFPS)
+        // Training consumes every real historical frame. Policy v6 live
+        // inference encodes only the current frame plus one reduced frame to
+        // cache, then supplies compact cached embeddings for the N prior frames.
+        let hasTemporalMemory = pastFrameCount > 0
+        let runtimeEncodedVision = hasTemporalMemory
+            ? add(currentConvolution, pastConvolution)
+            : currentConvolution
+        let runtimeCachedVisual = hasTemporalMemory
+            ? multiply(pastFrameCount, Int64(max(1, profile.training.architecture.visualEmbedding)))
+            : 0
+        let runtimePerDecision = add(runtimeEncodedVision, add(runtimeCachedVisual, controls))
+        let runtimeValuesPerSecond = rate(runtimePerDecision, fps: perceptionFPS)
         let totalPackedVision = add(currentCounts.packed, multiply(pastFrameCount, pastCounts.packed))
-        let packedVisionBytesPerSecond = rate(totalPackedVision, fps: perceptionFPS)
+        let runtimePackedVision = hasTemporalMemory
+            ? add(currentCounts.packed, pastCounts.packed)
+            : currentCounts.packed
+        let packedVisionBytesPerSecond = rate(runtimePackedVision, fps: perceptionFPS)
         let batchSize = max(1, Int64(profile.training.batchSize))
         let perBatch = multiply(perDecision, batchSize)
 
@@ -1244,6 +1394,9 @@ enum NeuralInputSizing {
             frameSpacingSeconds: temporal.spacingSeconds(perceptionFPS: perceptionFPS),
             temporalLookbackSeconds: temporal.lookbackSeconds(perceptionFPS: perceptionFPS),
             valuesPerDecision: perDecision,
+            runtimeEncodedVisionValues: runtimeEncodedVision,
+            runtimeCachedVisualValues: runtimeCachedVisual,
+            runtimeValuesPerDecision: runtimePerDecision,
             runtimeValuesPerSecond: runtimeValuesPerSecond,
             packedVisionBytesPerSecond: packedVisionBytesPerSecond,
             batchSize: batchSize,

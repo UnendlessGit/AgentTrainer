@@ -214,7 +214,7 @@ actor WorkspaceStore {
     func removeObsoleteModelArtifacts(currentSchema: Int) throws -> Int {
         try prepare()
         let marker = modelsRoot.appendingPathComponent("model-contract.json")
-        let auditMarker = modelsRoot.appendingPathComponent("model-artifact-audit-1.8.2.json")
+        let auditMarker = modelsRoot.appendingPathComponent("model-artifact-audit-2.1.json")
         let storedSchema = (try? Data(contentsOf: marker)).flatMap { try? decoder.decode(Int.self, from: $0) }
         if storedSchema == currentSchema,
            let data = try? Data(contentsOf: auditMarker),
@@ -289,6 +289,7 @@ actor WorkspaceStore {
             if compatibleVersionIDs.isEmpty && !keepsCheckpoint {
                 profile.training.architecture = migratedArchitecture(profile.training.architecture)
                 profile.training.temporalVision = TemporalVisionConfiguration()
+                profile.training.generalization = GeneralizationConfiguration()
                 if !profile.training.learningRate.isFinite || profile.training.learningRate <= 0 {
                     profile.training.learningRate = 0.0003
                 } else {
