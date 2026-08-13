@@ -434,7 +434,9 @@ final class ReinforcementTrainer: @unchecked Sendable {
             inputs: [trainingModel, trainingOptimizer],
             outputs: [trainingModel, trainingOptimizer]
         ) { (arrays: [MLXArray]) -> [MLXArray] in
-            let currentImages = VisionPreprocessor.mlxTensor(arrays[0], spec: trainingProfile.preprocessing)
+            let currentImages = VisionPreprocessor.mlxTensor(
+                arrays[0], spec: trainingProfile.preprocessing, dtype: trainingModel.dtype
+            )
             let actionIndex = hasTemporalMemory ? 3 : 1
             let behaviorIndex = actionIndex + 1
             let maskIndex = actionIndex + 2

@@ -537,14 +537,43 @@ final class CachedDataset: @unchecked Sendable {
         at indices: [Int],
         using suppliedPlan: CachedVisionBatchPlan? = nil
     ) -> [[Int]] {
-        let plan = suppliedPlan ?? visionBatchPlan(at: indices)
-        precondition(
-            plan.sampleToVision.count == indices.count,
-            "A vision plan must describe every supplied dataset row."
-        )
-        var groups = Array(repeating: [Int](), count: plan.uniqueSequences.count)
-        for (row, sampleIndex) in indices.enumerated() {
-            groups[Int(plan.sampleToVision[row])].append(sampleIndex)
+        if let plan = suppliedPlan {
+            precondition(
+                plan.sampleToVision.count == indices.count,
+                "A vision plan must describe every supplied dataset row."
+            )
+            var groups = Array(repeating: [Int](), count: plan.uniqueSequences.count)
+            for (row, sampleIndex) in indices.enumerated() {
+                groups[Int(plan.sampleToVision[row])].append(sampleIndex)
+            }
+            return groups
+        }
+
+        // The cache contract assigns one global current-observation index to a
+        // complete causal sequence. Grouping needs only that compact key; a
+        // full visionBatchPlan would also materialize every temporal sequence,
+        // deduplicate every past frame, and build two gather maps that startup
+        // immediately discards.
+        guard !indices.isEmpty else { return [] }
+        var currentToGroup: [UInt32: Int] = [:]
+        currentToGroup.reserveCapacity(indices.count)
+        var groups: [[Int]] = []
+        groups.reserveCapacity(indices.count)
+        observationIndices.withUnsafeBytes { raw in
+            let valuesPerSample = manifest.observationIndexValuesPerSample
+            for sampleIndex in indices {
+                let byteOffset = sampleIndex * valuesPerSample * MemoryLayout<UInt32>.size
+                let current = raw.loadUnaligned(
+                    fromByteOffset: byteOffset,
+                    as: UInt32.self
+                ).littleEndian
+                if let group = currentToGroup[current] {
+                    groups[group].append(sampleIndex)
+                } else {
+                    currentToGroup[current] = groups.count
+                    groups.append([sampleIndex])
+                }
+            }
         }
         return groups
     }

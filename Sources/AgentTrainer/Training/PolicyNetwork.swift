@@ -718,19 +718,71 @@ final class AgentPolicy: Module, @unchecked Sendable {
             encodedControls = regularized.controls
         }
         let temporalSteps = concatenated([regularized.embeddings, encodedControls], axis: -1)
-        let batch = current.dim(0)
         let recurrent: MLXArray
         if let gru {
-            recurrent = gru(temporalSteps)[.ellipsis, -1, 0...]
+            recurrent = Self.finalGRUState(temporalSteps, gru: gru)
         } else if let lstm {
-            recurrent = lstm(temporalSteps).0[.ellipsis, -1, 0...]
+            recurrent = Self.finalLSTMState(temporalSteps, lstm: lstm)
         } else {
             recurrent = MLXArray.zeros(
-                [batch, profile.training.architecture.recurrentWidth],
+                [current.dim(0), profile.training.architecture.recurrentWidth],
                 dtype: dtype
             )
         }
         return concatenated([current, recurrent], axis: -1)
+    }
+
+    /// MLX's public recurrent layers return every time-step state. The policy
+    /// consumes only the final causal state, so reproducing the same recurrence
+    /// without stacking intermediate outputs avoids an unused allocation and
+    /// copy while retaining the layer's exact parameters and gate equations.
+    static func finalGRUState(_ input: MLXArray, gru: GRU) -> MLXArray {
+        let projected = gru.b.map { addMM($0, input, gru.wx.T) }
+            ?? matmul(input, gru.wx.T)
+        let inputRZ = projected[.ellipsis, .stride(to: -gru.hiddenSize)]
+        let inputN = projected[.ellipsis, .stride(from: -gru.hiddenSize)]
+        var hidden: MLXArray?
+        for index in 0..<projected.dim(-2) {
+            var rz = inputRZ[.ellipsis, index, 0...]
+            var hiddenN: MLXArray?
+            if let previous = hidden {
+                let hiddenProjection = matmul(previous, gru.wh.T)
+                rz = rz + hiddenProjection[.ellipsis, .stride(to: -gru.hiddenSize)]
+                hiddenN = hiddenProjection[.ellipsis, .stride(from: -gru.hiddenSize)]
+                if let bias = gru.bhn { hiddenN = hiddenN! + bias }
+            }
+            let gates = split(sigmoid(rz), parts: 2, axis: -1)
+            let reset = gates[0]
+            let update = gates[1]
+            var candidate = inputN[.ellipsis, index, 0...]
+            if let hiddenN { candidate = candidate + reset * hiddenN }
+            candidate = tanh(candidate)
+            hidden = hidden.map { (1 - update) * candidate + update * $0 }
+                ?? (1 - update) * candidate
+        }
+        precondition(hidden != nil, "A temporal policy requires at least one recurrent step.")
+        return hidden!
+    }
+
+    static func finalLSTMState(_ input: MLXArray, lstm: LSTM) -> MLXArray {
+        let projected = lstm.bias.map { addMM($0, input, lstm.wx.T) }
+            ?? matmul(input, lstm.wx.T)
+        var hidden: MLXArray?
+        var cell: MLXArray?
+        for index in 0..<projected.dim(-2) {
+            var gates = projected[.ellipsis, index, 0...]
+            if let previous = hidden { gates = addMM(gates, previous, lstm.wh.T) }
+            let pieces = split(gates, parts: 4, axis: -1)
+            let inputGate = sigmoid(pieces[0])
+            let forgetGate = sigmoid(pieces[1])
+            let candidate = tanh(pieces[2])
+            let outputGate = sigmoid(pieces[3])
+            cell = cell.map { forgetGate * $0 + inputGate * candidate }
+                ?? inputGate * candidate
+            hidden = outputGate * tanh(cell!)
+        }
+        precondition(hidden != nil, "A temporal policy requires at least one recurrent step.")
+        return hidden!
     }
 
     /// Corrupts historical state without dropout rescaling, because the goal is

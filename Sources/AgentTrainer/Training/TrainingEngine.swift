@@ -147,8 +147,7 @@ final class TrainingEngine: @unchecked Sendable {
         let batchSize = max(1, profile.training.batchSize)
         let stepsPerEpoch = Int(ceil(Double(split.train.count) / Double(batchSize)))
         let (observationReuseRatio, groupedTrainingObservations): (Double, [[Int]]) = {
-            let plan = dataset.visionBatchPlan(at: split.train)
-            let groups = dataset.observationGroups(at: split.train, using: plan)
+            let groups = dataset.observationGroups(at: split.train)
             let probeRows = Array(localityGroupedVisionTrainingOrder(
                 groups: groups,
                 batchSize: batchSize,
@@ -282,6 +281,7 @@ final class TrainingEngine: @unchecked Sendable {
             let batch = Self.expandBatch(
                 arrays,
                 profile: profile,
+                dtype: model.dtype,
                 reusesVisionFeatures: reusesValidationVisionFeatures
             )
             let temporalFeatures = model.temporalFeatures(
@@ -387,6 +387,7 @@ final class TrainingEngine: @unchecked Sendable {
             let batch = Self.expandBatch(
                 arrays,
                 profile: profile,
+                dtype: model.dtype,
                 reusesVisionFeatures: reusesVisionFeatures
             )
             let gradientInputs = [
@@ -929,6 +930,7 @@ final class TrainingEngine: @unchecked Sendable {
     private static func expandBatch(
         _ arrays: [MLXArray],
         profile: AIProfile,
+        dtype: DType,
         reusesVisionFeatures: Bool
     ) -> ExpandedTrainingBatch {
         let temporal = profile.training.effectiveTemporalVision
@@ -936,7 +938,9 @@ final class TrainingEngine: @unchecked Sendable {
             let actions = arrays[reusesVisionFeatures ? 2 : 1]
             let visionCount = arrays[0].dim(0)
             return ExpandedTrainingBatch(
-                currentImages: VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
+                currentImages: VisionPreprocessor.mlxTensor(
+                    arrays[0], spec: profile.preprocessing, dtype: dtype
+                ),
                 pastImages: MLXArray.zeros(
                     [visionCount, 1, 1, 1, profile.preprocessing.channelCount],
                     dtype: .float32
@@ -951,10 +955,12 @@ final class TrainingEngine: @unchecked Sendable {
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         let actions = arrays[reusesVisionFeatures ? 5 : 3]
         return ExpandedTrainingBatch(
-            currentImages: VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
+            currentImages: VisionPreprocessor.mlxTensor(
+                arrays[0], spec: profile.preprocessing, dtype: dtype
+            ),
             pastImages: reusesVisionFeatures
-                ? VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec)
-                : VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec),
+                ? VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec, dtype: dtype)
+                : VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec, dtype: dtype),
             pastControls: arrays[2],
             visionToPast: reusesVisionFeatures ? arrays[3] : nil,
             sampleToVision: reusesVisionFeatures ? arrays[4] : nil,

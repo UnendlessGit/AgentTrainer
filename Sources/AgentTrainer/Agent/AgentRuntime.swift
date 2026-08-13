@@ -225,14 +225,16 @@ final class AgentRuntime: @unchecked Sendable {
         let hasTemporalMemory = temporal.pastFrameCount > 0
         let pastSpec = temporal.pastFrameSpec(from: runtimeProfile.preprocessing)
         let predictionFunction: VisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
+            let currentImages = VisionPreprocessor.mlxTensor(
+                inputs[0], spec: runtimeProfile.preprocessing, dtype: model.dtype
+            )
             if hasTemporalMemory {
                 let currentEmbedding = model.visualEmbedding(
                     visualFeatures: model.visualActivations(images: currentImages).last!
                 )
                 let reducedEmbedding = model.pastVisualEmbedding(
                     visualFeatures: model.pastVisualActivations(
-                        images: VisionPreprocessor.mlxTensor(inputs[1], spec: pastSpec)
+                        images: VisionPreprocessor.mlxTensor(inputs[1], spec: pastSpec, dtype: model.dtype)
                     ).last!
                 )
                 let temporalFeatures = model.temporalFeatures(
@@ -256,11 +258,13 @@ final class AgentRuntime: @unchecked Sendable {
         // when its view is enabled and reaches its independently capped rate.
         let activationVisualizationFunctions: [VisualizationFunction] = (0..<max(1, model.convolutions.count)).map { selectedLayer in
             compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-                let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
+                let currentImages = VisionPreprocessor.mlxTensor(
+                    inputs[0], spec: runtimeProfile.preprocessing, dtype: model.dtype
+                )
                 let layers = model.visualActivations(images: currentImages)
                 let reducedEmbedding = hasTemporalMemory ? model.pastVisualEmbedding(
                     visualFeatures: model.pastVisualActivations(
-                        images: VisionPreprocessor.mlxTensor(inputs[1], spec: pastSpec)
+                        images: VisionPreprocessor.mlxTensor(inputs[1], spec: pastSpec, dtype: model.dtype)
                     ).last!
                 ) : nil
                 let temporalFeatures = hasTemporalMemory
@@ -278,11 +282,13 @@ final class AgentRuntime: @unchecked Sendable {
             }
         }
         let channelVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
+            let currentImages = VisionPreprocessor.mlxTensor(
+                inputs[0], spec: runtimeProfile.preprocessing, dtype: model.dtype
+            )
             let layers = model.visualActivations(images: currentImages)
             let reducedEmbedding = hasTemporalMemory ? model.pastVisualEmbedding(
                 visualFeatures: model.pastVisualActivations(
-                    images: VisionPreprocessor.mlxTensor(inputs[1], spec: pastSpec)
+                    images: VisionPreprocessor.mlxTensor(inputs[1], spec: pastSpec, dtype: model.dtype)
                 ).last!
             ) : nil
             let temporalFeatures = hasTemporalMemory
@@ -298,11 +304,13 @@ final class AgentRuntime: @unchecked Sendable {
                 + [model.strongestChannelsForVisualization(layers.last!)]
         }
         let saliencyVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
-            let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
+            let currentImages = VisionPreprocessor.mlxTensor(
+                inputs[0], spec: runtimeProfile.preprocessing, dtype: model.dtype
+            )
             let layers = model.visualActivations(images: currentImages)
             let reducedEmbedding = hasTemporalMemory ? model.pastVisualEmbedding(
                 visualFeatures: model.pastVisualActivations(
-                    images: VisionPreprocessor.mlxTensor(inputs[1], spec: pastSpec)
+                    images: VisionPreprocessor.mlxTensor(inputs[1], spec: pastSpec, dtype: model.dtype)
                 ).last!
             ) : nil
             let temporalFeatures = hasTemporalMemory

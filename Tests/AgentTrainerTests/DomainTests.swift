@@ -1226,6 +1226,64 @@ final class DomainTests: XCTestCase {
         }
     }
 
+    func testPackedUInt8BFloat16ExpansionMatchesEstablishedRoundingExactly() {
+        let specs = [
+            PreprocessingSpec(
+                width: 256, height: 1, colorMode: .grayscale,
+                bitDepth: 8, chroma: .yuv444
+            ),
+            PreprocessingSpec(
+                width: 7, height: 5, colorMode: .color,
+                bitDepth: 8, chroma: .yuv420
+            ),
+            PreprocessingSpec(
+                width: 7, height: 5, colorMode: .color,
+                bitDepth: 8, chroma: .yuv422
+            ),
+            PreprocessingSpec(
+                width: 7, height: 5, colorMode: .color,
+                bitDepth: 8, chroma: .yuv444
+            )
+        ]
+        for spec in specs {
+            let packed = Data((0..<spec.sampleByteCount).map { UInt8($0 % 256) })
+            let direct = VisionPreprocessor.mlxTensor(
+                packed, batch: 1, spec: spec, dtype: .bfloat16
+            )
+            let established = VisionPreprocessor.mlxTensor(
+                packed, batch: 1, spec: spec
+            ).asType(.bfloat16)
+            MLX.eval(direct, established)
+            XCTAssertEqual(direct.dtype, .bfloat16)
+            XCTAssertEqual(
+                direct.asData().data,
+                established.asData().data,
+                "Direct BF16 expansion changed the established rounded bytes for \(spec.chroma.rawValue)."
+            )
+        }
+    }
+
+    func testPackedUInt8Float16RequestRetainsEstablishedFloat32Expansion() {
+        let spec = PreprocessingSpec(
+            width: 16, height: 16, colorMode: .grayscale,
+            bitDepth: 8, chroma: .yuv444
+        )
+        let packed = Data((0...255).map(UInt8.init))
+        let requested = VisionPreprocessor.mlxTensor(
+            packed, batch: 1, spec: spec, dtype: .float16
+        )
+        let established = VisionPreprocessor.mlxTensor(
+            packed, batch: 1, spec: spec
+        )
+        MLX.eval(requested, established)
+        XCTAssertEqual(
+            requested.dtype,
+            .float32,
+            "FP16 must keep Float32 normalization until its different rounding is independently quality-gated."
+        )
+        XCTAssertEqual(requested.asData().data, established.asData().data)
+    }
+
     func testFolderSelectionAndRecursiveDeletion() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("workspace-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -3634,6 +3692,9 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(plan.uniquePastObservations, [0, 1])
         XCTAssertEqual(plan.visionToPast, [0, 0, 1])
         XCTAssertEqual(plan.pastFrameReuseRatio, 1.5, accuracy: 0.000_001)
+        let plannedGroups = fixture.dataset.observationGroups(at: indices, using: plan)
+        XCTAssertEqual(fixture.dataset.observationGroups(at: indices), plannedGroups)
+        XCTAssertEqual(plannedGroups, [[3, 2], [0, 1], [5, 4]])
 
         let rowBytes = ActionLayout.count * MemoryLayout<Float>.size
         var current = Data(count: plan.uniqueSequences.count)
@@ -4360,6 +4421,63 @@ final class DomainTests: XCTestCase {
         ))
         MLX.eval(imagePredictions, cachedPredictions)
         XCTAssertEqual(imagePredictions.asArray(Float.self), cachedPredictions.asArray(Float.self))
+    }
+
+    func testFinalOnlyRecurrentStatesMatchMLXOutputsAndGradients() {
+        MLXRandom.seed(88_200)
+        let input = MLXRandom.uniform(low: -1, high: 1, [3, 5, 11])
+        let selector = MLXRandom.uniform(low: -1, high: 1, [3, 7])
+
+        let gru = GRU(inputSize: 11, hiddenSize: 7)
+        let expectedGRU = gru(input)[.ellipsis, -1, 0...]
+        let actualGRU = AgentPolicy.finalGRUState(input, gru: gru)
+        let expectedGRUGradient = valueAndGrad(model: gru) { model, values in
+            [(model(values[0])[.ellipsis, -1, 0...] * values[1]).sum()]
+        }(gru, [input, selector]).1
+        let actualGRUGradient = valueAndGrad(model: gru) { model, values in
+            [(AgentPolicy.finalGRUState(values[0], gru: model) * values[1]).sum()]
+        }(gru, [input, selector]).1
+
+        let lstm = LSTM(inputSize: 11, hiddenSize: 7)
+        let expectedLSTM = lstm(input).0[.ellipsis, -1, 0...]
+        let actualLSTM = AgentPolicy.finalLSTMState(input, lstm: lstm)
+        let expectedLSTMGradient = valueAndGrad(model: lstm) { model, values in
+            [(model(values[0]).0[.ellipsis, -1, 0...] * values[1]).sum()]
+        }(lstm, [input, selector]).1
+        let actualLSTMGradient = valueAndGrad(model: lstm) { model, values in
+            [(AgentPolicy.finalLSTMState(values[0], lstm: model) * values[1]).sum()]
+        }(lstm, [input, selector]).1
+        MLX.eval(
+            expectedGRU, actualGRU, expectedGRUGradient, actualGRUGradient,
+            expectedLSTM, actualLSTM, expectedLSTMGradient, actualLSTMGradient
+        )
+
+        func maximumDelta(_ lhs: MLXArray, _ rhs: MLXArray) -> Float {
+            zip(lhs.asArray(Float.self), rhs.asArray(Float.self)).reduce(0) {
+                max($0, abs($1.0 - $1.1))
+            }
+        }
+        func maximumGradientDelta(
+            _ lhs: ModuleParameters,
+            _ rhs: ModuleParameters
+        ) -> Float {
+            let expected = Dictionary(uniqueKeysWithValues: lhs.flattened())
+            let actual = Dictionary(uniqueKeysWithValues: rhs.flattened())
+            XCTAssertEqual(expected.keys.sorted(), actual.keys.sorted())
+            return expected.keys.reduce(0) { maximum, name in
+                max(maximum, maximumDelta(expected[name]!, actual[name]!))
+            }
+        }
+        XCTAssertLessThanOrEqual(maximumDelta(expectedGRU, actualGRU), 0.000_001)
+        XCTAssertLessThanOrEqual(
+            maximumGradientDelta(expectedGRUGradient, actualGRUGradient),
+            0.000_001
+        )
+        XCTAssertLessThanOrEqual(maximumDelta(expectedLSTM, actualLSTM), 0.000_001)
+        XCTAssertLessThanOrEqual(
+            maximumGradientDelta(expectedLSTMGradient, actualLSTMGradient),
+            0.000_001
+        )
     }
 
     func testAcceleratedGroupNormMatchesEstablishedGroupingAndGradient() {

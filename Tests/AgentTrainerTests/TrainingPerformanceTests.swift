@@ -8,6 +8,34 @@ import XCTest
 /// Opt-in hardware benchmark. Normal CI remains deterministic and quick; use
 /// `./benchmark.sh` to exercise the complete packed temporal-vision data path.
 final class TrainingPerformanceTests: XCTestCase {
+    func testObservationGroupingStartupBenchmark() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["AGENTTRAINER_RUN_GROUPING_BENCHMARK"] == "1" else {
+            throw XCTSkip("Set AGENTTRAINER_RUN_GROUPING_BENCHMARK=1 and provide a cache path.")
+        }
+        guard let path = environment["AGENTTRAINER_BENCHMARK_CACHE_PATH"] else {
+            throw XCTSkip("AGENTTRAINER_BENCHMARK_CACHE_PATH is required.")
+        }
+        let dataset = try CachedDataset(directory: URL(fileURLWithPath: path, isDirectory: true))
+        let indices = Array(0..<dataset.count)
+
+        let directStarted = ContinuousClock.now
+        let direct = dataset.observationGroups(at: indices)
+        let directSeconds = directStarted.duration(to: .now).benchmarkSeconds
+
+        let establishedStarted = ContinuousClock.now
+        let plan = dataset.visionBatchPlan(at: indices)
+        let established = dataset.observationGroups(at: indices, using: plan)
+        let establishedSeconds = establishedStarted.duration(to: .now).benchmarkSeconds
+
+        XCTAssertEqual(direct, established)
+        print(
+            "OBSERVATION_GROUPING_BENCHMARK rows=\(indices.count) groups=\(direct.count) "
+                + "established_seconds=\(establishedSeconds) direct_seconds=\(directSeconds) "
+                + "speedup=\(establishedSeconds / max(0.000_001, directSeconds))"
+        )
+    }
+
     func testCompiledMetalDataPathPreservesOrderedUpdatesAndMeasuresThroughput() throws {
         guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_PERFORMANCE_TESTS"] == "1" else {
             throw XCTSkip("Set AGENTTRAINER_RUN_PERFORMANCE_TESTS=1 to run the local Metal benchmark.")
@@ -363,8 +391,12 @@ final class TrainingPerformanceTests: XCTestCase {
                 compile(inputs: [model, optimizer], outputs: [model, optimizer]) { arrays in
                     let actions = arrays[5]
                     let uniqueInputs = [
-                        VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
-                        VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec),
+                        VisionPreprocessor.mlxTensor(
+                            arrays[0], spec: profile.preprocessing, dtype: model.dtype
+                        ),
+                        VisionPreprocessor.mlxTensor(
+                            arrays[1], spec: pastSpec, dtype: model.dtype
+                        ),
                         arrays[2]
                     ]
                     let targets = actions[0..., 0, 0...]
@@ -541,8 +573,12 @@ final class TrainingPerformanceTests: XCTestCase {
             }
             let reusedValidation = compile(inputs: [validationModel]) { arrays in
                 let actions = arrays[5]
-                let current = VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing)
-                let past = VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec)
+                let current = VisionPreprocessor.mlxTensor(
+                    arrays[0], spec: profile.preprocessing, dtype: validationModel.dtype
+                )
+                let past = VisionPreprocessor.mlxTensor(
+                    arrays[1], spec: pastSpec, dtype: validationModel.dtype
+                )
                 let temporalFeatures = validationModel.temporalFeatures(
                     currentImages: current,
                     pastImages: past,
@@ -597,8 +633,16 @@ final class TrainingPerformanceTests: XCTestCase {
 
             func compiledInference(accelerated: Bool) -> @Sendable ([MLXArray]) -> [MLXArray] {
                 compile(inputs: [validationModel]) { arrays in
-                    let current = VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing)
-                    let past = VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec)
+                    let current = VisionPreprocessor.mlxTensor(
+                        arrays[0],
+                        spec: profile.preprocessing,
+                        dtype: accelerated ? validationModel.dtype : .float32
+                    )
+                    let past = VisionPreprocessor.mlxPastFrameTensor(
+                        arrays[1],
+                        spec: pastSpec,
+                        dtype: accelerated ? validationModel.dtype : .float32
+                    )
                     let currentFeatures = validationModel.visualActivations(
                         images: current,
                         acceleratedOperators: accelerated

@@ -1,4 +1,4 @@
-# AgentTrainer 2.4.0
+# AgentTrainer 2.5.0
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -41,6 +41,16 @@ Policy v6, introduced in AgentTrainer 2.1, is designed around both useful capaci
 - live temporal inference encodes each reduced frame once, caches its compact visual embedding, and reuses that embedding when the frame enters later causal windows
 
 Training has independent, configurable anti-memorization controls for label-preserving vision variation, small random neutral occlusions, control-history dropout/noise, whole temporal-token dropout, and binary label smoothing. These perturbations are disabled for validation and live inference. Recording-disjoint validation where possible, purged causal validation otherwise, per-head metrics, and best-held-out-brain activation remain the primary generalization checks.
+
+## Faster training in 2.5
+
+AgentTrainer 2.5 removes three measured costs while preserving Policy v6's learned tensors, objective, sample order, and numerical inputs:
+
+- Packed 8-bit vision expands directly to BFloat16 at the model boundary. This is bit-exact for all byte values; Float16 deliberately retains Float32 normalization because direct half-precision division rounds ten byte values differently.
+- GRU and LSTM temporal branches compute only the final causal state consumed by the policy instead of materializing every intermediate time-step output. Focused tests compare both outputs and gradients against MLX's full-sequence layers.
+- Reused-cache startup groups labels directly by their current-observation identity. It no longer constructs whole-library temporal plans and past-frame maps that are immediately discarded.
+
+On the release Mac, the BFloat16 path improved the default sustained training workload by 2.8–3.3%, and final-only recurrence improved the 16-frame temporal stress workload by 10.4–10.8%. Direct grouping reduced startup work on a 606,770-row cache from 0.123–0.127 seconds to 0.0218–0.0229 seconds, a 5.6× speedup. Independent reviews rejected all changes that did not reproduce a real speedup or remain inside the quality gates.
 
 ## Resilient large-library training in 2.4
 
@@ -144,7 +154,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.4.0.dmg`
+- `AgentTrainer-2.5.0.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

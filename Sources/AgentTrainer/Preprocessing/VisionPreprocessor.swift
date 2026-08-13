@@ -238,23 +238,42 @@ final class VisionPreprocessor: @unchecked Sendable {
     /// Builds the model-ready tensor directly from packed UInt8 cache bytes. Chroma
     /// expansion and normalization stay in MLX instead of allocating millions of
     /// Swift Float values for every batch.
-    static func mlxTensor(_ packed: Data, batch: Int, spec: PreprocessingSpec) -> MLXArray {
+    static func mlxTensor(
+        _ packed: Data,
+        batch: Int,
+        spec: PreprocessingSpec,
+        dtype: DType = .float32
+    ) -> MLXArray {
         mlxTensor(
             MLXArray(packed, [batch, spec.sampleByteCount], dtype: .uint8),
-            spec: spec
+            spec: spec,
+            dtype: dtype
         )
     }
 
     /// Array-input form used by compiled training graphs. Keeping UInt8
     /// expansion inside the compiled function lets MLX fuse normalization and
     /// chroma expansion with the policy graph.
-    static func mlxTensor(_ packed: MLXArray, spec: PreprocessingSpec) -> MLXArray {
+    static func mlxTensor(
+        _ packed: MLXArray,
+        spec: PreprocessingSpec,
+        dtype: DType = .float32
+    ) -> MLXArray {
         precondition(
             packed.ndim == 2 && packed.dim(1) == spec.sampleByteCount,
             "Packed vision must have shape [batch, sampleByteCount]."
         )
         let batch = packed.dim(0)
-        let raw = packed.asType(.float32) / 255
+        // Expand directly into BF16 for the default policy path, avoiding a
+        // full-resolution Float32 image that would immediately be narrowed at
+        // the visual encoder boundary. UInt8 -> BF16 normalization is bit-exact
+        // to Float32 division followed by BF16 rounding for all 256 byte values.
+        // FP16 division differs from that established rounding for a few byte
+        // values, so retain Float32 expansion there until it has an independent
+        // training-quality and speed gate. The default also stays Float32 for
+        // presentation/reference callers.
+        let expansionDType: DType = dtype == .bfloat16 ? .bfloat16 : .float32
+        let raw = packed.asType(expansionDType) / MLXArray(255, dtype: expansionDType)
         let width = spec.width, height = spec.height
         let lumaCount = width * height
         let y = raw[0..., 0..<lumaCount].reshaped([batch, height, width, 1])
@@ -278,7 +297,11 @@ final class VisionPreprocessor: @unchecked Sendable {
     /// Expands independently packed lower-resolution frames without changing
     /// their spatial size or synthesizing motion channels. The result keeps the
     /// temporal axis so each visual embedding can stay paired with its controls.
-    static func mlxPastFrameTensor(_ packedFrames: MLXArray, spec: PreprocessingSpec) -> MLXArray {
+    static func mlxPastFrameTensor(
+        _ packedFrames: MLXArray,
+        spec: PreprocessingSpec,
+        dtype: DType = .float32
+    ) -> MLXArray {
         precondition(
             packedFrames.ndim == 3 && packedFrames.dim(1) > 0
                 && packedFrames.dim(2) == spec.sampleByteCount,
@@ -288,7 +311,8 @@ final class VisionPreprocessor: @unchecked Sendable {
         let frameCount = packedFrames.dim(1)
         let dense = mlxTensor(
             packedFrames.reshaped([batch * frameCount, spec.sampleByteCount]),
-            spec: spec
+            spec: spec,
+            dtype: dtype
         )
         return dense.reshaped([
             batch, frameCount, spec.height, spec.width, spec.channelCount

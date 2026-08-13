@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.4.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.5.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -88,6 +88,8 @@ Packed observations are `UInt8`:
 
 MLX expands each packed image independently to dense RGB-like channels at its native configured size. The visual encoder appends generated X/Y coordinate planes internally.
 
+Packed 8-bit vision may normalize directly into BFloat16: exhaustive byte-value tests prove it is bit-identical to Float32 normalization followed by the established model-boundary BFloat16 cast. Do not generalize this shortcut to Float16; direct half-precision division changes ten of the 256 possible values by one ULP, so Float16 must continue through Float32 normalization unless a future quality cycle independently proves otherwise.
+
 Temporal vision is either current-only or an explicit three-part input:
 
 1. one current frame at the exact configured `PreprocessingSpec`
@@ -153,9 +155,11 @@ The performance path preserves those semantics:
 - Projected cache plus peak shard working space is checked against the training-data volume before decode. Out-of-order packed shards use a strict two-worker-window look-ahead; a slow early recording must never permit temporary disk usage or pending merge state to grow with the full library size.
 - When one decoded frame remains causal across many configured perception ticks, Metal packs it once and the cache writer repeats those exact packed bytes in large buffered writes. Observation cadence, indices, controls, and every action label remain unchanged. Temporary shards skip redundant durability barriers; the final cache files are synchronized before their atomic directory move.
 - Dataset files are required memory mappings with adaptive VM advice. Epochs randomize small collections of temporally local lanes rather than every row globally, so each optimizer batch remains diverse while macOS can read ahead the contiguous mapped pages inside each lane. A batch gathers packed vision, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
+- Whole-library grouping reads only each row's current-observation index. The cache validator guarantees that a global current-observation identity determines its complete causal sequence, so direct grouping must remain byte-for-byte order-equivalent to grouping through `visionBatchPlan`; the latter is still used for actual batches where its past-frame deduplication maps are consumed.
 - Current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those embeddings to their exact frame slots. Training-only pixel augmentation is sampled per unique encoded observation; visual-feature dropout and history corruption occur only after action-row gathering, preserving one independent post-encoder stochastic path per label. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
 - Above the measured workload crossover, the coordinate contribution to the first convolution is evaluated once per batch and the established GroupNorm layout uses MLX's fused Metal layer-normalization kernel. Small tensors retain the lower-overhead kernels.
 - The six affine action heads retain their named Policy v6 tensors but concatenate those tensors into one Metal matrix multiplication. Reference tests compare both predictions and gradients against the six-call form.
+- GRU/LSTM execution mirrors MLX Swift 0.31.3's gate equations but returns only the final state consumed by Policy v6, avoiding MLX's otherwise unused stack of every time-step output. Output and parameter-gradient parity tests are mandatory, and this local recurrence must be re-audited whenever the pinned MLX recurrent implementation changes.
 - AdamW concatenates parameters, finite gradients, and both moment sets during the compiled update so identical elementwise work is issued as a few large kernels. Save/load splits moments back into the established checkpoint keys and shapes; the schedule, clipping rule, decay rule, and missing-gradient behavior are unchanged.
 - Validation shares deterministic temporal work and head logits before gathering them back to every held-out label, then derives loss and predictions from that one compiled forward graph.
 - CPU gathering overlaps a bounded queue of one to four strictly ordered Metal updates. Each compiled invocation consumes the lazy weights, AdamW moments, scheduler step, and MLX random state produced by the preceding invocation. The queue is unified-memory-aware, never crosses an epoch/autosave/run limit, stops growing on pause, and is fully evaluated before the checkpoint cursor advances.
