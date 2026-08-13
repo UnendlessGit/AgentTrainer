@@ -940,7 +940,10 @@ actor WorkspaceStore {
                     updatedAt: active.createdAt,
                     savedBrainCount: versionDirectoryCount(profileID: profile.id),
                     trainingDurationSeconds: active.trainingDurationSeconds,
-                    experienceDurationSeconds: active.experienceDurationSeconds
+                    experienceDurationSeconds: active.experienceDurationSeconds,
+                    reinforcementFeedbackCount: active.reinforcementFeedbackCount,
+                    reinforcementUpdateCount: active.reinforcementUpdateCount,
+                    reinforcementNetReward: active.reinforcementNetReward
                 )
             }
             // Profiles from earlier builds already have a cheap progress row but
@@ -1085,6 +1088,175 @@ actor WorkspaceStore {
         return manifest
     }
 
+    /// Publishes one online-learning snapshot as an immutable runnable brain.
+    /// The prior supervised checkpoint is removed in the same transaction as
+    /// activation: later dataset training must warm-start from these RL weights
+    /// instead of restoring an older, otherwise-valid optimizer checkpoint.
+    func publishReinforcementSnapshot(
+        _ snapshot: ReinforcementSnapshot
+    ) throws -> WorkspaceReinforcementPublication? {
+        try prepare()
+        guard var profile = storedProfile(snapshot.profileID) else {
+            throw AgentTrainerError.storage("The AI profile for this RL snapshot no longer exists.")
+        }
+        let manifest = snapshot.manifest
+        let reinforcementSequence = manifest.reinforcementSequence ?? 0
+        let feedbackCount = manifest.reinforcementFeedbackCount ?? -1
+        let updateCount = manifest.reinforcementUpdateCount ?? -1
+        let netReward = manifest.reinforcementNetReward ?? .nan
+        let reinforcementSeconds = manifest.reinforcementTrainingSeconds ?? .nan
+        guard manifest.schemaVersion == ModelContract.schemaVersion,
+              !manifest.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              manifest.globalStep >= 0,
+              manifest.trainingLoss.isFinite,
+              manifest.artifactFileNamesAreSafe,
+              manifest.reinforcementSessionID != nil,
+              manifest.reinforcementSessionStartedAt != nil,
+              reinforcementSequence > 0,
+              feedbackCount >= 0,
+              updateCount > 0,
+              netReward.isFinite,
+              reinforcementSeconds.isFinite,
+              reinforcementSeconds >= 0,
+              manifest.reinforcementOptimizerFile != nil,
+              manifest.reinforcementStateFile != nil,
+              manifest.optimizerFile == nil,
+              manifest.trainingStateFile == nil,
+              manifest.randomStateFile == nil else {
+            throw AgentTrainerError.storage("The online-learning snapshot has an invalid or ambiguous manifest.")
+        }
+
+        let profileRoot = profileDirectory(snapshot.profileID).standardizedFileURL
+        let staging = snapshot.stagingDirectory.standardizedFileURL
+        guard staging.deletingLastPathComponent() == profileRoot,
+              staging.lastPathComponent.hasPrefix(".ReinforcementSnapshot."),
+              FileManager.default.fileExists(atPath: staging.path) else {
+            throw AgentTrainerError.storage("The online-learning snapshot is outside its managed AI directory.")
+        }
+        let requiredNames = [
+            manifest.weightsFile,
+            manifest.reinforcementOptimizerFile!,
+            manifest.reinforcementStateFile!
+        ]
+        guard Set(requiredNames).count == requiredNames.count else {
+            throw AgentTrainerError.storage("The online-learning snapshot reuses an artifact filename.")
+        }
+        for name in requiredNames {
+            var isDirectory: ObjCBool = false
+            let artifact = staging.appendingPathComponent(name)
+            guard FileManager.default.fileExists(
+                atPath: artifact.path,
+                isDirectory: &isDirectory
+            ), !isDirectory.boolValue,
+                  ((try? artifact.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0 else {
+                throw AgentTrainerError.storage("The online-learning snapshot is incomplete.")
+            }
+        }
+
+        // Periodic publication is asynchronous. A slower old autosave must
+        // never activate after a newer snapshot from the same or a later run.
+        if let activeID = profile.activeVersionID,
+           let active = version(profileID: profile.id, versionID: activeID),
+           let activeStart = active.reinforcementSessionStartedAt,
+           let incomingStart = manifest.reinforcementSessionStartedAt {
+            let sameSession = active.reinforcementSessionID == manifest.reinforcementSessionID
+            let sequenceIsStale = sameSession
+                && (active.reinforcementSequence ?? -1) >= (manifest.reinforcementSequence ?? 0)
+            if activeStart > incomingStart || sequenceIsStale {
+                try? FileManager.default.removeItem(at: staging)
+                return nil
+            }
+        }
+
+        let destination = versionDirectory(profileID: profile.id, versionID: manifest.id)
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw AgentTrainerError.storage("The online-learning brain identifier already exists.")
+        }
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let profileURL = profileRoot.appendingPathComponent("profile.json")
+        let previousProfileData = try Data(contentsOf: profileURL)
+        let checkpoint = checkpointDirectory(profileID: profile.id)
+        let checkpointBackup = profileRoot.appendingPathComponent(
+            ".Checkpoint.before-reinforcement.\(UUID().uuidString)",
+            isDirectory: true
+        )
+        var checkpointWasMoved = false
+        var versionWasMoved = false
+        do {
+            try FileManager.default.moveItem(at: staging, to: destination)
+            versionWasMoved = true
+            try atomicWrite(
+                try encoder.encode(manifest),
+                to: destination.appendingPathComponent("manifest.json")
+            )
+            if FileManager.default.fileExists(atPath: checkpoint.path) {
+                try FileManager.default.moveItem(at: checkpoint, to: checkpointBackup)
+                checkpointWasMoved = true
+            }
+
+            profile.activeVersionID = manifest.id
+            profile.trainingProgress = TrainingProgressSummary(
+                globalStep: manifest.globalStep,
+                epoch: manifest.epoch ?? 0,
+                updatedAt: manifest.createdAt,
+                savedBrainCount: listVersions(profileID: profile.id).count,
+                trainingDurationSeconds: manifest.trainingDurationSeconds,
+                experienceDurationSeconds: manifest.experienceDurationSeconds,
+                reinforcementFeedbackCount: manifest.reinforcementFeedbackCount,
+                reinforcementUpdateCount: manifest.reinforcementUpdateCount,
+                reinforcementNetReward: manifest.reinforcementNetReward
+            )
+            try saveProfile(profile)
+        } catch {
+            var rollbackError: Error?
+            do { try atomicWrite(previousProfileData, to: profileURL) }
+            catch { rollbackError = rollbackError ?? error }
+            if checkpointWasMoved,
+               FileManager.default.fileExists(atPath: checkpointBackup.path),
+               !FileManager.default.fileExists(atPath: checkpoint.path) {
+                do { try FileManager.default.moveItem(at: checkpointBackup, to: checkpoint) }
+                catch { rollbackError = rollbackError ?? error }
+            }
+            if versionWasMoved, FileManager.default.fileExists(atPath: destination.path) {
+                do { try FileManager.default.removeItem(at: destination) }
+                catch { rollbackError = rollbackError ?? error }
+            }
+            if let rollbackError {
+                throw AgentTrainerError.storage(
+                    "Online-learning publication failed and rollback was incomplete: \(rollbackError.localizedDescription)"
+                )
+            }
+            throw error
+        }
+
+        if checkpointWasMoved {
+            do { try FileManager.default.removeItem(at: checkpointBackup) }
+            catch {
+                AppLog.write(
+                    .warning,
+                    category: "Storage",
+                    "An obsolete pre-RL checkpoint remains in a hidden cleanup folder",
+                    details: error.localizedDescription
+                )
+            }
+        }
+        do {
+            _ = try pruneAutosaveVersions(profile: profile, keeping: 10)
+        } catch {
+            AppLog.write(
+                .warning,
+                category: "Storage",
+                "RL brain published but old autosave cleanup was deferred",
+                details: error.localizedDescription
+            )
+        }
+        let publishedProfile = storedProfile(profile.id) ?? profile
+        return WorkspaceReinforcementPublication(profile: publishedProfile, version: manifest)
+    }
+
     @discardableResult
     func deleteVersion(profile: AIProfile, versionID: UUID) throws -> AIProfile {
         guard !profile.isDeletionProtected else {
@@ -1221,7 +1393,10 @@ actor WorkspaceStore {
                 updatedAt: version.createdAt,
                 savedBrainCount: listVersions(profileID: profile.id).count,
                 trainingDurationSeconds: version.trainingDurationSeconds,
-                experienceDurationSeconds: version.experienceDurationSeconds
+                experienceDurationSeconds: version.experienceDurationSeconds,
+                reinforcementFeedbackCount: version.reinforcementFeedbackCount,
+                reinforcementUpdateCount: version.reinforcementUpdateCount,
+                reinforcementNetReward: version.reinforcementNetReward
             )
             try saveProfile(updated)
             if backupWasCreated {
@@ -1333,6 +1508,12 @@ actor WorkspaceStore {
 
     private func versionDirectoryCount(profileID: UUID) -> Int {
         listVersions(profileID: profileID).count
+    }
+
+    private func storedProfile(_ id: UUID) -> AIProfile? {
+        let url = profileDirectory(id).appendingPathComponent("profile.json")
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? decoder.decode(AIProfile.self, from: data)
     }
 
     private func checkpointTiming(profileID: UUID) -> (training: Double?, experience: Double?) {

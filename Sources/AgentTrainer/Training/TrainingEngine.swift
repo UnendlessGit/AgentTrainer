@@ -59,6 +59,7 @@ final class TrainingEngine: @unchecked Sendable {
     private static let minimumVisionReuseRatio = 1.20
     private static let metricsPublishInterval = 0.5
     private static let publishedLossHistoryLimit = 2_048
+    private static let repeatedPerformanceWarningInterval = 5 * 60.0
     typealias MetricsHandler = @Sendable (TrainingMetrics, String) -> Void
     typealias CompletionHandler = @Sendable (Result<TrainingCompletion, Error>) -> Void
 
@@ -121,6 +122,19 @@ final class TrainingEngine: @unchecked Sendable {
             metrics(value, "\(status) • \(Int((progress * 100).rounded()))%")
         }
         guard dataset.count > 0 else { throw AgentTrainerError.noData }
+        let packedRecordingIDs = Set(dataset.manifest.segments.map(\.recordingID))
+        let trainingRecordings = recordings.filter {
+            packedRecordingIDs.contains($0.id)
+        }
+        guard !trainingRecordings.isEmpty else { throw AgentTrainerError.noData }
+        if trainingRecordings.count != recordings.count {
+            AppLog.write(
+                .warning,
+                category: "Training",
+                "Training set excludes unusable recordings",
+                details: "Using \(trainingRecordings.count) of \(recordings.count) selected recordings. Check the earlier packing diagnostic for exact package names."
+            )
+        }
         let inputBufferPool = try MetalArrayBufferPool()
         let split = splitIndices(
             dataset: dataset,
@@ -219,8 +233,11 @@ final class TrainingEngine: @unchecked Sendable {
             minimumLearningRateRatio: Float(profile.training.effectiveMinimumLearningRateRatio)
         )
         optimizer.initialize(model: model)
-        let signature = try profileSignature(profile, recordings: recordings)
-        let inputSummaries = try recordings.map { recording in
+        let signature = try profileSignature(
+            profile,
+            recordings: trainingRecordings
+        )
+        let inputSummaries = try trainingRecordings.map { recording in
             let url = recording.directory.appendingPathComponent(recording.manifest.eventFile)
             return (recording, try InputEventReader.summarize(url: url, previewLimit: 0, globalRect: recording.manifest.globalRect.cgRect))
         }
@@ -232,7 +249,7 @@ final class TrainingEngine: @unchecked Sendable {
             if value.1.mouse.isGameCamera { result.camera += duration } else { result.cursor += duration }
         }
         let recommendedMouseMode: MouseControlMode = mouseDurations.camera > mouseDurations.cursor ? .relative : .absolute
-        let recordingOrder = recordings.map(\.id)
+        let recordingOrder = trainingRecordings.map(\.id)
         var state = CheckpointState(
             profileSignature: signature,
             epoch: 0,
@@ -303,7 +320,7 @@ final class TrainingEngine: @unchecked Sendable {
             state.samplingStrategy = desiredSamplingStrategy
         }
         state.recommendedMouseMode = recommendedMouseMode
-        let cursorDurations = recordings.reduce(into: (shown: 0.0, total: 0.0)) { result, recording in
+        let cursorDurations = trainingRecordings.reduce(into: (shown: 0.0, total: 0.0)) { result, recording in
             let start = max(0, min(recording.manifest.duration, recording.manifest.trimStart))
             let end = max(start, min(recording.manifest.duration, recording.manifest.trimEnd ?? recording.manifest.duration))
             let duration = end - start
@@ -312,7 +329,7 @@ final class TrainingEngine: @unchecked Sendable {
         }
         state.trainingShowsCursor = cursorDurations.total > 0
             ? cursorDurations.shown >= cursorDurations.total / 2
-            : recordings.filter { $0.manifest.capture.showsCursor }.count * 2 >= recordings.count
+            : trainingRecordings.filter { $0.manifest.capture.showsCursor }.count * 2 >= trainingRecordings.count
 
         if split.validation.isEmpty {
             // A checkpoint from an older split may contain a score and best
@@ -485,7 +502,8 @@ final class TrainingEngine: @unchecked Sendable {
 
         var lastMetricsPublish = CACurrentMediaTime() - 1
         var performance = TrainingPerformanceWindow()
-        var lastPerformanceLimit: String?
+        var lastLoggedPerformanceLimit: String?
+        var lastPerformanceWarningTime = -Double.greatestFiniteMagnitude
         let optimizerPipelineDepth = Self.recommendedOptimizerPipelineDepth(
             profile: profile,
             physicalMemory: ProcessInfo.processInfo.physicalMemory
@@ -661,19 +679,23 @@ final class TrainingEngine: @unchecked Sendable {
                         memory: memory,
                         thermalState: thermalState
                     )
-                    if performanceLimit != lastPerformanceLimit {
-                        lastPerformanceLimit = performanceLimit
-                        if let performanceLimit {
-                            AppLog.write(
-                                .warning,
-                                category: "Training",
-                                performanceLimit,
-                                details: "throughput retention \((100 * performance.throughputRetention).formatted(.number.precision(.fractionLength(1))))%; "
-                                    + "step \(performance.stepMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms; "
-                                    + "input \(performance.preparationMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms; "
-                                    + "thermal \(thermalState.rawValue)"
-                            )
-                        }
+                    if let performanceLimit,
+                       (
+                           performanceLimit != lastLoggedPerformanceLimit
+                               || now - lastPerformanceWarningTime
+                                   >= Self.repeatedPerformanceWarningInterval
+                       ) {
+                        lastLoggedPerformanceLimit = performanceLimit
+                        lastPerformanceWarningTime = now
+                        AppLog.write(
+                            .warning,
+                            category: "Training",
+                            performanceLimit,
+                            details: "throughput retention \((100 * performance.throughputRetention).formatted(.number.precision(.fractionLength(1))))%; "
+                                + "step \(performance.stepMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms; "
+                                + "input \(performance.preparationMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms; "
+                                + "thermal \(thermalState.rawValue)"
+                        )
                     }
                     metrics(
                         report,
@@ -1503,7 +1525,7 @@ final class TrainingEngine: @unchecked Sendable {
             experienceDurationSeconds: state.experienceSeconds ?? 0
         )
         try await WorkspaceStore.shared.saveProfile(updated)
-        if removed > 0 {
+        if removed > 1 {
             AppLog.write(category: "Training", "Pruned old autosaves", details: "\(profile.name): removed \(removed), kept the newest 10")
         }
         return TrainingCompletion(profile: updated, version: version, completed: completed)

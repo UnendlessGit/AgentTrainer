@@ -274,6 +274,17 @@ enum TrainingDataContract {
     static let schemaVersion = 10
 }
 
+/// Versioned independently from model weights and demonstration caches. The
+/// online learner intentionally keeps Policy v6's tensor layout so supervised
+/// and reinforcement phases can hand the same brain back and forth without a
+/// conversion or a reset.
+enum ReinforcementLearningContract {
+    static let schemaVersion = 1
+    static let maximumSignalMagnitude = 100.0
+    static let maximumCreditFrames = 64
+    static let maximumTransitionBytes = 256 * 1_024 * 1_024
+}
+
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
 /// deltas are divided by this value in the dataset and multiplied by the same
 /// value during execution, so the model learns useful values independent of the
@@ -587,6 +598,121 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     }
 }
 
+/// Profile-owned settings for bounded online policy-gradient updates. Manual
+/// controls are part of this configuration today; future screen/color/shape
+/// detectors feed the same `ReinforcementSignal` interface and therefore do
+/// not require another optimizer or brain format.
+struct ReinforcementConfiguration: Codable, Hashable, Sendable {
+    var enabled = false
+    var learningRate = 0.000_01
+    var creditWindowSeconds = 0.75
+    var creditDecay = 0.92
+    var maximumCreditFrames = 16
+    /// Mixed probability is deliberately tiny because it is applied to every
+    /// allowed discrete control independently; a seemingly small per-key rate
+    /// compounds quickly across a keyboard and eight mouse buttons.
+    var binaryExploration = 0.005
+    var continuousExplorationStandardDeviation = 0.01
+    var policyClip = 0.20
+    var behaviorAnchor = 0.02
+    var entropyBonus = 0.001
+    var maximumGradientNorm = 0.5
+    var learnFromInaction = false
+
+    var rewardAmount = 1.0
+    var punishmentAmount = 1.0
+    var rewardHotkey = HotkeyBinding(
+        keyCode: 24,
+        carbonModifiers: UInt32(1 << 12 | 1 << 11)
+    )
+    var punishmentHotkey = HotkeyBinding(
+        keyCode: 27,
+        carbonModifiers: UInt32(1 << 12 | 1 << 11)
+    )
+    var scrollFeedbackEnabled = true
+    var scrollCarbonModifiers = UInt32(1 << 12 | 1 << 11)
+    var scrollStep = 0.25
+    var scrollUpRewards = true
+    var autosaveFeedbackCount = 10
+
+    /// A brand-new policy has no demonstration-derived keyboard capability.
+    /// These explicitly selected keys form its output firewall; an existing
+    /// brain uses the union of this set and its demonstrated keys.
+    var allowedKeyCodes: Set<UInt16> = []
+
+    func validated() throws -> Self {
+        let validModifierBits = UInt32(1 << 8 | 1 << 9 | 1 << 11 | 1 << 12)
+        let validFeedbackBinding: (HotkeyBinding) -> Bool = { binding in
+            // Mouse buttons are already encoded as UInt8 and macOS can expose
+            // vendor-specific side-button numbers. Do not impose an arbitrary
+            // smaller ceiling on a user-selected feedback control.
+            if binding.mouseButton != nil { return true }
+            return binding.keyCode < 128
+        }
+        guard learningRate.isFinite,
+              creditWindowSeconds.isFinite,
+              creditDecay.isFinite,
+              binaryExploration.isFinite,
+              continuousExplorationStandardDeviation.isFinite,
+              policyClip.isFinite,
+              behaviorAnchor.isFinite,
+              entropyBonus.isFinite,
+              maximumGradientNorm.isFinite,
+              rewardAmount.isFinite,
+              punishmentAmount.isFinite,
+              scrollStep.isFinite,
+              (0.000_000_1...0.001).contains(learningRate),
+              (0.05...10).contains(creditWindowSeconds),
+              (0.1...1).contains(creditDecay),
+              (1...ReinforcementLearningContract.maximumCreditFrames).contains(maximumCreditFrames),
+              (0...0.5).contains(binaryExploration),
+              (0.001...0.5).contains(continuousExplorationStandardDeviation),
+              (0.05...0.5).contains(policyClip),
+              (0...1).contains(behaviorAnchor),
+              (0...0.1).contains(entropyBonus),
+              (0.01...10).contains(maximumGradientNorm),
+              (0...ReinforcementLearningContract.maximumSignalMagnitude).contains(rewardAmount),
+              (0...ReinforcementLearningContract.maximumSignalMagnitude).contains(punishmentAmount),
+              (0.01...ReinforcementLearningContract.maximumSignalMagnitude).contains(scrollStep),
+              (1...1_000).contains(autosaveFeedbackCount),
+              rewardAmount > 0,
+              punishmentAmount > 0,
+              rewardHotkey != punishmentHotkey,
+              validFeedbackBinding(rewardHotkey),
+              validFeedbackBinding(punishmentHotkey),
+              rewardHotkey.carbonModifiers & ~validModifierBits == 0,
+              punishmentHotkey.carbonModifiers & ~validModifierBits == 0,
+              scrollCarbonModifiers & ~validModifierBits == 0,
+              (!scrollFeedbackEnabled || scrollCarbonModifiers != 0),
+              allowedKeyCodes.allSatisfy({ $0 < 128 }) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "Use bounded finite RL values: learning rate 0.0000001–0.001, credit window 0.05–10 seconds, decay 0.1–1, 1–64 credited frames, binary exploration 0–0.5, continuous exploration 0.001–0.5, policy clip 0.05–0.5, behavior anchor 0–1, entropy 0–0.1, gradient norm 0.01–10, positive feedback amounts up to 100, and a modified scroll chord. Reward and Punish shortcuts must be different."
+            )
+        }
+        return self
+    }
+}
+
+struct ReinforcementSignal: Identifiable, Sendable {
+    var id = UUID()
+    /// `CACurrentMediaTime()` captured at the input/provider boundary. Credit
+    /// assignment uses this timestamp even if a GPU update runs later.
+    var timestamp: Double
+    var value: Double
+    var sourceIdentifier: String
+    var detail: String? = nil
+}
+
+/// Automatic detectors can implement this protocol and emit the same signal
+/// type as manual hotkeys/scroll. A provider owns detection only; the runtime
+/// remains the single authority for credit assignment, optimization, safety,
+/// and persistence.
+protocol ReinforcementSignalSource: AnyObject, Sendable {
+    var sourceIdentifier: String { get }
+    func start(emitting: @escaping @Sendable (ReinforcementSignal) -> Void) throws
+    func stop()
+}
+
 struct TrainingRunSettings: Codable, Hashable, Sendable {
     var maximumSteps = 10_000
     var autosaveSteps = 1_000
@@ -854,11 +980,29 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Optional keeps existing manifests decodable. New brains retain the
     /// per-head held-out report that justified best-brain selection.
     var validationReport: ValidationReport? = nil
+    /// Online-learning state is separate from the demonstration optimizer.
+    /// Activating an RL brain for dataset training intentionally treats it as a
+    /// weights-only warm start, while another RL session can resume this state.
+    var reinforcementOptimizerFile: String? = nil
+    var reinforcementStateFile: String? = nil
+    var reinforcementSessionID: UUID? = nil
+    var reinforcementSessionStartedAt: Date? = nil
+    var reinforcementSequence: Int? = nil
+    var reinforcementFeedbackCount: Int? = nil
+    var reinforcementUpdateCount: Int? = nil
+    var reinforcementNetReward: Double? = nil
+    var reinforcementTrainingSeconds: Double? = nil
 
     /// Manifest filenames are treated as leaf names, never paths. A damaged or
     /// hand-edited manifest must not escape its immutable version directory.
     var artifactFileNamesAreSafe: Bool {
-        let names = [weightsFile] + [optimizerFile, trainingStateFile, randomStateFile].compactMap { $0 }
+        let names = [weightsFile] + [
+            optimizerFile,
+            trainingStateFile,
+            randomStateFile,
+            reinforcementOptimizerFile,
+            reinforcementStateFile
+        ].compactMap { $0 }
         return names.allSatisfy {
             !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0")
         }
@@ -873,6 +1017,9 @@ struct TrainingProgressSummary: Codable, Hashable, Sendable {
     /// Optional for backward-compatible decoding of existing profile.json files.
     var trainingDurationSeconds: Double? = nil
     var experienceDurationSeconds: Double? = nil
+    var reinforcementFeedbackCount: Int? = nil
+    var reinforcementUpdateCount: Int? = nil
+    var reinforcementNetReward: Double? = nil
 }
 
 struct AIProfile: Codable, Hashable, Identifiable, Sendable {
@@ -893,6 +1040,9 @@ struct AIProfile: Codable, Hashable, Identifiable, Sendable {
     /// Sticky once Crystal V4 is discovered, so renaming the profile cannot
     /// accidentally remove its user-requested protection.
     var deletionProtected: Bool?
+    /// Optional keeps every existing profile decodable. Missing settings mean
+    /// online learning is off until the user opens the dedicated RL tab.
+    var reinforcement: ReinforcementConfiguration? = nil
 
     static func fresh(name: String = "New Agent") -> AIProfile {
         AIProfile(id: UUID(), name: name, createdAt: Date(), preprocessing: PreprocessingSpec(), channels: ActionChannels(), training: TrainingConfiguration(), recordingIDs: [], activeVersionID: nil, recordingFolderIDs: [], restrictions: ActionRestrictions(), trainingProgress: nil, deletionProtected: isProtectedModelName(name))
@@ -901,6 +1051,12 @@ struct AIProfile: Codable, Hashable, Identifiable, Sendable {
 
     var effectiveFolderIDs: [UUID] { recordingFolderIDs ?? [] }
     var effectiveRestrictions: ActionRestrictions { restrictions ?? ActionRestrictions() }
+    var effectiveReinforcement: ReinforcementConfiguration {
+        reinforcement ?? ReinforcementConfiguration()
+    }
+    var canRunOrLearn: Bool {
+        activeVersionID != nil || effectiveReinforcement.enabled
+    }
     var isDeletionProtected: Bool {
         deletionProtected == true || Self.isProtectedModelName(name)
     }
@@ -1035,6 +1191,37 @@ struct RuntimeMetrics: Sendable {
     var frameCount = 0
     var actionCount = 0
     var droppedFrames = 0
+}
+
+struct ReinforcementMetrics: Sendable {
+    var isActive = false
+    var feedbackCount = 0
+    var rewardCount = 0
+    var punishmentCount = 0
+    var rewardTotal = 0.0
+    var punishmentTotal = 0.0
+    var updateCount = 0
+    var optimizerStep = 0
+    var lastSignal: Double?
+    var lastSignalSource = ""
+    var creditedFrames = 0
+    var lastPolicyLoss: Double?
+    var lastUpdateMilliseconds = 0.0
+    var autosavesPublished = 0
+    var pendingFeedback = 0
+
+    var netReward: Double { rewardTotal - punishmentTotal }
+}
+
+struct ReinforcementSnapshot: Sendable {
+    var profileID: UUID
+    var stagingDirectory: URL
+    var manifest: ModelVersionManifest
+}
+
+struct WorkspaceReinforcementPublication: Sendable {
+    var profile: AIProfile
+    var version: ModelVersionManifest
 }
 
 struct VisionPreviewFrame: Sendable {

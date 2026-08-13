@@ -263,6 +263,16 @@ extension HotkeyBinding {
         }
         return KeyNames.name(for: UInt16(clamping: keyCode))
     }
+
+    var shortcutDisplayName: String {
+        var result = ""
+        if carbonModifiers & UInt32(1 << 12) != 0 { result += "⌃" }
+        if carbonModifiers & UInt32(1 << 11) != 0 { result += "⌥" }
+        if carbonModifiers & UInt32(1 << 9) != 0 { result += "⇧" }
+        if carbonModifiers & UInt32(1 << 8) != 0 { result += "⌘" }
+        result += displayName
+        return result
+    }
 }
 
 #if canImport(Carbon)

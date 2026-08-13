@@ -22,6 +22,9 @@ final class InputHUDModel: ObservableObject {
     @Published private(set) var cnnVisualizationDetail = ""
     @Published private(set) var cnnVisualizationMode: CNNVisualizationMode = .activationOverlay
     @Published private(set) var showsCNNVisualization = false
+    @Published private(set) var showsReinforcement = false
+    @Published private(set) var reinforcementMetrics = ReinforcementMetrics()
+    @Published private(set) var lastReinforcementSignal: ReinforcementSignal?
     private var controller: InputHUDController?
     private let previewRenderer = VisionPreviewRenderer()
     private let cnnRenderer = CNNVisualizationRenderer()
@@ -31,10 +34,41 @@ final class InputHUDModel: ObservableObject {
         controller = InputHUDController(model: self)
     }
 
-    func show(source: HUDInputSource, vision: Bool = false, cnnVisualization: CNNVisualizationSettings = CNNVisualizationSettings()) {
-        self.source = source; state = .empty; recentKeys = []; recentButtons = []; visionImage = nil; visionSpec = nil; showsVision = vision; cnnVisualizationImage = nil; cnnVisualizationDetail = ""; cnnVisualizationMode = cnnVisualization.mode; showsCNNVisualization = cnnVisualization.enabled; isVisible = true
+    func show(
+        source: HUDInputSource,
+        vision: Bool = false,
+        cnnVisualization: CNNVisualizationSettings = CNNVisualizationSettings(),
+        reinforcement: Bool = false
+    ) {
+        self.source = source
+        state = .empty
+        recentKeys = []
+        recentButtons = []
+        visionImage = nil
+        visionSpec = nil
+        showsVision = vision
+        cnnVisualizationImage = nil
+        cnnVisualizationDetail = ""
+        cnnVisualizationMode = cnnVisualization.mode
+        showsCNNVisualization = cnnVisualization.enabled
+        showsReinforcement = reinforcement
+        reinforcementMetrics = ReinforcementMetrics(isActive: reinforcement)
+        lastReinforcementSignal = nil
+        isVisible = true
     }
-    func hide() { previewRenderer.cancel(); cnnRenderer.cancel(); state = .empty; visionImage = nil; cnnVisualizationImage = nil; showsVision = false; showsCNNVisualization = false; isVisible = false }
+    func hide() {
+        previewRenderer.cancel()
+        cnnRenderer.cancel()
+        state = .empty
+        visionImage = nil
+        cnnVisualizationImage = nil
+        showsVision = false
+        showsCNNVisualization = false
+        showsReinforcement = false
+        reinforcementMetrics = ReinforcementMetrics()
+        lastReinforcementSignal = nil
+        isVisible = false
+    }
     func update(state: InputState, source: HUDInputSource) {
         for key in state.keys.sorted() where !recentKeys.contains(key) { recentKeys.append(key) }
         for button in state.buttons.sorted() where !recentButtons.contains(button) { recentButtons.append(button) }
@@ -65,6 +99,16 @@ final class InputHUDModel: ObservableObject {
                 self.cnnVisualizationDetail = render.detail
             }
         }
+    }
+
+    func updateReinforcementSignal(_ signal: ReinforcementSignal) {
+        guard showsReinforcement else { return }
+        lastReinforcementSignal = signal
+    }
+
+    func updateReinforcementMetrics(_ metrics: ReinforcementMetrics) {
+        guard showsReinforcement else { return }
+        reinforcementMetrics = metrics
     }
 }
 
@@ -111,7 +155,11 @@ private final class InputHUDController {
             guard let self else { return }
             if visible { position(); panel.orderFrontRegardless() } else { panel.orderOut(nil) }
         }.store(in: &cancellables)
-        model.$showsVision.combineLatest(model.$showsCNNVisualization, model.$recentKeys).sink { [weak self] visionVisible, cnnVisible, keys in
+        model.$showsVision.combineLatest(
+            model.$showsCNNVisualization,
+            model.$recentKeys,
+            model.$showsReinforcement
+        ).sink { [weak self] visionVisible, cnnVisible, keys, reinforcementVisible in
             guard let self else { return }
             let rowSets: [Set<UInt16>] = [
                 [53, 122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111],
@@ -124,7 +172,13 @@ private final class InputHUDController {
             let keySet = Set(keys)
             let rows = max(1, rowSets.count { !$0.isDisjoint(with: keySet) })
             let keyboardHeight = CGFloat(rows * 17)
-            panel.setContentSize(NSSize(width: 400, height: 110 + keyboardHeight + (visionVisible ? 206 : 0) + (cnnVisible ? 206 : 0)))
+            panel.setContentSize(NSSize(
+                width: 400,
+                height: 110 + keyboardHeight
+                    + (visionVisible ? 206 : 0)
+                    + (cnnVisible ? 206 : 0)
+                    + (reinforcementVisible ? 62 : 0)
+            ))
             if model.isVisible { position() }
         }.store(in: &cancellables)
     }
@@ -174,6 +228,31 @@ private struct InputHUDView: View {
                 Spacer()
                 Text("Capture-excluded").font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
             }
+            if model.showsReinforcement {
+                HStack(spacing: 9) {
+                    Image(systemName: "bolt.heart.fill")
+                        .foregroundStyle(reinforcementColor)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("LIVE RL")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.orange)
+                        Text(reinforcementSignalText)
+                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                            .foregroundStyle(reinforcementColor)
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("NET \(signed(model.reinforcementMetrics.netReward))")
+                        Text("\(model.reinforcementMetrics.updateCount) updates • \(model.reinforcementMetrics.creditedFrames) frames")
+                    }
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 7)
+                .background(RoundedRectangle(cornerRadius: ATCorner.scaled(10), style: .continuous).fill(reinforcementColor.opacity(0.10)))
+                .overlay(RoundedRectangle(cornerRadius: ATCorner.scaled(10), style: .continuous).stroke(reinforcementColor.opacity(0.35), lineWidth: 0.8))
+            }
             VisualKeyboard(usedKeys: Set(model.recentKeys), activeKeys: model.state.keys, accent: model.source.color, compact: true)
             HStack(spacing: 8) {
                 HUDGroup(title: "MOUSE", accent: .purple) {
@@ -200,6 +279,20 @@ private struct InputHUDView: View {
     }
 
     private func mouseLabel(_ button: UInt8) -> String { switch button { case 0: "L"; case 1: "R"; case 2: "M"; default: "M\(Int(button) + 1)" } }
+
+    private var reinforcementColor: Color {
+        guard let value = model.lastReinforcementSignal?.value else { return .orange }
+        return value > 0 ? .green : .red
+    }
+
+    private var reinforcementSignalText: String {
+        guard let value = model.lastReinforcementSignal?.value else { return "ARMED" }
+        return value > 0 ? "REWARD \(signed(value))" : "PUNISH \(signed(value))"
+    }
+
+    private func signed(_ value: Double) -> String {
+        value.formatted(.number.sign(strategy: .always()).precision(.fractionLength(0...2)))
+    }
 }
 
 private struct HUDGroup<Content: View>: View {

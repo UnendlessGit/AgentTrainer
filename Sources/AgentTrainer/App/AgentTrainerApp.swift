@@ -19,6 +19,11 @@ struct AgentTrainerApp: App {
                 Divider()
                 Button(model.recordingIsActiveOrStarting ? "Stop Recording" : "Start Recording") { Task { model.recordingIsActiveOrStarting ? await model.stopRecording() : await model.startRecording() } }
                 Button(model.agentIsActiveOrStarting ? "Stop Agent" : "Run Agent") { Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() } }
+                if model.reinforcementMetrics.isActive {
+                    Divider()
+                    Button("Reward Running AI") { model.rewardRunningAgent() }
+                    Button("Punish Running AI") { model.punishRunningAgent() }
+                }
             }
             CommandMenu("Recordings") {
                 Button("Import Recordings…") {
@@ -62,11 +67,20 @@ private struct AgentTrainerMenuBarView: View {
             status("Recording", model.isStoppingRecording ? "Saving" : model.isRecording ? "Active" : model.isStartingRecording ? "Starting" : "Idle", model.recordingIsActiveOrStarting ? .red : .secondary)
             status("Training", model.isTraining ? model.profiles.first(where: { $0.id == model.trainingProfileID })?.name ?? "Active" : "Idle", model.isTraining ? ATColor.cyan : .secondary)
             status("Agent", model.isStartingAgent ? "Starting / stopping" : model.isRunning ? model.profiles.first(where: { $0.id == model.runningProfileID })?.name ?? "Running" : "Idle", model.agentIsActiveOrStarting ? ATColor.violet : .secondary)
+            if model.reinforcementMetrics.isActive {
+                status("Live RL", "Net \(signed(model.reinforcementMetrics.netReward)) • \(model.reinforcementMetrics.updateCount) updates", model.reinforcementMetrics.netReward >= 0 ? ATColor.green : ATColor.coral)
+            }
             Divider()
             Button(model.recordingIsActiveOrStarting ? (model.isStoppingRecording ? "Saving Recording…" : model.isRecording ? "Stop & Save Recording" : "Cancel Recording Start") : "Start Recording") { Task { model.recordingIsActiveOrStarting ? await model.stopRecording() : await model.startRecording() } }
                 .disabled(model.agentIsActiveOrStarting || model.isStoppingRecording)
             Button(model.agentIsActiveOrStarting ? "Stop Agent & Release Inputs" : "Start Selected Agent") { Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() } }
-                .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil)
+                .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.canRunOrLearn != true)
+            if model.reinforcementMetrics.isActive {
+                HStack {
+                    Button("Reward") { model.rewardRunningAgent() }
+                    Button("Punish") { model.punishRunningAgent() }
+                }
+            }
             Button("Panic — Stop Everything", role: .destructive) { model.panic() }
             Divider()
             Button("Show AgentTrainer") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
@@ -76,6 +90,10 @@ private struct AgentTrainerMenuBarView: View {
 
     private func status(_ name: String, _ value: String, _ color: Color) -> some View {
         HStack { Text(name).foregroundStyle(.secondary); Spacer(); Text(value).foregroundStyle(color).lineLimit(1) }.font(.callout)
+    }
+
+    private func signed(_ value: Double) -> String {
+        value.formatted(.number.sign(strategy: .always()).precision(.fractionLength(0...2)))
     }
 }
 

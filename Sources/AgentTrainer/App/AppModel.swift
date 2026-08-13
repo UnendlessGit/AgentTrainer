@@ -3,6 +3,7 @@ import AVFoundation
 import CoreGraphics
 import Foundation
 import MLX
+import QuartzCore
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -41,6 +42,7 @@ final class AppModel: ObservableObject {
     @Published var isAppActive = NSApplication.shared.isActive
     @Published var trainingMetrics = TrainingMetrics()
     @Published var runtimeMetrics = RuntimeMetrics()
+    @Published var reinforcementMetrics = ReinforcementMetrics()
     @Published var activityStatus = "Ready"
     @Published var trainingStatus = "Idle"
     @Published var runtimeStatus = "Idle"
@@ -94,6 +96,8 @@ final class AppModel: ObservableObject {
     private lazy var panicHotkey = GlobalHotkeyMonitor(identifier: 1, binding: hotkeys.panic) { [weak self] in Task { @MainActor in self?.panic() } }
     private lazy var recordHotkey = GlobalHotkeyMonitor(identifier: 2, binding: hotkeys.record) { [weak self] in Task { @MainActor in guard let self else { return }; self.recordingIsActiveOrStarting ? await self.stopRecording() : await self.startRecording() } }
     private lazy var runHotkey = GlobalHotkeyMonitor(identifier: 3, binding: hotkeys.run) { [weak self] in Task { @MainActor in guard let self else { return }; self.agentIsActiveOrStarting ? await self.stopAgent() : await self.startAgent() } }
+    private var reinforcementRewardHotkey: GlobalHotkeyMonitor?
+    private var reinforcementPunishmentHotkey: GlobalHotkeyMonitor?
     private var agent: AgentRuntime?
     private var eventWriter: InputEventWriter?
     private var recordingDirectory: URL?
@@ -750,9 +754,18 @@ final class AppModel: ObservableObject {
     }
 
     func startAgent() async {
-        guard let profile = selectedProfile, let versionID = profile.activeVersionID,
-              let source = selectedSource, !recordingIsActiveOrStarting, !agentIsActiveOrStarting, agent == nil, !isReplaying else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop recording, replay, or any current AI first.")); return }
+        guard let profile = selectedProfile,
+              profile.canRunOrLearn,
+              let source = selectedSource,
+              !recordingIsActiveOrStarting,
+              !agentIsActiveOrStarting,
+              agent == nil,
+              !isReplaying else {
+            present(AgentTrainerError.model("Select a trained AI—or enable RL for a brand-new AI—plus a live capture source, and stop recording, replay, or any current AI first."))
+            return
+        }
         guard trainingProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently training. Select another trained AI to run at the same time.")); return }
+        do { try validateProfile(profile) } catch { present(error); return }
         isStartingAgent = true
         runningProfileID = profile.id
         agentLaunchRevision &+= 1
@@ -763,24 +776,43 @@ final class AppModel: ObservableObject {
         var attemptedRuntime: AgentRuntime?
         var installedRuntime = false
         do {
-            guard let version = await WorkspaceStore.shared.version(profileID: profile.id, versionID: versionID) else {
-                throw AgentTrainerError.model("The active runnable brain is missing. Load Saved Brains in AI Models and choose another version.")
+            let version: ModelVersionManifest?
+            if let versionID = profile.activeVersionID {
+                guard let loaded = await WorkspaceStore.shared.version(profileID: profile.id, versionID: versionID) else {
+                    throw AgentTrainerError.model("The active runnable brain is missing. Load Saved Brains in AI Models and choose another version.")
+                }
+                version = loaded
+            } else {
+                guard profile.effectiveReinforcement.enabled else {
+                    throw AgentTrainerError.model("Train this AI from recordings or enable Reinforcement Learning before running it.")
+                }
+                version = nil
             }
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
 
             let resolvedMouseMode: MouseControlMode
             if runMouseMode != .automatic {
                 resolvedMouseMode = runMouseMode
-            } else if let recommended = version.recommendedMouseMode {
+            } else if let recommended = version?.recommendedMouseMode {
                 resolvedMouseMode = recommended
+            } else if version == nil {
+                // A new policy's zero relative output is genuinely neutral.
+                // Absolute coordinates have no "do not move" value—0.5 means
+                // the capture center—so Auto must never surprise the user by
+                // warping a brand-new AI's cursor before its first feedback.
+                resolvedMouseMode = .relative
             } else {
                 resolvedMouseMode = await self.resolvedMouseMode(for: profile)
             }
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
 
             let allowedKeyCodes: Set<UInt16>
-            if let persisted = version.demonstratedKeyCodes { allowedKeyCodes = persisted }
-            else { allowedKeyCodes = await demonstratedKeyCodes(for: profile) }
+            if let persisted = version?.demonstratedKeyCodes {
+                allowedKeyCodes = persisted.union(profile.effectiveReinforcement.allowedKeyCodes)
+            } else {
+                allowedKeyCodes = await demonstratedKeyCodes(for: profile)
+                    .union(profile.effectiveReinforcement.allowedKeyCodes)
+            }
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
 
             let runtime = try AgentRuntime()
@@ -789,23 +821,90 @@ final class AppModel: ObservableObject {
             runtime.onMetrics = { [weak self] value in Task { @MainActor in self?.runtimeMetrics = value } }
             runtime.onPreview = { [weak self] frame in Task { @MainActor in self?.hudModel.updateVision(frame) } }
             runtime.onVisualization = { [weak self] frame in Task { @MainActor in self?.hudModel.updateCNNVisualization(frame) } }
+            runtime.onReinforcementSignal = { [weak self] signal in Task { @MainActor in
+                self?.hudModel.updateReinforcementSignal(signal)
+            } }
+            runtime.onReinforcementMetrics = { [weak self] value in Task { @MainActor in
+                self?.reinforcementMetrics = value
+                self?.hudModel.updateReinforcementMetrics(value)
+            } }
+            runtime.onReinforcementError = { [weak self] message in Task { @MainActor in
+                self?.runtimeStatus = "RL warning: \(message)"
+                AppLog.write(.error, category: "Reinforcement", message)
+            } }
+            runtime.onReinforcementSnapshot = { [weak self] snapshot in
+                guard let self else {
+                    try? FileManager.default.removeItem(at: snapshot.stagingDirectory)
+                    return
+                }
+                try await self.publishReinforcementSnapshot(snapshot)
+            }
             runtime.onStop = { [weak self, weak runtime] reason in Task { @MainActor in
                 guard let self, let runtime, self.agent === runtime else { return }
                 self.finishAgentRuntime(runtime, status: reason ?? "Agent stopped")
             } }
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
-            agent = runtime; isRunning = true; runningProfileID = profile.id; hudModel.show(source: .agent, vision: showVisionPreview, cnnVisualization: cnnVisualizationSettings)
+            agent = runtime
+            isRunning = true
+            runningProfileID = profile.id
+            reinforcementMetrics = ReinforcementMetrics()
+            hudModel.show(
+                source: .agent,
+                vision: showVisionPreview,
+                cnnVisualization: cnnVisualizationSettings,
+                reinforcement: profile.effectiveReinforcement.enabled
+            )
             installedRuntime = true
-            runtimeStatus = "Agent starting at exactly \(version.preprocessing.width) × \(version.preprocessing.height)"; activityStatus = runtimeStatus
+            let runtimePreprocessing = version?.preprocessing ?? profile.preprocessing
+            let runtimeTraining = version?.training ?? profile.training
+            let reinforcement = profile.effectiveReinforcement.enabled
+                ? profile.effectiveReinforcement
+                : nil
+            let feedbackHotkeys = try installReinforcementFeedbackHotkeys(
+                reinforcement,
+                runtime: runtime
+            )
+            runtimeStatus = reinforcement == nil
+                ? "Agent starting at exactly \(runtimePreprocessing.width) × \(runtimePreprocessing.height)"
+                : "Preparing real-time RL at exactly \(runtimePreprocessing.width) × \(runtimePreprocessing.height)"
+            activityStatus = runtimeStatus
             var runtimeSafety = safety
             runtimeSafety.panicKeyCode = UInt16(clamping: hotkeys.panic.keyCode)
             runtimeSafety.panicModifiers = hotkeys.panic.cgEventModifiers
-            let previewRate = visionPreviewMatchesPerception ? version.training.perceptionFPS : visionPreviewFPS
-            try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: captureSpec(source: source), captureRect: effectiveCaptureRect(source), mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, safety: runtimeSafety, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run])
+            let previewRate = visionPreviewMatchesPerception ? runtimeTraining.perceptionFPS : visionPreviewFPS
+            let profileDirectory = await WorkspaceStore.shared.profileDirectory(profile.id)
+            try await runtime.start(
+                profile: profile,
+                version: version,
+                allowedKeyCodes: allowedKeyCodes,
+                captureSpec: captureSpec(source: source),
+                captureRect: effectiveCaptureRect(source),
+                mode: frameMode,
+                mouseMode: resolvedMouseMode,
+                gameCamera: gameCamera,
+                outputPermissions: runtimeOutputPermissions,
+                safety: runtimeSafety,
+                previewFPS: showVisionPreview ? previewRate : 0,
+                visualizationSettings: cnnVisualizationSettings,
+                ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run] + feedbackHotkeys,
+                reinforcementConfiguration: reinforcement,
+                reinforcementSnapshotRoot: profileDirectory
+            )
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
-            if isRunning, agent === runtime { runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue)"; activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus; AppLog.write(category: "Runtime", "Agent started", details: "\(profile.name), \(resolvedMouseMode.rawValue), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")") }
+            if isRunning, agent === runtime {
+                runtimeStatus = reinforcement == nil
+                    ? "Agent running locally • \(resolvedMouseMode.rawValue)"
+                    : "Agent running & learning • reward/punish armed • \(resolvedMouseMode.rawValue)"
+                activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus
+                AppLog.write(
+                    category: reinforcement == nil ? "Runtime" : "Reinforcement",
+                    reinforcement == nil ? "Agent started" : "Real-time RL session started",
+                    details: "\(profile.name), \(resolvedMouseMode.rawValue), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")"
+                )
+            }
         } catch is CancellationError {
             await attemptedRuntime?.stop(reason: nil)
+            stopReinforcementFeedbackHotkeys()
             // If an installed runtime already cleared itself, its onStop reason
             // is more precise (focus loss, stale inference, capture failure,
             // or explicit Stop) than replacing it with generic cancellation.
@@ -819,6 +918,7 @@ final class AppModel: ObservableObject {
         }
         catch {
             await attemptedRuntime?.stop(reason: nil)
+            stopReinforcementFeedbackHotkeys()
             guard attemptedRuntime == nil || agent === attemptedRuntime || agent == nil else { return }
             if agent === attemptedRuntime { agent = nil }
             isRunning = false; runningProfileID = nil; runtimeMetrics = RuntimeMetrics(); hudModel.hide(); runtimeStatus = error.localizedDescription
@@ -837,6 +937,7 @@ final class AppModel: ObservableObject {
             : "Agent stopped; all hooks disabled and held inputs released"
         runtimeStatus = wasStarting ? "Cancelling agent start and releasing inputs…" : "Stopping agent and releasing inputs…"
         activityStatus = runtimeStatus
+        stopReinforcementFeedbackHotkeys()
         await runtime?.stop(reason: finalStatus)
 
         if wasStarting {
@@ -851,11 +952,126 @@ final class AppModel: ObservableObject {
 
     private func finishAgentRuntime(_ runtime: AgentRuntime, status: String) {
         guard agent === runtime else { return }
-        agent = nil; isRunning = false; runningProfileID = nil; runtimeMetrics = RuntimeMetrics(); hudModel.hide()
+        stopReinforcementFeedbackHotkeys()
+        agent = nil
+        isRunning = false
+        runningProfileID = nil
+        runtimeMetrics = RuntimeMetrics()
+        reinforcementMetrics = ReinforcementMetrics()
+        hudModel.hide()
         runtimeStatus = status; activityStatus = isTraining ? trainingStatus : runtimeStatus
         let level: AppLogLevel = status == "Agent stopped" || status.contains("all hooks disabled") ? .info : .warning
         AppLog.write(level, category: "Runtime", status)
     }
+
+    /// Public UI/provider boundary for live feedback. The runtime serializes
+    /// every update with inference; callers never touch MLX state directly.
+    func rewardRunningAgent() {
+        guard let runtime = agent,
+              let configuration = runningReinforcementConfiguration else { return }
+        runtime.submitReinforcement(
+            value: configuration.rewardAmount,
+            sourceIdentifier: "manual.button",
+            detail: "Reward button"
+        )
+    }
+
+    func punishRunningAgent() {
+        guard let runtime = agent,
+              let configuration = runningReinforcementConfiguration else { return }
+        runtime.submitReinforcement(
+            value: -configuration.punishmentAmount,
+            sourceIdentifier: "manual.button",
+            detail: "Punish button"
+        )
+    }
+
+    func submitReinforcementSignal(_ signal: ReinforcementSignal) {
+        agent?.submitReinforcementSignal(signal)
+    }
+
+    private var runningReinforcementConfiguration: ReinforcementConfiguration? {
+        guard let runningProfileID,
+              let profile = profiles.first(where: { $0.id == runningProfileID }),
+              profile.effectiveReinforcement.enabled else { return nil }
+        return profile.effectiveReinforcement
+    }
+
+    private func installReinforcementFeedbackHotkeys(
+        _ configuration: ReinforcementConfiguration?,
+        runtime: AgentRuntime
+    ) throws -> [HotkeyBinding] {
+        stopReinforcementFeedbackHotkeys()
+        guard let configuration else { return [] }
+        let feedback = [configuration.rewardHotkey, configuration.punishmentHotkey]
+        guard Set(feedback).count == feedback.count,
+              Set(feedback).isDisjoint(with: [hotkeys.panic, hotkeys.record, hotkeys.run]) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "Reward and Punish shortcuts must be different from each other and from the Panic, Record, and Run shortcuts."
+            )
+        }
+
+        let rewardAmount = configuration.rewardAmount
+        let punishmentAmount = configuration.punishmentAmount
+        let reward = GlobalHotkeyMonitor(identifier: 4, binding: configuration.rewardHotkey) { [weak runtime] in
+            let timestamp = CACurrentMediaTime()
+            runtime?.submitReinforcement(
+                value: rewardAmount,
+                sourceIdentifier: "manual.hotkey",
+                detail: "Reward shortcut",
+                timestamp: timestamp
+            )
+        }
+        let punishment = GlobalHotkeyMonitor(identifier: 5, binding: configuration.punishmentHotkey) { [weak runtime] in
+            let timestamp = CACurrentMediaTime()
+            runtime?.submitReinforcement(
+                value: -punishmentAmount,
+                sourceIdentifier: "manual.hotkey",
+                detail: "Punish shortcut",
+                timestamp: timestamp
+            )
+        }
+        reward.start()
+        punishment.start()
+        guard reward.registrationStatus == GlobalHotkeyMonitor.successStatus,
+              punishment.registrationStatus == GlobalHotkeyMonitor.successStatus else {
+            reward.stop()
+            punishment.stop()
+            throw AgentTrainerError.invalidConfiguration(
+                "macOS could not register one of this AI's live Reward/Punish shortcuts. Choose another shortcut in RL Configuration."
+            )
+        }
+        reinforcementRewardHotkey = reward
+        reinforcementPunishmentHotkey = punishment
+        return feedback
+    }
+
+    private func stopReinforcementFeedbackHotkeys() {
+        reinforcementRewardHotkey?.stop()
+        reinforcementPunishmentHotkey?.stop()
+        reinforcementRewardHotkey = nil
+        reinforcementPunishmentHotkey = nil
+    }
+
+    private func publishReinforcementSnapshot(_ snapshot: ReinforcementSnapshot) async throws {
+        do {
+            guard let publication = try await WorkspaceStore.shared.publishReinforcementSnapshot(snapshot) else {
+                return
+            }
+            let selectedID = selectedProfileID
+            await refreshLibrary()
+            if profiles.contains(where: { $0.id == selectedID }) { selectedProfileID = selectedID }
+            AppLog.write(
+                category: "Reinforcement",
+                publication.version.isAutosave == true ? "RL autosave published" : "RL brain published",
+                details: "\(publication.profile.name), feedback \(publication.version.reinforcementFeedbackCount ?? 0), updates \(publication.version.reinforcementUpdateCount ?? 0)"
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: snapshot.stagingDirectory)
+            throw error
+        }
+    }
+
     func startReenactment() {
         guard let recording = selectedRecording else { return }
         guard !agentIsActiveOrStarting, !recordingIsActiveOrStarting, !isReplaying else {
@@ -967,6 +1183,18 @@ final class AppModel: ObservableObject {
 
     func saveHotkeys(_ value: HotkeySettings) {
         guard Set([value.panic, value.record, value.run]).count == 3 else { resumeGlobalHotkeys(); present(AgentTrainerError.invalidConfiguration("Panic, recording, and agent shortcuts must be different.")); return }
+        let appBindings = Set([value.panic, value.record, value.run])
+        if let collision = profiles.first(where: {
+            let reinforcement = $0.effectiveReinforcement
+            return reinforcement.enabled
+                && !appBindings.isDisjoint(with: [reinforcement.rewardHotkey, reinforcement.punishmentHotkey])
+        }) {
+            resumeGlobalHotkeys()
+            present(AgentTrainerError.invalidConfiguration(
+                "That shortcut conflicts with \(collision.name)'s Reward or Punish shortcut. Change the AI's RL Configuration first."
+            ))
+            return
+        }
         let previous = hotkeys
         hotkeys = value
         panicHotkey.update(value.panic); recordHotkey.update(value.record); runHotkey.update(value.run)
@@ -1213,6 +1441,15 @@ final class AppModel: ObservableObject {
             throw AgentTrainerError.invalidConfiguration("AI names cannot be empty.")
         }
         _ = try profile.preprocessing.validated()
+        let reinforcement = try profile.effectiveReinforcement.validated()
+        if reinforcement.enabled {
+            let feedbackBindings = Set([reinforcement.rewardHotkey, reinforcement.punishmentHotkey])
+            guard feedbackBindings.isDisjoint(with: [hotkeys.panic, hotkeys.record, hotkeys.run]) else {
+                throw AgentTrainerError.invalidConfiguration(
+                    "Reward and Punish shortcuts must be different from the Panic, Record, and Run shortcuts in Settings."
+                )
+            }
+        }
         let training = profile.training
         _ = try training.effectiveTemporalVision.validated(
             current: profile.preprocessing,

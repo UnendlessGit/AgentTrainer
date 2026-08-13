@@ -200,6 +200,13 @@ struct ModelsView: View {
                                         .font(.caption2.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
                                     Text("\(profile.preprocessing.width) × \(profile.preprocessing.height) • \(profile.training.precision.rawValue)")
                                         .font(.caption2).foregroundStyle(.secondary)
+                                    if let feedback = progress?.reinforcementFeedbackCount {
+                                        Text("RL \(feedback) feedback • \(progress?.reinforcementUpdateCount ?? 0) updates • net \((progress?.reinforcementNetReward ?? 0).formatted(.number.sign(strategy: .always()).precision(.fractionLength(0...2))))")
+                                            .font(.caption2.bold().monospacedDigit())
+                                            .foregroundStyle((progress?.reinforcementNetReward ?? 0) >= 0 ? ATColor.green : ATColor.coral)
+                                    } else if profile.effectiveReinforcement.enabled {
+                                        Text("Real-time RL enabled").font(.caption2.bold()).foregroundStyle(ATColor.violet)
+                                    }
                                 }
                                 Spacer(minLength: 4)
                                 if profile.isDeletionProtected {
@@ -236,10 +243,17 @@ struct ModelsView: View {
 }
 
 private struct ProfileEditor: View {
+    private enum TrainingConfigurationTab: String, CaseIterable, Identifiable {
+        case trainingData = "Training Data"
+        case reinforcement = "RL Configuration"
+        var id: String { rawValue }
+    }
+
     @State var draft: AIProfile
     @State private var acceptedDraft: AIProfile
     @State private var pendingBrainReset: AIProfile?
     @State private var suppressDraftObserver = false
+    @State private var trainingConfigurationTab: TrainingConfigurationTab = .trainingData
     @ObservedObject var model: AppModel
     init(profile: AIProfile, model: AppModel) {
         _draft = State(initialValue: profile)
@@ -272,6 +286,11 @@ private struct ProfileEditor: View {
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack { Text("Training configuration").font(.headline).foregroundStyle(ATColor.green); InfoTip("Maximum Steps and Autosave Steps are universal run controls in the Training tab, so they do not change a model's learning identity. Architecture, exact vision, and temporal-context changes require a fresh brain, and the app asks before clearing training.") }
+                        Picker("Configuration", selection: $trainingConfigurationTab) {
+                            ForEach(TrainingConfigurationTab.allCases) { tab in Text(tab.rawValue).tag(tab) }
+                        }
+                        .pickerStyle(.segmented)
+                        if trainingConfigurationTab == .trainingData {
                         HStack { IntField("Epochs per block", value: $draft.training.epochs, help: "How many complete dataset passes to add. If a block is paused, Train finishes it first; after a completed block, Train adds another block of this size."); IntField("Batch", value: $draft.training.batchSize, help: "Samples evaluated together. Larger batches use more unified memory."); Spacer() }
                         VStack(alignment: .leading, spacing: 9) {
                             HStack {
@@ -350,27 +369,39 @@ private struct ProfileEditor: View {
                         HStack { InfoTip("Training encodes real current and reduced causal frames. Live inference caches each reduced visual embedding when first seen, so history length no longer multiplies visual-encoder work."); Spacer() }
                         HStack { IntArrayField("Stage channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Spatial kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Stage strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
                         HStack { DoubleField("Feature dropout", value: $draft.training.architecture.dropout, help: "Randomly hides fusion features and, at half strength, visual-embedding features during training. Inference disables it completely."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft).formatted()) • runtime visual MACs: \(ModelSizing.runtimeVisualBackboneMultiplyAdds(draft).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
+                        } else {
+                            ReinforcementConfigurationEditor(
+                                configuration: Binding(
+                                    get: { draft.effectiveReinforcement },
+                                    set: { draft.reinforcement = $0 }
+                                ),
+                                hasExistingBrain: draft.activeVersionID != nil,
+                                model: model
+                            )
+                        }
                     }
                 }
-                NeuralNetworkInputOverview(profile: draft)
-                OLEDCard {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Training recordings").font(.headline).foregroundStyle(ATColor.amber)
-                        Text("Open a folder to select individual recordings, or select the folder to keep every recording in it included automatically.")
-                            .font(.caption).foregroundStyle(.secondary)
-                        ProfileRecordingPicker(
-                            folders: model.recordingFolders,
-                            recordings: model.recordings,
-                            recordingIDs: $draft.recordingIDs,
-                            folderIDs: Binding(get: { draft.effectiveFolderIDs }, set: { draft.recordingFolderIDs = $0 })
-                        )
+                if trainingConfigurationTab == .trainingData {
+                    NeuralNetworkInputOverview(profile: draft)
+                    OLEDCard {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Training recordings").font(.headline).foregroundStyle(ATColor.amber)
+                            Text("Open a folder to select individual recordings, or select the folder to keep every recording in it included automatically.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            ProfileRecordingPicker(
+                                folders: model.recordingFolders,
+                                recordings: model.recordings,
+                                recordingIDs: $draft.recordingIDs,
+                                folderIDs: Binding(get: { draft.effectiveFolderIDs }, set: { draft.recordingFolderIDs = $0 })
+                            )
+                        }
                     }
                 }
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
                             Text("Saved brains and autosaves").font(.headline).foregroundStyle(ATColor.violet)
-                            InfoTip("This list is loaded only when you ask for it, which keeps the page fast after long runs. Completed training activates the lowest held-out validation-loss brain; the separate latest checkpoint remains available for exact continuation.")
+                            InfoTip("This list is loaded only when you ask for it, which keeps the page fast after long runs. Training Data brains preserve exact continuation checkpoints; RL brains preserve their separate online optimizer and resume from the selected immutable snapshot.")
                             Spacer()
                             if model.versionsLoadedForProfileID == draft.id {
                                 Button("Hide List") { model.unloadVersions() }.primaryButton(color: ATColor.violet)
@@ -387,8 +418,8 @@ private struct ProfileEditor: View {
                         } else {
                             ForEach(model.versions) { version in
                                 HStack {
-                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
-                                    Spacer(); Button(version.optimizerFile == nil ? "Run this" : "Revert & Resume") {
+                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) }; if version.reinforcementOptimizerFile != nil { StatusPill(text: "RL", color: ATColor.violet) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "")\(version.reinforcementFeedbackCount.map { " • RL \($0) feedback / \(version.reinforcementUpdateCount ?? 0) updates / net \((version.reinforcementNetReward ?? 0).formatted(.number.sign(strategy: .always()).precision(.fractionLength(0...2))))" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
+                                    Spacer(); Button(version.reinforcementOptimizerFile != nil ? "Resume RL" : version.optimizerFile == nil ? "Run this" : "Revert & Resume") {
                                         Task {
                                             if await model.activateVersion(version) { draft.activeVersionID = version.id }
                                         }
@@ -480,6 +511,292 @@ private struct ProfileEditor: View {
             suppressDraftObserver = true
             draft = reset
         }
+    }
+}
+
+private struct ReinforcementConfigurationEditor: View {
+    @Binding var configuration: ReinforcementConfiguration
+    let hasExistingBrain: Bool
+    @ObservedObject var model: AppModel
+    @State private var showsAdvanced = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack(spacing: 12) {
+                Toggle("Enable real-time reinforcement learning", isOn: $configuration.enabled)
+                    .tint(ATColor.green)
+                    .font(.headline)
+                Spacer()
+                StatusPill(
+                    text: configuration.enabled ? "Run & Learn" : "Off",
+                    color: configuration.enabled ? ATColor.green : .secondary
+                )
+            }
+            Text(hasExistingBrain
+                 ? "The active brain continues from its current weights. RL snapshots become normal runnable brains, and later Training Data runs warm-start from the latest RL brain without resetting it."
+                 : "This AI can run immediately from a neutral, low-action policy. Reward and Punish teach it online; the first credited update creates its first runnable brain.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label("Manual feedback", systemImage: "hand.tap.fill")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(ATColor.green)
+                    Spacer()
+                    InfoTip("Feedback is timestamped the instant the shortcut, button, or wheel gesture occurs. The bounded causal window is credited even if the GPU update finishes after the scene changes.")
+                }
+                HStack(alignment: .bottom, spacing: 12) {
+                    DoubleField("Reward amount", value: $configuration.rewardAmount, help: "Exact positive value submitted by the Reward shortcut and Run-page button (up to 100).")
+                    ProfileHotkeyCaptureButton(
+                        title: "Reward shortcut",
+                        binding: $configuration.rewardHotkey,
+                        color: ATColor.green,
+                        model: model
+                    )
+                    DoubleField("Punish amount", value: $configuration.punishmentAmount, help: "Exact magnitude submitted as a negative value by the Punish shortcut and Run-page button (up to 100).")
+                    ProfileHotkeyCaptureButton(
+                        title: "Punish shortcut",
+                        binding: $configuration.punishmentHotkey,
+                        color: ATColor.coral,
+                        model: model
+                    )
+                }
+                if shortcutCollision {
+                    Label("Reward and Punish must differ and cannot match Panic, Record, or Run in Settings.", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption.bold())
+                        .foregroundStyle(ATColor.coral)
+                }
+                Divider()
+                Toggle("Modifier + scroll wheel gives exact feedback steps", isOn: $configuration.scrollFeedbackEnabled)
+                    .tint(ATColor.cyan)
+                if configuration.scrollFeedbackEnabled {
+                    HStack(alignment: .bottom, spacing: 12) {
+                        ReinforcementModifierChordEditor(modifiers: $configuration.scrollCarbonModifiers)
+                        DoubleField("Amount per detent", value: $configuration.scrollStep, help: "Trackpad deltas accumulate to the same fixed step as a physical wheel detent, so the submitted amount is exact.")
+                        Toggle("Scroll up rewards", isOn: $configuration.scrollUpRewards)
+                            .tint(ATColor.green)
+                        Spacer()
+                    }
+                    if configuration.scrollCarbonModifiers == 0 {
+                        Text("Select at least one modifier so ordinary scrolling remains available to you and the AI.")
+                            .font(.caption.bold()).foregroundStyle(ATColor.coral)
+                    }
+                }
+            }
+            .padding(12)
+            .raisedGlassSurface(cornerRadius: 11, tint: ATColor.green)
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Credit assignment").font(.subheadline.bold()).foregroundStyle(ATColor.cyan)
+                    Spacer()
+                    InfoTip("Recent decisions receive decayed credit, newest first. Updates are serialized with inference and clipped to keep manual training stable.")
+                }
+                HStack {
+                    DoubleField("Window (seconds)", value: $configuration.creditWindowSeconds, help: "How far before your feedback the learner looks for causal actions (0.05–10 seconds).")
+                    DoubleField("Older-frame decay", value: $configuration.creditDecay, help: "Multiplier applied for each older credited decision (0.1–1).")
+                    IntField("Maximum frames", value: $configuration.maximumCreditFrames, help: "Hard cap on transitions updated by one feedback event (1–64).")
+                    IntField("Autosave feedback", value: $configuration.autosaveFeedbackCount, help: "Publish an immutable RL autosave after this many feedback events that produced an update.")
+                }
+                Toggle("Learn from inactive keys and buttons", isOn: $configuration.learnFromInaction)
+                    .tint(ATColor.amber)
+                Text(configuration.learnFromInaction
+                     ? "Both action and inaction are credited. Punishment can therefore make previously inactive controls more likely; use this only for deliberate stillness/waiting shaping."
+                     : "Recommended: credit follows activated keys/buttons and meaningful movement, avoiding punishment that accidentally promotes every inactive control.")
+                    .font(.caption).foregroundStyle(configuration.learnFromInaction ? ATColor.amber : .secondary)
+            }
+            .padding(12)
+            .raisedGlassSurface(cornerRadius: 11, tint: ATColor.cyan)
+
+            ReinforcementAllowedKeysEditor(keys: $configuration.allowedKeyCodes)
+
+            DisclosureGroup("Advanced stability and exploration", isExpanded: $showsAdvanced) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        DoubleField("RL learning rate", value: $configuration.learningRate, help: "AdamW update size for online learning. This optimizer is separate from Training Data continuation.")
+                        DoubleField("Binary exploration", value: $configuration.binaryExploration, help: "Probability mix with an unbiased binary action sample. New policies otherwise begin with a low 0.2% binary-action probability.")
+                        DoubleField("Continuous noise", value: $configuration.continuousExplorationStandardDeviation, help: "Standard deviation for bounded mouse and scroll exploration.")
+                    }
+                    HStack {
+                        DoubleField("PPO clip", value: $configuration.policyClip, help: "Bounds the likelihood-ratio change from the behavior policy that generated each action.")
+                        DoubleField("Behavior anchor", value: $configuration.behaviorAnchor, help: "KL-style penalty that resists abrupt drift from the action-time policy.")
+                        DoubleField("Entropy bonus", value: $configuration.entropyBonus, help: "Small incentive to preserve exploration in binary controls.")
+                        DoubleField("Gradient norm", value: $configuration.maximumGradientNorm, help: "Global gradient clipping threshold for each online update.")
+                    }
+                    HStack {
+                        Button("Recommended defaults") {
+                            let enabled = configuration.enabled
+                            let allowedKeys = configuration.allowedKeyCodes
+                            configuration = ReinforcementConfiguration()
+                            configuration.enabled = enabled
+                            configuration.allowedKeyCodes = allowedKeys
+                        }
+                        .primaryButton(color: ATColor.amber)
+                        Spacer()
+                        Text("Online updates use clipped policy gradients, a fixed exploration distribution, behavior anchoring, finite checks, and a bounded 256 MB transition budget.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.top, 10)
+            }
+
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "viewfinder.circle")
+                    .foregroundStyle(ATColor.violet)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Ready for automatic rewards").font(.subheadline.bold()).foregroundStyle(ATColor.violet)
+                    Text("Future screen-element, shape, color, OCR, or game-state detectors plug into the same timestamped signal interface as manual controls. They do not require a new optimizer, brain format, or persistence path.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding(11)
+            .raisedGlassSurface(cornerRadius: 11, tint: ATColor.violet)
+        }
+        .opacity(configuration.enabled ? 1 : 0.78)
+    }
+
+    private var shortcutCollision: Bool {
+        let feedback = Set([configuration.rewardHotkey, configuration.punishmentHotkey])
+        return feedback.count != 2
+            || !feedback.isDisjoint(with: [model.hotkeys.panic, model.hotkeys.record, model.hotkeys.run])
+    }
+}
+
+private struct ProfileHotkeyCaptureButton: View {
+    let title: String
+    @Binding var binding: HotkeyBinding
+    let color: Color
+    @ObservedObject var model: AppModel
+    @State private var isListening = false
+    @State private var keyMonitor: Any?
+    @State private var mouseMonitor: Any?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Button(isListening ? "Press shortcut…" : binding.shortcutDisplayName) {
+                isListening ? stop() : begin()
+            }
+            .primaryButton(color: isListening ? ATColor.amber : color)
+            .help("Keyboard and mouse-button shortcuts are supported. Add modifiers to avoid intercepting normal input.")
+        }
+        .onDisappear { stop() }
+    }
+
+    private func begin() {
+        stop(resume: false)
+        model.suspendGlobalHotkeys()
+        isListening = true
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard !event.isARepeat else { return nil }
+            binding = HotkeyBinding(
+                keyCode: UInt32(event.keyCode),
+                carbonModifiers: event.modifierFlags.carbonHotkeyModifiers
+            )
+            stop()
+            return nil
+        }
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { event in
+            binding = .mouse(
+                UInt8(clamping: event.buttonNumber),
+                carbonModifiers: event.modifierFlags.carbonHotkeyModifiers
+            )
+            stop()
+            return nil
+        }
+    }
+
+    private func stop(resume: Bool = true) {
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
+        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor); self.mouseMonitor = nil }
+        let wasListening = isListening
+        isListening = false
+        if resume, wasListening { model.resumeGlobalHotkeys() }
+    }
+}
+
+private struct ReinforcementModifierChordEditor: View {
+    @Binding var modifiers: UInt32
+    private let options: [(String, UInt32)] = [
+        ("⌃ Control", UInt32(1 << 12)),
+        ("⌥ Option", UInt32(1 << 11)),
+        ("⇧ Shift", UInt32(1 << 9)),
+        ("⌘ Command", UInt32(1 << 8))
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Scroll modifiers").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 5) {
+                ForEach(options, id: \.1) { option in
+                    Button(option.0) { modifiers ^= option.1 }
+                        .buttonStyle(.plain)
+                        .font(.caption.bold())
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 7).fill(modifiers & option.1 != 0 ? ATColor.cyan.opacity(0.22) : Color.white.opacity(0.04)))
+                        .overlay(RoundedRectangle(cornerRadius: 7).stroke(modifiers & option.1 != 0 ? ATColor.cyan : ATColor.border, lineWidth: 0.8))
+                }
+            }
+        }
+    }
+}
+
+private struct ReinforcementAllowedKeysEditor: View {
+    @Binding var keys: Set<UInt16>
+    private let keyRows: [[UInt16]] = [
+        [18, 19, 20, 21, 23, 22, 26, 28, 25, 29],
+        [48, 12, 13, 14, 15, 17, 16, 32, 34, 31, 35, 33, 30],
+        [57, 0, 1, 2, 3, 5, 4, 38, 40, 37, 41, 39, 36],
+        [56, 6, 7, 8, 9, 11, 45, 46, 43, 47, 44, 49],
+        [59, 58, 55, 123, 125, 124, 126]
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text("Brand-new AI keyboard firewall").font(.subheadline.bold()).foregroundStyle(ATColor.violet)
+                InfoTip("A new policy may emit only these explicitly allowed keys. Existing trained brains use the union of this set and demonstrated keys. Per-AI blocked outputs and the Run keyboard switch still take priority.")
+                Spacer()
+                StatusPill(text: "\(keys.count) allowed", color: keys.isEmpty ? ATColor.amber : ATColor.violet)
+                Button("WASD + Space") { keys.formUnion([0, 1, 2, 13, 49]) }.primaryButton(color: ATColor.violet)
+                Button("Clear") { keys.removeAll() }.primaryButton()
+            }
+            ForEach(keyRows.indices, id: \.self) { row in
+                HStack(spacing: 5) {
+                    ForEach(keyRows[row], id: \.self) { code in
+                        let selected = keys.contains(code)
+                        Button(KeyNames.name(for: code)) {
+                            if selected { keys.remove(code) } else { keys.insert(code) }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .frame(minWidth: code == 49 ? 74 : 28, minHeight: 25)
+                        .background(RoundedRectangle(cornerRadius: 7).fill(selected ? ATColor.violet.opacity(0.25) : Color.white.opacity(0.035)))
+                        .overlay(RoundedRectangle(cornerRadius: 7).stroke(selected ? ATColor.violet : ATColor.border, lineWidth: 0.8))
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            if keys.isEmpty {
+                Text("No keyboard key can be explored by a brand-new AI. Mouse, buttons, and scroll still follow the Control Channels and runtime firewalls above.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .raisedGlassSurface(cornerRadius: 11, tint: ATColor.violet)
+    }
+}
+
+private extension NSEvent.ModifierFlags {
+    var carbonHotkeyModifiers: UInt32 {
+        var result: UInt32 = 0
+        if contains(.command) { result |= UInt32(1 << 8) }
+        if contains(.shift) { result |= UInt32(1 << 9) }
+        if contains(.option) { result |= UInt32(1 << 11) }
+        if contains(.control) { result |= UInt32(1 << 12) }
+        return result
     }
 }
 
@@ -1392,18 +1709,18 @@ struct RunView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                SectionTitle("Run", "A persistent ScreenCaptureKit stream sees the exact training resolution while cached temporal embeddings and independent action execution keep response latency low.")
+                SectionTitle("Run", "Run an existing brain or start a new neutral one with live Reward/Punish learning. Capture, causal credit, inference, and input safety stay local.")
                 OLEDCard {
                     HStack {
                         Picker("AI to run", selection: $model.selectedProfileID) {
                             Text("Select an AI…").tag(UUID?.none)
                             ForEach(model.profiles) { profile in
-                                Text("\(profile.name) — \(profile.trainingProgress?.globalStep ?? 0) steps").tag(Optional(profile.id))
+                                Text("\(profile.name) — \(profile.activeVersionID == nil ? (profile.effectiveReinforcement.enabled ? "new RL brain" : "untrained") : "\(profile.trainingProgress?.globalStep ?? 0) steps")").tag(Optional(profile.id))
                             }
                         }
                         .frame(maxWidth: 430)
                         .disabled(model.agentIsActiveOrStarting)
-                        InfoTip("Choose the trained AI to run here. The active saved brain for that AI is loaded directly, so the full autosave list does not need to be opened.")
+                        InfoTip("Choose an AI with an active saved brain, or a brand-new AI with RL enabled. Saved weights load directly; a new RL AI starts neutral and publishes its first brain after credited feedback.")
                         Spacer()
                         if let progress = model.selectedProfile?.trainingProgress {
                             Text("\(progress.globalStep) steps • \(progress.epoch) epochs").font(.caption.bold()).foregroundStyle(ATColor.green)
@@ -1412,7 +1729,7 @@ struct RunView: View {
                 }
                 if let profile = model.selectedProfile {
                     OLEDCard {
-                        HStack { VStack(alignment: .leading, spacing: 7) { Text(profile.name).font(.title2.bold()); Text("Model vision \(profile.preprocessing.width) × \(profile.preprocessing.height) — live capture will be exactly the same").foregroundStyle(ATColor.cyan); Text("\(profile.preprocessing.colorMode.rawValue), \(profile.preprocessing.bitDepth)-bit, \(profile.preprocessing.chroma.rawValue)").foregroundStyle(.secondary) }; Spacer(); StatusPill(text: model.isStartingAgent ? "Starting / stopping" : model.isRunning ? "AI running" : profile.activeVersionID == nil ? "Training required" : "Ready", color: model.agentIsActiveOrStarting ? ATColor.green : ATColor.violet) }
+                        HStack { VStack(alignment: .leading, spacing: 7) { Text(profile.name).font(.title2.bold()); Text("Model vision \(profile.preprocessing.width) × \(profile.preprocessing.height) — live capture will be exactly the same").foregroundStyle(ATColor.cyan); Text("\(profile.preprocessing.colorMode.rawValue), \(profile.preprocessing.bitDepth)-bit, \(profile.preprocessing.chroma.rawValue)").foregroundStyle(.secondary) }; Spacer(); StatusPill(text: runReadiness(profile), color: model.agentIsActiveOrStarting || profile.effectiveReinforcement.enabled ? ATColor.green : ATColor.violet) }
                     }
                     OLEDCard {
                         VStack(alignment: .leading, spacing: 12) {
@@ -1425,12 +1742,15 @@ struct RunView: View {
                                 Text("The persistent stream is preprocessed to the model's exact \(profile.preprocessing.width) × \(profile.preprocessing.height) vision contract. Reduced historical frames are encoded once and reused as compact embeddings. AgentTrainer and its floating HUD are excluded.").font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    if profile.effectiveReinforcement.enabled {
+                        LiveReinforcementCard(profile: profile, model: model)
+                    }
                     HStack(alignment: .top, spacing: 14) {
                         OLEDCard {
                             VStack(alignment: .leading, spacing: 14) {
                             Text("Perception and action").font(.headline)
                             HStack { Picker("Frame mode", selection: $model.frameMode) { ForEach(FrameMode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented); InfoTip("Newest Frame stays responsive by skipping old frames when inference is busy. Every Frame preserves order by slowing capture instead of building a large queue.") }
-                            HStack { Picker("Mouse execution", selection: $model.runMouseMode) { ForEach(MouseControlMode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented); InfoTip("Auto checks the selected AI's recordings and chooses normal cursor movement or signed Game Camera deltas. This prevents a locked-camera recording from being run as positive screen coordinates, which can look like the AI only moves right and down. Use Absolute Cursor only for a visibly moving pointer.") }
+                            HStack { Picker("Mouse execution", selection: $model.runMouseMode) { ForEach(MouseControlMode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented); InfoTip("Auto checks the selected AI's recordings and chooses normal cursor movement or signed Game Camera deltas. A brand-new RL brain starts in neutral Game Camera mode because absolute coordinates have no no-movement value. Choose Absolute Cursor explicitly when the task uses a visible pointer.") }
                                 if model.runMouseMode != .absolute {
                                     VStack(alignment: .leading, spacing: 9) {
                                         HStack { Text(model.runMouseMode == .automatic ? "Game Camera settings (when Auto detects it)" : "Game Camera").font(.subheadline.bold()).foregroundStyle(ATColor.violet); Spacer(); Text("\(model.gameCamera.sensitivity.formatted(.number.precision(.fractionLength(2))))× sensitivity").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
@@ -1516,7 +1836,7 @@ struct RunView: View {
                             KeyRestrictionGrid(restrictions: Binding(get: { profile.effectiveRestrictions }, set: { value in var changed = profile; changed.restrictions = value; model.saveProfile(changed) }), model: model).disabled(model.agentIsActiveOrStarting)
                         }
                     }
-                    HStack { StatusPill(text: model.isTraining ? "Background training remains active" : "Custom panic shortcut armed", color: model.isTraining ? ATColor.cyan : ATColor.coral); Spacer(); if model.agentIsActiveOrStarting { Button(model.isStartingAgent ? "Cancel AI Start & Release Inputs" : "Stop AI & Disable All Hooks") { Task { await model.stopAgent() } }.primaryButton(color: ATColor.coral) } else { Button("Run AI") { Task { await model.startAgent() } }.primaryButton(color: ATColor.green).disabled(profile.activeVersionID == nil || model.trainingProfileID == profile.id || model.recordingIsActiveOrStarting || model.isReplaying) } }
+                    HStack { StatusPill(text: model.isTraining ? "Background training remains active" : "Custom panic shortcut armed", color: model.isTraining ? ATColor.cyan : ATColor.coral); Spacer(); if model.agentIsActiveOrStarting { Button(model.isStartingAgent ? "Cancel AI Start & Release Inputs" : "Stop AI & Save Learning") { Task { await model.stopAgent() } }.primaryButton(color: ATColor.coral) } else { Button(profile.effectiveReinforcement.enabled ? "Run & Learn" : "Run AI") { Task { await model.startAgent() } }.primaryButton(color: ATColor.green).disabled(!profile.canRunOrLearn || model.trainingProfileID == profile.id || model.recordingIsActiveOrStarting || model.isReplaying) } }
                 } else { ContentUnavailableView("No AI profile selected", systemImage: "cpu") }
             }.padding(28)
         }
@@ -1530,6 +1850,136 @@ struct RunView: View {
         case .keyboard: profile.channels.keyboard
         case .modifiers: profile.channels.modifiers
         }
+    }
+
+    private func runReadiness(_ profile: AIProfile) -> String {
+        if model.isStartingAgent { return "Starting / stopping" }
+        if model.isRunning { return profile.effectiveReinforcement.enabled ? "AI running & learning" : "AI running" }
+        if profile.activeVersionID != nil { return profile.effectiveReinforcement.enabled ? "Ready to run & learn" : "Ready" }
+        return profile.effectiveReinforcement.enabled ? "New neutral RL brain" : "Training required"
+    }
+}
+
+private struct LiveReinforcementCard: View {
+    let profile: AIProfile
+    @ObservedObject var model: AppModel
+
+    private var configuration: ReinforcementConfiguration { profile.effectiveReinforcement }
+    private var controlsAreLive: Bool {
+        model.isRunning && model.runningProfileID == profile.id && model.reinforcementMetrics.isActive
+    }
+
+    var body: some View {
+        OLEDCard {
+            VStack(alignment: .leading, spacing: 13) {
+                HStack {
+                    Label("Live reinforcement", systemImage: "bolt.heart.fill")
+                        .font(.headline)
+                        .foregroundStyle(ATColor.green)
+                    StatusPill(text: controlsAreLive ? "Feedback armed" : "Arms when running", color: controlsAreLive ? ATColor.green : ATColor.amber)
+                    Spacer()
+                    Text("Session net \(signed(model.reinforcementMetrics.netReward))")
+                        .font(.callout.bold().monospacedDigit())
+                        .foregroundStyle(model.reinforcementMetrics.netReward >= 0 ? ATColor.green : ATColor.coral)
+                }
+
+                HStack(spacing: 12) {
+                    feedbackButton(
+                        title: "REWARD",
+                        amount: configuration.rewardAmount,
+                        shortcut: configuration.rewardHotkey.shortcutDisplayName,
+                        color: ATColor.green,
+                        symbol: "hand.thumbsup.fill",
+                        action: model.rewardRunningAgent
+                    )
+                    feedbackButton(
+                        title: "PUNISH",
+                        amount: -configuration.punishmentAmount,
+                        shortcut: configuration.punishmentHotkey.shortcutDisplayName,
+                        color: ATColor.coral,
+                        symbol: "hand.thumbsdown.fill",
+                        action: model.punishRunningAgent
+                    )
+                }
+                .disabled(!controlsAreLive)
+
+                HStack(spacing: 10) {
+                    ReinforcementMetricChip(title: "Feedback", value: "\(model.reinforcementMetrics.feedbackCount)", color: ATColor.violet)
+                    ReinforcementMetricChip(title: "Updates", value: "\(model.reinforcementMetrics.updateCount)", color: ATColor.green)
+                    ReinforcementMetricChip(title: "Last credit", value: "\(model.reinforcementMetrics.creditedFrames) frames", color: ATColor.cyan)
+                    ReinforcementMetricChip(title: "Update time", value: model.reinforcementMetrics.updateCount == 0 ? "—" : "\(model.reinforcementMetrics.lastUpdateMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms", color: ATColor.amber)
+                    if let loss = model.reinforcementMetrics.lastPolicyLoss {
+                        ReinforcementMetricChip(title: "Policy loss", value: loss.formatted(.number.precision(.fractionLength(4))), color: ATColor.violet)
+                    }
+                }
+
+                HStack(alignment: .top, spacing: 12) {
+                    Label("Global shortcuts: \(configuration.rewardHotkey.shortcutDisplayName) reward • \(configuration.punishmentHotkey.shortcutDisplayName) punish", systemImage: "keyboard")
+                    if configuration.scrollFeedbackEnabled {
+                        Label("\(scrollChord) + wheel: \(configuration.scrollStep.formatted(.number.precision(.fractionLength(0...2)))) per detent", systemImage: "computermouse")
+                    }
+                    Spacer()
+                }
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+
+                Text(controlsAreLive
+                     ? "Feedback is acknowledged immediately in the capture-excluded HUD. It credits up to \(configuration.maximumCreditFrames) decisions from the previous \(configuration.creditWindowSeconds.formatted(.number.precision(.fractionLength(2)))) seconds; learning snapshots are saved automatically and once more when you stop."
+                     : "Start this AI to arm global feedback. You can switch scenes immediately after pressing a shortcut—the signal keeps its input-time timestamp.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func feedbackButton(
+        title: String,
+        amount: Double,
+        shortcut: String,
+        color: Color,
+        symbol: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: symbol).font(.title2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(title) \(signed(amount))").font(.title3.bold())
+                    Text(shortcut).font(.caption.bold().monospaced())
+                }
+                Spacer()
+            }
+            .foregroundStyle(color)
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, minHeight: 62)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(color.opacity(0.12)))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(color.opacity(0.65), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var scrollChord: String {
+        HotkeyBinding(keyCode: 0, carbonModifiers: configuration.scrollCarbonModifiers).shortcutDisplayName
+            .replacingOccurrences(of: KeyNames.name(for: 0), with: "")
+    }
+
+    private func signed(_ value: Double) -> String {
+        value.formatted(.number.sign(strategy: .always()).precision(.fractionLength(0...2)))
+    }
+}
+
+private struct ReinforcementMetricChip: View {
+    let title: String
+    let value: String
+    let color: Color
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title.uppercased()).font(.system(size: 9, weight: .bold)).foregroundStyle(color)
+            Text(value).font(.caption.bold().monospacedDigit())
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 9).fill(color.opacity(0.08)))
     }
 }
 

@@ -1,4 +1,4 @@
-# AgentTrainer 2.2.0
+# AgentTrainer 2.4.0
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -20,8 +20,8 @@ The package pins MLX Swift exactly in `Package.resolved`.
 2. Create a recording folder, choose a display, window, or region, optionally save those settings as a reusable preset, then record a demonstration.
    Existing native `.atrrecord` packages or a portable recording export can also be imported from the Library without transcoding.
 3. Create an AI profile, select recording folders, and configure its vision, controls, and network.
-4. Train the profile. Pause publishes a runnable brain and retains an exact checkpoint.
-5. In Run, choose cursor mode and output permissions, then start the AI.
+4. Train from demonstrations, enable real-time reinforcement learning, or use both in either order. Pausing supervised training publishes a runnable brain and retains an exact checkpoint.
+5. In Run, choose cursor mode and output permissions, then start the AI. An RL-enabled profile exposes live Reward and Punish controls while it runs.
 6. Use the configured panic shortcut at any time to stop hooks and release held controls.
 
 Training and another already-trained AI may run at the same time when they use different profiles.
@@ -42,6 +42,12 @@ Policy v6, introduced in AgentTrainer 2.1, is designed around both useful capaci
 
 Training has independent, configurable anti-memorization controls for label-preserving vision variation, small random neutral occlusions, control-history dropout/noise, whole temporal-token dropout, and binary label smoothing. These perturbations are disabled for validation and live inference. Recording-disjoint validation where possible, purged causal validation otherwise, per-head metrics, and best-held-out-brain activation remain the primary generalization checks.
 
+## Resilient large-library training in 2.4
+
+Large recording selections now receive a bounded metadata and synchronized-input preflight before any expensive frame packing. An interrupted or manually copied QuickTime package with no readable track index is identified in seconds, named by recording and package ID in Diagnostics, and excluded while valid neighboring recordings continue. Source packages are never repaired, deleted, or rewritten implicitly, and the cache/checkpoint identity is derived only from recordings that actually supplied training rows.
+
+Cache construction estimates peak working-disk demand before decoding and reports the projected packed size. Parallel packing retains deterministic recording order while limiting out-of-order shard look-ahead, so one long early recording cannot allow hundreds of completed temporary shards to accumulate. Progress aggregation is constant-time per update, a reusable cache no longer initializes the Metal preprocessor unnecessarily, and duplicate percentage text plus repetitive training-performance/autosave log noise have been removed.
+
 ## Faster training in 2.2
 
 AgentTrainer 2.2 removes host and kernel overhead without changing the learned model or training objective. Compatible Policy v6 brains, exact optimizer checkpoints, recordings, and packed caches remain reusable.
@@ -53,6 +59,21 @@ AgentTrainer 2.2 removes host and kernel overhead without changing the learned m
 - Up to four strictly ordered compiled MLX updates are chained before one host synchronization when unified memory permits. Queues never cross an epoch, autosave, pause, or configured run boundary.
 
 Every row, current and past frame, target, loss term, optimizer update, schedule value, and random-state transition remains present. The release benchmark compares matched-update loss and validation behavior; no speed setting silently lowers resolution, precision, capacity, or data coverage.
+
+## Real-time reinforcement learning in 2.3
+
+Each AI model's Training configuration now has separate **Training Data** and **RL Configuration** tabs. Reinforcement learning is opt-in per AI and works in both directions:
+
+- A brand-new AI starts from a neutral, deliberately low-action Policy v6 brain and creates its first saved brain after its first credited online update.
+- An already-trained AI loads its active weights exactly and learns on top of them.
+- An RL brain is an ordinary runnable immutable version. A later Training Data run warm-starts from those weights instead of restoring an older pre-RL brain.
+- Returning to RL resumes its separate AdamW state when the RL optimizer settings still match. Changing those settings starts fresh optimizer state but never resets the learned weights.
+
+To use it, open **AI Models**, select an AI, switch Training configuration to **RL Configuration**, enable real-time RL, and choose feedback controls. Reward and Punish support configurable exact amounts, global keyboard or mouse-button shortcuts, Run-page buttons, and a modifier-plus-scroll gesture. Physical wheel detents submit one exact configured step; trackpad motion is accumulated into those same fixed steps. Configure the keyboard firewall before starting a brand-new AI, then use **Run & Learn** and give feedback immediately after the action you want to reinforce or discourage. **Stop AI & Save Learning** publishes the final updated brain; bounded periodic autosaves protect longer sessions.
+
+Feedback is timestamped at the shortcut, button, or wheel boundary. The learner credits only recent causal decisions, updates on the same serial queue as inference, clips policy movement and gradients, and keeps transition memory bounded. Inactive keys and buttons are excluded from credit by default so a punishment does not accidentally promote every unused control.
+
+Manual controls use the same `ReinforcementSignal` boundary intended for future automatic screen-element, color, shape, OCR, or game-state detectors. A detector supplies timestamped signed values; credit assignment, optimization, safety filtering, metrics, and persistence remain shared.
 
 ## Recording efficiency
 
@@ -79,7 +100,7 @@ Runtime output is constrained in several independent layers:
 
 - A physical-input monitor can stop the AI as soon as the user intervenes.
 - The panic action stops capture and action queues before releasing every held key and button.
-- A model can emit only keys represented in its training data.
+- A model can emit only keys represented in its demonstrations or explicitly enabled in its RL keyboard firewall.
 - Per-profile restrictions and live cursor/keyboard permissions are applied again at execution.
 - Full-Mac control is opt-in; otherwise output stays inside the configured control region.
 - Locked-camera movement is transient and is never replayed from a stale prediction.
@@ -123,7 +144,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.2.0.dmg`
+- `AgentTrainer-2.4.0.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

@@ -21,6 +21,10 @@ final class AgentRuntime: @unchecked Sendable {
     var onStop: (@Sendable (String?) -> Void)?
     var onPreview: (@Sendable (VisionPreviewFrame) -> Void)?
     var onVisualization: (@Sendable (CNNVisualizationFrame) -> Void)?
+    var onReinforcementSignal: (@Sendable (ReinforcementSignal) -> Void)?
+    var onReinforcementMetrics: (@Sendable (ReinforcementMetrics) -> Void)?
+    var onReinforcementError: (@Sendable (String) -> Void)?
+    var onReinforcementSnapshot: (@Sendable (ReinforcementSnapshot) async throws -> Void)?
 
     private let capture = CaptureService()
     private let preprocessor: VisionPreprocessor
@@ -31,6 +35,11 @@ final class AgentRuntime: @unchecked Sendable {
     private let actionQueue = DispatchQueue(label: "AgentTrainer.Actions", qos: .userInteractive)
     private let lock = NSLock()
     private var model: AgentPolicy?
+    /// Accessed only on `inferenceQueue` after startup. The runtime lock owns
+    /// publication/removal of the reference and the pending-signal handoff.
+    private var reinforcementTrainer: ReinforcementTrainer?
+    private var pendingReinforcementSignals: [ReinforcementSignal] = []
+    private var reinforcementScroll = ReinforcementScrollAccumulator()
     private var predictionFunction: VisualizationFunction?
     private var activationVisualizationFunctions: [VisualizationFunction] = []
     private var channelVisualizationFunction: (@Sendable ([MLXArray]) -> [MLXArray])?
@@ -119,15 +128,35 @@ final class AgentRuntime: @unchecked Sendable {
         injector.onState = { [weak self] state in self?.onState?(state) }
     }
 
-    func start(profile: AIProfile, version: ModelVersionManifest, allowedKeyCodes: Set<UInt16>, captureSpec: CaptureSpec, captureRect: CGRect, mode: FrameMode, mouseMode: MouseControlMode, gameCamera: GameCameraSettings = GameCameraSettings(), outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions(), safety: AgentSafetyPolicy, previewFPS: Double = 0, visualizationSettings: CNNVisualizationSettings = CNNVisualizationSettings(), ignoredHotkeys: [HotkeyBinding] = []) async throws {
+    func start(
+        profile: AIProfile,
+        version: ModelVersionManifest?,
+        allowedKeyCodes: Set<UInt16>,
+        captureSpec: CaptureSpec,
+        captureRect: CGRect,
+        mode: FrameMode,
+        mouseMode: MouseControlMode,
+        gameCamera: GameCameraSettings = GameCameraSettings(),
+        outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions(),
+        safety: AgentSafetyPolicy,
+        previewFPS: Double = 0,
+        visualizationSettings: CNNVisualizationSettings = CNNVisualizationSettings(),
+        ignoredHotkeys: [HotkeyBinding] = [],
+        reinforcementConfiguration: ReinforcementConfiguration? = nil,
+        reinforcementSnapshotRoot: URL? = nil
+    ) async throws {
         guard AXIsProcessTrusted() else {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(options)
             throw AgentTrainerError.permission("Accessibility permission is required before AgentTrainer can press keys or control the mouse.")
         }
-        guard version.schemaVersion == ModelContract.schemaVersion,
-              version.relativeMouseScale == GameCameraContract.deltaScale else {
-            throw AgentTrainerError.model("This brain predates the current visual and Game Camera contracts. Retrain it from the original recordings.")
+        if let version {
+            guard version.schemaVersion == ModelContract.schemaVersion,
+                  version.relativeMouseScale == GameCameraContract.deltaScale else {
+                throw AgentTrainerError.model("This brain predates the current visual and Game Camera contracts. Retrain it from the original recordings.")
+            }
+        } else if reinforcementConfiguration?.enabled != true {
+            throw AgentTrainerError.model("This AI has no runnable brain. Enable Reinforcement Learning to start it safely from a new neutral policy.")
         }
         let launchToken: UInt64? = lock.withLock {
             guard stopped, !starting, !teardownInProgress else { return nil }
@@ -150,9 +179,11 @@ final class AgentRuntime: @unchecked Sendable {
         // precision, and architecture must come from the saved version rather
         // than mutable editor fields that may have changed after training.
         var runtimeProfile = profile
-        runtimeProfile.preprocessing = version.preprocessing
-        runtimeProfile.channels = RuntimeActionSemantics.effectiveChannels(saved: version.channels, current: profile.channels)
-        runtimeProfile.training = version.training
+        if let version {
+            runtimeProfile.preprocessing = version.preprocessing
+            runtimeProfile.channels = RuntimeActionSemantics.effectiveChannels(saved: version.channels, current: profile.channels)
+            runtimeProfile.training = version.training
+        }
         _ = try runtimeProfile.preprocessing.validated()
         _ = try runtimeProfile.training.effectiveTemporalVision.validated(
             current: runtimeProfile.preprocessing,
@@ -160,9 +191,36 @@ final class AgentRuntime: @unchecked Sendable {
         )
         let startRevisions = lock.withLock { (outputPermissionsRevision, visualizationSettingsRevision) }
         let model = AgentPolicy(profile: runtimeProfile)
-        let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
-        try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
+        let versionDirectory: URL?
+        if let version {
+            let directory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
+            try model.loadWeights(from: directory.appendingPathComponent(version.weightsFile))
+            versionDirectory = directory
+        } else {
+            model.initializeForSafeExploration()
+            versionDirectory = nil
+        }
         model.train(false)
+        let reinforcementTrainer: ReinforcementTrainer?
+        if let reinforcementConfiguration, reinforcementConfiguration.enabled {
+            guard let reinforcementSnapshotRoot else {
+                throw AgentTrainerError.storage("The managed model folder is unavailable for online-learning snapshots.")
+            }
+            reinforcementTrainer = try ReinforcementTrainer(
+                model: model,
+                profile: runtimeProfile,
+                configuration: reinforcementConfiguration,
+                baseVersion: version,
+                baseVersionDirectory: versionDirectory,
+                snapshotRoot: reinforcementSnapshotRoot,
+                demonstratedKeyCodes: allowedKeyCodes,
+                trainingShowsCursor: version?.trainingShowsCursor ?? captureSpec.showsCursor,
+                recommendedMouseMode: mouseMode
+            )
+        } else {
+            reinforcementTrainer = nil
+        }
+        let reinforcementIsActive = reinforcementTrainer != nil
         let temporal = runtimeProfile.training.effectiveTemporalVision
         let hasTemporalMemory = temporal.pastFrameCount > 0
         let pastSpec = temporal.pastFrameSpec(from: runtimeProfile.preprocessing)
@@ -182,12 +240,16 @@ final class AgentRuntime: @unchecked Sendable {
                     pastVisualEmbeddings: inputs[2],
                     pastControls: inputs[3]
                 )
+                let logits = model.logits(temporalFeatures: temporalFeatures)
                 return [
-                    model.activatedPredictions(logits: model.logits(temporalFeatures: temporalFeatures)),
+                    reinforcementIsActive ? logits : model.activatedPredictions(logits: logits),
                     reducedEmbedding.asType(.float32)
                 ]
             }
-            return [model.currentOnlyPredictions(currentImages: currentImages)]
+            let logits = model.logits(
+                temporalFeatures: model.currentOnlyTemporalFeatures(currentImages: currentImages)
+            )
+            return [reinforcementIsActive ? logits : model.activatedPredictions(logits: logits)]
         }
         // Diagnostic graphs are lazy: creating these closures does not execute
         // or materialize an extra tensor. The selected graph first compiles only
@@ -210,7 +272,7 @@ final class AgentRuntime: @unchecked Sendable {
                     : model.currentOnlyTemporalFeatures(currentVisualFeatures: layers.last!)
                 let logits = model.logits(temporalFeatures: temporalFeatures)
                 let map = model.sampledForVisualization(layers[selectedLayer]).mean(axis: -1, keepDims: true)
-                return [model.activatedPredictions(logits: logits)]
+                return [reinforcementIsActive ? logits : model.activatedPredictions(logits: logits)]
                     + (reducedEmbedding.map { [$0.asType(.float32)] } ?? [])
                     + [map]
             }
@@ -231,7 +293,7 @@ final class AgentRuntime: @unchecked Sendable {
                 )
                 : model.currentOnlyTemporalFeatures(currentVisualFeatures: layers.last!)
             let logits = model.logits(temporalFeatures: temporalFeatures)
-            return [model.activatedPredictions(logits: logits)]
+            return [reinforcementIsActive ? logits : model.activatedPredictions(logits: logits)]
                 + (reducedEmbedding.map { [$0.asType(.float32)] } ?? [])
                 + [model.strongestChannelsForVisualization(layers.last!)]
         }
@@ -254,7 +316,7 @@ final class AgentRuntime: @unchecked Sendable {
             // Keep the exact final tensor on GPU for the post-CNN gradient.
             // This graph intentionally omits the channel ranking used by the
             // separate feature-grid view.
-            return [model.activatedPredictions(logits: logits)]
+            return [reinforcementIsActive ? logits : model.activatedPredictions(logits: logits)]
                 + (reducedEmbedding.map { [$0.asType(.float32)] } ?? [])
                 + [layers.last!]
         }
@@ -277,6 +339,9 @@ final class AgentRuntime: @unchecked Sendable {
         let accepted = lock.withLock { () -> Bool in
             guard launchRevision == launchToken, starting, stopped else { return false }
             self.model = model
+            self.reinforcementTrainer = reinforcementTrainer
+            self.pendingReinforcementSignals.removeAll(keepingCapacity: false)
+            self.reinforcementScroll = ReinforcementScrollAccumulator()
             self.predictionFunction = predictionFunction
             self.activationVisualizationFunctions = activationVisualizationFunctions
             self.channelVisualizationFunction = channelVisualizationFunction
@@ -284,7 +349,7 @@ final class AgentRuntime: @unchecked Sendable {
             self.saliencyGradientFunction = saliencyGradient
             self.profile = runtimeProfile
             self.allowedKeyCodes = allowedKeyCodes
-            self.shiftUsesKeyboardChannel = (version.trainingDataSchema ?? 0) >= 7
+            self.shiftUsesKeyboardChannel = (version?.trainingDataSchema ?? TrainingDataContract.schemaVersion) >= 7
             self.safety = safety
             self.captureRect = captureRect
             self.mode = mode
@@ -310,13 +375,18 @@ final class AgentRuntime: @unchecked Sendable {
             return true
         }
         guard accepted else { throw CancellationError() }
+        if let reinforcementTrainer {
+            onReinforcementMetrics?(reinforcementTrainer.metrics)
+        }
         do {
             guard lock.withLock({ !stopped }) else { throw CancellationError() }
             safetyMonitor.ignoredHotkeys = ignoredHotkeys
             safetyMonitor.onSample = { [weak self] sample in
                 guard let self else { return }
-                let panic = sample.kind == .key && sample.isDown && sample.keyCode == self.safety.panicKeyCode && (sample.modifiers & self.safety.panicModifiers) == self.safety.panicModifiers
-                guard panic || self.safety.stopOnHumanInput else { return }
+                if self.processReinforcementInput(sample) { return }
+                let policy = self.lock.withLock { self.safety }
+                let panic = sample.kind == .key && sample.isDown && sample.keyCode == policy.panicKeyCode && (sample.modifiers & policy.panicModifiers) == policy.panicModifiers
+                guard panic || policy.stopOnHumanInput else { return }
                 Task { await self.stop(reason: panic ? "Panic stop" : "Stopped on human input") }
             }
             try safetyMonitor.start()
@@ -325,7 +395,7 @@ final class AgentRuntime: @unchecked Sendable {
             lock.withLock { self.targetPID = targetPID }
             var liveCaptureSpec = captureSpec
             liveCaptureSpec.requestedFPS = runtimeProfile.training.perceptionFPS
-            liveCaptureSpec.showsCursor = version.trainingShowsCursor ?? captureSpec.showsCursor
+            liveCaptureSpec.showsCursor = version?.trainingShowsCursor ?? captureSpec.showsCursor
             try await capture.start(spec: liveCaptureSpec, queueDepth: mode == .newest ? 3 : 8, onFrame: { [weak self] buffer, pts in
                 self?.receive(buffer, timestamp: pts)
             }, onIdle: { [weak self] pts in
@@ -372,6 +442,128 @@ final class AgentRuntime: @unchecked Sendable {
         }
     }
 
+    /// Every provider—manual today and screen-aware automation later—enters
+    /// through this timestamped boundary. Signals are bounded immediately and
+    /// optimized on the inference queue, never concurrently with prediction.
+    func submitReinforcementSignal(_ rawSignal: ReinforcementSignal) {
+        guard rawSignal.timestamp.isFinite,
+              rawSignal.value.isFinite,
+              rawSignal.value != 0 else { return }
+        var signal = rawSignal
+        signal.value = min(
+            ReinforcementLearningContract.maximumSignalMagnitude,
+            max(-ReinforcementLearningContract.maximumSignalMagnitude, signal.value)
+        )
+        let accepted = lock.withLock { () -> Bool in
+            guard !stopped, reinforcementTrainer != nil else { return false }
+            if pendingReinforcementSignals.count >= 256,
+               let last = pendingReinforcementSignals.indices.last {
+                let combined = pendingReinforcementSignals[last].value + signal.value
+                pendingReinforcementSignals[last].value = min(
+                    ReinforcementLearningContract.maximumSignalMagnitude,
+                    max(
+                        -ReinforcementLearningContract.maximumSignalMagnitude,
+                        combined
+                    )
+                )
+                pendingReinforcementSignals[last].timestamp = max(
+                    pendingReinforcementSignals[last].timestamp,
+                    signal.timestamp
+                )
+                pendingReinforcementSignals[last].sourceIdentifier = "feedback.coalesced"
+                pendingReinforcementSignals[last].detail = "High-rate feedback coalesced at the bounded input queue"
+                if pendingReinforcementSignals[last].value == 0 {
+                    pendingReinforcementSignals.removeLast()
+                }
+            } else {
+                pendingReinforcementSignals.append(signal)
+            }
+            return true
+        }
+        guard accepted else { return }
+        onReinforcementSignal?(signal)
+        inferenceQueue.async { [weak self] in
+            self?.applyPendingReinforcementSignals(publishAutosaves: true)
+        }
+    }
+
+    func submitReinforcement(
+        value: Double,
+        sourceIdentifier: String,
+        detail: String? = nil,
+        timestamp: Double = CACurrentMediaTime()
+    ) {
+        submitReinforcementSignal(ReinforcementSignal(
+            timestamp: timestamp,
+            value: value,
+            sourceIdentifier: sourceIdentifier,
+            detail: detail
+        ))
+    }
+
+    private func processReinforcementInput(_ sample: InputSample) -> Bool {
+        let result = lock.withLock { () -> (Bool, Double?) in
+            guard let reinforcementTrainer else { return (false, nil) }
+            let result = reinforcementScroll.process(
+                sample,
+                configuration: reinforcementTrainer.configuration
+            )
+            return (result.handled, result.signal)
+        }
+        if let value = result.1 {
+            submitReinforcement(
+                value: value,
+                sourceIdentifier: "manual.scroll",
+                detail: "Modifier + feedback wheel"
+            )
+        }
+        return result.0
+    }
+
+    /// Must run on `inferenceQueue`. The queue is also the sole owner of model
+    /// inference and transition history, so an AdamW update can never race a
+    /// prediction or publish half-updated parameters.
+    private func applyPendingReinforcementSignals(publishAutosaves: Bool) {
+        let pending = lock.withLock { () -> ([ReinforcementSignal], ReinforcementTrainer?) in
+            let pending = pendingReinforcementSignals
+            pendingReinforcementSignals.removeAll(keepingCapacity: true)
+            return (pending, reinforcementTrainer)
+        }
+        guard let trainer = pending.1, !pending.0.isEmpty else { return }
+        do {
+            var shouldAutosave = false
+            for signal in pending.0 {
+                let result = try trainer.apply(signal)
+                shouldAutosave = shouldAutosave || result.shouldAutosave
+                onReinforcementMetrics?(result.metrics)
+            }
+            if publishAutosaves, shouldAutosave,
+               let snapshot = try trainer.makeSnapshot(isAutosave: true) {
+                onReinforcementMetrics?(trainer.metrics)
+                publishReinforcementSnapshotInBackground(snapshot)
+            }
+        } catch {
+            let message = error.localizedDescription
+            onReinforcementError?(message)
+            Task { await stop(reason: "Online learning stopped safely: \(message)") }
+        }
+    }
+
+    private func publishReinforcementSnapshotInBackground(_ snapshot: ReinforcementSnapshot) {
+        guard let publisher = onReinforcementSnapshot else {
+            try? FileManager.default.removeItem(at: snapshot.stagingDirectory)
+            return
+        }
+        Task { [onReinforcementError] in
+            do {
+                try await publisher(snapshot)
+            } catch {
+                try? FileManager.default.removeItem(at: snapshot.stagingDirectory)
+                onReinforcementError?(error.localizedDescription)
+            }
+        }
+    }
+
     func stop(reason: String? = nil) async {
         let action = lock.withLock { () -> StopAction in
             launchRevision &+= 1
@@ -408,11 +600,35 @@ final class AgentRuntime: @unchecked Sendable {
         safetyMonitor.onSample = nil
         _ = try? await capture.stop()
         await drain(queue: inferenceQueue)
+        let finalReinforcementSnapshot: ReinforcementSnapshot? = await withCheckedContinuation { continuation in
+            inferenceQueue.async { [weak self] in
+                guard let self else { continuation.resume(returning: nil); return }
+                self.applyPendingReinforcementSignals(publishAutosaves: false)
+                do {
+                    continuation.resume(returning: try self.reinforcementTrainer?.makeSnapshot(isAutosave: false))
+                } catch {
+                    self.onReinforcementError?(error.localizedDescription)
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+        if let finalReinforcementSnapshot {
+            if let publisher = onReinforcementSnapshot {
+                do { try await publisher(finalReinforcementSnapshot) }
+                catch {
+                    try? FileManager.default.removeItem(at: finalReinforcementSnapshot.stagingDirectory)
+                    onReinforcementError?(error.localizedDescription)
+                }
+            } else {
+                try? FileManager.default.removeItem(at: finalReinforcementSnapshot.stagingDirectory)
+            }
+        }
         lock.withLock {
-            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
+            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; reinforcementTrainer = nil; pendingReinforcementSignals.removeAll(keepingCapacity: false); reinforcementScroll = ReinforcementScrollAccumulator(); model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
             latestFrame = nil; lastUsableCaptureFrame = nil; temporalFrames.reset(); predictionLatch.reset(); processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
+        onReinforcementMetrics?(ReinforcementMetrics())
         MLXMemoryLifecycle.reclaimCaches(after: "agent runtime")
         onStop?(reason)
         let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
@@ -476,6 +692,8 @@ final class AgentRuntime: @unchecked Sendable {
     private func infer(_ buffer: CVPixelBuffer) {
         lock.lock()
         guard !stopped, let predictionFunction, let model, let profile else { lock.unlock(); return }
+        let reinforcementTrainer = self.reinforcementTrainer
+        let samplingOutputPermissions = outputPermissions
         let temporal = profile.training.effectiveTemporalVision
         let selectedPriorFrames: [TemporalFrame?] = (0..<temporal.pastFrameCount).map { frame in
             let distance = temporal.frameSpacing * (temporal.pastFrameCount - frame)
@@ -595,9 +813,24 @@ final class AgentRuntime: @unchecked Sendable {
                 hasTemporalMemory: hasTemporalMemory
             ) : nil
             MLX.eval(result)
-            let values = output.asArray(Float.self)
-            guard values.count >= ActionLayout.count, values.prefix(ActionLayout.count).allSatisfy(\.isFinite) else {
+            let policyValues = output.asArray(Float.self)
+            guard policyValues.count >= ActionLayout.count, policyValues.prefix(ActionLayout.count).allSatisfy(\.isFinite) else {
                 throw AgentTrainerError.model("The brain produced an invalid prediction, so all outputs were stopped safely.")
+            }
+            let values: [Float]
+            if let reinforcementTrainer {
+                let allowedMask = ReinforcementActionPolicy.allowedMask(
+                    profile: profile,
+                    allowedKeyCodes: allowedKeyCodes,
+                    mouseMode: mouseMode,
+                    outputPermissions: samplingOutputPermissions
+                )
+                values = reinforcementTrainer.sample(
+                    logits: Array(policyValues.prefix(ActionLayout.count)),
+                    allowedMask: allowedMask
+                )
+            } else {
+                values = policyValues
             }
             if let visualization {
                 let frame = CNNVisualizationFrame(
@@ -636,12 +869,13 @@ final class AgentRuntime: @unchecked Sendable {
             }
             lock.lock()
             guard !stopped else { lock.unlock(); return }
+            let transitionOutputPermissions = outputPermissions
             let frameControls = RuntimeActionSemantics.temporalControlValues(
                 values,
                 channels: profile.channels,
                 restrictions: profile.effectiveRestrictions,
                 allowedKeyCodes: allowedKeyCodes,
-                outputPermissions: outputPermissions,
+                outputPermissions: transitionOutputPermissions,
                 shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
             )
             if hasTemporalMemory {
@@ -660,6 +894,23 @@ final class AgentRuntime: @unchecked Sendable {
             let snapshot: RuntimeMetrics? = now - lastMetricsReportTime >= 0.1 ? metrics : nil
             if snapshot != nil { lastMetricsReportTime = now }
             lock.unlock()
+            if let reinforcementTrainer {
+                reinforcementTrainer.record(
+                    timestamp: now,
+                    currentPacked: packed,
+                    pastEmbeddings: selectedFrames.flatMap(\.embedding),
+                    pastControls: selectedFrames.flatMap(\.controls),
+                    behaviorLogits: Array(policyValues.prefix(ActionLayout.count)),
+                    action: frameControls,
+                    allowedMask: ReinforcementActionPolicy.allowedMask(
+                        profile: profile,
+                        allowedKeyCodes: allowedKeyCodes,
+                        mouseMode: mouseMode,
+                        outputPermissions: transitionOutputPermissions
+                    )
+                )
+                applyPendingReinforcementSignals(publishAutosaves: true)
+            }
             if let snapshot { onMetrics?(snapshot) }
         } catch {
             Task { await stop(reason: error.localizedDescription) }

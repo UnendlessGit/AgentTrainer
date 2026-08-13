@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.2.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.4.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -23,6 +23,7 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Training/DatasetCache.swift` — causal frame/action pairing and memory-mapped datasets
 - `Training/PolicyNetwork.swift` — Policy v6 and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
+- `Training/ReinforcementTrainer.swift` — bounded exploration, causal credit, compiled online updates, metrics, and RL snapshots
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
 - `Agent/AgentRuntime.swift` — capture, inference scheduling, prediction latching, and teardown
 - `Agent/InputInjector.swift` — final output firewall and synthetic HID events
@@ -148,6 +149,8 @@ The performance path preserves those semantics:
 
 - VideoToolbox decodes directly into native video-range YUV. One CVMetalTexture mapping and Metal command buffer produce both configured output resolutions, while decode, resize/color packing, and cache writes overlap through a bounded ordered pipeline of up to eight observations within a 64 MB cap.
 - Multiple recordings use up to four parallel decode/packing workers, bounded by active CPU count and a conservative half-of-unified-memory budget. Each worker produces a local shard; the builder merges shards in the user's original recording order and rebases only non-sentinel observation indices. Cache bytes, segment boundaries, and sample order remain deterministic.
+- Before packing, a bounded metadata-only preflight validates each fixed-width input stream and opens the video track, duration, and dimensions. Unreadable packages are reported by recording name and identifier, left byte-for-byte untouched, and excluded from both packed data and the exact checkpoint signature. If every selected package is unreadable, training fails immediately with an actionable error.
+- Projected cache plus peak shard working space is checked against the training-data volume before decode. Out-of-order packed shards use a strict two-worker-window look-ahead; a slow early recording must never permit temporary disk usage or pending merge state to grow with the full library size.
 - When one decoded frame remains causal across many configured perception ticks, Metal packs it once and the cache writer repeats those exact packed bytes in large buffered writes. Observation cadence, indices, controls, and every action label remain unchanged. Temporary shards skip redundant durability barriers; the final cache files are synchronized before their atomic directory move.
 - Dataset files are required memory mappings with adaptive VM advice. Epochs randomize small collections of temporally local lanes rather than every row globally, so each optimizer batch remains diverse while macOS can read ahead the contiguous mapped pages inside each lane. A batch gathers packed vision, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
 - Current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those embeddings to their exact frame slots. Training-only pixel augmentation is sampled per unique encoded observation; visual-feature dropout and history corruption occur only after action-row gathering, preserving one independent post-encoder stochastic path per label. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
@@ -171,6 +174,20 @@ Checkpoint and version activation are transactions. A profile must never point a
 
 Completed training publishes an immutable version. With honest held-out data, the lowest acceptable validation brain is activated; periodic autosaves are bounded and never prune the active or protected brain.
 
+## Online reinforcement learning contracts
+
+`ReinforcementLearningContract.schemaVersion` is versioned independently from Policy v6 and demonstration caches. RL deliberately uses the same Policy v6 parameter layout: an existing active version is loaded without alteration, while a brand-new AI receives neutral action-head weights and a sparse binary prior before its first inference. Enabling or disabling RL is not a learned-brain contract change.
+
+Every manual or automatic provider emits a `ReinforcementSignal` containing a monotonic action-time timestamp, a finite signed value, and a source identifier. Values are clamped to ±100 at the runtime boundary. Hotkeys, mouse buttons, Run-page controls, exact modifier-scroll steps, and future screen/OCR/game-state detectors all enter this one interface. Providers own detection only; the runtime owns credit assignment, optimization, safety, persistence, and metrics.
+
+Runtime inference, transition recording, feedback application, and MLX optimization share one serial inference queue. A feedback timestamp selects only transitions at or before the signal inside the configured causal window. The newest decision receives full credit and older decisions receive exponential decay. By default, inactive binary controls and negligible relative/scroll outputs are masked out; explicitly enabling inaction learning changes that behavior. Transition storage is capped by configured frames, elapsed credit time, and a 256 MB memory ceiling. The pending signal queue is capped at 256 entries and preserves the bounded signed total when high-rate feedback must coalesce.
+
+The online objective uses the stored behavior logits and executed, safety-sanitized action. It applies a clipped likelihood ratio, behavior-policy anchor, binary entropy bonus, fixed action-time exploration distribution, finite checks, and global gradient clipping. The compiled step must force evaluation of its objective, model parameters, and optimizer state together before metrics or a snapshot can observe it. No online update may race inference or input injection.
+
+RL persistence is separate from the exact demonstration checkpoint. Each published RL brain contains Policy v6 weights, RL AdamW state, its optimizer identity, exploration random state, cumulative counters/reward, and training time. Publication is an immutable transaction; stale asynchronous autosaves cannot replace a newer sequence, and the active profile is updated only after every required artifact verifies. Activating an RL brain removes the former demonstration checkpoint transactionally so a later Training Data run warm-starts from current RL weights rather than resuming stale pre-RL parameters. Returning to RL restores its optimizer only when the saved optimizer identity matches the current stability/exploration configuration; otherwise only optimizer state restarts and brain weights remain intact.
+
+A brand-new AI may emit only keyboard keys explicitly enabled in its RL keyboard firewall. An existing brain uses the union of demonstrated and RL-enabled keys. Profile restrictions, live cursor/keyboard permissions, configured control regions, and input-injection safety still take precedence. Periodic snapshots require at least one successful update; after any successful session learning, stopping publishes a final named brain even if the latest state was also covered by an autosave.
+
 ## Runtime safety contracts
 
 The final executable action is the intersection of:
@@ -178,7 +195,7 @@ The final executable action is the intersection of:
 1. immutable capabilities learned by the saved version
 2. current profile channel disables
 3. profile key/button/modifier restrictions
-4. demonstrated key codes
+4. demonstrated or explicitly RL-enabled key codes
 5. live cursor and keyboard permissions
 6. the allowed control region unless full-Mac control is enabled
 

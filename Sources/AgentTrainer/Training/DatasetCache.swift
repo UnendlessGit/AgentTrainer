@@ -1145,6 +1145,26 @@ private struct PackedRecordingSegment: Sendable {
     let observations: Int
 }
 
+struct RecordingReadinessFailure: Equatable, Sendable {
+    let recordingID: UUID
+    let recordingName: String
+    let reason: String
+
+    var diagnosticSummary: String {
+        "\(recordingName) [\(recordingID.uuidString)]: \(reason)"
+    }
+}
+
+struct TrainingRecordingReadiness: Sendable {
+    let recordings: [RecordingItem]
+    let failures: [RecordingReadinessFailure]
+}
+
+private struct IndexedRecordingReadiness: Sendable {
+    let index: Int
+    let failure: RecordingReadinessFailure?
+}
+
 private final class DatasetPackingProgress: @unchecked Sendable {
     private let lock = NSLock()
     private let names: [String]
@@ -1152,6 +1172,7 @@ private final class DatasetPackingProgress: @unchecked Sendable {
     private let totalDuration: Double
     private let progress: @Sendable (Double, String) -> Void
     private var fractions: [Double]
+    private var completedDuration = 0.0
     private var lastOverall = 0.0
 
     init(
@@ -1172,15 +1193,15 @@ private final class DatasetPackingProgress: @unchecked Sendable {
         defer { lock.unlock() }
         guard fractions.indices.contains(index) else { return }
         let fraction = rawFraction.isFinite ? min(1, max(0, rawFraction)) : 0
-        fractions[index] = max(fractions[index], fraction)
-        let completed = zip(fractions, durations).reduce(0.0) {
-            $0 + $1.0 * $1.1
-        }
-        let overall = max(lastOverall, min(0.999, completed / totalDuration))
+        let previous = fractions[index]
+        guard fraction > previous else { return }
+        fractions[index] = fraction
+        completedDuration += (fraction - previous) * durations[index]
+        let overall = max(lastOverall, min(0.999, completedDuration / totalDuration))
         lastOverall = overall
         progress(
             overall,
-            "Packing \(names[index]) in parallel • \(Int((overall * 100).rounded()))%"
+            "Packing \(names[index]) in parallel"
         )
     }
 }
@@ -1190,19 +1211,64 @@ actor DatasetCacheBuilder {
     private var preprocessor: VisionPreprocessor?
     private let workspace: WorkspaceStore
 
+    private static let recordingPreflightFraction = 0.05
+    private static let minimumFreeSpaceReserve = UInt64(256 * 1_024 * 1_024)
+
     init(workspace: WorkspaceStore = .shared) { self.workspace = workspace }
 
     func cache(for profile: AIProfile, recordings: [RecordingItem], progress: @escaping @Sendable (Double, String) -> Void) async throws -> CachedDataset {
         guard !recordings.isEmpty else { throw AgentTrainerError.noData }
-        if preprocessor == nil { preprocessor = try VisionPreprocessor() }
         try await workspace.prepare()
         let root = await workspace.cacheDirectory()
+        let selectedRecordingCount = recordings.count
+        let readiness = try await Self.trainingReadyRecordings(recordings) { completed, total, name in
+            let fraction = Double(completed) / Double(max(1, total))
+            progress(
+                Self.recordingPreflightFraction * fraction,
+                "Checking recording \(completed) of \(total): \(name)"
+            )
+        }
+        let recordings = readiness.recordings
+        guard !recordings.isEmpty else {
+            let firstFailure = readiness.failures.first?.diagnosticSummary
+                ?? "No selected recording contained usable synchronized media."
+            throw AgentTrainerError.storage(
+                "None of the \(selectedRecordingCount) selected recordings can be opened for training. \(firstFailure)"
+            )
+        }
+        if !readiness.failures.isEmpty {
+            let shown = readiness.failures.prefix(12).map(\.diagnosticSummary).joined(separator: "\n")
+            let omitted = readiness.failures.count - min(12, readiness.failures.count)
+            let suffix = omitted > 0 ? "\n… and \(omitted) more" : ""
+            AppLog.write(
+                .warning,
+                category: "Training",
+                "Skipped unreadable recordings before packing",
+                details: "Using \(recordings.count) of \(selectedRecordingCount). The source packages were left unchanged.\n\(shown)\(suffix)"
+            )
+            progress(
+                Self.recordingPreflightFraction,
+                "Skipping \(readiness.failures.count) unreadable recording\(readiness.failures.count == 1 ? "" : "s"); using \(recordings.count)"
+            )
+        }
         let key = try cacheKey(profile: profile, recordings: recordings)
         let directory = root.appendingPathComponent("\(key).atrcache", isDirectory: true)
         if FileManager.default.fileExists(atPath: directory.appendingPathComponent("manifest.json").path), let cached = try? CachedDataset(directory: directory) {
             progress(1, "Reusing packed dataset cache")
             return cached
         }
+
+        let estimate = Self.estimatedCacheStorage(profile: profile, recordings: recordings)
+        try Self.requireFreeSpace(for: estimate, at: root)
+        let estimatedSize = ByteCountFormatter.string(
+            fromByteCount: Int64(min(estimate.cacheBytes, UInt64(Int64.max))),
+            countStyle: .file
+        )
+        progress(
+            Self.recordingPreflightFraction,
+            "Preparing about \(estimatedSize) of packed training data"
+        )
+        if preprocessor == nil { preprocessor = try VisionPreprocessor() }
 
         let temporary = root.appendingPathComponent(".\(key).\(UUID().uuidString).tmp", isDirectory: true)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -1223,9 +1289,17 @@ actor DatasetCacheBuilder {
             return end - start
         }
         let totalUsableDuration = max(0.000_001, usableDurations.reduce(0, +))
+        let packingProgress: @Sendable (Double, String) -> Void = { fraction, status in
+            let bounded = fraction.isFinite ? min(1, max(0, fraction)) : 0
+            progress(
+                Self.recordingPreflightFraction
+                    + (1 - Self.recordingPreflightFraction) * bounded,
+                status
+            )
+        }
         do {
             if recordings.count == 1, let recording = recordings.first {
-                progress(0, "Packing \(recording.manifest.name) • 0%")
+                packingProgress(0, "Packing \(recording.manifest.name)")
                 let appended = try await Self.appendRecording(
                     recording,
                     profile: profile,
@@ -1238,10 +1312,7 @@ actor DatasetCacheBuilder {
                     actions: actions,
                     progress: { fraction in
                         let overall = min(0.999, max(0, fraction))
-                        progress(
-                            overall,
-                            "Packing \(recording.manifest.name) • \(Int((overall * 100).rounded()))%"
-                        )
+                        packingProgress(overall, "Packing \(recording.manifest.name)")
                     }
                 )
                 sampleCount = appended.samples
@@ -1263,7 +1334,7 @@ actor DatasetCacheBuilder {
                     recordings: recordings,
                     usableDurations: usableDurations,
                     totalUsableDuration: totalUsableDuration,
-                    progress: progress
+                    progress: packingProgress
                 )
                 let concurrency = Self.recommendedPackingConcurrency(
                     recordings: recordings,
@@ -1272,6 +1343,10 @@ actor DatasetCacheBuilder {
                 )
                 try await withThrowingTaskGroup(of: PackedRecordingSegment.self) { group in
                     let initialCount = min(concurrency, recordings.count)
+                    let maximumOutstanding = Self.recommendedPackingLookahead(
+                        recordingCount: recordings.count,
+                        concurrency: concurrency
+                    )
                     for index in 0..<initialCount {
                         let recording = recordings[index]
                         group.addTask(priority: .userInitiated) {
@@ -1287,8 +1362,13 @@ actor DatasetCacheBuilder {
                     }
                     var nextSubmission = initialCount
                     var nextMerge = 0
+                    var activeCount = initialCount
                     var pending: [Int: PackedRecordingSegment] = [:]
-                    while let result = try await group.next() {
+                    while activeCount > 0 {
+                        guard let result = try await group.next() else {
+                            throw AgentTrainerError.storage("Parallel recording packing ended before every submitted recording completed.")
+                        }
+                        activeCount -= 1
                         pending[result.index] = result
                         while let segment = pending.removeValue(forKey: nextMerge) {
                             let start = sampleCount
@@ -1313,7 +1393,9 @@ actor DatasetCacheBuilder {
                             try FileManager.default.removeItem(at: segment.directory)
                             nextMerge += 1
                         }
-                        if nextSubmission < recordings.count {
+                        while nextSubmission < recordings.count,
+                              activeCount < concurrency,
+                              nextSubmission - nextMerge < maximumOutstanding {
                             let index = nextSubmission
                             let recording = recordings[index]
                             group.addTask(priority: .userInitiated) {
@@ -1327,6 +1409,7 @@ actor DatasetCacheBuilder {
                                 )
                             }
                             nextSubmission += 1
+                            activeCount += 1
                         }
                     }
                     guard nextMerge == recordings.count, pending.isEmpty else {
@@ -1404,6 +1487,261 @@ actor DatasetCacheBuilder {
         )
         let digest = SHA256.hash(data: try encoder.encode(identity))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Checks every selected package before expensive frame packing starts.
+    /// Older libraries can contain recordings from an interrupted writer or a
+    /// manual copy even though current imports validate media transactionally.
+    /// A small metadata-only worker window finds those packages quickly without
+    /// opening hundreds of VideoToolbox decoder sessions at once.
+    nonisolated static func trainingReadyRecordings(
+        _ recordings: [RecordingItem],
+        progress: @escaping @Sendable (Int, Int, String) -> Void
+    ) async throws -> TrainingRecordingReadiness {
+        guard !recordings.isEmpty else {
+            return TrainingRecordingReadiness(recordings: [], failures: [])
+        }
+        let concurrency = min(
+            recordings.count,
+            max(1, min(8, ProcessInfo.processInfo.activeProcessorCount))
+        )
+        var failures = [RecordingReadinessFailure?](
+            repeating: nil,
+            count: recordings.count
+        )
+        var completed = 0
+        try await withThrowingTaskGroup(of: IndexedRecordingReadiness.self) { group in
+            for index in 0..<concurrency {
+                let recording = recordings[index]
+                group.addTask(priority: .userInitiated) {
+                    try await validateTrainingRecording(recording, index: index)
+                }
+            }
+            var nextSubmission = concurrency
+            while let result = try await group.next() {
+                failures[result.index] = result.failure
+                completed += 1
+                progress(
+                    completed,
+                    recordings.count,
+                    recordings[result.index].manifest.name
+                )
+                if nextSubmission < recordings.count {
+                    let index = nextSubmission
+                    let recording = recordings[index]
+                    group.addTask(priority: .userInitiated) {
+                        try await validateTrainingRecording(recording, index: index)
+                    }
+                    nextSubmission += 1
+                }
+            }
+        }
+        let accepted = recordings.enumerated().compactMap { index, recording in
+            failures[index] == nil ? recording : nil
+        }
+        return TrainingRecordingReadiness(
+            recordings: accepted,
+            failures: failures.compactMap { $0 }
+        )
+    }
+
+    private nonisolated static func validateTrainingRecording(
+        _ recording: RecordingItem,
+        index: Int
+    ) async throws -> IndexedRecordingReadiness {
+        try Task.checkCancellation()
+        let manifest = recording.manifest
+        guard manifest.isStructurallyValid, manifest.hostStartNanos > 0 else {
+            return IndexedRecordingReadiness(
+                index: index,
+                failure: RecordingReadinessFailure(
+                    recordingID: recording.id,
+                    recordingName: manifest.name,
+                    reason: "its recording manifest or synchronized timeline is invalid"
+                )
+            )
+        }
+        let eventURL = recording.directory.appendingPathComponent(manifest.eventFile)
+        do {
+            let events = try InputEventReader.mapped(url: eventURL)
+            guard events.count == manifest.eventCount else {
+                throw AgentTrainerError.storage(
+                    "the manifest declares \(manifest.eventCount) input events but the file contains \(events.count)"
+                )
+            }
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            return IndexedRecordingReadiness(
+                index: index,
+                failure: RecordingReadinessFailure(
+                    recordingID: recording.id,
+                    recordingName: manifest.name,
+                    reason: "its synchronized input cannot be read (\(error.localizedDescription))"
+                )
+            )
+        }
+
+        let videoURL = recording.directory.appendingPathComponent(manifest.videoFile)
+        do {
+            let values = try videoURL.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .fileSizeKey
+            ])
+            guard values.isRegularFile == true, (values.fileSize ?? 0) > 0 else {
+                throw AgentTrainerError.storage("the video file is missing or empty")
+            }
+            let asset = AVURLAsset(url: videoURL)
+            async let loadedDuration = asset.load(.duration)
+            async let loadedTracks = asset.loadTracks(withMediaType: .video)
+            let (durationTime, tracks) = try await (loadedDuration, loadedTracks)
+            guard let track = tracks.first else {
+                throw AgentTrainerError.storage("the media contains no video track")
+            }
+            let duration = CMTimeGetSeconds(durationTime)
+            let naturalSize = try await track.load(.naturalSize)
+            guard duration.isFinite, duration > 0,
+                  naturalSize.width.isFinite, naturalSize.height.isFinite,
+                  naturalSize.width > 0, naturalSize.height > 0 else {
+                throw AgentTrainerError.storage("the video timeline or dimensions are invalid")
+            }
+            return IndexedRecordingReadiness(index: index, failure: nil)
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            return IndexedRecordingReadiness(
+                index: index,
+                failure: RecordingReadinessFailure(
+                    recordingID: recording.id,
+                    recordingName: manifest.name,
+                    reason: "its video cannot be opened and may be incomplete or damaged (\(error.localizedDescription))"
+                )
+            )
+        }
+    }
+
+    struct EstimatedCacheStorage: Equatable, Sendable {
+        let cacheBytes: UInt64
+        let peakWorkingBytes: UInt64
+    }
+
+    nonisolated static func estimatedCacheStorage(
+        profile: AIProfile,
+        recordings: [RecordingItem]
+    ) -> EstimatedCacheStorage {
+        let temporal = profile.training.effectiveTemporalVision
+        let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
+        let observationBytes = saturatedAdd(
+            UInt64(max(0, profile.preprocessing.sampleByteCount)),
+            saturatedAdd(
+                temporal.pastFrameCount > 0
+                    ? UInt64(max(0, pastSpec.sampleByteCount))
+                    : 0,
+                temporal.pastFrameCount > 0
+                    ? UInt64(ActionLayout.count * MemoryLayout<Float>.size)
+                    : 0
+            )
+        )
+        let sampleBytes = saturatedAdd(
+            UInt64(ActionLayout.count * MemoryLayout<Float>.size),
+            UInt64((1 + max(0, temporal.pastFrameCount)) * MemoryLayout<UInt32>.size)
+        )
+        var cacheBytes: UInt64 = 0
+        var largestShard: UInt64 = 0
+        for recording in recordings {
+            let start = max(
+                0,
+                min(recording.manifest.duration, recording.manifest.trimStart)
+            )
+            let end = max(
+                start,
+                min(
+                    recording.manifest.duration,
+                    recording.manifest.trimEnd ?? recording.manifest.duration
+                )
+            )
+            let duration = end - start
+            let observations = estimatedTickCount(
+                duration: duration,
+                rate: profile.training.perceptionFPS
+            )
+            let samples = estimatedTickCount(
+                duration: duration,
+                rate: profile.training.actionFPS
+            )
+            let shardBytes = saturatedAdd(
+                saturatedMultiply(observations, observationBytes),
+                saturatedMultiply(samples, sampleBytes)
+            )
+            cacheBytes = saturatedAdd(cacheBytes, shardBytes)
+            largestShard = max(largestShard, shardBytes)
+        }
+        return EstimatedCacheStorage(
+            cacheBytes: cacheBytes,
+            peakWorkingBytes: saturatedAdd(
+                saturatedAdd(cacheBytes, largestShard),
+                minimumFreeSpaceReserve
+            )
+        )
+    }
+
+    private nonisolated static func estimatedTickCount(
+        duration: Double,
+        rate: Double
+    ) -> UInt64 {
+        let value = max(0, duration) * max(0, rate)
+        guard value.isFinite, value < Double(UInt64.max - 1) else {
+            return UInt64.max
+        }
+        return UInt64(value.rounded(.down)) + 1
+    }
+
+    private nonisolated static func saturatedAdd(
+        _ lhs: UInt64,
+        _ rhs: UInt64
+    ) -> UInt64 {
+        let result = lhs.addingReportingOverflow(rhs)
+        return result.overflow ? UInt64.max : result.partialValue
+    }
+
+    private nonisolated static func saturatedMultiply(
+        _ lhs: UInt64,
+        _ rhs: UInt64
+    ) -> UInt64 {
+        let result = lhs.multipliedReportingOverflow(by: rhs)
+        return result.overflow ? UInt64.max : result.partialValue
+    }
+
+    private nonisolated static func requireFreeSpace(
+        for estimate: EstimatedCacheStorage,
+        at directory: URL
+    ) throws {
+        guard let availableValue = try? directory.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        ).volumeAvailableCapacityForImportantUsage,
+        availableValue >= 0 else { return }
+        let available = UInt64(availableValue)
+        guard estimate.peakWorkingBytes <= available else {
+            let requiredText = ByteCountFormatter.string(
+                fromByteCount: Int64(min(estimate.peakWorkingBytes, UInt64(Int64.max))),
+                countStyle: .file
+            )
+            let availableText = ByteCountFormatter.string(
+                fromByteCount: availableValue,
+                countStyle: .file
+            )
+            throw AgentTrainerError.storage(
+                "Packing these recordings needs about \(requiredText) of free working space, but this training-data disk has \(availableText) available. Free space or move Training Data in Settings before starting."
+            )
+        }
+    }
+
+    nonisolated static func recommendedPackingLookahead(
+        recordingCount: Int,
+        concurrency: Int
+    ) -> Int {
+        guard recordingCount > 0 else { return 0 }
+        let workers = min(recordingCount, max(1, concurrency))
+        let doubled = workers.multipliedReportingOverflow(by: 2)
+        return min(recordingCount, doubled.overflow ? Int.max : doubled.partialValue)
     }
 
     nonisolated static func recommendedPackingConcurrency(
@@ -1564,10 +1902,46 @@ actor DatasetCacheBuilder {
             cachedEmbeddingWidth: profile.training.architecture.visualEmbedding
         )
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
-        let events = try InputEventReader.mapped(url: recording.directory.appendingPathComponent(recording.manifest.eventFile))
-        let asset = AVURLAsset(url: recording.directory.appendingPathComponent(recording.manifest.videoFile))
-        guard let track = try await asset.loadTracks(withMediaType: .video).first else { return (0, 0) }
-        let reader = try AVAssetReader(asset: asset)
+        let events: InputEventReader.MappedEvents
+        do {
+            events = try InputEventReader.mapped(
+                url: recording.directory.appendingPathComponent(
+                    recording.manifest.eventFile
+                )
+            )
+        } catch {
+            throw AgentTrainerError.storage(
+                "\(recording.manifest.name)'s synchronized input cannot be opened for training: \(error.localizedDescription)"
+            )
+        }
+        let asset = AVURLAsset(
+            url: recording.directory.appendingPathComponent(
+                recording.manifest.videoFile
+            )
+        )
+        let track: AVAssetTrack
+        do {
+            guard let loadedTrack = try await asset.loadTracks(withMediaType: .video).first else {
+                throw AgentTrainerError.storage(
+                    "\(recording.manifest.name) contains no readable video track."
+                )
+            }
+            track = loadedTrack
+        } catch let error as AgentTrainerError {
+            throw error
+        } catch {
+            throw AgentTrainerError.storage(
+                "\(recording.manifest.name)'s video cannot be opened for training and may be incomplete or damaged: \(error.localizedDescription)"
+            )
+        }
+        let reader: AVAssetReader
+        do {
+            reader = try AVAssetReader(asset: asset)
+        } catch {
+            throw AgentTrainerError.storage(
+                "\(recording.manifest.name)'s video reader could not be created: \(error.localizedDescription)"
+            )
+        }
         let trainingStart = max(0, min(recording.manifest.duration, recording.manifest.trimStart))
         let trainingEnd = max(trainingStart, min(recording.manifest.duration, recording.manifest.trimEnd ?? recording.manifest.duration))
         guard trainingEnd > trainingStart else { return (0, 0) }
@@ -1580,9 +1954,17 @@ actor DatasetCacheBuilder {
         // resize at the final training resolution.
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
         output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else { throw AgentTrainerError.storage("The recording video cannot be decoded for training.") }
+        guard reader.canAdd(output) else {
+            throw AgentTrainerError.storage(
+                "\(recording.manifest.name)'s video cannot be decoded for training."
+            )
+        }
         reader.add(output)
-        guard reader.startReading() else { throw reader.error ?? AgentTrainerError.storage("The recording video could not be opened.") }
+        guard reader.startReading() else {
+            throw AgentTrainerError.storage(
+                "\(recording.manifest.name)'s video could not be opened for training: \(reader.error?.localizedDescription ?? "unknown media error")"
+            )
+        }
 
         let actionInterval = 1 / max(0.0001, profile.training.actionFPS)
         let perceptionInterval = 1 / max(0.0001, profile.training.perceptionFPS)
@@ -1675,7 +2057,11 @@ actor DatasetCacheBuilder {
             }
             lastDecodedBuffer = buffer
         }
-        if reader.status == .failed { throw reader.error ?? AgentTrainerError.storage("Video decoding failed while building the cache.") }
+        if reader.status == .failed {
+            throw AgentTrainerError.storage(
+                "Decoding \(recording.manifest.name) failed while building the packed cache: \(reader.error?.localizedDescription ?? "unknown media error")"
+            )
+        }
         if let lastDecodedBuffer {
             let heldStart = observationTimes.count
             while nextPerception <= trainingEnd + 0.000_001 {

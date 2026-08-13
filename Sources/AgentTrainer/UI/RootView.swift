@@ -124,7 +124,7 @@ struct RootView: View {
                 }
                 .primaryButton(color: ATColor.violet)
                 .help(model.agentIsActiveOrStarting ? "Stop AI and release inputs" : "Run selected AI")
-                .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil)
+                .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.canRunOrLearn != true)
 
                 Button(role: .destructive) { model.panic() } label: {
                     Image(systemName: "hand.raised.fill")
@@ -193,7 +193,9 @@ struct RootView: View {
         if model.isRecording { return "Recording" }
         if model.agentIsActiveOrStarting && model.isTraining { return model.isStartingAgent ? "Start/stop + train" : "Run + train" }
         if model.isStartingAgent { return "AI starting / stopping" }
-        if model.isRunning { return "AI running" }
+        if model.isRunning {
+            return model.reinforcementMetrics.isActive ? "AI learning live" : "AI running"
+        }
         if model.isTraining { return "Training" }
         return "Local only"
     }

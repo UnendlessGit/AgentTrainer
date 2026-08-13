@@ -880,6 +880,35 @@ final class AgentPolicy: Module, @unchecked Sendable {
         ))
     }
 
+    /// A brand-new online policy must begin neutral. MLX's ordinary Linear
+    /// initialization is appropriate for supervised loss, but its near-zero
+    /// binary logits mean roughly half of every allowed key/button would be
+    /// pressed before the user could provide the first correction. Zero action
+    /// projections keep the randomly initialized visual representation intact,
+    /// center the absolute cursor, and make discrete actions deliberately rare.
+    func initializeForSafeExploration(binaryProbability rawProbability: Float = 0.002) {
+        let probability = min(0.1, max(0.0001, rawProbability))
+        let binaryLogit = Foundation.log(probability / (1 - probability))
+        let continuousHeads = [absoluteMouseHead, relativeMouseHead, scrollHead]
+        let binaryHeads = [buttonHead, keyboardHead, modifierHead]
+        for head in continuousHeads + binaryHeads {
+            head.weight._updateInternal(MLXArray.zeros(head.weight.shape, dtype: dtype))
+        }
+        for head in continuousHeads {
+            head.bias?._updateInternal(MLXArray.zeros(head.bias?.shape ?? [0], dtype: dtype))
+        }
+        for head in binaryHeads {
+            if let bias = head.bias {
+                bias._updateInternal(MLXArray.full(
+                    bias.shape,
+                    values: MLXArray(binaryLogit),
+                    dtype: dtype
+                ))
+            }
+        }
+        MLX.eval((continuousHeads + binaryHeads).flatMap { [$0.weight] + ($0.bias.map { [$0] } ?? []) })
+    }
+
     /// Caps the longest spatial side copied out of MLX while preserving every
     /// channel. This bounds CPU transfer and HUD rendering for very large model
     /// vision sizes; the model itself always runs at its exact configured size.

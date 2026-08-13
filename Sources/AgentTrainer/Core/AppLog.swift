@@ -54,7 +54,11 @@ final class AppLogStore: ObservableObject {
 
     func append(_ entry: AppLogEntry) {
         entries.append(entry)
-        if entries.count > maximumEntries { entries.removeFirst(entries.count - maximumEntries) }
+        // Trim in batches so a noisy framework or long training run cannot
+        // force an O(n) Array shift on the main actor for every new log line.
+        if entries.count > maximumEntries {
+            entries.removeFirst(maximumEntries / 4)
+        }
         let url = Self.fileURL
         persistenceQueue.async {
             do {
