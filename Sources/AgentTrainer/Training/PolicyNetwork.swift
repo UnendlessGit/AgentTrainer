@@ -15,6 +15,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
     private let _poolCoordinates: MLXArray?
     private let _pastPoolCoordinates: MLXArray?
     private let _binaryControlMask: MLXArray
+    private let _continuousControlMask: MLXArray
 
     /// Stage zero is the dense coordinate-aware stem. Later entries are 1x1
     /// channel mixers paired with the depthwise spatial filters below.
@@ -57,10 +58,19 @@ final class AgentPolicy: Module, @unchecked Sendable {
         _coordinateGrid = Self.coordinateGrid(width: width, height: height, dtype: dtype)
         _pastCoordinateGrid = Self.coordinateGrid(width: pastSpec.width, height: pastSpec.height, dtype: dtype)
         var binaryControlMask = [Float](repeating: 0, count: ActionLayout.count)
-        for index in ActionLayout.buttons { binaryControlMask[index] = 1 }
-        for index in ActionLayout.keyboard { binaryControlMask[index] = 1 }
-        for index in ActionLayout.modifiers { binaryControlMask[index] = 1 }
+        // Match the exact learnable binary layout. In particular, do not let
+        // history corruption synthesize Command/Option/Control in their
+        // duplicate ordinary-key slots after the dataset sanitizer zeroed them.
+        for index in ActionLayout.binary { binaryControlMask[index] = 1 }
         _binaryControlMask = MLXArray(binaryControlMask, [1, 1, ActionLayout.count]).asType(dtype)
+        var continuousControlMask = [Float](repeating: 0, count: ActionLayout.count)
+        for index in ActionLayout.absoluteMouse { continuousControlMask[index] = 1 }
+        for index in ActionLayout.relativeMouse { continuousControlMask[index] = 1 }
+        for index in ActionLayout.scroll { continuousControlMask[index] = 1 }
+        _continuousControlMask = MLXArray(
+            continuousControlMask,
+            [1, 1, ActionLayout.count]
+        ).asType(dtype)
         // Real color planes plus explicit X/Y. Current and past images use the
         // same weights and never include a synthetic difference channel.
         var inputChannels = profile.preprocessing.channelCount + 2
@@ -510,14 +520,16 @@ final class AgentPolicy: Module, @unchecked Sendable {
         pastImages: MLXArray,
         pastControls: MLXArray,
         visionToPast: MLXArray? = nil,
-        sampleToVision: MLXArray? = nil
+        sampleToVision: MLXArray? = nil,
+        pastFrameMask: MLXArray? = nil
     ) -> MLXArray {
         temporalFeatures(
             currentVisualFeatures: visualActivations(images: currentImages).last!,
             pastImages: pastImages,
             pastControls: pastControls,
             visionToPast: visionToPast,
-            sampleToVision: sampleToVision
+            sampleToVision: sampleToVision,
+            pastFrameMask: pastFrameMask
         )
     }
 
@@ -564,14 +576,16 @@ final class AgentPolicy: Module, @unchecked Sendable {
         pastImages: MLXArray,
         pastControls: MLXArray,
         visionToPast: MLXArray? = nil,
-        sampleToVision: MLXArray? = nil
+        sampleToVision: MLXArray? = nil,
+        pastFrameMask: MLXArray? = nil
     ) -> MLXArray {
         temporalFeatures(
             currentVisualEmbedding: visualEmbedding(visualFeatures: currentVisualFeatures),
             pastImages: pastImages,
             pastControls: pastControls,
             visionToPast: visionToPast,
-            sampleToVision: sampleToVision
+            sampleToVision: sampleToVision,
+            pastFrameMask: pastFrameMask
         )
     }
 
@@ -580,7 +594,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
         pastImages: MLXArray,
         pastControls: MLXArray,
         visionToPast: MLXArray? = nil,
-        sampleToVision: MLXArray? = nil
+        sampleToVision: MLXArray? = nil,
+        pastFrameMask: MLXArray? = nil
     ) -> MLXArray {
         let temporal = profile.training.effectiveTemporalVision
         if temporal.pastFrameCount == 0 {
@@ -655,7 +670,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
             currentVisualEmbedding: currentVisualEmbedding,
             pastVisualEmbeddings: pastEmbedding,
             pastControls: pastControls,
-            sampleToVision: sampleToVision
+            sampleToVision: sampleToVision,
+            pastFrameMask: pastFrameMask
         )
     }
 
@@ -666,7 +682,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
         currentVisualEmbedding: MLXArray,
         pastVisualEmbeddings: MLXArray,
         pastControls: MLXArray,
-        sampleToVision: MLXArray? = nil
+        sampleToVision: MLXArray? = nil,
+        pastFrameMask: MLXArray? = nil
     ) -> MLXArray {
         let temporal = profile.training.effectiveTemporalVision
         if temporal.pastFrameCount == 0 {
@@ -690,6 +707,23 @@ final class AgentPolicy: Module, @unchecked Sendable {
         var past = pastVisualEmbeddings.asType(dtype)
         var controls = pastControls.asType(dtype)
         let visionCount = current.dim(0)
+
+        if let pastFrameMask {
+            precondition(
+                pastFrameMask.ndim == 3
+                    && pastFrameMask.dim(0) == visionCount
+                    && pastFrameMask.dim(1) == temporal.pastFrameCount
+                    && pastFrameMask.dim(2) == 1,
+                "The past-frame validity mask must have shape [batch, frames, 1]."
+            )
+            let validity = pastFrameMask.asType(dtype)
+            // Cache sentinels represent history that did not yet exist at a
+            // recording boundary. Runtime supplies zero embeddings and zero
+            // controls for the same state, so training must not substitute the
+            // current image embedding merely to keep packed tensors rectangular.
+            past = past * validity
+            controls = controls * validity
+        }
 
         // The visual encoder evaluates each unique causal observation once.
         // Gather compact features back to action-row shape before stochastic
@@ -817,7 +851,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
                 low: -noiseMagnitude,
                 high: noiseMagnitude,
                 controls.shape
-            ).asType(dtype) * (1 - _binaryControlMask)
+            ).asType(dtype) * _continuousControlMask
             let noisy = controls + noise
             controls = concatenated([
                 clip(noisy[.ellipsis, ActionLayout.absoluteMouse], min: 0, max: 1),
@@ -1064,20 +1098,48 @@ final class AgentPolicy: Module, @unchecked Sendable {
         let lossTargets = smoothing > 0
             ? targets * (1 - 2 * smoothing) + smoothing
             : targets
-        let raw = binaryCrossEntropy(logits: logits, targets: lossTargets, reduction: .none)
+        let objectiveLogits: MLXArray
         let classWeights: MLXArray
         if let positiveWeights {
             let learnedOutput = (positiveWeights .> 0).asType(dtype)
             classWeights = (1 + targets * (positiveWeights - 1)) * learnedOutput
+            // Positive weighting deliberately changes the training prior. If
+            // BCE consumes raw logits directly, inverse-frequency weights make
+            // an uninformative rare key converge near 0.5 (and transition
+            // weighting can push it close to 0.8), exactly where the runtime
+            // interprets it as held. Applying the same weight as a loss-only
+            // logit offset preserves the strong rare-positive gradient while
+            // leaving raw/saved logits calibrated to the real action rate.
+            let calibrationOffset = log(maximum(
+                positiveWeights,
+                MLXArray(1, dtype: dtype)
+            ))
+            objectiveLogits = logits + calibrationOffset
         } else {
             classWeights = MLXArray.ones(like: targets)
+            objectiveLogits = logits
         }
+        let raw = binaryCrossEntropy(
+            logits: objectiveLogits,
+            targets: lossTargets,
+            reduction: .none
+        )
         // Press/release boundaries matter far more than another frame in the
         // middle of a long hold. Upweighting transitions prevents a policy from
         // learning only action persistence.
         let transitionWeights = 1 + 3 * abs(targets - previous)
-        let weights = classWeights * transitionWeights * binaryFocalWeights(logits: logits, targets: targets)
-        return (raw * weights).sum() / (weights.sum() + 1e-6)
+        let staticWeights = classWeights * transitionWeights
+        let focalWeights = binaryFocalWeights(
+            logits: objectiveLogits,
+            targets: targets
+        )
+        // Focal modulation is prediction-dependent and therefore belongs only
+        // in the numerator. Dividing by its own changing sum lets the model
+        // alter the normalization and makes gamma cancel completely when all
+        // examples have equal difficulty. Static class/transition weights keep
+        // the loss scale stable without changing the focal objective.
+        return (raw * staticWeights * focalWeights).sum()
+            / (staticWeights.sum() + 1e-6)
     }
 
     private func binaryFocalWeights(logits: MLXArray, targets: MLXArray) -> MLXArray {

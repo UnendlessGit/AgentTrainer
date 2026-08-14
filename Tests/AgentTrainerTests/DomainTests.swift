@@ -805,6 +805,14 @@ final class DomainTests: XCTestCase {
         let snapshot = try XCTUnwrap(trainer.makeSnapshot(isAutosave: false))
         XCTAssertEqual(snapshot.manifest.reinforcementFeedbackCount, 1)
         XCTAssertEqual(snapshot.manifest.reinforcementUpdateCount, 1)
+        XCTAssertEqual(
+            snapshot.manifest.trainingDataSchema,
+            TrainingDataContract.schemaVersion
+        )
+        XCTAssertNil(
+            snapshot.manifest.trainingObjectiveSchema,
+            "A brand-new RL-only brain has no supervised-loss ancestry to claim."
+        )
         XCTAssertTrue(FileManager.default.fileExists(atPath: snapshot.stagingDirectory.appendingPathComponent(snapshot.manifest.weightsFile).path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: snapshot.stagingDirectory.appendingPathComponent(try XCTUnwrap(snapshot.manifest.reinforcementOptimizerFile)).path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: snapshot.stagingDirectory.appendingPathComponent(try XCTUnwrap(snapshot.manifest.reinforcementStateFile)).path))
@@ -3457,6 +3465,56 @@ final class DomainTests: XCTestCase {
         )
     }
 
+    func testCacheStorageEstimateReservesEveryOutstandingParallelShard() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(
+            width: 64,
+            height: 36,
+            colorMode: .grayscale
+        )
+        profile.training.actionFPS = 60
+        profile.training.perceptionFPS = 30
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 2,
+            frameSpacing: 1,
+            downsampleFactor: 2
+        )
+        let directory = FileManager.default.temporaryDirectory
+        let recordings = (0..<3).map { index in
+            let manifest = RecordingManifest(
+                id: UUID(),
+                name: "Estimate \(index)",
+                createdAt: Date(),
+                hostStartNanos: 1,
+                duration: 60,
+                capture: CaptureSpec(requestedFPS: 60),
+                globalRect: CodableRect(CGRect(x: 0, y: 0, width: 1920, height: 1080)),
+                pixelWidth: 1920,
+                pixelHeight: 1080,
+                deliveredFPS: 60,
+                eventCount: 0
+            )
+            return RecordingItem(manifest: manifest, directory: directory)
+        }
+        let single = DatasetCacheBuilder.estimatedCacheStorage(
+            profile: profile,
+            recordings: [recordings[0]]
+        )
+        let parallel = DatasetCacheBuilder.estimatedCacheStorage(
+            profile: profile,
+            recordings: recordings
+        )
+        let reserve = single.peakWorkingBytes - single.cacheBytes
+
+        // Even with a one-worker memory bound, lookahead permits two completed
+        // shards to coexist with the growing final cache. A single recording
+        // writes directly and exposes the common free-space reserve here.
+        XCTAssertGreaterThanOrEqual(
+            parallel.peakWorkingBytes,
+            parallel.cacheBytes + 2 * single.cacheBytes + reserve
+        )
+    }
+
     func testPackedShardWriterRepeatsBytesAndRebasesOnlyRealIndices() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("packed-shard-\(UUID().uuidString)", isDirectory: true)
@@ -3605,6 +3663,56 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(previous[0], 2)
         XCTAssertEqual(previous[ActionLayout.count], 0, "A recording boundary must start from released controls.")
         XCTAssertEqual(previous[2 * ActionLayout.count], 1)
+    }
+
+    func testFusedTrainingBatchMarksUnavailablePastFrames() throws {
+        let sequences: [[UInt32]] = [
+            [0, .max, .max],
+            [1, .max, 0],
+            [2, 0, 1]
+        ]
+        let rows = sequences.map { _ in
+            [Float](repeating: 0, count: ActionLayout.count)
+        }
+        let fixture = try makeSyntheticDataset(
+            name: "past-frame-validity",
+            pastFrameCount: 2,
+            sequences: sequences,
+            actionRows: rows
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        let rowBytes = ActionLayout.count * MemoryLayout<Float>.size
+        var current = Data(count: sequences.count)
+        var past = Data(count: sequences.count * 2)
+        var controls = Data(count: sequences.count * 2 * rowBytes)
+        var validity = Data(count: sequences.count * 2 * MemoryLayout<Float>.size)
+        var actions = Data(count: sequences.count * 2 * rowBytes)
+        current.withUnsafeMutableBytes { currentDestination in
+            past.withUnsafeMutableBytes { pastDestination in
+                controls.withUnsafeMutableBytes { controlDestination in
+                    validity.withUnsafeMutableBytes { validityDestination in
+                        actions.withUnsafeMutableBytes { actionDestination in
+                            fixture.dataset.populateTrainingBatch(
+                                at: Array(sequences.indices),
+                                observationSequences: sequences.map {
+                                    CachedObservationSequence(indices: $0)
+                                },
+                                packedCurrentObservations: currentDestination,
+                                packedPastObservations: pastDestination,
+                                pastControlRows: controlDestination,
+                                pastFrameValidity: validityDestination,
+                                actionRows: actionDestination
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        let values = validity.withUnsafeBytes {
+            Array($0.bindMemory(to: Float.self))
+        }
+        XCTAssertEqual(values, [0, 0, 0, 1, 1, 1])
     }
 
     func testFusedTrainingBatchMatchesCanonicalCacheReadsAcrossSegments() throws {
@@ -4058,6 +4166,73 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(dataset.demonstratedKeyCodes().contains(13))
     }
 
+    func testCacheDoesNotLeakARecordingFirstFuturePointerEventBackward() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "causal-pointer-cache-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let recordingID = UUID()
+        let directory = try await store.createRecordingDirectory(id: recordingID)
+        try await writeTestMovie(
+            to: directory.appendingPathComponent("capture.mov"),
+            width: 16,
+            height: 16,
+            frameCount: 4,
+            fps: 20
+        )
+
+        let base: UInt64 = 3_000_000_000
+        let eventWriter = try InputEventWriter(
+            url: directory.appendingPathComponent("events.atrevents")
+        )
+        // Imported recordings are allowed to lack the native time-zero pointer
+        // seed. This first pointer sample belongs to the future, not row zero.
+        eventWriter.append(InputSample(
+            timestampNanos: base + 100_000_000,
+            kind: .mouseMove,
+            x: 90,
+            y: 75
+        ))
+        let eventCount = try eventWriter.finish()
+        let manifest = RecordingManifest(
+            id: recordingID,
+            name: "Causal pointer",
+            createdAt: Date(),
+            hostStartNanos: base,
+            duration: 0.2,
+            capture: CaptureSpec(requestedFPS: 20),
+            globalRect: CodableRect(CGRect(x: 0, y: 0, width: 100, height: 100)),
+            pixelWidth: 16,
+            pixelHeight: 16,
+            deliveredFPS: 20,
+            frameCount: 4,
+            eventCount: eventCount
+        )
+        try await store.writeRecording(manifest, to: directory)
+
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(
+            width: 8,
+            height: 8,
+            colorMode: .grayscale
+        )
+        profile.training.actionFPS = 20
+        profile.training.perceptionFPS = 20
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 0)
+        let dataset = try await DatasetCacheBuilder(workspace: store).cache(
+            for: profile,
+            recordings: [RecordingItem(manifest: manifest, directory: directory)]
+        ) { _, _ in }
+
+        XCTAssertGreaterThanOrEqual(dataset.count, 3)
+        XCTAssertEqual(dataset.action(at: 0)[ActionLayout.absoluteMouse.lowerBound], 0.5, accuracy: 0.000_1)
+        XCTAssertEqual(dataset.action(at: 1)[ActionLayout.absoluteMouse.lowerBound], 0.5, accuracy: 0.000_1)
+        XCTAssertEqual(dataset.action(at: 2)[ActionLayout.absoluteMouse.lowerBound], 0.9, accuracy: 0.000_1)
+    }
+
     func testSparseStaticVideoIsSampledAtConfiguredPerceptionCadence() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("static-video-cache-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -4423,6 +4598,49 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(imagePredictions.asArray(Float.self), cachedPredictions.asArray(Float.self))
     }
 
+    func testUnavailableTrainingHistoryExactlyMatchesRuntimeZeroHistory() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(
+            width: 16,
+            height: 12,
+            colorMode: .grayscale
+        )
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 2,
+            frameSpacing: 1,
+            downsampleFactor: 2
+        )
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.precision = .float32
+        profile.training.generalization = .disabled
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+
+        let embeddingWidth = profile.training.architecture.visualEmbedding
+        let current = MLXRandom.uniform(low: -1, high: 1, [1, embeddingWidth])
+        let substitutedPast = MLXRandom.uniform(low: -1, high: 1, [1, 2, embeddingWidth])
+        let substitutedControls = MLXArray.ones([1, 2, ActionLayout.count])
+        let masked = model.temporalFeatures(
+            currentVisualEmbedding: current,
+            pastVisualEmbeddings: substitutedPast,
+            pastControls: substitutedControls,
+            pastFrameMask: MLXArray.zeros([1, 2, 1])
+        )
+        let runtimeEquivalent = model.temporalFeatures(
+            currentVisualEmbedding: current,
+            pastVisualEmbeddings: MLXArray.zeros([1, 2, embeddingWidth]),
+            pastControls: MLXArray.zeros([1, 2, ActionLayout.count])
+        )
+        MLX.eval(masked, runtimeEquivalent)
+
+        let maximumDelta = zip(
+            masked.asArray(Float.self),
+            runtimeEquivalent.asArray(Float.self)
+        ).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        XCTAssertLessThanOrEqual(maximumDelta, 0.000_001)
+    }
+
     func testFinalOnlyRecurrentStatesMatchMLXOutputsAndGradients() {
         MLXRandom.seed(88_200)
         let input = MLXRandom.uniform(low: -1, high: 1, [3, 5, 11])
@@ -4769,6 +4987,17 @@ final class DomainTests: XCTestCase {
         ).map { trainingControlValues[$0] }
         XCTAssertTrue(keyValues.contains(0), "Historical controls must sometimes be hidden even when feature dropout is zero.")
         XCTAssertTrue(keyValues.contains(1), "History corruption must preserve some exact evidence without dropout rescaling.")
+        for duplicateIndex in ActionLayout.commandOptionControlKeyboardIndices {
+            let values = stride(
+                from: duplicateIndex,
+                to: batch * ActionLayout.count,
+                by: ActionLayout.count
+            ).map { trainingControlValues[$0] }
+            XCTAssertTrue(
+                values.allSatisfy { $0 == 0 },
+                "History corruption must never synthesize a duplicate modifier-key path."
+            )
+        }
         XCTAssertEqual(training.embeddings.asArray(Float.self), embeddings.asArray(Float.self))
     }
 
@@ -4882,6 +5111,116 @@ final class DomainTests: XCTestCase {
             heldActionLoss.item(Float.self),
             accuracy: 0.000_001,
             "A held action and a fresh transition need different weighting independently of the sampled frame context."
+        )
+    }
+
+    func testClassBalancedBinaryLossKeepsRareKeysBelowTheHeldThreshold() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(
+            width: 8,
+            height: 8,
+            colorMode: .grayscale
+        )
+        profile.channels = ActionChannels(
+            absoluteMouse: false,
+            relativeMouse: false,
+            buttons: false,
+            scroll: false,
+            keyboard: true,
+            modifiers: false
+        )
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 0)
+        profile.training.binaryFocalGamma = 0
+        profile.training.architecture = .small
+        profile.training.precision = .float32
+        profile.training.generalization = .disabled
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+
+        let rowCount = 100
+        let key = ActionLayout.keyboard.lowerBound + 13
+        var targetValues = [Float](repeating: 0, count: rowCount * ActionLayout.count)
+        var previousValues = targetValues
+        targetValues[key] = 1
+        previousValues[ActionLayout.count + key] = 1 // The following row is a release.
+        let targets = MLXArray(targetValues, [rowCount, ActionLayout.count])
+        let previous = MLXArray(previousValues, [rowCount, ActionLayout.count])
+        var weightValues = [Float](repeating: 0, count: ActionLayout.count)
+        weightValues[key] = 99
+        let weights = MLXArray(weightValues, [ActionLayout.count])
+
+        func loss(at rawLogit: Float) -> Float {
+            var values = [Float](repeating: 0, count: rowCount * ActionLayout.count)
+            for row in 0..<rowCount {
+                values[row * ActionLayout.count + key] = rawLogit
+            }
+            let loss = model.loss(
+                logits: MLXArray(values, [rowCount, ActionLayout.count]),
+                targets: targets,
+                positiveWeights: weights,
+                previousTargets: previous
+            )
+            MLX.eval(loss)
+            return loss.item(Float.self)
+        }
+
+        // One press receives 4 * 99 static weight; one release receives 4 and
+        // the other 98 negatives receive 1. A calibrated loss-only prior shift
+        // therefore places the saved/raw optimum at log(4 / 102), far below the
+        // runtime's 0.5 held threshold. The former objective optimized near 0.8.
+        let calibratedRawLogit = Float(log(4.0 / 102.0))
+        let heldRawLogit = Float(log(4.0))
+        let calibratedProbability = sigmoid(MLXArray(calibratedRawLogit))
+        MLX.eval(calibratedProbability)
+
+        XCTAssertLessThan(calibratedProbability.item(Float.self), 0.05)
+        XCTAssertLessThan(loss(at: calibratedRawLogit), loss(at: 0))
+        XCTAssertLessThan(loss(at: calibratedRawLogit), loss(at: heldRawLogit))
+    }
+
+    func testBinaryFocalGammaActuallyDownweightsUniformEasyNegatives() {
+        func loss(gamma: Double) -> Float {
+            var profile = AIProfile.fresh()
+            profile.preprocessing = PreprocessingSpec(
+                width: 8,
+                height: 8,
+                colorMode: .grayscale
+            )
+            profile.channels = ActionChannels(
+                absoluteMouse: false,
+                relativeMouse: false,
+                buttons: true,
+                scroll: false,
+                keyboard: false,
+                modifiers: false
+            )
+            profile.training.binaryFocalGamma = gamma
+            profile.training.architecture = .small
+            profile.training.precision = .float32
+            profile.training.generalization = .disabled
+            let model = AgentPolicy(profile: profile)
+            model.train(false)
+            var weights = [Float](repeating: 0, count: ActionLayout.count)
+            weights[ActionLayout.buttons.lowerBound] = 1
+            let result = model.loss(
+                logits: MLXArray(
+                    [Float](repeating: -5, count: 8 * ActionLayout.count),
+                    [8, ActionLayout.count]
+                ),
+                targets: MLXArray.zeros([8, ActionLayout.count]),
+                positiveWeights: MLXArray(weights, [ActionLayout.count])
+            )
+            MLX.eval(result)
+            return result.item(Float.self)
+        }
+
+        let ordinary = loss(gamma: 0)
+        let focused = loss(gamma: 2)
+        XCTAssertGreaterThan(ordinary, 0)
+        XCTAssertLessThan(
+            focused,
+            ordinary * 0.01,
+            "Prediction-dependent focal weights must not cancel out through their own denominator."
         )
     }
 

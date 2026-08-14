@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.5.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for the non-stable AgentTrainer 2.6.0 pre-release. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -79,6 +79,8 @@ Live HUD state and persisted recording state are intentionally separate. The HUD
 
 Saved HEVC sessions end on the shared host clock even when ScreenCaptureKit reports only idle frames. Dataset construction materializes the last decoded frame at every configured perception interval until a newer frame becomes causal; a static screen must not collapse temporal spacing or observation count.
 
+Action accumulation is causal at the usable trim boundary. Begin from the capture-region center, then consume only input at or before that boundary. A native time-zero pointer seed therefore restores the recorded position, while an imported recording whose first pointer sample occurs later must remain centered until that sample's own action interval.
+
 ## Vision and dataset contracts
 
 Packed observations are `UInt8`:
@@ -100,7 +102,7 @@ Temporal vision is either current-only or an explicit three-part input:
 
 The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of compact cached embeddings plus controls. Packed historical images are not retained at runtime. Zero frames disables the temporal branch: runtime and training consume only current vision, and Policy v6 omits the recurrent/control-projection parameters and unused fusion columns.
 
-`TrainingDataContract.schemaVersion` is 10. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, or target meaning changes. A cache has:
+`TrainingDataContract.schemaVersion` is 11. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, or target meaning changes. Version 11 removes future-pointer leakage at a recording's usable start. A cache has:
 
 - `current-observations.bin` — one full-resolution packed image per perception
 - `past-observations.bin` — one reduced packed image of the same perception
@@ -122,7 +124,7 @@ One action row has 146 values:
 
 Shift belongs to Keyboard. Control, Option, and Command use only their dedicated outputs; their duplicate ordinary key-code slots must be zeroed in targets, loss, frame-aligned controls, and runtime.
 
-Every frame-control row includes normalized absolute cursor position, raw relative movement, held and sub-tick mouse-button presses, scroll, held and sub-tick key presses, Shift, Control, Option, and Command. Sub-tick taps must survive both action and perception-interval sampling. Cache loading verifies exact configured spacing, strictly causal indices, monotonic current frames, segment-leading sentinels, file sizes, and bounded arithmetic. Validation context must not reach into training frames or cross recording boundaries.
+Every frame-control row includes normalized absolute cursor position, raw relative movement, held and sub-tick mouse-button presses, scroll, held and sub-tick key presses, Shift, Control, Option, and Command. Sub-tick taps must survive both action and perception-interval sampling. Cache loading verifies exact configured spacing, strictly causal indices, monotonic current frames, segment-leading sentinels, file sizes, and bounded arithmetic. A fused training batch carries a tiny validity value for every past slot; sentinel images may stay rectangular in host storage, but their encoded features and controls must be multiplied to exact zero before temporal fusion so training matches runtime startup. Validation context must not reach into training frames or cross recording boundaries.
 
 ## Model and training contracts
 
@@ -143,16 +145,16 @@ Current Policy v6 combines:
 
 Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling remains decodable for profile repair/tests but is no longer offered by the current editor; it needs distinct projections when spatial dimensions differ.
 
-`GeneralizationConfiguration` owns five training-only defenses. Structured YUV luminance/contrast/chroma variation and small neutral rectangles alter pixels without moving absolute pointer geometry. Per-value control-history dropout, rare binary flips, and bounded continuous noise simulate imperfect prior outputs. Temporal-token dropout trains startup/missing-history behavior. Small binary label smoothing reduces brittle confidence while validation retains exact targets. Visual-embedding and fusion dropout occur only after unique visual work is gathered back to action rows, preserving an independent stochastic path per label. Inference applies none of these perturbations.
+`GeneralizationConfiguration` owns five training-only defenses. Structured YUV luminance/contrast/chroma variation and small neutral rectangles alter pixels without moving absolute pointer geometry. Per-value control-history dropout, rare flips on exact learnable binary slots, and bounded noise on exact continuous slots simulate imperfect prior outputs; ignored duplicate modifier-key slots remain zero. Temporal-token dropout trains additional missing-history cases beyond the exact sentinel mask. Small binary label smoothing reduces brittle confidence while validation retains exact targets. Visual-embedding and fusion dropout occur only after unique visual work is gathered back to action rows, preserving an independent stochastic path per label. Inference applies none of these perturbations.
 
-Training uses class/transition weighting, focal binary loss, the v6 generalization pipeline, deterministic salience-balanced locality order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Do not change those semantics without updating tests and the relevant schema.
+Training uses calibrated class/transition weighting, focal binary loss, the v6 generalization pipeline, deterministic salience-balanced locality order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Positive-class weights are applied both as static loss weights and as a loss-only `log(weight)` offset; this preserves rare-positive gradients without shifting saved raw logits toward runtime's `0.5` held threshold. Prediction-dependent focal weights affect only the numerator and are normalized by static class/transition weight, so gamma must not cancel on equally difficult examples. `TrainingObjectiveContract.schemaVersion` is 1 and participates in exact-checkpoint signatures independently of packed data and tensor shapes. Supervised versions record it in their immutable manifests, and RL descendants preserve that supervised ancestry rather than claiming a newer objective. Objective changes must increment it, retain compatible active brain weights as a warm start, and restart optimizer state. Do not change those semantics without updating focused calibration tests and the relevant schema.
 
 The performance path preserves those semantics:
 
 - VideoToolbox decodes directly into native video-range YUV. One CVMetalTexture mapping and Metal command buffer produce both configured output resolutions, while decode, resize/color packing, and cache writes overlap through a bounded ordered pipeline of up to eight observations within a 64 MB cap.
 - Multiple recordings use up to four parallel decode/packing workers, bounded by active CPU count and a conservative half-of-unified-memory budget. Each worker produces a local shard; the builder merges shards in the user's original recording order and rebases only non-sentinel observation indices. Cache bytes, segment boundaries, and sample order remain deterministic.
 - Before packing, a bounded metadata-only preflight validates each fixed-width input stream and opens the video track, duration, and dimensions. Unreadable packages are reported by recording name and identifier, left byte-for-byte untouched, and excluded from both packed data and the exact checkpoint signature. If every selected package is unreadable, training fails immediately with an actionable error.
-- Projected cache plus peak shard working space is checked against the training-data volume before decode. Out-of-order packed shards use a strict two-worker-window look-ahead; a slow early recording must never permit temporary disk usage or pending merge state to grow with the full library size.
+- Projected cache plus every shard that the bounded look-ahead can retain is checked against the training-data volume before decode. Out-of-order packed shards use a strict two-worker-window look-ahead; a slow early recording must never permit temporary disk usage or pending merge state to grow with the full library size. The one-recording path writes directly and must not reserve a nonexistent shard copy.
 - When one decoded frame remains causal across many configured perception ticks, Metal packs it once and the cache writer repeats those exact packed bytes in large buffered writes. Observation cadence, indices, controls, and every action label remain unchanged. Temporary shards skip redundant durability barriers; the final cache files are synchronized before their atomic directory move.
 - Dataset files are required memory mappings with adaptive VM advice. Epochs randomize small collections of temporally local lanes rather than every row globally, so each optimizer batch remains diverse while macOS can read ahead the contiguous mapped pages inside each lane. A batch gathers packed vision, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
 - Whole-library grouping reads only each row's current-observation index. The cache validator guarantees that a global current-observation identity determines its complete causal sequence, so direct grouping must remain byte-for-byte order-equivalent to grouping through `visionBatchPlan`; the latter is still used for actual batches where its past-frame deduplication maps are consumed.
@@ -205,7 +207,7 @@ The final executable action is the intersection of:
 
 Predictions must contain 146 finite values. Held keys/buttons may persist between fresh predictions, but cursor deltas and scroll are transient. The prediction latch consumes transient outputs once.
 
-At runtime, every successfully inferred perception stores its compact reduced-frame visual embedding with the sanitized controls predicted for that interval. Exact spaced entries are selected from a fixed-capacity circular buffer. Unavailable startup slots use zero embeddings and controls; training's whole-token dropout explicitly covers that state. Sampling/appending remains O(1), and historical images are never re-encoded.
+At runtime, every successfully inferred perception stores its compact reduced-frame visual embedding with the sanitized controls predicted for that interval. Exact spaced entries are selected from a fixed-capacity circular buffer. Unavailable startup slots use zero embeddings and controls; training's explicit past-slot validity mask reproduces that state exactly, and whole-token dropout covers additional missing-history cases. Sampling/appending remains O(1), and historical images are never re-encoded.
 
 All synthetic events carry `agentTrainerSyntheticTag`; input safety monitors ignore that tag. Panic and normal stop both drain action work and release held state.
 

@@ -668,7 +668,13 @@ final class ReinforcementTrainer: @unchecked Sendable {
                 isAutosave: isAutosave,
                 demonstratedKeyCodes: demonstratedKeyCodes,
                 relativeMouseScale: GameCameraContract.deltaScale,
-                trainingDataSchema: TrainingDataContract.schemaVersion,
+                // Online updates do not reinterpret the demonstration target
+                // layout that produced their starting brain. Preserve that
+                // contract across RL descendants; a brand-new neutral policy
+                // adopts the current layout.
+                trainingDataSchema: baseVersion?.trainingDataSchema
+                    ?? TrainingDataContract.schemaVersion,
+                trainingObjectiveSchema: baseVersion?.trainingObjectiveSchema,
                 trainingDurationSeconds: previousTrainingSeconds + cumulativeTrainingSeconds
                     - (baseVersion?.reinforcementTrainingSeconds ?? 0),
                 experienceDurationSeconds: baseVersion?.experienceDurationSeconds

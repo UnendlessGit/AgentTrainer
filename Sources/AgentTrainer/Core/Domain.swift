@@ -268,10 +268,18 @@ enum ModelContract {
 /// a data-only correction can invalidate caches/checkpoints without needlessly
 /// changing tensor shapes. Policy v6 itself is an intentional weight break.
 enum TrainingDataContract {
-    /// Version 10 adds a current-frame-only cache layout for disabled temporal
-    /// memory. Version 9's causal cadence remains unchanged when past frames are
-    /// enabled.
-    static let schemaVersion = 10
+    /// Version 11 keeps segment-leading pointer targets causal: a recording
+    /// without a pointer sample at or before its usable trim begins at the
+    /// capture-region center instead of borrowing a future pointer position.
+    static let schemaVersion = 11
+}
+
+/// Versioned independently from packed dataset bytes and learned tensor shapes.
+/// Adding this value to the exact-checkpoint signature lets objective fixes
+/// retain compatible brain weights while safely restarting stale optimizer
+/// state. Version 1 introduces calibrated class-balanced focal binary loss.
+enum TrainingObjectiveContract {
+    static let schemaVersion = 1
 }
 
 /// Versioned independently from model weights and demonstration caches. The
@@ -566,8 +574,8 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
 
     /// Optional adaptive fields preserve exact behavior for profiles created by
     /// older releases: a missing schedule selects inverse-square-root decay and
-    /// a missing focal gamma selects ordinary class-balanced BCE. New profiles
-    /// receive the stronger defaults below.
+    /// a missing focal gamma selects calibrated class-balanced BCE without
+    /// focal modulation. New profiles receive the stronger defaults below.
     var learningRateSchedule: LearningRateSchedule? = .adaptiveCosine
     var cosineCycleEpochs: Int? = 8
     var plateauPatience: Int? = 5
@@ -962,6 +970,9 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Optional keeps existing runnable brains compatible. New training writes
     /// the dataset/target contract that produced the brain.
     var trainingDataSchema: Int? = nil
+    /// Loss semantics do not alter Policy v6 tensor shapes, but recording them
+    /// keeps every immutable brain auditable across optimizer-objective fixes.
+    var trainingObjectiveSchema: Int? = nil
     /// Cumulative optimizer wall time represented by this immutable brain.
     /// Optional keeps every version created before timing metrics decodable.
     var trainingDurationSeconds: Double? = nil

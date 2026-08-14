@@ -288,7 +288,8 @@ final class TrainingEngine: @unchecked Sendable {
                 currentImages: batch.currentImages,
                 pastImages: batch.pastImages,
                 pastControls: batch.pastControls,
-                visionToPast: batch.visionToPast
+                visionToPast: batch.visionToPast,
+                pastFrameMask: batch.pastFrameMask
             )
             let uniqueLogits = model.logits(temporalFeatures: temporalFeatures)
             let logits: MLXArray
@@ -402,13 +403,15 @@ final class TrainingEngine: @unchecked Sendable {
             // to construct a meaningless gradient for it.
             let sampleToVision = batch.sampleToVision
             let visionToPast = batch.visionToPast
+            let pastFrameMask = batch.pastFrameMask
             let result = valueAndGrad(model: model) { model, arrays in
                 let temporalFeatures = model.temporalFeatures(
                     currentImages: arrays[0],
                     pastImages: arrays[1],
                     pastControls: arrays[2],
                     visionToPast: visionToPast,
-                    sampleToVision: sampleToVision
+                    sampleToVision: sampleToVision,
+                    pastFrameMask: pastFrameMask
                 )
                 let logits = model.logits(temporalFeatures: temporalFeatures)
                 return [model.loss(
@@ -877,7 +880,8 @@ final class TrainingEngine: @unchecked Sendable {
             reusesVisionFeatures
                 ? .init([pastVisionCount, pastSpec.sampleByteCount], dtype: .uint8)
                 : .init([visionCount, temporal.pastFrameCount, pastSpec.sampleByteCount], dtype: .uint8),
-            .init([visionCount, temporal.pastFrameCount, ActionLayout.count], dtype: .float32)
+            .init([visionCount, temporal.pastFrameCount, ActionLayout.count], dtype: .float32),
+            .init([visionCount, temporal.pastFrameCount, 1], dtype: .float32)
         ]
         if reusesVisionFeatures {
             descriptors.append(.init([visionCount, temporal.pastFrameCount], dtype: .int32))
@@ -887,7 +891,7 @@ final class TrainingEngine: @unchecked Sendable {
             .init([count, 2, ActionLayout.count], dtype: .float32)
         )
         return try inputBufferPool.makeArrays(descriptors) { destinations in
-            let actionDestination = destinations[reusesVisionFeatures ? 5 : 3]
+            let actionDestination = destinations[reusesVisionFeatures ? 6 : 4]
             if let visionPlan {
                 dataset.populateTrainingBatch(
                     at: indices,
@@ -895,13 +899,14 @@ final class TrainingEngine: @unchecked Sendable {
                     packedCurrentObservations: destinations[0],
                     packedPastObservations: destinations[1],
                     pastControlRows: destinations[2],
+                    pastFrameValidity: destinations[3],
                     actionRows: actionDestination
                 )
                 visionPlan.visionToPast.withUnsafeBytes {
-                    destinations[3].copyMemory(from: $0)
+                    destinations[4].copyMemory(from: $0)
                 }
                 visionPlan.sampleToVision.withUnsafeBytes {
-                    destinations[4].copyMemory(from: $0)
+                    destinations[5].copyMemory(from: $0)
                 }
             } else {
                 dataset.populateTrainingBatch(
@@ -909,6 +914,7 @@ final class TrainingEngine: @unchecked Sendable {
                     packedCurrentObservations: destinations[0],
                     packedPastObservations: destinations[1],
                     pastControlRows: destinations[2],
+                    pastFrameValidity: destinations[3],
                     actionRows: actionDestination
                 )
             }
@@ -948,12 +954,13 @@ final class TrainingEngine: @unchecked Sendable {
                 pastControls: MLXArray.zeros([visionCount, 1, ActionLayout.count], dtype: .float32),
                 visionToPast: nil,
                 sampleToVision: reusesVisionFeatures ? arrays[1] : nil,
+                pastFrameMask: nil,
                 targets: actions[0..., 0, 0...],
                 previousTargets: actions[0..., 1, 0...]
             )
         }
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
-        let actions = arrays[reusesVisionFeatures ? 5 : 3]
+        let actions = arrays[reusesVisionFeatures ? 6 : 4]
         return ExpandedTrainingBatch(
             currentImages: VisionPreprocessor.mlxTensor(
                 arrays[0], spec: profile.preprocessing, dtype: dtype
@@ -962,8 +969,9 @@ final class TrainingEngine: @unchecked Sendable {
                 ? VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec, dtype: dtype)
                 : VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec, dtype: dtype),
             pastControls: arrays[2],
-            visionToPast: reusesVisionFeatures ? arrays[3] : nil,
-            sampleToVision: reusesVisionFeatures ? arrays[4] : nil,
+            visionToPast: reusesVisionFeatures ? arrays[4] : nil,
+            sampleToVision: reusesVisionFeatures ? arrays[5] : nil,
+            pastFrameMask: arrays[3],
             targets: actions[0..., 0, 0...],
             previousTargets: actions[0..., 1, 0...]
         )
@@ -1405,6 +1413,7 @@ final class TrainingEngine: @unchecked Sendable {
     private func profileSignature(_ profile: AIProfile, recordings: [RecordingItem]) throws -> String {
         struct TrainingIdentity: Encodable {
             let trainingDataSchema: Int
+            let trainingObjectiveSchema: Int
             let preprocessing: PreprocessingSpec
             let channels: ActionChannels
             let training: TrainingConfiguration
@@ -1425,7 +1434,16 @@ final class TrainingEngine: @unchecked Sendable {
         let recordingIdentities = try recordings
             .map { try RecordingTrainingIdentity(recording: $0) }
             .sorted { $0.id.uuidString < $1.id.uuidString }
-        let identity = TrainingIdentity(trainingDataSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, channels: normalizedChannels, training: resumeCompatibleTraining, recordings: recordingIdentities, folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString }, restrictions: profile.effectiveRestrictions)
+        let identity = TrainingIdentity(
+            trainingDataSchema: TrainingDataContract.schemaVersion,
+            trainingObjectiveSchema: TrainingObjectiveContract.schemaVersion,
+            preprocessing: profile.preprocessing,
+            channels: normalizedChannels,
+            training: resumeCompatibleTraining,
+            recordings: recordingIdentities,
+            folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString },
+            restrictions: profile.effectiveRestrictions
+        )
         return SHA256.hash(data: try encoder.encode(identity)).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -1494,6 +1512,7 @@ final class TrainingEngine: @unchecked Sendable {
             demonstratedKeyCodes: state.demonstratedKeyCodes ?? [],
             relativeMouseScale: GameCameraContract.deltaScale,
             trainingDataSchema: TrainingDataContract.schemaVersion,
+            trainingObjectiveSchema: TrainingObjectiveContract.schemaVersion,
             trainingDurationSeconds: usesBest ? state.bestElapsed : state.elapsed,
             experienceDurationSeconds: usesBest ? state.bestExperienceSeconds : state.experienceSeconds ?? 0,
             trainingShowsCursor: state.trainingShowsCursor,
@@ -1685,6 +1704,7 @@ private struct ExpandedTrainingBatch {
     let pastControls: MLXArray
     let visionToPast: MLXArray?
     let sampleToVision: MLXArray?
+    let pastFrameMask: MLXArray?
     let targets: MLXArray
     let previousTargets: MLXArray
 }

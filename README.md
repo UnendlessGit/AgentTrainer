@@ -1,4 +1,6 @@
-# AgentTrainer 2.5.0
+# AgentTrainer 2.6.0 (Pre-release)
+
+> **Status:** 2.6 is a non-stable testing build. It is not published as a stable GitHub release.
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -41,6 +43,14 @@ Policy v6, introduced in AgentTrainer 2.1, is designed around both useful capaci
 - live temporal inference encodes each reduced frame once, caches its compact visual embedding, and reuses that embedding when the frame enters later causal windows
 
 Training has independent, configurable anti-memorization controls for label-preserving vision variation, small random neutral occlusions, control-history dropout/noise, whole temporal-token dropout, and binary label smoothing. These perturbations are disabled for validation and live inference. Recording-disjoint validation where possible, purged causal validation otherwise, per-head metrics, and best-held-out-brain activation remain the primary generalization checks.
+
+## Calibrated controls in 2.6
+
+AgentTrainer 2.6 corrects a sparse-control objective that could make the least-used key or button look permanently active. Positive examples were intentionally class-balanced and press/release boundaries were emphasized, but those two weights also shifted an uninformative output toward—or above—the same `0.5` probability that runtime interprets as held. Setting Binary focal gamma to `0` did not remove either weight.
+
+The supervised objective now applies its positive-class prior as a loss-only logit adjustment. Rare positives still receive a strong learning signal, while the raw logits saved in the brain remain calibrated to the demonstrated action rate. Focal modulation is normalized only by static class/transition weights, so gamma now genuinely suppresses easy idle examples instead of cancelling through its own prediction-dependent denominator.
+
+The same correctness pass also makes unavailable segment-leading temporal frames exactly match runtime's zero embedding/control state, keeps ignored duplicate Command/Option/Control key slots untouched by history corruption, prevents a future first pointer event in imported recordings from leaking into earlier targets, and reserves disk space for every temporary shard that parallel cache packing can retain. Policy v6 tensor shapes are unchanged: compatible active brain weights are retained, while 2.6 safely starts a new optimizer sequence and rebuilds affected disposable caches.
 
 ## Faster training in 2.5
 
@@ -154,7 +164,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.5.0.dmg`
+- `AgentTrainer-2.6.0.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

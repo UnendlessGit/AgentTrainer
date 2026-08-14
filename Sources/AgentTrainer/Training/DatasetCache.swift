@@ -196,8 +196,8 @@ struct CachedVisionBatchPlan: Sendable {
     let uniqueSequences: [CachedObservationSequence]
     /// Distinct reduced-resolution observations referenced by every past slot
     /// in `uniqueSequences`. Segment-leading padding resolves to that
-    /// sequence's current observation, exactly as it does in the canonical
-    /// batch path.
+    /// sequence's current observation only to keep packed storage rectangular;
+    /// the fused batch's validity tensor zeros its embedding before fusion.
     let uniquePastObservations: [UInt32]
     /// Row-major [unique sequence, past slot] map into
     /// `uniquePastObservations`. Keeping this as Int32 lets MLX gather the
@@ -590,6 +590,7 @@ final class CachedDataset: @unchecked Sendable {
         packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
         packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
         pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
+        pastFrameValidity validityDestination: UnsafeMutableRawBufferPointer? = nil,
         actionRows actionDestination: UnsafeMutableRawBufferPointer
     ) {
         let sequences = observationSequences(at: indices)
@@ -600,6 +601,7 @@ final class CachedDataset: @unchecked Sendable {
             packedCurrentObservations: currentDestination,
             packedPastObservations: pastDestination,
             pastControlRows: controlDestination,
+            pastFrameValidity: validityDestination,
             actionRows: actionDestination
         )
     }
@@ -610,6 +612,7 @@ final class CachedDataset: @unchecked Sendable {
         packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
         packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
         pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
+        pastFrameValidity validityDestination: UnsafeMutableRawBufferPointer? = nil,
         actionRows actionDestination: UnsafeMutableRawBufferPointer
     ) {
         populateTrainingBatch(
@@ -619,6 +622,7 @@ final class CachedDataset: @unchecked Sendable {
             packedCurrentObservations: currentDestination,
             packedPastObservations: pastDestination,
             pastControlRows: controlDestination,
+            pastFrameValidity: validityDestination,
             actionRows: actionDestination
         )
     }
@@ -634,6 +638,7 @@ final class CachedDataset: @unchecked Sendable {
         packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
         packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
         pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
+        pastFrameValidity validityDestination: UnsafeMutableRawBufferPointer? = nil,
         actionRows actionDestination: UnsafeMutableRawBufferPointer
     ) {
         precondition(visionPlan.sampleToVision.count == indices.count)
@@ -648,6 +653,7 @@ final class CachedDataset: @unchecked Sendable {
             packedCurrentObservations: currentDestination,
             packedPastObservations: pastDestination,
             pastControlRows: controlDestination,
+            pastFrameValidity: validityDestination,
             actionRows: actionDestination
         )
     }
@@ -676,6 +682,7 @@ final class CachedDataset: @unchecked Sendable {
         packedCurrentObservations currentDestination: UnsafeMutableRawBufferPointer,
         packedPastObservations pastDestination: UnsafeMutableRawBufferPointer,
         pastControlRows controlDestination: UnsafeMutableRawBufferPointer,
+        pastFrameValidity validityDestination: UnsafeMutableRawBufferPointer?,
         actionRows actionDestination: UnsafeMutableRawBufferPointer
     ) {
         let batchCount = indices.count
@@ -686,6 +693,12 @@ final class CachedDataset: @unchecked Sendable {
         precondition(currentDestination.count == observationSequences.count * currentBytes)
         precondition(pastDestination.count == pastObservationIndices.count * pastBytes)
         precondition(controlDestination.count == observationSequences.count * pastFrameCount * actionRowBytes)
+        if let validityDestination {
+            precondition(
+                validityDestination.count
+                    == observationSequences.count * pastFrameCount * MemoryLayout<Float>.size
+            )
+        }
         precondition(actionDestination.count == batchCount * 2 * actionRowBytes)
         if pastFrameCount == 0 {
             populateCurrentOnlyTrainingBatch(
@@ -698,6 +711,16 @@ final class CachedDataset: @unchecked Sendable {
         }
         if let controlBase = controlDestination.baseAddress {
             memset(controlBase, 0, controlDestination.count)
+        }
+        if let validityDestination {
+            let validity = validityDestination.bindMemory(to: Float.self)
+            for (visionRow, sequence) in observationSequences.enumerated() {
+                precondition(sequence.indices.count == pastFrameCount + 1)
+                for frame in 0..<pastFrameCount {
+                    validity[visionRow * pastFrameCount + frame]
+                        = sequence.indices[frame + 1] == UInt32.max ? 0 : 1
+                }
+            }
         }
         if let actionBase = actionDestination.baseAddress {
             memset(actionBase, 0, actionDestination.count)
@@ -722,9 +745,9 @@ final class CachedDataset: @unchecked Sendable {
                         )
                         for frame in 0..<pastFrameCount {
                             let mapped = sequence.indices[frame + 1]
-                            // Padding frames intentionally carry no controls, so
-                            // duplicating the current low-resolution image at a
-                            // segment boundary can never leak its target action.
+                            // Padding frames carry no controls and their fused
+                            // validity value is zero, so the rectangular image
+                            // placeholder cannot affect temporal fusion.
                             if mapped != UInt32.max {
                                 memcpy(
                                     controlDestinationBase.advanced(by: (visionRow * pastFrameCount + frame) * actionRowBytes),
@@ -1674,7 +1697,8 @@ actor DatasetCacheBuilder {
             UInt64((1 + max(0, temporal.pastFrameCount)) * MemoryLayout<UInt32>.size)
         )
         var cacheBytes: UInt64 = 0
-        var largestShard: UInt64 = 0
+        var shardBytes: [UInt64] = []
+        shardBytes.reserveCapacity(recordings.count)
         for recording in recordings {
             let start = max(
                 0,
@@ -1696,17 +1720,40 @@ actor DatasetCacheBuilder {
                 duration: duration,
                 rate: profile.training.actionFPS
             )
-            let shardBytes = saturatedAdd(
+            let recordingBytes = saturatedAdd(
                 saturatedMultiply(observations, observationBytes),
                 saturatedMultiply(samples, sampleBytes)
             )
-            cacheBytes = saturatedAdd(cacheBytes, shardBytes)
-            largestShard = max(largestShard, shardBytes)
+            cacheBytes = saturatedAdd(cacheBytes, recordingBytes)
+            shardBytes.append(recordingBytes)
+        }
+        // Multi-recording packing writes independent shards in parallel while
+        // earlier shards are merged into the final cache. Out-of-order workers
+        // can leave as many shards resident as the lookahead permits; reserving
+        // only the single largest shard understated that real disk peak.
+        let parallelShardBytes: UInt64
+        if recordings.count > 1 {
+            let concurrency = recommendedPackingConcurrency(
+                recordings: recordings,
+                physicalMemory: ProcessInfo.processInfo.physicalMemory,
+                processorCount: ProcessInfo.processInfo.activeProcessorCount
+            )
+            let lookahead = recommendedPackingLookahead(
+                recordingCount: recordings.count,
+                concurrency: concurrency
+            )
+            parallelShardBytes = shardBytes
+                .sorted(by: >)
+                .prefix(lookahead)
+                .reduce(0, saturatedAdd)
+        } else {
+            // The one-recording fast path writes directly into the final cache.
+            parallelShardBytes = 0
         }
         return EstimatedCacheStorage(
             cacheBytes: cacheBytes,
             peakWorkingBytes: saturatedAdd(
-                saturatedAdd(cacheBytes, largestShard),
+                saturatedAdd(cacheBytes, parallelShardBytes),
                 minimumFreeSpaceReserve
             )
         )
@@ -2108,10 +2155,13 @@ actor DatasetCacheBuilder {
             return (0, 0)
         }
 
-        let initialPointer = events.first { $0.kind == .mouseMove || $0.kind == .mouseButton || $0.kind == .scroll }
         let trainingStartNanos = try absoluteHostNanos(recording.manifest, seconds: trainingStart)
         func makePrimedAccumulator() -> (ActionAccumulator, Int) {
-            var accumulator = ActionAccumulator(manifest: recording.manifest, initialPointer: initialPointer)
+            // Start from a neutral, known pointer position and advance only
+            // through events that are causal for the first usable target. Some
+            // imported/legacy recordings have no initial pointer seed; using
+            // their first pointer event here leaked a future position backward.
+            var accumulator = ActionAccumulator(manifest: recording.manifest)
             var eventIndex = 0
             while eventIndex < events.count, events[eventIndex].timestampNanos <= trainingStartNanos {
                 accumulator.consume(events[eventIndex])

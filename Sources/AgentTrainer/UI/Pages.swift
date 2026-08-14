@@ -333,7 +333,7 @@ private struct ProfileEditor: View {
                         }
                         HStack {
                             DoubleField("Minimum LR ratio", value: Binding(get: { draft.training.effectiveMinimumLearningRateRatio }, set: { draft.training.minimumLearningRateRatio = $0 }), help: "Lowest fraction of the peak rate inside a cosine cycle and the final adaptive envelope floor.")
-                            DoubleField("Binary focal gamma", value: Binding(get: { draft.training.effectiveBinaryFocalGamma }, set: { draft.training.binaryFocalGamma = $0 }), help: "Focuses button, key, and modifier learning on current mistakes instead of easy idle frames. Use 0 for ordinary class-balanced BCE.")
+                            DoubleField("Binary focal gamma", value: Binding(get: { draft.training.effectiveBinaryFocalGamma }, set: { draft.training.binaryFocalGamma = $0 }), help: "Focuses button, key, and modifier learning on current mistakes instead of easy idle frames. Use 0 for calibrated class-balanced BCE without focal modulation.")
                             Spacer()
                             InfoTip("Changing scheduler or loss settings keeps the active brain weights but safely starts a new optimizer sequence. Older profiles remain on their exact legacy schedule until you explicitly select Adaptive Cosine + Plateau.")
                         }
