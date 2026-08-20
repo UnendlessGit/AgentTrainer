@@ -4,6 +4,11 @@ import MLXNN
 import MLXRandom
 
 final class AgentPolicy: Module, @unchecked Sendable {
+    /// A fixed objective-level exposure to the runtime's zero-action startup
+    /// state. This is intentionally independent of optional generalization:
+    /// disabling augmentation must never restore a teacher-forcing shortcut.
+    static let runtimeStartupHistoryDropout: Float = 0.50
+
     let profile: AIProfile
     let dtype: DType
     // Leading underscore deliberately keeps this deterministic tensor out of
@@ -821,8 +826,9 @@ final class AgentPolicy: Module, @unchecked Sendable {
 
     /// Corrupts historical state without dropout rescaling, because the goal is
     /// to simulate missing or imperfect prior predictions rather than preserve
-    /// activation expectation. This is intentionally internal for deterministic
-    /// contract tests and is a no-op during inference.
+    /// activation expectation. A fixed share of rows receive an exact all-zero
+    /// control history so the policy cannot settle into runtime's inert startup
+    /// fixed point. This is internal for contract tests and a no-op at inference.
     func regularizedTemporalHistory(
         pastVisualEmbeddings: MLXArray,
         pastControls: MLXArray
@@ -833,9 +839,19 @@ final class AgentPolicy: Module, @unchecked Sendable {
         let frameDropout = Float(min(0.5, max(0, configuration.temporalFrameDropout)))
         var embeddings = pastVisualEmbeddings
         var controls = pastControls
+        let runtimeHistoryKeep = MLXRandom.bernoulli(
+            1 - Self.runtimeStartupHistoryDropout,
+            [controls.dim(0), 1, 1]
+        ).asType(dtype)
 
         if controlDropout > 0 {
-            let keep = MLXRandom.bernoulli(1 - controlDropout, controls.shape).asType(dtype)
+            // One decision spans every temporal frame for an output. Per-value
+            // dropout left almost every long held-key trace visible and taught
+            // the recurrent branch to copy actions instead of reading pixels.
+            let keep = MLXRandom.bernoulli(
+                1 - controlDropout,
+                [controls.dim(0), 1, controls.dim(2)]
+            ).asType(dtype)
             controls = controls * keep
 
             // Rare flips expose the temporal encoder to both false negatives and
@@ -862,6 +878,9 @@ final class AgentPolicy: Module, @unchecked Sendable {
                 noisy[.ellipsis, ActionLayout.modifiers]
             ], axis: -1)
         }
+        // Apply this last so derived flips/noise cannot repopulate an exact
+        // runtime-start row that the objective selected for visual learning.
+        controls = controls * runtimeHistoryKeep
         if frameDropout > 0 {
             let keep = MLXRandom.bernoulli(
                 1 - frameDropout,
@@ -1056,11 +1075,21 @@ final class AgentPolicy: Module, @unchecked Sendable {
         let channels = profile.channels
         if channels.mouseMovement {
             let absolute = smoothL1Loss(predictions: sigmoid(logits[.ellipsis, ActionLayout.absoluteMouse]), targets: targets[.ellipsis, ActionLayout.absoluteMouse], beta: 0.05)
-            let relative = activeContinuousLoss(predictions: tanh(logits[.ellipsis, ActionLayout.relativeMouse]), targets: targets[.ellipsis, ActionLayout.relativeMouse])
+            let relative = activeContinuousLoss(
+                predictions: tanh(logits[.ellipsis, ActionLayout.relativeMouse]),
+                targets: targets[.ellipsis, ActionLayout.relativeMouse],
+                activeWeights: positiveWeights.map { $0[ActionLayout.relativeMouse] }
+            )
             losses.append((absolute + relative) / 2)
         }
         if channels.buttons { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.buttons)) }
-        if channels.scroll { losses.append(activeContinuousLoss(predictions: tanh(logits[.ellipsis, ActionLayout.scroll]), targets: targets[.ellipsis, ActionLayout.scroll])) }
+        if channels.scroll {
+            losses.append(activeContinuousLoss(
+                predictions: tanh(logits[.ellipsis, ActionLayout.scroll]),
+                targets: targets[.ellipsis, ActionLayout.scroll],
+                activeWeights: positiveWeights.map { $0[ActionLayout.scroll] }
+            ))
+        }
         if channels.keyboard { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, indices: ActionLayout.keyboardAndShiftIndices)) }
         if channels.modifiers { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.commandOptionControl)) }
         guard let first = losses.first else { return MLXArray(0, dtype: dtype) }
@@ -1151,9 +1180,22 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return pow(abs(targets - sigmoid(logits)), Float(gamma))
     }
 
-    private func activeContinuousLoss(predictions: MLXArray, targets: MLXArray) -> MLXArray {
+    private func activeContinuousLoss(
+        predictions: MLXArray,
+        targets: MLXArray,
+        activeWeights: MLXArray?
+    ) -> MLXArray {
         let raw = smoothL1Loss(predictions: predictions, targets: targets, beta: 0.05, reduction: .none)
-        let weights = which(abs(targets) .> 0.0001, MLXArray(8, dtype: dtype), MLXArray(1, dtype: dtype))
+        let activeWeights = activeWeights.map {
+            // Eight is the established ordinary-motion emphasis. Dataset
+            // statistics may raise it for rarer activity but never weaken it.
+            maximum($0.asType(dtype), MLXArray(8, dtype: dtype))
+        } ?? MLXArray(8, dtype: dtype)
+        let weights = which(
+            abs(targets) .> 0.0001,
+            activeWeights,
+            MLXArray(1, dtype: dtype)
+        )
         return (raw * weights).sum() / (weights.sum() + 1e-6)
     }
 

@@ -271,6 +271,10 @@ private struct ProfileEditor: View {
                         Divider(); HStack { Text("Exact model vision").font(.headline).foregroundStyle(ATColor.cyan); InfoTip("These dimensions are the AI's actual eyesight. Training and live running always use this exact width and height.") }
                         HStack { IntField("Width", value: $draft.preprocessing.width, help: "Exact pixels the model sees horizontally."); IntField("Height", value: $draft.preprocessing.height, help: "Exact pixels the model sees vertically."); IntField("Bit detail", value: $draft.preprocessing.bitDepth, help: "Quantization detail from 1 to 8 bits per stored channel.") }
                         HStack { Picker("Mode", selection: $draft.preprocessing.colorMode) { ForEach(ColorMode.allCases) { Text($0.rawValue).tag($0) } }; Picker("Chroma", selection: $draft.preprocessing.chroma) { ForEach(ChromaSubsampling.allCases) { Text($0.rawValue).tag($0) } }.disabled(draft.preprocessing.colorMode == .grayscale); Picker("Resize", selection: $draft.preprocessing.resizePolicy) { ForEach(ResizePolicy.allCases) { Text($0.rawValue).tag($0) } } }
+                        ForEach(draft.preprocessing.trainingQualityWarnings, id: \.self) { warning in
+                            Label(warning, systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption).foregroundStyle(ATColor.amber)
+                        }
                         HStack { Spacer(); InfoTip("Chroma controls color-position detail. 4:2:0 is lighter and faster; 4:4:4 preserves color at every pixel. Grayscale stores luminance only.") }
                     }
                 }
@@ -325,7 +329,7 @@ private struct ProfileEditor: View {
                         }
                         .padding(11)
                         .raisedGlassSurface(cornerRadius: 11, tint: ATColor.cyan)
-                        HStack { DoubleField("Learning rate", value: $draft.training.learningRate, help: "Peak AdamW update size. Adaptive scheduling warms up, uses bounded cosine restarts so updates never decay silently to zero, and reduces its envelope only after a measured plateau."); DoubleField("Weight decay", value: $draft.training.weightDecay, help: "Regularization applied by AdamW."); DoubleField("Validation", value: $draft.training.validationSplit, help: "Fraction of whole recordings held out. Splits target sample count, keep rare controls in training, purge shared context, and score diverse examples from every held-out recording.") }
+                        HStack { DoubleField("Learning rate", value: $draft.training.learningRate, help: "Peak AdamW update size. Adaptive scheduling warms up, uses bounded cosine restarts so updates never decay silently to zero, and reduces its envelope only after a measured plateau."); DoubleField("Weight decay", value: $draft.training.weightDecay, help: "Regularization applied by AdamW."); DoubleField("Validation", value: $draft.training.validationSplit, help: "Fraction of whole recordings held out. Splits target sample count, keep rare controls in training, purge shared visual context, and stress-test the brain with zero prior actions. Per-head threshold misses are reported as quality warnings, not whole-model failures.") }
                         HStack {
                             Picker("Learning-rate schedule", selection: Binding(get: { draft.training.effectiveLearningRateSchedule }, set: { draft.training.learningRateSchedule = $0 })) { ForEach(LearningRateSchedule.allCases) { Text($0.rawValue).tag($0) } }
                             IntField("Cosine cycle epochs", value: Binding(get: { draft.training.effectiveCosineCycleEpochs }, set: { draft.training.cosineCycleEpochs = $0 }), help: "Length of each cosine restart. Restarts periodically restore useful update size instead of letting learning freeze.")
@@ -348,7 +352,7 @@ private struct ProfileEditor: View {
                             HStack {
                                 DoubleField("Vision variation", value: generalizationDoubleBinding(\.visionAugmentationStrength), help: "Luminance, contrast, chroma, and structured sensor variation from 0–0.5. It never moves pixels or pointer labels.")
                                 DoubleField("Random erasing", value: generalizationDoubleBinding(\.randomErasingProbability), help: "Chance from 0–0.5 of covering a small neutral rectangle, preventing reliance on one exact pixel patch.")
-                                DoubleField("History dropout", value: generalizationDoubleBinding(\.controlHistoryDropout), help: "Chance from 0–0.8 of hiding each prior control. Rare derived bit flips and bounded continuous noise model imperfect self-predictions.")
+                                DoubleField("History dropout", value: generalizationDoubleBinding(\.controlHistoryDropout), help: "Chance from 0–0.8 of hiding a prior control's entire trajectory. Rare derived bit flips and bounded continuous noise model imperfect self-predictions; autonomous-start zero history is always trained independently.")
                                     .disabled(draft.training.effectiveTemporalVision.pastFrameCount == 0)
                                 DoubleField("Frame dropout", value: generalizationDoubleBinding(\.temporalFrameDropout), help: "Chance from 0–0.5 of hiding an entire historical visual/control token, including missing startup context.")
                                     .disabled(draft.training.effectiveTemporalVision.pastFrameCount == 0)
@@ -418,7 +422,27 @@ private struct ProfileEditor: View {
                         } else {
                             ForEach(model.versions) { version in
                                 HStack {
-                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) }; if version.reinforcementOptimizerFile != nil { StatusPill(text: "RL", color: ATColor.violet) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "")\(version.reinforcementFeedbackCount.map { " • RL \($0) feedback / \(version.reinforcementUpdateCount ?? 0) updates / net \((version.reinforcementNetReward ?? 0).formatted(.number.sign(strategy: .always()).precision(.fractionLength(0...2))))" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        HStack {
+                                            Text(version.name).font(.subheadline.bold())
+                                            if draft.activeVersionID == version.id {
+                                                StatusPill(text: "Active", color: ATColor.green)
+                                            }
+                                            if version.reinforcementOptimizerFile != nil {
+                                                StatusPill(text: "RL", color: ATColor.violet)
+                                            }
+                                        }
+                                        Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • \((version.trainingObjectiveSchema ?? 0) >= 2 ? "zero-history " : "")validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "")\(version.reinforcementFeedbackCount.map { " • RL \($0) feedback / \(version.reinforcementUpdateCount ?? 0) updates / net \((version.reinforcementNetReward ?? 0).formatted(.number.sign(strategy: .always()).precision(.fractionLength(0...2))))" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                        ForEach(version.autonomousRunQualityWarnings, id: \.self) { warning in
+                                            Text("⚠︎ \(warning)").font(.caption2).foregroundStyle(ATColor.amber)
+                                        }
+                                        if let validationStep = version.validationGlobalStep,
+                                           validationStep != version.globalStep {
+                                            Text("Validation metrics were measured at step \(validationStep); this autosave contains newer exact weights from step \(version.globalStep).")
+                                                .font(.caption2).foregroundStyle(.tertiary)
+                                        }
+                                    }
                                     Spacer(); Button(version.reinforcementOptimizerFile != nil ? "Resume RL" : version.optimizerFile == nil ? "Run this" : "Revert & Resume") {
                                         Task {
                                             if await model.activateVersion(version) { draft.activeVersionID = version.id }
@@ -1395,7 +1419,7 @@ struct TrainingView: View {
     }
 
     private func validationSummary(_ report: ValidationReport) -> String {
-        var components = ["Validation report: \(report.sampleCount.formatted()) diverse held-out samples"]
+        var components = ["Zero-history stress validation: \(report.sampleCount.formatted()) diverse held-out samples"]
         if let binary = report.binary {
             components.append("binary precision \((100 * binary.precision).formatted(.number.precision(.fractionLength(1))))%")
             components.append("recall \((100 * binary.recall).formatted(.number.precision(.fractionLength(1))))%")
@@ -1410,7 +1434,7 @@ struct TrainingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                SectionTitle("Training", "Compiled MLX training uses an efficient residual vision encoder, causal temporal memory, pixel and history perturbations, focal class balance, transition-balanced batches, recording-disjoint validation when possible, purged causal validation otherwise, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
+                SectionTitle("Training", "Compiled MLX training uses an efficient residual vision encoder, causal temporal memory, autonomous-start history exposure, pixel and trajectory perturbations, class-balanced sparse controls, transition-balanced batches, disjoint visual validation, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
                 HStack {
                     if model.isTraining, let profile = displayedProfile {
                         Text(profile.name).font(.title2.bold())
@@ -1460,9 +1484,9 @@ struct TrainingView: View {
                 HStack(spacing: 12) {
                     MetricCard(title: "Batch loss", value: lossText(model.trainingMetrics.lossHistory.last), symbol: "waveform.path.ecg", color: ATColor.cyan)
                     MetricCard(title: "Epoch-average loss", value: lossText(model.trainingMetrics.epochTrainingLoss), symbol: "chart.xyaxis.line", color: ATColor.green)
-                    MetricCard(title: "Held-out loss", value: lossText(model.trainingMetrics.validationLoss), symbol: "checkmark.shield.fill", color: ATColor.violet)
+                    MetricCard(title: "Zero-history loss", value: lossText(model.trainingMetrics.validationLoss), symbol: "checkmark.shield.fill", color: ATColor.violet)
                     MetricCard(title: "Effective LR • envelope", value: model.trainingMetrics.effectiveLearningRate > 0 ? String(format: "%.2e • %.3fx", model.trainingMetrics.effectiveLearningRate, model.trainingMetrics.learningRateScale) : "—", symbol: "speedometer", color: ATColor.amber)
-                    MetricCard(title: "Held-out binary F1", value: model.trainingMetrics.validationReport?.binary.map { "\((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))%" } ?? "—", symbol: "scope", color: ATColor.coral)
+                    MetricCard(title: "Zero-history binary F1", value: model.trainingMetrics.validationReport?.binary.map { "\((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))%" } ?? "—", symbol: "scope", color: ATColor.coral)
                 }
                 HStack(spacing: 12) {
                     MetricCard(title: "Actual training time", value: TrainingDurationFormatter.string(seconds: displayedTiming.trainingSeconds), symbol: "clock.fill", color: ATColor.cyan)
@@ -1504,9 +1528,26 @@ struct TrainingView: View {
                         }
                         if let report = model.trainingMetrics.validationReport {
                             Text(validationSummary(report)).font(.caption).foregroundStyle(ATColor.green)
+                            ForEach(report.executableBinaryCollapseWarnings, id: \.self) { warning in
+                                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption).foregroundStyle(ATColor.amber)
+                            }
                         }
-                        if let profile = displayedProfile { Text("\(profile.preprocessing.width) × \(profile.preprocessing.height) • \(profile.preprocessing.bitDepth)-bit \(profile.preprocessing.chroma.rawValue) • \(profile.training.precision.rawValue) • perception \(profile.training.perceptionFPS.formatted()) FPS • action \(profile.training.actionFPS.formatted()) FPS").font(.caption).foregroundStyle(.secondary) }
-                        Text("Exact continuation always uses the latest optimizer and adaptive-scheduler checkpoint. When a validation split exists, completed training runs the lowest-loss held-out brain so late regression is never silently activated.").font(.caption2).foregroundStyle(.secondary)
+                        if let coverage = model.trainingMetrics.trainingDataCoverage,
+                           let profile = displayedProfile {
+                            ForEach(coverage.warnings(for: profile.channels), id: \.self) { warning in
+                                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption).foregroundStyle(ATColor.amber)
+                            }
+                        }
+                        if let profile = displayedProfile {
+                            Text("\(profile.preprocessing.width) × \(profile.preprocessing.height) • \(profile.preprocessing.bitDepth)-bit \(profile.preprocessing.chroma.rawValue) • \(profile.training.precision.rawValue) • perception \(profile.training.perceptionFPS.formatted()) FPS • action \(profile.training.actionFPS.formatted()) FPS").font(.caption).foregroundStyle(.secondary)
+                            ForEach(profile.preprocessing.trainingQualityWarnings, id: \.self) { warning in
+                                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption).foregroundStyle(ATColor.amber)
+                            }
+                        }
+                        Text("Exact continuation always uses the latest optimizer and adaptive-scheduler checkpoint. With validation data, completed training prefers a brain whose supported discrete heads cross the execution threshold, then the lowest-loss non-regressing checkpoint. If a head remains weak, the best available brain is still saved and the limitation is shown as a quality warning.").font(.caption2).foregroundStyle(.secondary)
                         Text("MLX reports allocator-backed unified memory: active arrays, reusable cache, and process-lifetime peak. It is not separate VRAM on Apple silicon.").font(.caption2).foregroundStyle(.tertiary)
                     }
                 }

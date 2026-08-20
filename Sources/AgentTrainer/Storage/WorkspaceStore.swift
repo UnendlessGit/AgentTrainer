@@ -240,6 +240,7 @@ actor WorkspaceStore {
                    manifest.schemaVersion == currentSchema,
                    manifest.id.uuidString.caseInsensitiveCompare(item.lastPathComponent) == .orderedSame,
                    manifest.artifactFileNamesAreSafe,
+                   manifest.trainingDataCoverage?.isValid != false,
                    FileManager.default.fileExists(atPath: item.appendingPathComponent(manifest.weightsFile).path) {
                     compatibleVersionIDs.insert(manifest.id)
                 } else {
@@ -1057,8 +1058,10 @@ actor WorkspaceStore {
     func saveVersionManifest(_ manifest: ModelVersionManifest, profileID: UUID) throws {
         var manifest = manifest
         manifest.name = manifest.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !manifest.name.isEmpty, manifest.artifactFileNamesAreSafe else {
-            throw AgentTrainerError.storage("The model version manifest contains an invalid name or artifact filename.")
+        guard !manifest.name.isEmpty,
+              manifest.artifactFileNamesAreSafe,
+              manifest.trainingDataCoverage?.isValid != false else {
+            throw AgentTrainerError.storage("The model version manifest contains an invalid name, artifact filename, or coverage report.")
         }
         let directory = versionDirectory(profileID: profileID, versionID: manifest.id)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1073,6 +1076,7 @@ actor WorkspaceStore {
                   let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
                   manifest.schemaVersion == ModelContract.schemaVersion,
                   manifest.artifactFileNamesAreSafe,
+                  manifest.trainingDataCoverage?.isValid != false,
                   manifest.id.uuidString.caseInsensitiveCompare(url.lastPathComponent) == .orderedSame else { return nil }
             return manifest
         }.sorted { $0.createdAt > $1.createdAt }
@@ -1084,7 +1088,8 @@ actor WorkspaceStore {
               let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
               manifest.id == versionID,
               manifest.schemaVersion == ModelContract.schemaVersion,
-              manifest.artifactFileNamesAreSafe else { return nil }
+              manifest.artifactFileNamesAreSafe,
+              manifest.trainingDataCoverage?.isValid != false else { return nil }
         return manifest
     }
 
@@ -1110,6 +1115,7 @@ actor WorkspaceStore {
               manifest.globalStep >= 0,
               manifest.trainingLoss.isFinite,
               manifest.artifactFileNamesAreSafe,
+              manifest.trainingDataCoverage?.isValid != false,
               manifest.reinforcementSessionID != nil,
               manifest.reinforcementSessionStartedAt != nil,
               reinforcementSequence > 0,

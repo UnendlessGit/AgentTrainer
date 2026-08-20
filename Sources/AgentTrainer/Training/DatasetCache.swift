@@ -183,6 +183,28 @@ struct CachedTrainingBatch: Sendable {
     let actionRows: Data
 }
 
+/// One pass over the selected target rows supplies every dataset-level action
+/// statistic needed by weighting, capability firewalls, and user diagnostics.
+/// Keeping this separate from the cache manifest lets existing caches benefit
+/// from objective improvements without another multi-gigabyte rebuild.
+struct TrainingActionStatistics: Sendable {
+    let sampleCount: Int
+    let activeCounts: [Int]
+    let coverage: TrainingDataCoverage
+
+    var demonstratedKeyCodes: Set<UInt16> {
+        var result: Set<UInt16> = []
+        for key in 0..<128 where activeCounts[ActionLayout.keyboard.lowerBound + key] > 0 {
+            result.insert(UInt16(key))
+        }
+        let modifierKeys: [UInt16] = [56, 59, 58, 55]
+        for modifier in 0..<4 where activeCounts[ActionLayout.modifiers.lowerBound + modifier] > 0 {
+            result.insert(modifierKeys[modifier])
+        }
+        return result
+    }
+}
+
 struct CachedObservationSequence: Hashable, Sendable {
     /// Slot zero is current. Remaining slots are causal past frames ordered
     /// oldest to newest. `UInt32.max` marks unavailable segment-leading slots.
@@ -398,6 +420,65 @@ final class CachedDataset: @unchecked Sendable {
             }
         }
         return positiveCounts
+    }
+
+    func trainingActionStatistics(at indices: [Int]) -> TrainingActionStatistics {
+        var activeCounts = [Int](repeating: 0, count: ActionLayout.count)
+        var mouseMovementRows = 0
+        var mouseButtonRows = 0
+        var scrollRows = 0
+        var keyboardRows = 0
+        var modifierRows = 0
+        actions.withUnsafeBytes { raw in
+            guard let address = raw.baseAddress else { return }
+            let values = address.assumingMemoryBound(to: UInt32.self)
+            func value(base: Int, output: Int) -> Float {
+                Float(bitPattern: UInt32(littleEndian: values[base + output]))
+            }
+            for row in indices {
+                let base = row * manifest.actionValuesPerSample
+                var hasMouseMovement = false
+                var hasMouseButton = false
+                var hasScroll = false
+                var hasKeyboard = false
+                var hasModifier = false
+
+                for output in ActionLayout.relativeMouse where abs(value(base: base, output: output)) > 0.0001 {
+                    activeCounts[output] += 1
+                    hasMouseMovement = true
+                }
+                for output in ActionLayout.scroll where abs(value(base: base, output: output)) > 0.0001 {
+                    activeCounts[output] += 1
+                    hasScroll = true
+                }
+                for output in ActionLayout.binary where value(base: base, output: output) >= 0.5 {
+                    activeCounts[output] += 1
+                    switch output {
+                    case ActionLayout.buttons: hasMouseButton = true
+                    case ActionLayout.keyboardAndShift: hasKeyboard = true
+                    case ActionLayout.commandOptionControl: hasModifier = true
+                    default: break
+                    }
+                }
+                if hasMouseMovement { mouseMovementRows += 1 }
+                if hasMouseButton { mouseButtonRows += 1 }
+                if hasScroll { scrollRows += 1 }
+                if hasKeyboard { keyboardRows += 1 }
+                if hasModifier { modifierRows += 1 }
+            }
+        }
+        return TrainingActionStatistics(
+            sampleCount: indices.count,
+            activeCounts: activeCounts,
+            coverage: TrainingDataCoverage(
+                sampleCount: indices.count,
+                mouseMovementRows: mouseMovementRows,
+                mouseButtonRows: mouseButtonRows,
+                scrollRows: scrollRows,
+                keyboardRows: keyboardRows,
+                modifierRows: modifierRows
+            )
+        )
     }
 
     func packedObservation(at index: Int) -> Data {
@@ -906,14 +987,26 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
-    /// Per-output positive weights for class-balanced binary control losses.
-    /// A keyboard tensor has 128 mostly-zero values, so unweighted BCE rewards
-    /// an inert policy. Weights are derived only from the training split and are
-    /// bounded so a handful of noisy samples cannot dominate every batch. The
-    /// ceiling remains high enough for brief but intentional controls to matter.
+    /// Per-output active weights for sparse binary and additive controls. A
+    /// keyboard tensor and signed delta/scroll targets are mostly zero, so an
+    /// unweighted objective rewards an inert policy. Weights are derived only
+    /// from the training split and bounded so a handful of noisy rows cannot
+    /// dominate every batch.
     func positiveClassWeights(at indices: [Int], restrictions: ActionRestrictions) -> [Float] {
-        guard !indices.isEmpty else { return [Float](repeating: 1, count: ActionLayout.count) }
-        let positiveCounts = binaryPositiveCounts(at: indices)
+        positiveClassWeights(
+            statistics: trainingActionStatistics(at: indices),
+            restrictions: restrictions
+        )
+    }
+
+    func positiveClassWeights(
+        statistics: TrainingActionStatistics,
+        restrictions: ActionRestrictions
+    ) -> [Float] {
+        guard statistics.sampleCount > 0 else {
+            return [Float](repeating: 1, count: ActionLayout.count)
+        }
+        let positiveCounts = statistics.activeCounts
 
         var result = [Float](repeating: 1, count: ActionLayout.count)
         for index in ActionLayout.binary {
@@ -938,8 +1031,16 @@ final class CachedDataset: @unchecked Sendable {
                 if ActionLayout.keyboard.contains(index) || ActionLayout.modifiers.contains(index) { result[index] = 0 }
                 continue
             }
-            let negatives = max(1, indices.count - positives)
+            let negatives = max(1, statistics.sampleCount - positives)
             result[index] = min(1_024, max(1, Float(negatives) / Float(positives)))
+        }
+        for index in Array(ActionLayout.relativeMouse) + Array(ActionLayout.scroll) {
+            let active = positiveCounts[index]
+            guard active > 0 else { continue }
+            let inactive = max(1, statistics.sampleCount - active)
+            // Preserve the established 8x emphasis for ordinary motion while
+            // allowing genuinely sparse deltas to contribute useful gradient.
+            result[index] = min(1_024, max(8, Float(inactive) / Float(active)))
         }
         return result
     }

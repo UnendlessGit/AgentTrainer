@@ -714,10 +714,18 @@ final class AppModel: ObservableObject {
         isAutoTraining = false
         autoTrainingProfileID = nil
         trainingInterruption = nil
+        let qualityWarningCount = completion.version.autonomousRunQualityWarnings.count
         switch interruption {
         case .pause: trainingStatus = "Paused — current brain is ready to run and resume"
         case .stop: trainingStatus = "Training stopped."
-        case nil: trainingStatus = completion.completed ? "Training complete — runnable brain saved" : "Paused — current brain is ready to run and resume"
+        case nil:
+            if completion.completed, qualityWarningCount > 0 {
+                trainingStatus = "Training complete — runnable brain saved with \(qualityWarningCount) quality warning\(qualityWarningCount == 1 ? "" : "s")"
+            } else {
+                trainingStatus = completion.completed
+                    ? "Training complete — runnable brain saved"
+                    : "Paused — current brain is ready to run and resume"
+            }
         }
         activityStatus = trainingStatus
     }
@@ -788,6 +796,7 @@ final class AppModel: ObservableObject {
                 }
                 version = nil
             }
+            let brainQualityWarnings = version?.autonomousRunQualityWarnings ?? []
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
 
             let resolvedMouseMode: MouseControlMode
@@ -892,9 +901,12 @@ final class AppModel: ObservableObject {
             )
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
             if isRunning, agent === runtime {
+                let qualitySuffix = brainQualityWarnings.isEmpty
+                    ? ""
+                    : " • \(brainQualityWarnings.count) quality warning\(brainQualityWarnings.count == 1 ? "" : "s")"
                 runtimeStatus = reinforcement == nil
-                    ? "Agent running locally • \(resolvedMouseMode.rawValue)"
-                    : "Agent running & learning • reward/punish armed • \(resolvedMouseMode.rawValue)"
+                    ? "Agent running locally • \(resolvedMouseMode.rawValue)\(qualitySuffix)"
+                    : "Agent running & learning • reward/punish armed • \(resolvedMouseMode.rawValue)\(qualitySuffix)"
                 activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus
                 AppLog.write(
                     category: reinforcement == nil ? "Runtime" : "Reinforcement",

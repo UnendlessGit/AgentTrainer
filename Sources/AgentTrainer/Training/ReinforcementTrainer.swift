@@ -682,6 +682,7 @@ final class ReinforcementTrainer: @unchecked Sendable {
                 trainingShowsCursor: trainingShowsCursor,
                 recommendedMouseMode: recommendedMouseMode,
                 validationReport: nil,
+                trainingDataCoverage: baseVersion?.trainingDataCoverage,
                 reinforcementOptimizerFile: optimizerFile,
                 reinforcementStateFile: stateFile,
                 reinforcementSessionID: sessionID,
