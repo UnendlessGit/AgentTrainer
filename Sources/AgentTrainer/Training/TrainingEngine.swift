@@ -48,11 +48,11 @@ private enum TrainingSamplingContract {
 }
 
 private enum TrainingValidationContract {
-    /// Version 2 retains disjoint context, balances whole-recording splits by
-    /// sample count, expands representative coverage across recordings, and
-    /// records per-head quality. Compatible optimizer state is retained while
-    /// the best-score baseline is recalibrated on this stronger contract.
-    static let disjointContext = 2
+    /// Version 4 retains the zero-history stress test while making per-head
+    /// threshold misses advisory. Best-brain selection always preserves a
+    /// finite checkpoint, prefers complete head responsiveness when available,
+    /// and never turns a diagnostic for one optional head into a whole-app gate.
+    static let capabilityAware = 4
 }
 
 final class TrainingEngine: @unchecked Sendable {
@@ -189,8 +189,28 @@ final class TrainingEngine: @unchecked Sendable {
             // the potentially large membership set and use the normal shuffle.
             return detected.count == split.train.count ? [] : detected
         }()
+        let trainingActionStatistics = dataset.trainingActionStatistics(at: split.train)
+        let trainingDataCoverage = trainingActionStatistics.coverage
+        let visionWarnings = profile.preprocessing.trainingQualityWarnings
+        if !visionWarnings.isEmpty {
+            AppLog.write(
+                .warning,
+                category: "Training",
+                "Model vision may be too lossy for reliable control timing",
+                details: visionWarnings.joined(separator: " ")
+            )
+        }
+        let coverageWarnings = trainingDataCoverage.warnings(for: profile.channels)
+        if !coverageWarnings.isEmpty {
+            AppLog.write(
+                .warning,
+                category: "Training",
+                "Some enabled controls have insufficient demonstrations",
+                details: coverageWarnings.joined(separator: " ")
+            )
+        }
         let positiveClassWeightValues = dataset.positiveClassWeights(
-            at: split.train,
+            statistics: trainingActionStatistics,
             restrictions: profile.effectiveRestrictions
         )
         let validationSampleLimit = Self.recommendedValidationSampleLimit(
@@ -240,7 +260,7 @@ final class TrainingEngine: @unchecked Sendable {
             let url = recording.directory.appendingPathComponent(recording.manifest.eventFile)
             return (recording, try InputEventReader.summarize(url: url, previewLimit: 0, globalRect: recording.manifest.globalRect.cgRect))
         }
-        let demonstratedKeys = dataset.demonstratedKeyCodes(at: split.train)
+        let demonstratedKeys = trainingActionStatistics.demonstratedKeyCodes
         let mouseDurations = inputSummaries.reduce(into: (camera: 0.0, cursor: 0.0)) { result, value in
             guard value.1.mouse.moveEventCount > 0 else { return }
             let recording = value.0.manifest
@@ -261,7 +281,7 @@ final class TrainingEngine: @unchecked Sendable {
             experienceSeconds: 0,
             recordingOrder: recordingOrder,
             samplingStrategy: desiredSamplingStrategy,
-            validationStrategy: TrainingValidationContract.disjointContext
+            validationStrategy: TrainingValidationContract.capabilityAware
         )
         let restore = try await restoreCheckpointIfPresent(
             profile: profile,
@@ -287,7 +307,10 @@ final class TrainingEngine: @unchecked Sendable {
             let temporalFeatures = model.temporalFeatures(
                 currentImages: batch.currentImages,
                 pastImages: batch.pastImages,
-                pastControls: batch.pastControls,
+                // Runtime begins with no predicted actions and can remain at
+                // that fixed point indefinitely. Stress best-brain candidates
+                // without teacher-forced action history so weakness is visible.
+                pastControls: Self.runtimeStartupControls(like: batch.pastControls),
                 visionToPast: batch.visionToPast,
                 pastFrameMask: batch.pastFrameMask
             )
@@ -313,6 +336,7 @@ final class TrainingEngine: @unchecked Sendable {
         // The raw event stream is authoritative, including taps shorter than one
         // action interval. Refresh after restoring an older checkpoint.
         state.demonstratedKeyCodes = demonstratedKeys
+        state.trainingDataCoverage = trainingDataCoverage
         // Legacy checkpoints did not persist sample-to-recording order. Preserve
         // their current epoch order, then make every subsequent save enforce it.
         if state.recordingOrder == nil { state.recordingOrder = recordingOrder }
@@ -344,6 +368,7 @@ final class TrainingEngine: @unchecked Sendable {
             state.bestElapsed = nil
             state.bestExperienceSeconds = nil
             state.currentValidationReport = nil
+            state.currentValidationGlobalStep = nil
             state.bestValidationReport = nil
             state.schedulerBestMetric = nil
             state.schedulerPlateauEpochs = 0
@@ -369,16 +394,17 @@ final class TrainingEngine: @unchecked Sendable {
                 throw AgentTrainerError.model("The selected brain produced an invalid validation baseline on the current recordings.")
             }
             state.validationHistory = [baselineValidationLoss]
+            state.currentValidationReport = baseline.report
+            state.currentValidationGlobalStep = state.globalStep
+            state.schedulerBestMetric = baselineValidationLoss
+            state.schedulerPlateauEpochs = 0
             state.bestValidationLoss = baselineValidationLoss
             state.bestGlobalStep = state.globalStep
             state.bestEpoch = state.batchOffset > 0 ? state.epoch + 1 : state.epoch
             state.bestTrainingLoss = state.lossHistory.last
             state.bestElapsed = state.elapsed
             state.bestExperienceSeconds = state.experienceSeconds
-            state.currentValidationReport = baseline.report
             state.bestValidationReport = baseline.report
-            state.schedulerBestMetric = baselineValidationLoss
-            state.schedulerPlateauEpochs = 0
         }
 
         let trainingStep = compile(inputs: [model, optimizer, randomState], outputs: [model, optimizer, randomState]) { (arrays: [MLXArray]) -> [MLXArray] in
@@ -472,7 +498,9 @@ final class TrainingEngine: @unchecked Sendable {
         // as the validation baseline before fine-tuning, while initializing a
         // fresh exact-resume checkpoint from it. A first worse epoch can no
         // longer replace the brain the user explicitly chose.
-        if restore.captureValidationBaseline, !split.validation.isEmpty {
+        if restore.captureValidationBaseline,
+           !split.validation.isEmpty,
+           state.bestGlobalStep != nil {
             try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer, randomState: randomState, state: state, captureBest: true)
         }
 
@@ -490,6 +518,7 @@ final class TrainingEngine: @unchecked Sendable {
             epochTrainingLoss: state.epochLossHistory?.last,
             validationLoss: state.validationHistory.last,
             validationReport: state.currentValidationReport,
+            trainingDataCoverage: trainingDataCoverage,
             effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
             learningRateScale: Double(optimizer.learningRateScale),
             samplesPerSecond: 0,
@@ -659,6 +688,7 @@ final class TrainingEngine: @unchecked Sendable {
                         epochTrainingLoss: epochSampleCount > 0 ? epochWeightedLoss / Double(epochSampleCount) : nil,
                         validationLoss: state.validationHistory.last,
                         validationReport: state.currentValidationReport,
+                        trainingDataCoverage: trainingDataCoverage,
                         effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
                         learningRateScale: Double(optimizer.learningRateScale),
                         samplesPerSecond: performance.samplesPerSecond,
@@ -760,13 +790,21 @@ final class TrainingEngine: @unchecked Sendable {
                 }
                 monitorMetric = validationLoss
                 state.currentValidationReport = validation.report
+                state.currentValidationGlobalStep = state.globalStep
                 state.validationHistory.append(validationLoss)
                 if state.validationHistory.count > 2_048 { state.validationHistory.removeFirst(1_024) }
                 let improvesAggregate = validationLoss < (state.bestValidationLoss ?? .infinity)
                 let regressesSparseHead = state.bestValidationReport.map {
                     validation.report.hasSevereBinaryRegression(comparedTo: $0)
                 } ?? false
-                if improvesAggregate, !regressesSparseHead {
+                let hasActionCollapse = validation.report.hasExecutableBinaryCollapse
+                let previousBestHadCollapse = state.bestValidationReport?.hasExecutableBinaryCollapse
+                if Self.shouldSelectValidationCandidate(
+                    loss: validationLoss,
+                    report: validation.report,
+                    bestLoss: state.bestValidationLoss,
+                    bestReport: state.bestValidationReport
+                ) {
                     state.bestValidationLoss = validationLoss
                     state.bestGlobalStep = state.globalStep
                     state.bestEpoch = state.epoch
@@ -775,8 +813,16 @@ final class TrainingEngine: @unchecked Sendable {
                     state.bestExperienceSeconds = state.experienceSeconds
                     state.bestValidationReport = validation.report
                     capturedBest = true
+                    if hasActionCollapse {
+                        validationSelectionStatus = "Saved the best available brain • one or more control heads remain below the execution threshold"
+                    } else if previousBestHadCollapse == true {
+                        validationSelectionStatus = "Selected a fully responsive brain over the previous partial-control checkpoint"
+                    }
+                } else if improvesAggregate, hasActionCollapse,
+                          previousBestHadCollapse == false {
+                    validationSelectionStatus = "Zero-history loss improved, but the fully responsive best brain was retained"
                 } else if improvesAggregate, regressesSparseHead {
-                    validationSelectionStatus = "Held-out loss improved, but the runnable best brain was retained because a sparse control head regressed sharply"
+                    validationSelectionStatus = "Zero-history loss improved, but the best brain was retained because a sparse control head regressed sharply"
                 }
             }
             let schedulerStatus = updateAdaptiveLearningRate(
@@ -805,6 +851,7 @@ final class TrainingEngine: @unchecked Sendable {
                 epochTrainingLoss: epochTrainingLoss,
                 validationLoss: state.validationHistory.last,
                 validationReport: state.currentValidationReport,
+                trainingDataCoverage: trainingDataCoverage,
                 effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
                 learningRateScale: Double(optimizer.learningRateScale),
                 samplesPerSecond: performance.samplesPerSecond,
@@ -977,6 +1024,13 @@ final class TrainingEngine: @unchecked Sendable {
         )
     }
 
+    /// Validation deliberately evaluates the runtime-start condition instead
+    /// of teacher forcing exact demonstrated actions. Kept as a named helper so
+    /// the contract remains directly testable when batch plumbing changes.
+    static func runtimeStartupControls(like controls: MLXArray) -> MLXArray {
+        MLXArray.zeros(like: controls)
+    }
+
     private func evaluate(
         model: AgentPolicy,
         dataset: CachedDataset,
@@ -1064,6 +1118,31 @@ final class TrainingEngine: @unchecked Sendable {
         let diversity = min(8_192, max(1, min(128, segmentCount)) * 64)
         let statistical = min(8_192, Int(Double(total).squareRoot() * 32))
         return min(total, max(baseline, diversity, statistical))
+    }
+
+    /// A finite first candidate is always worth preserving. Once a best brain
+    /// exists, complete discrete-head responsiveness outranks aggregate loss;
+    /// among equally responsive candidates, lower loss wins unless a supported
+    /// sparse head regressed sharply on the same held-out rows.
+    static func shouldSelectValidationCandidate(
+        loss: Double,
+        report: ValidationReport,
+        bestLoss: Double?,
+        bestReport: ValidationReport?
+    ) -> Bool {
+        guard loss.isFinite else { return false }
+        guard let bestLoss, bestLoss.isFinite else { return true }
+        if let bestReport {
+            guard !report.hasSevereBinaryRegression(comparedTo: bestReport) else {
+                return false
+            }
+            let candidateHasCollapse = report.hasExecutableBinaryCollapse
+            let bestHasCollapse = bestReport.hasExecutableBinaryCollapse
+            if candidateHasCollapse != bestHasCollapse {
+                return bestHasCollapse && !candidateHasCollapse
+            }
+        }
+        return loss < bestLoss
     }
 
     /// Queues a few strictly ordered compiled updates before synchronizing the
@@ -1494,6 +1573,7 @@ final class TrainingEngine: @unchecked Sendable {
             : state.epochLossHistory?.last ?? state.lossHistory.last ?? 0
         let displayedValidationLoss = usesBest ? state.bestValidationLoss : state.validationHistory.last
         let displayedValidationReport = usesBest ? state.bestValidationReport : state.currentValidationReport
+        let displayedValidationStep = usesBest ? state.bestGlobalStep : state.currentValidationGlobalStep
         let version = ModelVersionManifest(
             id: UUID(),
             name: usesBest ? "Best Brain • Epoch \(displayedEpoch) • Step \(displayedStep)" : completed ? "Brain • Epoch \(displayedEpoch) • Step \(displayedStep)" : "Autosave • Epoch \(displayedEpoch) • Step \(displayedStep)",
@@ -1517,7 +1597,9 @@ final class TrainingEngine: @unchecked Sendable {
             experienceDurationSeconds: usesBest ? state.bestExperienceSeconds : state.experienceSeconds ?? 0,
             trainingShowsCursor: state.trainingShowsCursor,
             recommendedMouseMode: state.recommendedMouseMode,
-            validationReport: displayedValidationReport
+            validationReport: displayedValidationReport,
+            validationGlobalStep: displayedValidationStep,
+            trainingDataCoverage: state.trainingDataCoverage
         )
         let destination = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
@@ -1579,14 +1661,14 @@ final class TrainingEngine: @unchecked Sendable {
                recordingOrderMatches,
                samplingStrategyIsKnown {
                 let validationNeedsRefresh = restored.validationStrategy.map {
-                    $0 != TrainingValidationContract.disjointContext
+                    $0 != TrainingValidationContract.capabilityAware
                 } ?? legacyValidationNeedsRefresh
                 try model.loadWeights(from: directory.appendingPathComponent("weights.safetensors"))
                 try optimizer.load(from: directory.appendingPathComponent("optimizer.safetensors"))
                 let randomStateURL = directory.appendingPathComponent("random.safetensors")
                 if FileManager.default.fileExists(atPath: randomStateURL.path) { try TrainingRandomState.load(randomState, from: randomStateURL) }
                 state = restored
-                state.validationStrategy = TrainingValidationContract.disjointContext
+                state.validationStrategy = TrainingValidationContract.capabilityAware
                 return CheckpointRestore(
                     status: validationNeedsRefresh
                         ? "Restored exact optimizer state; recalibrated validation for the current split"
@@ -1616,6 +1698,7 @@ final class TrainingEngine: @unchecked Sendable {
             state.epochLossHistory = [version.trainingLoss]
             state.validationHistory = version.validationLoss.map { [$0] } ?? []
             state.currentValidationReport = version.validationReport
+            state.currentValidationGlobalStep = version.validationGlobalStep
             if let validationLoss = version.validationLoss, validationLoss.isFinite {
                 state.bestValidationLoss = validationLoss
                 state.bestGlobalStep = state.globalStep
@@ -1867,11 +1950,13 @@ private struct CheckpointState: Codable {
     var currentEpochWeightedLoss: Double? = nil
     var currentEpochSampleCount: Int? = nil
     var currentValidationReport: ValidationReport? = nil
+    var currentValidationGlobalStep: Int? = nil
     var bestValidationReport: ValidationReport? = nil
     var schedulerBestMetric: Double? = nil
     var schedulerPlateauEpochs: Int? = nil
     var schedulerReductions: Int? = nil
     var demonstratedKeyCodes: Set<UInt16>?
+    var trainingDataCoverage: TrainingDataCoverage? = nil
     /// Persisted goal for the current epoch block. Optional keeps checkpoints
     /// from earlier releases decodable.
     var epochGoal: Int? = nil

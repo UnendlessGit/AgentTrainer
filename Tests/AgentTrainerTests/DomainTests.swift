@@ -367,6 +367,9 @@ final class DomainTests: XCTestCase {
         var collapsed = baseline
         collapsed.keyboard = BinaryValidationMetrics(truePositives: 3, falsePositives: 2, falseNegatives: 7, trueNegatives: 88)
         XCTAssertTrue(collapsed.hasSevereBinaryRegression(comparedTo: baseline))
+        XCTAssertFalse(collapsed.hasExecutableBinaryCollapse)
+        collapsed.keyboard = BinaryValidationMetrics(truePositives: 0, falsePositives: 2, falseNegatives: 10, trueNegatives: 88)
+        XCTAssertTrue(collapsed.hasExecutableBinaryCollapse)
         var ordinaryNoise = baseline
         ordinaryNoise.keyboard = BinaryValidationMetrics(truePositives: 7, falsePositives: 2, falseNegatives: 3, trueNegatives: 88)
         XCTAssertFalse(ordinaryNoise.hasSevereBinaryRegression(comparedTo: baseline))
@@ -376,6 +379,154 @@ final class DomainTests: XCTestCase {
         var unsupportedCollapse = unsupportedBaseline
         unsupportedCollapse.keyboard = BinaryValidationMetrics(truePositives: 0, falsePositives: 0, falseNegatives: 4, trueNegatives: 96)
         XCTAssertFalse(unsupportedCollapse.hasSevereBinaryRegression(comparedTo: unsupportedBaseline), "Four positives are too few for a hard publication gate.")
+        XCTAssertFalse(unsupportedCollapse.hasExecutableBinaryCollapse)
+    }
+
+    func testTrainingDataCoverageRejectsImpossiblePersistedCounts() {
+        var coverage = TrainingDataCoverage(
+            sampleCount: 10,
+            mouseMovementRows: 2,
+            mouseButtonRows: 1,
+            scrollRows: 0,
+            keyboardRows: 8,
+            modifierRows: 3
+        )
+        XCTAssertTrue(coverage.isValid)
+        coverage.scrollRows = 11
+        XCTAssertFalse(coverage.isValid)
+        coverage.scrollRows = -1
+        XCTAssertFalse(coverage.isValid)
+    }
+
+    func testAutonomousRunQualityWarningsAreAdvisoryAndHeadSpecific() {
+        var profile = AIProfile.fresh()
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 2,
+            frameSpacing: 1,
+            downsampleFactor: 2
+        )
+        var version = ModelVersionManifest(
+            id: UUID(),
+            name: "Legacy temporal",
+            createdAt: Date(),
+            globalStep: 1,
+            trainingLoss: 0.1,
+            preprocessing: profile.preprocessing,
+            channels: profile.channels,
+            training: profile.training
+        )
+        XCTAssertEqual(version.autonomousRunQualityWarnings.count, 1)
+        XCTAssertTrue(version.autonomousRunQualityWarnings[0].contains("predates"))
+
+        version.trainingObjectiveSchema = TrainingObjectiveContract.schemaVersion
+        XCTAssertTrue(version.autonomousRunQualityWarnings.isEmpty)
+        version.validationReport = ValidationReport(
+            sampleCount: 20,
+            binary: nil,
+            buttons: nil,
+            keyboard: BinaryValidationMetrics(
+                truePositives: 0,
+                falsePositives: 0,
+                falseNegatives: 5,
+                trueNegatives: 15
+            ),
+            modifiers: nil,
+            absoluteMouseMAE: nil,
+            activeRelativeMouseMAE: nil,
+            activeScrollMAE: nil,
+            idleContinuousFalseActionRate: nil
+        )
+        XCTAssertEqual(version.autonomousRunQualityWarnings.count, 1)
+        XCTAssertTrue(version.autonomousRunQualityWarnings[0].contains("Keyboard"))
+        XCTAssertTrue(version.autonomousRunQualityWarnings[0].contains("remains runnable"))
+
+        version.reinforcementSequence = 1
+        version.reinforcementOptimizerFile = "reinforcement.optimizer.safetensors"
+        version.reinforcementStateFile = "reinforcement.state.json"
+        version.validationReport = nil
+        version.trainingObjectiveSchema = nil
+        XCTAssertTrue(
+            version.autonomousRunQualityWarnings.isEmpty,
+            "On-policy RL descendants do not inherit the supervised teacher-forcing restriction."
+        )
+    }
+
+    func testTinyLowBitVisionProducesAnActionableQualityWarning() {
+        var spec = PreprocessingSpec(
+            width: 1,
+            height: 1,
+            colorMode: .grayscale,
+            bitDepth: 1
+        )
+        XCTAssertEqual(spec.trainingQualityWarnings.count, 1)
+        XCTAssertTrue(spec.trainingQualityWarnings[0].contains("1 × 1"))
+        XCTAssertTrue(spec.trainingQualityWarnings[0].contains("1-bit"))
+
+        spec.width = 640
+        spec.height = 360
+        spec.bitDepth = 8
+        XCTAssertTrue(spec.trainingQualityWarnings.isEmpty)
+    }
+
+    func testValidationSelectionPreservesBestAvailableAndPrefersResponsiveHeads() {
+        func report(truePositives: Int, falseNegatives: Int) -> ValidationReport {
+            ValidationReport(
+                sampleCount: 20,
+                binary: nil,
+                buttons: nil,
+                keyboard: BinaryValidationMetrics(
+                    truePositives: truePositives,
+                    falsePositives: 0,
+                    falseNegatives: falseNegatives,
+                    trueNegatives: 15
+                ),
+                modifiers: nil,
+                absoluteMouseMAE: nil,
+                activeRelativeMouseMAE: nil,
+                activeScrollMAE: nil,
+                idleContinuousFalseActionRate: nil
+            )
+        }
+        let collapsed = report(truePositives: 0, falseNegatives: 5)
+        let responsive = report(truePositives: 5, falseNegatives: 0)
+
+        XCTAssertTrue(TrainingEngine.shouldSelectValidationCandidate(
+            loss: 0.4,
+            report: collapsed,
+            bestLoss: nil,
+            bestReport: nil
+        ), "The first finite checkpoint must never be discarded solely because one head is weak.")
+        XCTAssertTrue(TrainingEngine.shouldSelectValidationCandidate(
+            loss: 0.5,
+            report: responsive,
+            bestLoss: 0.4,
+            bestReport: collapsed
+        ), "A fully responsive brain should supersede a collapsed one even with a modestly higher aggregate loss.")
+        XCTAssertFalse(TrainingEngine.shouldSelectValidationCandidate(
+            loss: 0.3,
+            report: collapsed,
+            bestLoss: 0.4,
+            bestReport: responsive
+        ), "A lower aggregate loss must not replace a fully responsive brain with a collapsed one.")
+        XCTAssertTrue(TrainingEngine.shouldSelectValidationCandidate(
+            loss: 0.3,
+            report: responsive,
+            bestLoss: 0.4,
+            bestReport: responsive
+        ))
+        let regressed = report(truePositives: 1, falseNegatives: 4)
+        XCTAssertFalse(TrainingEngine.shouldSelectValidationCandidate(
+            loss: 0.2,
+            report: regressed,
+            bestLoss: 0.4,
+            bestReport: responsive
+        ), "A lower aggregate loss must not hide a severe supported-head regression.")
+        XCTAssertFalse(TrainingEngine.shouldSelectValidationCandidate(
+            loss: .nan,
+            report: responsive,
+            bestLoss: 0.4,
+            bestReport: responsive
+        ))
     }
 
     func testArchitecturePresetsHaveNoZeroWidths() {
@@ -1969,6 +2120,18 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(version.artifactFileNamesAreSafe)
         version.weightsFile = "../outside.safetensors"
         XCTAssertFalse(version.artifactFileNamesAreSafe)
+        await XCTAssertThrowsErrorAsync {
+            try await store.saveVersionManifest(version, profileID: profile.id)
+        }
+        version.weightsFile = "weights.safetensors"
+        version.trainingDataCoverage = TrainingDataCoverage(
+            sampleCount: 2,
+            mouseMovementRows: 3,
+            mouseButtonRows: 0,
+            scrollRows: 0,
+            keyboardRows: 0,
+            modifierRows: 0
+        )
         await XCTAssertThrowsErrorAsync {
             try await store.saveVersionManifest(version, profileID: profile.id)
         }
@@ -4287,6 +4450,41 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(blocked[ActionLayout.keyboard.lowerBound + 13], 0)
     }
 
+    func testActionStatisticsBalanceSparseContinuousControlsAndExposeMissingCoverage() throws {
+        var actionRows = [[Float]](
+            repeating: [Float](repeating: 0, count: ActionLayout.count),
+            count: 20
+        )
+        actionRows[0][ActionLayout.relativeMouse.lowerBound] = 0.5
+        actionRows[0][ActionLayout.scroll.lowerBound + 1] = -1
+        actionRows[1][ActionLayout.scroll.lowerBound + 1] = 1
+        actionRows[0][ActionLayout.keyboard.lowerBound + 13] = 1
+        let fixture = try makeSyntheticDataset(
+            name: "continuous-weights",
+            pastFrameCount: 1,
+            sequences: Array(repeating: [0, .max], count: actionRows.count),
+            actionRows: actionRows
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        let statistics = fixture.dataset.trainingActionStatistics(at: Array(actionRows.indices))
+        let weights = fixture.dataset.positiveClassWeights(
+            statistics: statistics,
+            restrictions: ActionRestrictions()
+        )
+        XCTAssertEqual(statistics.coverage.mouseMovementRows, 1)
+        XCTAssertEqual(statistics.coverage.scrollRows, 2)
+        XCTAssertEqual(statistics.coverage.mouseButtonRows, 0)
+        XCTAssertEqual(statistics.coverage.keyboardRows, 1)
+        XCTAssertEqual(statistics.demonstratedKeyCodes, [13])
+        XCTAssertEqual(weights[ActionLayout.relativeMouse.lowerBound], 19)
+        XCTAssertEqual(weights[ActionLayout.relativeMouse.lowerBound + 1], 1)
+        XCTAssertEqual(weights[ActionLayout.scroll.lowerBound + 1], 9)
+        let warnings = statistics.coverage.warnings(for: .all)
+        XCTAssertTrue(warnings.contains { $0.contains("mouse-button") && $0.contains("cannot be learned") })
+        XCTAssertTrue(warnings.contains { $0.contains("scroll") && $0.contains("unreliable") })
+    }
+
     func testValidationSplitNeverRemovesTheOnlyTrainingExampleOfAControl() throws {
         let segments = (0..<3).map { CacheSegment(recordingID: UUID(), start: $0 * 2, count: 2) }
         var actionRows: [[Float]] = []
@@ -5001,6 +5199,55 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(training.embeddings.asArray(Float.self), embeddings.asArray(Float.self))
     }
 
+    func testTemporalTrainingAlwaysIncludesExactRuntimeStartupHistories() {
+        MLXRandom.seed(20_260_814)
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 12, height: 8, colorMode: .grayscale, bitDepth: 8)
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 4, frameSpacing: 1, downsampleFactor: 2)
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.generalization = .disabled
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        model.train(true)
+        let batch = 128
+        let key = ActionLayout.keyboard.lowerBound + 13
+        var values = [Float](repeating: 0, count: batch * 4 * ActionLayout.count)
+        for row in 0..<batch {
+            for frame in 0..<4 {
+                values[(row * 4 + frame) * ActionLayout.count + key] = 1
+            }
+        }
+        let controls = MLXArray(values, [batch, 4, ActionLayout.count])
+        let embeddings = MLXArray.ones([batch, 4, profile.training.architecture.visualEmbedding])
+        let result = model.regularizedTemporalHistory(
+            pastVisualEmbeddings: embeddings,
+            pastControls: controls
+        )
+        MLX.eval(result.controls)
+        let output = result.controls.asArray(Float.self)
+        var zeroHistoryRows = 0
+        var retainedHistoryRows = 0
+        for row in 0..<batch {
+            let history = (0..<4).map {
+                output[(row * 4 + $0) * ActionLayout.count + key]
+            }
+            if history.allSatisfy({ $0 == 0 }) { zeroHistoryRows += 1 }
+            if history.allSatisfy({ $0 == 1 }) { retainedHistoryRows += 1 }
+        }
+        XCTAssertGreaterThan(zeroHistoryRows, 0, "The objective must exercise the exact all-zero state even when optional generalization is disabled.")
+        XCTAssertGreaterThan(retainedHistoryRows, 0)
+        XCTAssertEqual(zeroHistoryRows + retainedHistoryRows, batch)
+    }
+
+    func testRuntimeStartupValidationZerosEveryTeacherForcedControl() {
+        let controls = MLXArray([Float](repeating: 1, count: 3 * 4 * ActionLayout.count), [3, 4, ActionLayout.count])
+        let startup = TrainingEngine.runtimeStartupControls(like: controls)
+        MLX.eval(startup)
+        XCTAssertEqual(startup.shape, controls.shape)
+        XCTAssertTrue(startup.asArray(Float.self).allSatisfy { $0 == 0 })
+    }
+
     func testVisionAugmentationIsStochasticOnlyDuringTraining() {
         MLXRandom.seed(91_004)
         var profile = AIProfile.fresh()
@@ -5178,6 +5425,44 @@ final class DomainTests: XCTestCase {
         XCTAssertLessThan(loss(at: calibratedRawLogit), loss(at: heldRawLogit))
     }
 
+    func testSparseContinuousActivityUsesDatasetLevelBalance() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        profile.channels = ActionChannels(
+            absoluteMouse: false,
+            relativeMouse: false,
+            buttons: false,
+            scroll: true,
+            keyboard: false,
+            modifiers: false
+        )
+        profile.training.architecture = .small
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+        let rowCount = 100
+        var targets = [Float](repeating: 0, count: rowCount * ActionLayout.count)
+        targets[ActionLayout.scroll.lowerBound + 1] = 1
+        var weights = [Float](repeating: 1, count: ActionLayout.count)
+        weights[ActionLayout.scroll.lowerBound + 1] = 99
+        let logits = MLXArray.zeros([rowCount, ActionLayout.count])
+        let ordinary = model.loss(
+            logits: logits,
+            targets: MLXArray(targets, [rowCount, ActionLayout.count])
+        )
+        let balanced = model.loss(
+            logits: logits,
+            targets: MLXArray(targets, [rowCount, ActionLayout.count]),
+            positiveWeights: MLXArray(weights, [ActionLayout.count])
+        )
+        MLX.eval(ordinary, balanced)
+        XCTAssertGreaterThan(
+            balanced.item(Float.self),
+            ordinary.item(Float.self) * 3,
+            "One real scroll row must not be diluted by an entire idle tensor."
+        )
+    }
+
     func testBinaryFocalGammaActuallyDownweightsUniformEasyNegatives() {
         func loss(gamma: Double) -> Float {
             var profile = AIProfile.fresh()
@@ -5301,6 +5586,90 @@ final class DomainTests: XCTestCase {
         XCTAssertLessThan(final, initial.item(Float.self) * 0.2)
         XCTAssertLessThan(values[key], 0.2)
         XCTAssertGreaterThan(values[ActionLayout.count + key], 0.8)
+    }
+
+    func testTemporalPolicyLearnsToStartFromVisionWithoutTeacherForcedActions() {
+        MLXRandom.seed(202_608_14)
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        profile.channels = ActionChannels(absoluteMouse: false, relativeMouse: false, buttons: false, scroll: false, keyboard: true, modifiers: false)
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 1, downsampleFactor: 2)
+        profile.training.precision = .float32
+        profile.training.architecture = ArchitectureSpec(
+            convolutionChannels: [8], kernelSizes: [3], strides: [1],
+            visualEmbedding: 16, recurrentKind: .gru, recurrentWidth: 8,
+            fusionWidths: [16], dropout: 0, visualPooling: .attention,
+            attentionHeads: 2, controlEmbedding: 8
+        )
+        // The runtime-start exposure is part of objective v2, not an optional
+        // augmentation, so this regression deliberately disables everything.
+        profile.training.generalization = .disabled
+        let model = AgentPolicy(profile: profile)
+        let optimizer = ResumableAdamW(learningRate: 0.003, weightDecay: 0)
+        optimizer.initialize(model: model)
+
+        let pixels = 8 * 8
+        var imageValues = [Float](repeating: 0, count: 2 * pixels)
+        for row in 0..<8 {
+            for column in 0..<8 {
+                let pixel = row * 8 + column
+                imageValues[pixel] = column < 4 ? 1 : 0
+                imageValues[pixels + pixel] = column >= 4 ? 1 : 0
+            }
+        }
+        let images = MLXArray(imageValues, [2, 8, 8, 1])
+        let inputs = temporalModelInputs(profile: profile, batch: 2, value: 0)
+        let key = ActionLayout.keyboard.lowerBound + 13
+        var historyValues = [Float](repeating: 0, count: 2 * 2 * ActionLayout.count)
+        for frame in 0..<2 {
+            historyValues[(2 + frame) * ActionLayout.count + key] = 1
+        }
+        let teacherControls = MLXArray(historyValues, [2, 2, ActionLayout.count])
+        let runtimeStartupControls = MLXArray.zeros(teacherControls.shape)
+        var targetValues = [Float](repeating: 0, count: 2 * ActionLayout.count)
+        targetValues[ActionLayout.count + key] = 1
+        let targets = MLXArray(targetValues, [2, ActionLayout.count])
+        var weightValues = [Float](repeating: 0, count: ActionLayout.count)
+        weightValues[key] = 1
+        let classWeightValues = weightValues
+
+        let step = compile(inputs: [model, optimizer], outputs: [model, optimizer]) { (arrays: [MLXArray]) -> [MLXArray] in
+            let weights = MLXArray(classWeightValues, [ActionLayout.count])
+            let result = valueAndGrad(model: model) { model, arrays in
+                [model.loss(
+                    currentImages: arrays[0],
+                    pastImages: arrays[1],
+                    pastControls: arrays[2],
+                    targets: arrays[3],
+                    positiveWeights: weights
+                )]
+            }(model, arrays)
+            optimizer.update(
+                model: model,
+                gradients: clipGradNorm(gradients: result.1, maxNorm: 1).0,
+                targetType: model.dtype
+            )
+            return [result.0[0]]
+        }
+        model.train(true)
+        for _ in 0..<700 {
+            let loss = step([images, inputs.past, teacherControls, targets])[0]
+            MLX.eval(loss, model.parameters(), optimizer.stateArrays())
+        }
+        model.train(false)
+        let predictions = model.predictions(
+            currentImages: images,
+            pastImages: inputs.past,
+            pastControls: runtimeStartupControls
+        )
+        MLX.eval(predictions)
+        let values = predictions.asArray(Float.self)
+        XCTAssertLessThan(values[key], 0.2)
+        XCTAssertGreaterThan(
+            values[ActionLayout.count + key],
+            0.8,
+            "A temporal brain must initiate the demonstrated action when runtime history is still all zero."
+        )
     }
 
     func testKeyboardLossIgnoresRuntimeBlockedUnseenOutputs() {

@@ -131,6 +131,28 @@ struct PreprocessingSpec: Codable, Hashable, Sendable {
     var resizePolicy: ResizePolicy = .fit
 
     var channelCount: Int { colorMode == .grayscale ? 1 : 3 }
+
+    /// Valid configurations can still discard too much information for a
+    /// policy to associate controls with what happened on screen. Keep this
+    /// advisory: tiny or binary vision can be intentional for synthetic tasks,
+    /// but users should not spend hours training it without seeing the tradeoff.
+    var trainingQualityWarnings: [String] {
+        guard width > 0, height > 0 else { return [] }
+        let product = width.multipliedReportingOverflow(by: height)
+        guard !product.overflow else { return [] }
+        if product.partialValue < 64, bitDepth == 1 {
+            return ["Vision is only \(width) × \(height) at 1-bit, so each frame contains too little spatial and tonal evidence for most control timing. Increase the dimensions and bit detail before retraining."]
+        }
+        var warnings: [String] = []
+        if product.partialValue < 64 {
+            warnings.append("Vision is only \(width) × \(height), so most spatial cues are discarded. Increase the dimensions before retraining if actions depend on screen position or motion.")
+        }
+        if bitDepth == 1 {
+            warnings.append("Vision uses 1-bit detail, so every channel has only two levels. Increase bit detail if actions depend on subtle UI, lighting, or motion cues.")
+        }
+        return warnings
+    }
+
     var sampleByteCount: Int {
         guard width > 0, height > 0 else { return 0 }
         let y = saturatedMultiply(width, height)
@@ -277,9 +299,11 @@ enum TrainingDataContract {
 /// Versioned independently from packed dataset bytes and learned tensor shapes.
 /// Adding this value to the exact-checkpoint signature lets objective fixes
 /// retain compatible brain weights while safely restarting stale optimizer
-/// state. Version 1 introduces calibrated class-balanced focal binary loss.
+/// state. Version 2 prevents teacher-forced action history from becoming an
+/// inert runtime fixed point and balances sparse continuous controls.
 enum TrainingObjectiveContract {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
+    static let minimumAutonomousStartSchema = 2
 }
 
 /// Versioned independently from model weights and demonstration caches. The
@@ -420,8 +444,10 @@ struct GeneralizationConfiguration: Codable, Hashable, Sendable {
     var visionAugmentationStrength = 0.12
     /// Probability of replacing one small random rectangle with a neutral patch.
     var randomErasingProbability = 0.15
-    /// Probability of hiding an individual historical control value. A much
-    /// smaller derived bit-flip rate also simulates imperfect prior predictions.
+    /// Probability of hiding a control's complete historical trajectory. A
+    /// smaller derived bit-flip rate also simulates imperfect self-predictions.
+    /// Runtime-start histories are exercised independently by the objective, so
+    /// setting this to zero cannot reintroduce teacher-forcing collapse.
     var controlHistoryDropout = 0.18
     /// Probability of removing an entire historical visual/control token.
     var temporalFrameDropout = 0.08
@@ -908,6 +934,57 @@ struct BinaryValidationMetrics: Codable, Hashable, Sendable {
     var negativeSupport: Int { falsePositives + trueNegatives }
 }
 
+/// Exact active-row coverage from the training split. Enabled output channels
+/// with little or no support cannot be recovered by a larger model or a longer
+/// run, so this travels with training metrics and immutable brain manifests.
+struct TrainingDataCoverage: Codable, Hashable, Sendable {
+    static let minimumReliableActiveRows = 16
+
+    var sampleCount: Int
+    var mouseMovementRows: Int
+    var mouseButtonRows: Int
+    var scrollRows: Int
+    var keyboardRows: Int
+    var modifierRows: Int
+
+    var isValid: Bool {
+        sampleCount >= 0 && [
+            mouseMovementRows,
+            mouseButtonRows,
+            scrollRows,
+            keyboardRows,
+            modifierRows
+        ].allSatisfy { (0...sampleCount).contains($0) }
+    }
+
+    func warnings(for channels: ActionChannels) -> [String] {
+        var result: [String] = []
+        func append(_ label: String, count: Int, consequence: String) {
+            if count == 0 {
+                result.append("No \(label) examples were found; \(consequence) cannot be learned.")
+            } else if count < Self.minimumReliableActiveRows {
+                result.append("Only \(count) \(label) row\(count == 1 ? "" : "s") \(count == 1 ? "was" : "were") found; \(consequence) will be unreliable.")
+            }
+        }
+        if channels.mouseMovement {
+            append("mouse-movement", count: mouseMovementRows, consequence: "cursor/camera movement")
+        }
+        if channels.buttons {
+            append("mouse-button", count: mouseButtonRows, consequence: "mouse presses")
+        }
+        if channels.scroll {
+            append("scroll", count: scrollRows, consequence: "scrolling")
+        }
+        if channels.keyboard {
+            append("keyboard", count: keyboardRows, consequence: "key presses")
+        }
+        if channels.modifiers {
+            append("modifier", count: modifierRows, consequence: "modifier presses")
+        }
+        return result
+    }
+}
+
 /// Held-out quality is deliberately multi-dimensional. A single weighted loss
 /// can improve while a sparse keyboard head collapses or an idle policy starts
 /// emitting false actions; these fields make those failure modes visible.
@@ -921,6 +998,27 @@ struct ValidationReport: Codable, Hashable, Sendable {
     var activeRelativeMouseMAE: Double?
     var activeScrollMAE: Double?
     var idleContinuousFalseActionRate: Double?
+
+    /// A supported discrete head that never crosses the executable threshold is
+    /// a useful quality signal, not proof that the entire multi-head policy is
+    /// unusable. Five positives avoids warning on a handful of noisy labels.
+    var hasExecutableBinaryCollapse: Bool {
+        !executableBinaryCollapseWarnings.isEmpty
+    }
+
+    var executableBinaryCollapseWarnings: [String] {
+        let heads: [(label: String, metrics: BinaryValidationMetrics?)] = [
+            ("Mouse-button", buttons),
+            ("Keyboard", keyboard),
+            ("Modifier", modifiers)
+        ]
+        return heads.compactMap { head in
+            guard let metrics = head.metrics,
+                  metrics.positiveSupport >= 5,
+                  metrics.truePositives == 0 else { return nil }
+            return "\(head.label) output had \(metrics.positiveSupport) positive held-out targets but did not cross the execution threshold in the zero-history stress test. The brain remains runnable; improve visual detail or demonstrations if that control is missing at runtime."
+        }
+    }
 
     /// Aggregate weighted loss remains the primary selector, but it may hide a
     /// collapsed sparse head. On the same fixed held-out rows, reject only large
@@ -991,6 +1089,13 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Optional keeps existing manifests decodable. New brains retain the
     /// per-head held-out report that justified best-brain selection.
     var validationReport: ValidationReport? = nil
+    /// The exact optimizer step whose weights produced `validationLoss` and
+    /// `validationReport`. Autosaves can be newer than the last epoch-end
+    /// evaluation, so the validation step must be explicit rather than implied.
+    var validationGlobalStep: Int? = nil
+    /// Optional keeps existing manifests decodable. New brains make missing or
+    /// underrepresented demonstrations auditable after the training run ends.
+    var trainingDataCoverage: TrainingDataCoverage? = nil
     /// Online-learning state is separate from the demonstration optimizer.
     /// Activating an RL brain for dataset training intentionally treats it as a
     /// weights-only warm start, while another RL session can resume this state.
@@ -1003,6 +1108,30 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     var reinforcementUpdateCount: Int? = nil
     var reinforcementNetReward: Double? = nil
     var reinforcementTrainingSeconds: Double? = nil
+
+    /// Quality diagnostics are deliberately advisory. A multi-head model may
+    /// still perform useful controls when one optional head is weak, and older
+    /// temporal brains remain technically runnable. Hard compatibility checks
+    /// stay in runtime for actual tensor and control-contract mismatches.
+    var autonomousRunQualityWarnings: [String] {
+        var warnings = preprocessing.trainingQualityWarnings
+        let isReinforcementBrain = reinforcementOptimizerFile != nil
+            && reinforcementStateFile != nil
+            && reinforcementSequence != nil
+        let isSupervisedTemporalBrain = training.effectiveTemporalVision.pastFrameCount > 0
+            && !isReinforcementBrain
+        if isSupervisedTemporalBrain,
+           (trainingObjectiveSchema ?? 0) < TrainingObjectiveContract.minimumAutonomousStartSchema {
+            warnings.append("This temporal brain predates the autonomous-start training objective. It can run, but fine-tuning from its saved recordings improves its ability to initiate controls without demonstrated action history.")
+        }
+        if !isReinforcementBrain, let trainingDataCoverage {
+            warnings.append(contentsOf: trainingDataCoverage.warnings(for: channels))
+        }
+        if let validationReport {
+            warnings.append(contentsOf: validationReport.executableBinaryCollapseWarnings)
+        }
+        return warnings
+    }
 
     /// Manifest filenames are treated as leaf names, never paths. A damaged or
     /// hand-edited manifest must not escape its immutable version directory.
@@ -1172,6 +1301,7 @@ struct TrainingMetrics: Sendable {
     var epochTrainingLoss: Double?
     var validationLoss: Double?
     var validationReport: ValidationReport?
+    var trainingDataCoverage: TrainingDataCoverage?
     var effectiveLearningRate = 0.0
     var learningRateScale = 1.0
     var samplesPerSecond = 0.0

@@ -155,6 +155,14 @@ final class AgentRuntime: @unchecked Sendable {
                   version.relativeMouseScale == GameCameraContract.deltaScale else {
                 throw AgentTrainerError.model("This brain predates the current visual and Game Camera contracts. Retrain it from the original recordings.")
             }
+            for warning in version.autonomousRunQualityWarnings {
+                AppLog.write(
+                    .warning,
+                    category: "Runtime",
+                    "Brain quality warning",
+                    details: warning
+                )
+            }
         } else if reinforcementConfiguration?.enabled != true {
             throw AgentTrainerError.model("This AI has no runnable brain. Enable Reinforcement Learning to start it safely from a new neutral policy.")
         }
