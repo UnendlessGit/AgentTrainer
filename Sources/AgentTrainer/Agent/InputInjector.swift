@@ -80,7 +80,18 @@ final class InputInjector: @unchecked Sendable {
         onState?(state)
     }
 
-    func execute(_ prediction: [Float], profile: AIProfile, allowedKeyCodes: Set<UInt16>, mouseMode: MouseControlMode, captureRect: CGRect, safety: AgentSafetyPolicy, gameCamera: GameCameraSettings = GameCameraSettings(), predictionIsFresh: Bool = true, shiftUsesKeyboardChannel: Bool = false) {
+    func execute(
+        _ prediction: [Float],
+        profile: AIProfile,
+        allowedKeyCodes: Set<UInt16>,
+        mouseMode: MouseControlMode,
+        captureRect: CGRect,
+        safety: AgentSafetyPolicy,
+        gameCamera: GameCameraSettings = GameCameraSettings(),
+        predictionIsFresh: Bool = true,
+        shiftUsesKeyboardChannel: Bool = false,
+        binaryDecisionThresholds: [Float]? = nil
+    ) {
         guard prediction.count >= ActionLayout.count,
               prediction.prefix(ActionLayout.count).allSatisfy(\.isFinite) else { return }
         lock.lock()
@@ -113,7 +124,14 @@ final class InputInjector: @unchecked Sendable {
         }
 
         if channels.buttons {
-            let desired = Set((0..<8).compactMap { prediction[4 + $0] >= 0.5 && restrictions.allowsButton(UInt8($0)) ? UInt8($0) : nil })
+            let desired = Set((0..<8).compactMap { button -> UInt8? in
+                let index = ActionLayout.buttons.lowerBound + button
+                return BinaryDecisionCalibration.isActive(
+                    score: prediction[index],
+                    for: index,
+                    in: binaryDecisionThresholds
+                ) && restrictions.allowsButton(UInt8(button)) ? UInt8(button) : nil
+            })
             for button in heldButtons.subtracting(desired) { postButton(button, down: false, at: cursor) }
             for button in desired.subtracting(heldButtons) { postButton(button, down: true, at: cursor) }
             heldButtons = desired
@@ -135,7 +153,11 @@ final class InputInjector: @unchecked Sendable {
         let modifierKeys: [UInt16] = [56, 59, 58, 55]
         if outputPermissions.keyboard {
             for i in 0..<4 where (i == 0 && shiftUsesKeyboardChannel ? channels.keyboard : channels.modifiers)
-                && prediction[142 + i] >= 0.5
+                && BinaryDecisionCalibration.isActive(
+                    score: prediction[142 + i],
+                    for: 142 + i,
+                    in: binaryDecisionThresholds
+                )
                 && restrictions.allowsModifier(i)
                 && allowsDemonstratedModifier(i, keys: allowedKeyCodes) {
                 desiredModifiers |= modifierMasks[i].rawValue
@@ -143,7 +165,12 @@ final class InputInjector: @unchecked Sendable {
         }
         let desiredKeys = outputPermissions.keyboard && channels.keyboard ? Set<UInt16>((0..<128).compactMap {
             let code = UInt16($0)
-            return prediction[14 + $0] >= 0.5
+            let index = ActionLayout.keyboard.lowerBound + $0
+            return BinaryDecisionCalibration.isActive(
+                score: prediction[index],
+                for: index,
+                in: binaryDecisionThresholds
+            )
                 && !ActionLayout.commandOptionControlKeyCodeSet.contains(code)
                 && allowedKeyCodes.contains(code)
                 && restrictions.allowsKey(code) ? code : nil

@@ -1,6 +1,6 @@
-# AgentTrainer 2.6.6 (Stable)
+# AgentTrainer 2.7.5 (Stable)
 
-> **Status:** 2.6.6 is the current stable release.
+> **Status:** 2.7.5 is the current stable release.
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -44,27 +44,36 @@ Policy v6, introduced in AgentTrainer 2.1, is designed around both useful capaci
 
 Training has independent, configurable anti-memorization controls for label-preserving vision variation, small random neutral occlusions, control-trajectory dropout/noise, whole temporal-token dropout, and binary label smoothing. The objective also exercises exact all-zero action histories independently of those settings. Visual perturbations remain disabled for validation and live inference; validation deliberately supplies zero prior actions to reproduce runtime startup. Recording-disjoint validation where possible, purged causal validation otherwise, per-head metrics, and best-held-out-brain activation remain the primary generalization checks.
 
-## Reliable autonomous controls in 2.6.6
+## Reliable visually grounded controls in 2.7.5
 
-AgentTrainer 2.6.6 retains the autonomous-start objective introduced in 2.6.5 and fixes an over-strict publication/runtime rule around it. Earlier training and validation supplied the exact demonstrated controls for every past frame. Runtime starts with an all-zero control history and can feed back only its own executable predictions, so a recurrent policy could minimize loss by copying held actions and remain trapped in a zero-action fixed point. Per-value history dropout did not solve that mismatch because a held control was usually still visible elsewhere in the sequence.
+AgentTrainer 2.7.5 fixes the autonomous-start failure that could survive the earlier zero-history and first-epoch safeguards. A production diagnostic over 749 recordings found that the packed frames were diverse and visually usable, and the CNN stages still reacted to them, but the learned visual projection compressed that variation from an initialized batch variance near `3.8e-4` to about `2.3e-9`. The recurrent branch could then copy demonstrated controls whenever teacher-forced history was present, while zero-history inference emitted almost constant marginal key frequencies. Loss could improve even though the brain had learned little executable vision.
 
-The supervised objective now:
+On that same recording-disjoint cache, one complete objective-v4 grounding epoch retained `0.145` visual-embedding variance and produced safe held-out thresholds for all four repeatedly demonstrated driving keys at or below a 1% false-positive rate. A fifth key with only seven held-out positives remained explicitly disabled, as intended.
 
-- trains every temporal model on a fixed share of exact runtime-start histories, even when optional generalization is disabled
-- drops complete per-control trajectories rather than isolated history values
-- selects the best brain using held-out visual context with all prior controls zero
-- derives bounded inverse-frequency weights for sparse relative-mouse and scroll targets, not only binary controls
-- records active-row coverage for mouse movement, buttons, scroll, keyboard, and modifiers, and shows persistent warnings when an enabled output has too few demonstrations to learn reliably
+The objective and publication path now:
 
-A threshold miss in one discrete head is now correctly treated as a head-specific quality warning, not proof that the whole multi-output brain is unusable. Training always preserves the first finite candidate, prefers a checkpoint where every sufficiently supported discrete head responds, and then compares loss and sparse-head regressions among equally responsive candidates. Completion always publishes the best available brain, and Run blocks only genuine model/control-contract incompatibilities. Legacy objective, weak-head, missing-demonstration, and extremely lossy vision findings remain visible without disabling controls that did learn. Autosaves explicitly record the optimizer step that produced their validation metrics, so an older epoch-end report is never presented as if it measured newer weights.
+- preserve a modest amount of real across-frame variation in the compact visual embedding, preventing the learned projection from collapsing to a constant while action-head biases fit only marginal press rates
+- add a bounded per-control pairwise ranking signal whenever a batch contains both positive and negative demonstrations; calibrated BCE remains the primary loss, while hard negative frames receive direct pressure instead of disappearing inside a class average
+- give every brain a complete deterministic first visual-grounding epoch through the current image; temporal models use an exact zero recurrent state, and the bootstrap disables stochastic regularization and caps its effective learning rate at `0.0003`
+- retain a lower-weight visual-only action objective after causal memory returns, so later recurrent training cannot erase autonomous-start behavior; ordinary temporal loss, regularization, causal visual memory, and 80% zero-control-history exposure remain present
+- preserve every pre-2.7.5 supervised brain as an immutable runnable version but begin its first objective-v4 dataset run from coherent clean weights; an affected brain can carry the no-action fixed point in its visual projection, convolutional encoder, and recurrent readout, so a partial warm start is not reliable
+- clear the compact control projection and the first fusion layer's recurrent columns before grounding a temporal policy, preventing even a compatible or newly initialized recurrent path from masking newly learned pixels
+- weight shared-encoder head losses by demonstrated coverage and library size, so a few stray rows in an otherwise empty enabled channel cannot compete equally with hundreds of thousands of real keyboard examples; safety losses and the runtime capability firewall still neutralize or block unsupported outputs
+- select a per-key, per-button, and per-modifier threshold from zero-history held-out scores only when it has adequate support, recall, at least 50% precision, positive Matthews correlation, and no more than a 1% false-positive rate
+- persist an explicit disabled threshold when neither the calibrated candidate nor `0.5` is safe, so an incomplete control fails closed instead of producing random physical taps
+- persist those thresholds with the exact validated weights and use the same values for validation, temporal feedback, reinforcement descendants, and physical execution
+- track how many sufficiently demonstrated discrete outputs are individually responsive, so one working key can no longer conceal several missing keys inside an aggregate keyboard score
+- keep the latest exact optimizer checkpoint for continuation while periodic autosaves, pauses, and completion activate the best validated runnable weights and their matching thresholds
 
-Policy v6 tensor shapes and packed dataset schema 11 are unchanged. `TrainingObjectiveContract` remains at schema 2: a compatible active brain remains a warm start, while stale optimizer state and teacher-forced validation baselines are intentionally restarted. Existing older brains should be fine-tuned or retrained to gain autonomous-start exposure, but they remain runnable. No optimizer setting or training duration can learn an output with no demonstrations, or infer event timing from vision that discards the relevant scene information; 2.6.6 reports those limitations before more compute is spent.
+Policy v6 tensor shapes and packed dataset schema 11 remain unchanged. `TrainingObjectiveContract` is schema 4, zero-history validation is contract 5, and immutable manifests use `BinaryDecisionContract` schema 1. Existing brains remain runnable with their saved behavior or legacy `0.5` boundary. Starting dataset training from a pre-v4 supervised brain keeps that version untouched, reuses compatible packed data, and trains a clean replacement; exact v4 checkpoints and reinforcement brains retain their normal resume/warm-start behavior. No objective can infer an action absent from demonstrations or distinguish intent from pixels that discard the relevant scene detail, so coverage, lossy-vision, incomplete-control, and false-action findings remain explicit quality warnings rather than being hidden by more training time.
 
 ## Calibrated controls in 2.6
 
 AgentTrainer 2.6 corrects a sparse-control objective that could make the least-used key or button look permanently active. Positive examples were intentionally class-balanced and press/release boundaries were emphasized, but those two weights also shifted an uninformative output toward—or above—the same `0.5` probability that runtime interprets as held. Setting Binary focal gamma to `0` did not remove either weight.
 
 The supervised objective now applies its positive-class prior as a loss-only logit adjustment. Rare positives still receive a strong learning signal, while the raw logits saved in the brain remain calibrated to the demonstrated action rate. Focal modulation is normalized only by static class/transition weights, so gamma now genuinely suppresses easy idle examples instead of cancelling through its own prediction-dependent denominator.
+
+AgentTrainer 2.7.5 keeps that probability calibration and removes the mistaken assumption that every calibrated control should share a `0.5` decision boundary. Safe held-out per-control thresholds turn useful sparse rankings into executable actions without restoring the old permanently-held rare-key failure.
 
 The same correctness pass also makes unavailable segment-leading temporal frames exactly match runtime's zero embedding/control state, keeps ignored duplicate Command/Option/Control key slots untouched by history corruption, prevents a future first pointer event in imported recordings from leaking into earlier targets, and reserves disk space for every temporary shard that parallel cache packing can retain. Policy v6 tensor shapes are unchanged: compatible active brain weights are retained, while 2.6 safely starts a new optimizer sequence and rebuilds affected disposable caches.
 
@@ -180,7 +189,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.6.6.dmg`
+- `AgentTrainer-2.7.5.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

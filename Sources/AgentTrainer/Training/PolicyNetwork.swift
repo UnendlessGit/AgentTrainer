@@ -3,11 +3,31 @@ import MLX
 import MLXNN
 import MLXRandom
 
+struct ActionHeadLossWeights: Equatable, Sendable {
+    var mouseMovement: Float
+    var buttons: Float
+    var scroll: Float
+    var keyboard: Float
+    var modifiers: Float
+
+    static let uniform = ActionHeadLossWeights(
+        mouseMovement: 1,
+        buttons: 1,
+        scroll: 1,
+        keyboard: 1,
+        modifiers: 1
+    )
+}
+
 final class AgentPolicy: Module, @unchecked Sendable {
     /// A fixed objective-level exposure to the runtime's zero-action startup
     /// state. This is intentionally independent of optional generalization:
     /// disabling augmentation must never restore a teacher-forcing shortcut.
-    static let runtimeStartupHistoryDropout: Float = 0.50
+    /// Historical controls are useful for smooth continuation but are also a
+    /// much easier shortcut than understanding the screen. Four visual-first
+    /// rows for every history-retaining row keep the recurrent path available
+    /// without letting it dominate the supervised objective.
+    static let runtimeStartupHistoryDropout: Float = 0.80
 
     let profile: AIProfile
     let dtype: DType
@@ -576,6 +596,164 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return featureDropout(current)
     }
 
+    /// Encodes current pixels once so the temporal and visual-only objectives
+    /// can share the expensive CNN/attention work while retaining independent
+    /// post-encoder regularization paths.
+    func currentVisualEmbedding(currentImages: MLXArray) -> MLXArray {
+        visualEmbedding(
+            visualFeatures: visualActivations(images: currentImages).last!
+        )
+    }
+
+    /// The first objective-v4 epoch deliberately removes every recurrent
+    /// feature, not only teacher-forced controls. A collapsed temporal brain can
+    /// otherwise keep routing constant past-state features through a readout
+    /// that has already learned to ignore the current image. Training the same
+    /// fusion stack with an exact zero recurrent state forces its current-vision
+    /// columns to become useful before temporal context is reintroduced.
+    func visualGroundingFeatures(
+        currentImages: MLXArray,
+        sampleToVision: MLXArray? = nil
+    ) -> MLXArray {
+        visualGroundingFeatures(
+            currentVisualEmbedding: currentVisualEmbedding(
+                currentImages: currentImages
+            ),
+            sampleToVision: sampleToVision
+        )
+    }
+
+    func visualGroundingFeatures(
+        currentVisualEmbedding: MLXArray,
+        sampleToVision: MLXArray? = nil
+    ) -> MLXArray {
+        var current = currentVisualEmbedding
+        if let sampleToVision, sampleToVision.dim(0) != current.dim(0) {
+            current = current.take(sampleToVision, axis: 0)
+        }
+        current = featureDropout(current)
+        guard profile.training.effectiveTemporalVision.pastFrameCount > 0 else {
+            return current
+        }
+        let recurrent = MLXArray.zeros(
+            [current.dim(0), profile.training.architecture.recurrentWidth],
+            dtype: dtype
+        )
+        return concatenated([current, recurrent], axis: -1)
+    }
+
+    /// Prevents the learned visual projection from becoming constant across a
+    /// real batch while action-head biases learn only marginal press rates.
+    /// Statistics stay in Float32 so the safeguard remains useful for low-bit
+    /// model storage, and the normalized hinge is bounded to roughly 0...1.
+    func visualRepresentationLoss(
+        currentVisualEmbedding: MLXArray
+    ) -> MLXArray {
+        guard currentVisualEmbedding.ndim == 2,
+              currentVisualEmbedding.dim(0) > 1 else {
+            return MLXArray(0, dtype: .float32)
+        }
+        let values = currentVisualEmbedding.asType(.float32)
+        let centered = values - values.mean(axis: 0, keepDims: true)
+        let standardDeviation = sqrt(
+            square(centered).mean(axis: 0) + 1e-8
+        )
+        let target = TrainingObjectiveContract
+            .minimumVisualEmbeddingStandardDeviation
+        return (
+            maximum(
+                MLXArray(target, dtype: .float32) - standardDeviation,
+                MLXArray(0, dtype: .float32)
+            ) / target
+        ).mean()
+    }
+
+    /// A calibrated BCE optimum may assign every example the same sparse
+    /// marginal probability. This batchwise AUC surrogate keeps the calibrated
+    /// objective intact while requiring demonstrated positives to outrank
+    /// negatives whenever both are present. Unsupported outputs contribute
+    /// exactly zero and cannot consume encoder capacity.
+    func visualBinaryRankingLoss(
+        logits: MLXArray,
+        targets: MLXArray,
+        supportedIndices: [Int]
+    ) -> MLXArray {
+        guard !supportedIndices.isEmpty,
+              logits.ndim == 2,
+              targets.ndim == 2,
+              logits.dim(0) == targets.dim(0),
+              logits.dim(0) > 1 else {
+            return MLXArray(0, dtype: .float32)
+        }
+        let selection = MLXArray(supportedIndices)
+        let selectedLogits = logits[.ellipsis, selection].asType(.float32)
+        let selectedTargets = targets[.ellipsis, selection].asType(.float32)
+        let negativeTargets = 1 - selectedTargets
+        let positivePairs = selectedTargets.expandedDimensions(axis: 1)
+            * negativeTargets.expandedDimensions(axis: 0)
+        let pairwiseMargins = selectedLogits.expandedDimensions(axis: 1)
+            - selectedLogits.expandedDimensions(axis: 0)
+        let losses = softplus(
+            TrainingObjectiveContract.visualBinaryRankingMargin
+                - pairwiseMargins
+        ) * positivePairs
+        return losses.sum() / (positivePairs.sum() + 1e-6)
+    }
+
+    /// Composes the versioned supervised objective from one shared current
+    /// visual embedding. A temporal policy supplies its ordinary logits plus a
+    /// current-image-only auxiliary; grounding/current-only policies pass nil
+    /// because their primary logits are already visual-only.
+    func supervisedTrainingObjective(
+        primaryLogits: MLXArray,
+        visualLogits suppliedVisualLogits: MLXArray?,
+        currentVisualEmbedding: MLXArray,
+        targets: MLXArray,
+        positiveWeights: MLXArray?,
+        previousTargets: MLXArray?,
+        headWeights: ActionHeadLossWeights = .uniform,
+        supportedBinaryIndices: [Int]
+    ) -> MLXArray {
+        let primaryActionLoss = loss(
+            logits: primaryLogits,
+            targets: targets,
+            positiveWeights: positiveWeights,
+            previousTargets: previousTargets,
+            headWeights: headWeights
+        )
+        let visualLogits = suppliedVisualLogits ?? primaryLogits
+        let actionLoss: MLXArray
+        if suppliedVisualLogits == nil {
+            actionLoss = primaryActionLoss
+        } else {
+            let visualActionLoss = loss(
+                logits: visualLogits,
+                targets: targets,
+                positiveWeights: positiveWeights,
+                previousTargets: previousTargets,
+                headWeights: headWeights
+            )
+            let auxiliaryWeight = TrainingObjectiveContract
+                .temporalVisualAuxiliaryLossWeight
+            actionLoss = (
+                primaryActionLoss + auxiliaryWeight * visualActionLoss
+            ) / (1 + auxiliaryWeight)
+        }
+        let representationLoss = visualRepresentationLoss(
+            currentVisualEmbedding: currentVisualEmbedding
+        )
+        let rankingLoss = visualBinaryRankingLoss(
+            logits: visualLogits,
+            targets: targets,
+            supportedIndices: supportedBinaryIndices
+        )
+        return actionLoss
+            + TrainingObjectiveContract.visualRepresentationLossWeight
+                * representationLoss
+            + TrainingObjectiveContract.visualBinaryRankingLossWeight
+                * rankingLoss
+    }
+
     func temporalFeatures(
         currentVisualFeatures: MLXArray,
         pastImages: MLXArray,
@@ -1014,6 +1192,50 @@ final class AgentPolicy: Module, @unchecked Sendable {
         MLX.eval((continuousHeads + binaryHeads).flatMap { [$0.weight] + ($0.bias.map { [$0] } ?? []) })
     }
 
+    /// A visual-grounding epoch must not begin with a recurrent shortcut learned
+    /// under teacher forcing. Starting both the compact control projection and
+    /// the first fusion layer's recurrent columns at zero makes the grounding
+    /// epoch depend on current pixels. Both paths remain trainable and can
+    /// relearn useful temporal context later.
+    func resetHistoricalControlShortcut() {
+        var updated: [MLXArray] = []
+        if let controlProjection {
+            controlProjection.weight._updateInternal(
+                MLXArray.zeros(controlProjection.weight.shape, dtype: dtype)
+            )
+            updated.append(controlProjection.weight)
+            if let bias = controlProjection.bias {
+                bias._updateInternal(MLXArray.zeros(bias.shape, dtype: dtype))
+                updated.append(bias)
+            }
+        }
+        func zeroRecurrentColumns(in layer: Linear) {
+            let visualWidth = profile.training.architecture.visualEmbedding
+            let weight = layer.weight
+            if weight.dim(-1) > visualWidth {
+                layer.weight._updateInternal(concatenated([
+                    weight[.ellipsis, 0..<visualWidth],
+                    MLXArray.zeros(
+                        [weight.dim(0), weight.dim(1) - visualWidth],
+                        dtype: dtype
+                    )
+                ], axis: -1))
+                updated.append(layer.weight)
+            }
+        }
+        if let firstFusion = fusion.first {
+            zeroRecurrentColumns(in: firstFusion)
+        } else {
+            // Custom architectures may intentionally omit hidden fusion layers.
+            // Their action heads consume current and recurrent features directly.
+            [
+                absoluteMouseHead, relativeMouseHead, buttonHead,
+                scrollHead, keyboardHead, modifierHead
+            ].forEach { zeroRecurrentColumns(in: $0) }
+        }
+        if !updated.isEmpty { MLX.eval(updated) }
+    }
+
     /// Caps the longest spatial side copied out of MLX while preserving every
     /// channel. This bounds CPU transfer and HUD rendering for very large model
     /// vision sizes; the model itself always runs at its exact configured size.
@@ -1041,7 +1263,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
         pastControls: MLXArray,
         targets: MLXArray,
         positiveWeights: MLXArray? = nil,
-        previousTargets: MLXArray? = nil
+        previousTargets: MLXArray? = nil,
+        headWeights: ActionHeadLossWeights = .uniform
     ) -> MLXArray {
         let logits = callAsFunction(
             currentImages: currentImages,
@@ -1052,7 +1275,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
             logits: logits,
             targets: targets,
             positiveWeights: positiveWeights,
-            previousTargets: previousTargets
+            previousTargets: previousTargets,
+            headWeights: headWeights
         )
     }
 
@@ -1063,7 +1287,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
         logits: MLXArray,
         targets: MLXArray,
         positiveWeights: MLXArray? = nil,
-        previousTargets: MLXArray? = nil
+        previousTargets: MLXArray? = nil,
+        headWeights: ActionHeadLossWeights = .uniform
     ) -> MLXArray {
         let targets = targets.asType(dtype)
         // Transition weighting uses the immediately preceding action target,
@@ -1071,7 +1296,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         let previous = previousTargets?.asType(dtype)
             ?? MLXArray.zeros(like: targets)
         let positiveWeights = positiveWeights?.asType(dtype)
-        var losses: [MLXArray] = []
+        var losses: [(value: MLXArray, weight: Float)] = []
         let channels = profile.channels
         if channels.mouseMovement {
             let absolute = smoothL1Loss(predictions: sigmoid(logits[.ellipsis, ActionLayout.absoluteMouse]), targets: targets[.ellipsis, ActionLayout.absoluteMouse], beta: 0.05)
@@ -1080,20 +1305,24 @@ final class AgentPolicy: Module, @unchecked Sendable {
                 targets: targets[.ellipsis, ActionLayout.relativeMouse],
                 activeWeights: positiveWeights.map { $0[ActionLayout.relativeMouse] }
             )
-            losses.append((absolute + relative) / 2)
+            losses.append(((absolute + relative) / 2, headWeights.mouseMovement))
         }
-        if channels.buttons { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.buttons)) }
+        if channels.buttons { losses.append((binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.buttons), headWeights.buttons)) }
         if channels.scroll {
-            losses.append(activeContinuousLoss(
+            losses.append((activeContinuousLoss(
                 predictions: tanh(logits[.ellipsis, ActionLayout.scroll]),
                 targets: targets[.ellipsis, ActionLayout.scroll],
                 activeWeights: positiveWeights.map { $0[ActionLayout.scroll] }
-            ))
+            ), headWeights.scroll))
         }
-        if channels.keyboard { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, indices: ActionLayout.keyboardAndShiftIndices)) }
-        if channels.modifiers { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.commandOptionControl)) }
-        guard let first = losses.first else { return MLXArray(0, dtype: dtype) }
-        return losses.dropFirst().reduce(first, +) / Float(losses.count)
+        if channels.keyboard { losses.append((binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, indices: ActionLayout.keyboardAndShiftIndices), headWeights.keyboard)) }
+        if channels.modifiers { losses.append((binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.commandOptionControl), headWeights.modifiers)) }
+        let active = losses.filter { $0.weight.isFinite && $0.weight > 0 }
+        guard let first = active.first else { return MLXArray(0, dtype: dtype) }
+        let weighted = active.dropFirst().reduce(first.value * first.weight) {
+            $0 + $1.value * $1.weight
+        }
+        return weighted / active.reduce(Float(0)) { $0 + $1.weight }
     }
 
     private func binaryControlLoss(logits: MLXArray, targets: MLXArray, previous: MLXArray, positiveWeights: MLXArray?, range: Range<Int>) -> MLXArray {
@@ -1281,7 +1510,8 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         gradients: ModuleParameters,
         targetType: DType,
         gradientNorm: MLXArray? = nil,
-        maxGradientNorm: Float? = nil
+        maxGradientNorm: Float? = nil,
+        learningRateMultiplier rawLearningRateMultiplier: Float = 1
     ) {
         initialize(model: model)
         stepArray = stepArray + 1
@@ -1309,7 +1539,13 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
             // is designed to remove.
             scheduleScale = warmupScale * maximum(floor, cycleScale)
         }
-        let scheduledLearningRate = learningRate * scheduleScale
+        let learningRateMultiplier = min(
+            1,
+            max(0.0001, rawLearningRateMultiplier)
+        )
+        let scheduledLearningRate = learningRate
+            * scheduleScale
+            * learningRateMultiplier
         // These scalars are shared by every parameter. Hoisting them keeps one
         // bias-correction/decay subgraph instead of tracing identical pow and
         // multiply nodes for each tensor in the model.

@@ -298,12 +298,57 @@ enum TrainingDataContract {
 
 /// Versioned independently from packed dataset bytes and learned tensor shapes.
 /// Adding this value to the exact-checkpoint signature lets objective fixes
-/// retain compatible brain weights while safely restarting stale optimizer
-/// state. Version 2 prevents teacher-forced action history from becoming an
-/// inert runtime fixed point and balances sparse continuous controls.
+/// safely restart stale optimizer state. Version 4 retains the deterministic
+/// current-image grounding curriculum introduced by v3 and prevents its visual
+/// projection from collapsing to a constant representation on real, noisy
+/// demonstrations. A bounded ranking term and a persistent visual-only
+/// auxiliary keep supported controls separable after temporal context returns.
+/// Pre-v4 supervised brains stay immutable and runnable, but their successor
+/// starts from clean weights because the no-action fixed point can extend into
+/// the learned visual projection and encoder.
 enum TrainingObjectiveContract {
-    static let schemaVersion = 2
-    static let minimumAutonomousStartSchema = 2
+    static let schemaVersion = 4
+    static let minimumAutonomousStartSchema = 4
+    /// Large custom networks can erase useful visual structure when their
+    /// configured full-training rate is used during the bootstrap. Later
+    /// epochs retain the user's exact rate; only the deterministic grounding
+    /// curriculum is capped at the stable default.
+    static let maximumVisualGroundingLearningRate = 0.0003
+    /// The visual projection is normalized per sample, but its variation across
+    /// samples can still collapse while action-head biases learn only marginal
+    /// press rates. Preserve a modest fraction of the initialized batch spread
+    /// without forcing irrelevant high-variance features.
+    static let minimumVisualEmbeddingStandardDeviation: Float = 0.02
+    static let visualRepresentationLossWeight: Float = 0.05
+    /// BCE remains the probability-calibrated primary objective. This bounded
+    /// auxiliary supplies an explicit gradient when positive and negative
+    /// examples otherwise settle at the same raw score.
+    static let visualBinaryRankingMargin: Float = 0.5
+    static let visualBinaryRankingLossWeight: Float = 0.10
+    /// Once causal memory returns, retain a smaller current-image-only action
+    /// objective so the recurrent path cannot erase autonomous-start behavior.
+    static let temporalVisualAuxiliaryLossWeight: Float = 0.5
+}
+
+/// Versioned independently from model tensors and optimizer semantics. Binary
+/// logits are calibrated probabilities, but a useful executable boundary is a
+/// property of the trained brain and its demonstrated behavior rather than a
+/// universal constant. New brains persist the boundary selected on the same
+/// zero-history held-out condition used for runtime-quality validation.
+enum BinaryDecisionContract {
+    static let schemaVersion = 1
+    static let defaultThreshold: Float = 0.5
+    /// A stored value of one is an explicit fail-closed sentinel. Runtime uses
+    /// sigmoid probabilities, but still treats the sentinel as disabled rather
+    /// than relying on finite-precision scores to remain strictly below one.
+    static let disabledThreshold: Float = 1
+    static let minimumPositiveSupport = 5
+    static let minimumNegativeSupport = 20
+    static let minimumUsefulMatthewsCorrelation = 0.05
+    static let minimumMatthewsImprovement = 0.01
+    static let minimumUsefulRecall = 0.05
+    static let minimumUsefulPrecision = 0.50
+    static let maximumUsefulFalsePositiveRate = 0.01
 }
 
 /// Versioned independently from model weights and demonstration caches. The
@@ -947,6 +992,13 @@ struct TrainingDataCoverage: Codable, Hashable, Sendable {
     var keyboardRows: Int
     var modifierRows: Int
 
+    var reliableActiveRowTarget: Int {
+        max(
+            Self.minimumReliableActiveRows,
+            Int(ceil(Double(max(0, sampleCount)).squareRoot()))
+        )
+    }
+
     var isValid: Bool {
         sampleCount >= 0 && [
             mouseMovementRows,
@@ -962,8 +1014,8 @@ struct TrainingDataCoverage: Codable, Hashable, Sendable {
         func append(_ label: String, count: Int, consequence: String) {
             if count == 0 {
                 result.append("No \(label) examples were found; \(consequence) cannot be learned.")
-            } else if count < Self.minimumReliableActiveRows {
-                result.append("Only \(count) \(label) row\(count == 1 ? "" : "s") \(count == 1 ? "was" : "were") found; \(consequence) will be unreliable.")
+            } else if count < reliableActiveRowTarget {
+                result.append("Only \(count) \(label) row\(count == 1 ? "" : "s") \(count == 1 ? "was" : "were") found; \(consequence) will be unreliable for this library (target at least \(reliableActiveRowTarget)).")
             }
         }
         if channels.mouseMovement {
@@ -998,15 +1050,37 @@ struct ValidationReport: Codable, Hashable, Sendable {
     var activeRelativeMouseMAE: Double?
     var activeScrollMAE: Double?
     var idleContinuousFalseActionRate: Double?
+    /// Number of supported binary outputs whose held-out decision boundary
+    /// safely replaced the legacy 0.50 cutoff. Optional preserves reports
+    /// written before per-control calibration.
+    var calibratedBinaryOutputCount: Int? = nil
+    /// Demonstrated outputs that were persisted with the explicit disabled
+    /// threshold because no held-out executable boundary met safety gates.
+    var safetyDisabledBinaryOutputCount: Int? = nil
+    var supportedBinaryOutputCount: Int? = nil
+    var responsiveBinaryOutputCount: Int? = nil
 
     /// A supported discrete head that never crosses the executable threshold is
     /// a useful quality signal, not proof that the entire multi-head policy is
     /// unusable. Five positives avoids warning on a handful of noisy labels.
     var hasExecutableBinaryCollapse: Bool {
-        !executableBinaryCollapseWarnings.isEmpty
+        if let supportedBinaryOutputCount,
+           let responsiveBinaryOutputCount,
+           supportedBinaryOutputCount > 0 {
+            return responsiveBinaryOutputCount < supportedBinaryOutputCount
+        }
+        return !executableBinaryCollapseWarnings.isEmpty
     }
 
     var executableBinaryCollapseWarnings: [String] {
+        if let supportedBinaryOutputCount,
+           let responsiveBinaryOutputCount,
+           supportedBinaryOutputCount > 0,
+           responsiveBinaryOutputCount < supportedBinaryOutputCount {
+            return [
+                "Only \(responsiveBinaryOutputCount) of \(supportedBinaryOutputCount) sufficiently demonstrated key, button, and modifier outputs produced a safe executable response in the zero-history stress test. The brain remains runnable, but missing controls need more visual grounding, usable scene detail, or consistent demonstrations."
+            ]
+        }
         let heads: [(label: String, metrics: BinaryValidationMetrics?)] = [
             ("Mouse-button", buttons),
             ("Keyboard", keyboard),
@@ -1071,6 +1145,10 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Loss semantics do not alter Policy v6 tensor shapes, but recording them
     /// keeps every immutable brain auditable across optimizer-objective fixes.
     var trainingObjectiveSchema: Int? = nil
+    /// A weights-only activation must know whether the deterministic visual
+    /// curriculum already completed; otherwise it could unnecessarily clear a
+    /// mature temporal path or skip an interrupted first epoch.
+    var visualGroundingComplete: Bool? = nil
     /// Cumulative optimizer wall time represented by this immutable brain.
     /// Optional keeps every version created before timing metrics decodable.
     var trainingDurationSeconds: Double? = nil
@@ -1089,6 +1167,12 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Optional keeps existing manifests decodable. New brains retain the
     /// per-head held-out report that justified best-brain selection.
     var validationReport: ValidationReport? = nil
+    /// Binary loss outputs are probability-calibrated, so a universal 0.50
+    /// execution boundary can suppress a discriminative sparse control. New
+    /// brains persist one held-out-calibrated threshold at each action index;
+    /// continuous values and legacy manifests use the neutral 0.50 fallback.
+    var binaryDecisionSchema: Int? = nil
+    var binaryDecisionThresholds: [Float]? = nil
     /// The exact optimizer step whose weights produced `validationLoss` and
     /// `validationReport`. Autosaves can be newer than the last epoch-end
     /// evaluation, so the validation step must be explicit rather than implied.
@@ -1109,20 +1193,48 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     var reinforcementNetReward: Double? = nil
     var reinforcementTrainingSeconds: Double? = nil
 
+    var hasCurrentBinaryDecisionContract: Bool {
+        guard binaryDecisionSchema == BinaryDecisionContract.schemaVersion,
+              let binaryDecisionThresholds,
+              binaryDecisionThresholds.count == ActionLayout.count else {
+            return false
+        }
+        return ActionLayout.binary.allSatisfy {
+            binaryDecisionThresholds[$0].isFinite
+                && (0...1).contains(binaryDecisionThresholds[$0])
+        }
+    }
+
+    var isReinforcementBrain: Bool {
+        reinforcementOptimizerFile != nil
+            && reinforcementStateFile != nil
+            && reinforcementSequence != nil
+    }
+
+    /// Pre-v4 supervised models can encode the all-no-action fixed point in the
+    /// visual projection/encoder as well as their temporal readout. Their
+    /// immutable versions remain runnable, but a v4 dataset run initializes a
+    /// coherent new policy instead of inheriting those weights. Reinforcement
+    /// brains intentionally remain valid warm starts.
+    var requiresFreshSupervisedTrainingRestart: Bool {
+        !isReinforcementBrain
+            && (trainingObjectiveSchema ?? 0)
+                < TrainingObjectiveContract.schemaVersion
+    }
+
     /// Quality diagnostics are deliberately advisory. A multi-head model may
     /// still perform useful controls when one optional head is weak, and older
     /// temporal brains remain technically runnable. Hard compatibility checks
     /// stay in runtime for actual tensor and control-contract mismatches.
     var autonomousRunQualityWarnings: [String] {
         var warnings = preprocessing.trainingQualityWarnings
-        let isReinforcementBrain = reinforcementOptimizerFile != nil
-            && reinforcementStateFile != nil
-            && reinforcementSequence != nil
-        let isSupervisedTemporalBrain = training.effectiveTemporalVision.pastFrameCount > 0
-            && !isReinforcementBrain
-        if isSupervisedTemporalBrain,
-           (trainingObjectiveSchema ?? 0) < TrainingObjectiveContract.minimumAutonomousStartSchema {
-            warnings.append("This temporal brain predates the autonomous-start training objective. It can run, but fine-tuning from its saved recordings improves its ability to initiate controls without demonstrated action history.")
+        if requiresFreshSupervisedTrainingRestart {
+            warnings.append("This supervised brain predates the visual-retention autonomous-start objective. It remains runnable unchanged; starting dataset training preserves this version and builds a clean objective-v4 brain so an old no-action fixed point cannot carry forward.")
+        }
+        if !isReinforcementBrain,
+           (trainingObjectiveSchema ?? 0) >= TrainingObjectiveContract.minimumAutonomousStartSchema,
+           !hasCurrentBinaryDecisionContract {
+            warnings.append("This brain has no held-out per-control decision calibration. It remains runnable at the legacy 0.50 boundary; completing a validation epoch calibrates sparse keys and buttons against held-out recordings.")
         }
         if !isReinforcementBrain, let trainingDataCoverage {
             warnings.append(contentsOf: trainingDataCoverage.warnings(for: channels))

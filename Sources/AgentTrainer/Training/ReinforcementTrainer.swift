@@ -675,6 +675,7 @@ final class ReinforcementTrainer: @unchecked Sendable {
                 trainingDataSchema: baseVersion?.trainingDataSchema
                     ?? TrainingDataContract.schemaVersion,
                 trainingObjectiveSchema: baseVersion?.trainingObjectiveSchema,
+                visualGroundingComplete: baseVersion?.visualGroundingComplete,
                 trainingDurationSeconds: previousTrainingSeconds + cumulativeTrainingSeconds
                     - (baseVersion?.reinforcementTrainingSeconds ?? 0),
                 experienceDurationSeconds: baseVersion?.experienceDurationSeconds
@@ -682,6 +683,12 @@ final class ReinforcementTrainer: @unchecked Sendable {
                 trainingShowsCursor: trainingShowsCursor,
                 recommendedMouseMode: recommendedMouseMode,
                 validationReport: nil,
+                binaryDecisionSchema: BinaryDecisionContract.schemaVersion,
+                binaryDecisionThresholds: BinaryDecisionCalibration.normalized(
+                    baseVersion?.hasCurrentBinaryDecisionContract == true
+                        ? baseVersion?.binaryDecisionThresholds
+                        : nil
+                ),
                 trainingDataCoverage: baseVersion?.trainingDataCoverage,
                 reinforcementOptimizerFile: optimizerFile,
                 reinforcementStateFile: stateFile,

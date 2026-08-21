@@ -48,11 +48,11 @@ private enum TrainingSamplingContract {
 }
 
 private enum TrainingValidationContract {
-    /// Version 4 retains the zero-history stress test while making per-head
-    /// threshold misses advisory. Best-brain selection always preserves a
-    /// finite checkpoint, prefers complete head responsiveness when available,
-    /// and never turns a diagnostic for one optional head into a whole-app gate.
-    static let capabilityAware = 4
+    /// Version 5 retains the zero-history stress test and selects a supported
+    /// per-output execution boundary from its raw scores. Validation, saved
+    /// brain publication, recurrent feedback, and physical execution therefore
+    /// measure the same policy instead of disagreeing at a universal 0.50.
+    static let capabilityAware = 5
 }
 
 final class TrainingEngine: @unchecked Sendable {
@@ -191,6 +191,10 @@ final class TrainingEngine: @unchecked Sendable {
         }()
         let trainingActionStatistics = dataset.trainingActionStatistics(at: split.train)
         let trainingDataCoverage = trainingActionStatistics.coverage
+        let objectiveHeadLossWeights = Self.objectiveHeadLossWeights(
+            coverage: trainingDataCoverage,
+            channels: profile.channels
+        )
         let visionWarnings = profile.preprocessing.trainingQualityWarnings
         if !visionWarnings.isEmpty {
             AppLog.write(
@@ -213,6 +217,10 @@ final class TrainingEngine: @unchecked Sendable {
             statistics: trainingActionStatistics,
             restrictions: profile.effectiveRestrictions
         )
+        let visuallyRankedBinaryIndices = ActionLayout.learnableBinaryIndices(
+            channels: profile.channels,
+            restrictions: profile.effectiveRestrictions
+        ).filter { positiveClassWeightValues[$0] > 0 }
         let validationSampleLimit = Self.recommendedValidationSampleLimit(
             total: split.validation.count,
             batchSize: profile.training.batchSize,
@@ -293,6 +301,15 @@ final class TrainingEngine: @unchecked Sendable {
             randomState: randomState,
             state: &state
         )
+        if state.visualGroundingComplete == nil {
+            if profile.training.effectiveTemporalVision.pastFrameCount > 0 {
+                // This is an objective-v4 start, not an exact mid-epoch resume.
+                // Remove every established or random recurrent contribution
+                // before the visual-only curriculum.
+                model.resetHistoricalControlShortcut()
+            }
+            state.visualGroundingComplete = false
+        }
         let validationStep = compile(inputs: [model]) { (arrays: [MLXArray]) -> [MLXArray] in
             // Keep packed-frame expansion, the shared forward pass, loss, and activation
             // inside one Metal graph. The class weights are immutable for this
@@ -327,7 +344,8 @@ final class TrainingEngine: @unchecked Sendable {
                     logits: logits,
                     targets: batch.targets,
                     positiveWeights: classWeights,
-                    previousTargets: batch.previousTargets
+                    previousTargets: batch.previousTargets,
+                    headWeights: objectiveHeadLossWeights
                 ),
                 model.activatedPredictions(logits: logits),
                 batch.targets
@@ -370,6 +388,8 @@ final class TrainingEngine: @unchecked Sendable {
             state.currentValidationReport = nil
             state.currentValidationGlobalStep = nil
             state.bestValidationReport = nil
+            state.currentBinaryDecisionThresholds = nil
+            state.bestBinaryDecisionThresholds = nil
             state.schedulerBestMetric = nil
             state.schedulerPlateauEpochs = 0
         }
@@ -396,6 +416,7 @@ final class TrainingEngine: @unchecked Sendable {
             state.validationHistory = [baselineValidationLoss]
             state.currentValidationReport = baseline.report
             state.currentValidationGlobalStep = state.globalStep
+            state.currentBinaryDecisionThresholds = baseline.binaryDecisionThresholds
             state.schedulerBestMetric = baselineValidationLoss
             state.schedulerPlateauEpochs = 0
             state.bestValidationLoss = baselineValidationLoss
@@ -405,55 +426,107 @@ final class TrainingEngine: @unchecked Sendable {
             state.bestElapsed = state.elapsed
             state.bestExperienceSeconds = state.experienceSeconds
             state.bestValidationReport = baseline.report
+            state.bestBinaryDecisionThresholds = baseline.binaryDecisionThresholds
         }
 
-        let trainingStep = compile(inputs: [model, optimizer, randomState], outputs: [model, optimizer, randomState]) { (arrays: [MLXArray]) -> [MLXArray] in
-            // Capture the Sendable Swift values and materialize the constant while
-            // MLX traces the graph. MLXArray itself is intentionally non-Sendable.
-            let classWeights = MLXArray(positiveClassWeightValues, [ActionLayout.count])
-            let batch = Self.expandBatch(
-                arrays,
-                profile: profile,
-                dtype: model.dtype,
-                reusesVisionFeatures: reusesVisionFeatures
+        let visualGroundingLearningRateMultiplier = Self
+            .visualGroundingLearningRateMultiplier(
+                configuredLearningRate: profile.training.learningRate
             )
-            let gradientInputs = [
-                batch.currentImages,
-                batch.pastImages,
-                batch.pastControls,
-                batch.targets,
-                batch.previousTargets
-            ]
-            // The row map is integer metadata, not a differentiable input.
-            // Capture it in the compiled graph instead of asking valueAndGrad
-            // to construct a meaningless gradient for it.
-            let sampleToVision = batch.sampleToVision
-            let visionToPast = batch.visionToPast
-            let pastFrameMask = batch.pastFrameMask
-            let result = valueAndGrad(model: model) { model, arrays in
-                let temporalFeatures = model.temporalFeatures(
-                    currentImages: arrays[0],
-                    pastImages: arrays[1],
-                    pastControls: arrays[2],
-                    visionToPast: visionToPast,
-                    sampleToVision: sampleToVision,
-                    pastFrameMask: pastFrameMask
+
+        func compiledTrainingStep(
+            forceVisualGrounding: Bool
+        ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+            compile(
+                inputs: [model, optimizer, randomState],
+                outputs: [model, optimizer, randomState]
+            ) { (arrays: [MLXArray]) -> [MLXArray] in
+                // Capture Sendable Swift values and materialize constants while
+                // MLX traces the graph. MLXArray itself is non-Sendable.
+                let classWeights = MLXArray(
+                    positiveClassWeightValues,
+                    [ActionLayout.count]
                 )
-                let logits = model.logits(temporalFeatures: temporalFeatures)
-                return [model.loss(
-                    logits: logits,
-                    targets: arrays[3],
-                    positiveWeights: classWeights,
-                    previousTargets: arrays[4]
-                )]
-            }(model, gradientInputs)
-            optimizer.update(
-                model: model,
-                gradients: result.1,
-                targetType: model.dtype,
-                maxGradientNorm: 1
-            )
-            return [result.0[0]]
+                let batch = Self.expandBatch(
+                    arrays,
+                    profile: profile,
+                    dtype: model.dtype,
+                    reusesVisionFeatures: reusesVisionFeatures
+                )
+                let gradientInputs = [
+                    batch.currentImages,
+                    batch.pastImages,
+                    batch.pastControls,
+                    batch.targets,
+                    batch.previousTargets
+                ]
+                // The row maps are integer metadata, not differentiable inputs.
+                let sampleToVision = batch.sampleToVision
+                let visionToPast = batch.visionToPast
+                let pastFrameMask = batch.pastFrameMask
+                let result = valueAndGrad(model: model) { model, arrays in
+                    let currentVisualEmbedding = model.currentVisualEmbedding(
+                        currentImages: arrays[0]
+                    )
+                    let temporalFeatures = forceVisualGrounding
+                        ? model.visualGroundingFeatures(
+                            currentVisualEmbedding: currentVisualEmbedding,
+                            sampleToVision: sampleToVision
+                        )
+                        : model.temporalFeatures(
+                            currentVisualEmbedding: currentVisualEmbedding,
+                            pastImages: arrays[1],
+                            pastControls: arrays[2],
+                            visionToPast: visionToPast,
+                            sampleToVision: sampleToVision,
+                            pastFrameMask: pastFrameMask
+                        )
+                    let logits = model.logits(temporalFeatures: temporalFeatures)
+                    let visualLogits: MLXArray?
+                    if forceVisualGrounding
+                        || profile.training.effectiveTemporalVision.pastFrameCount == 0 {
+                        visualLogits = nil
+                    } else {
+                        visualLogits = model.logits(
+                            temporalFeatures: model.visualGroundingFeatures(
+                                currentVisualEmbedding: currentVisualEmbedding,
+                                sampleToVision: sampleToVision
+                            )
+                        )
+                    }
+                    return [model.supervisedTrainingObjective(
+                        primaryLogits: logits,
+                        visualLogits: visualLogits,
+                        currentVisualEmbedding: currentVisualEmbedding,
+                        targets: arrays[3],
+                        positiveWeights: classWeights,
+                        previousTargets: arrays[4],
+                        headWeights: objectiveHeadLossWeights,
+                        supportedBinaryIndices: visuallyRankedBinaryIndices
+                    )]
+                }(model, gradientInputs)
+                optimizer.update(
+                    model: model,
+                    gradients: result.1,
+                    targetType: model.dtype,
+                    maxGradientNorm: 1,
+                    learningRateMultiplier: forceVisualGrounding
+                        ? visualGroundingLearningRateMultiplier
+                        : 1
+                )
+                return [result.0[0]]
+            }
+        }
+        let trainingStep = compiledTrainingStep(forceVisualGrounding: false)
+        var visualGroundingStep: (@Sendable ([MLXArray]) -> [MLXArray])? = state.visualGroundingComplete == true
+            ? nil
+            : compiledTrainingStep(forceVisualGrounding: true)
+        if visualGroundingStep != nil {
+            // The first invocation traces a deterministic graph: no pixel
+            // augmentation, feature dropout, or label smoothing. Once a real
+            // visual policy exists, later epochs restore every configured
+            // regularizer around the ordinary temporal objective.
+            model.train(false)
         }
         let started = ContinuousClock.now
         let baseElapsed = state.elapsed
@@ -504,6 +577,14 @@ final class TrainingEngine: @unchecked Sendable {
             try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer, randomState: randomState, state: state, captureBest: true)
         }
 
+        let visualGroundingStatus: String
+        if visualGroundingStep == nil {
+            visualGroundingStatus = ""
+        } else if profile.training.effectiveTemporalVision.pastFrameCount > 0 {
+            visualGroundingStatus = " • deterministic current-pixel grounding at a capped rate with exact zero recurrent state"
+        } else {
+            visualGroundingStatus = " • deterministic current-pixel grounding at a capped rate"
+        }
         let initialMemory = Memory.snapshot()
         metrics(TrainingMetrics(
             epoch: min(targetEpoch, state.epoch + (state.batchOffset > 0 ? 1 : 0)),
@@ -519,7 +600,12 @@ final class TrainingEngine: @unchecked Sendable {
             validationLoss: state.validationHistory.last,
             validationReport: state.currentValidationReport,
             trainingDataCoverage: trainingDataCoverage,
-            effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
+            effectiveLearningRate: Double(
+                optimizer.effectiveLearningRate()
+                    * (visualGroundingStep == nil
+                        ? 1
+                        : visualGroundingLearningRateMultiplier)
+            ),
             learningRateScale: Double(optimizer.learningRateScale),
             samplesPerSecond: 0,
             elapsed: state.elapsed,
@@ -531,7 +617,7 @@ final class TrainingEngine: @unchecked Sendable {
             mlxActiveMemory: initialMemory.activeMemory,
             mlxCacheMemory: initialMemory.cacheMemory,
             mlxPeakMemory: initialMemory.peakMemory
-        ), "\(restore.status) • continuing to epoch \(targetEpoch)")
+        ), "\(restore.status)\(visualGroundingStatus) • continuing to epoch \(targetEpoch)")
 
         var lastMetricsPublish = CACurrentMediaTime() - 1
         var performance = TrainingPerformanceWindow()
@@ -608,7 +694,7 @@ final class TrainingEngine: @unchecked Sendable {
                         reusesVisionFeatures: reusesVisionFeatures
                     )
                     let preparationSeconds = CACurrentMediaTime() - preparationStarted
-                    let lossArray = trainingStep(arrays)[0]
+                    let lossArray = (visualGroundingStep ?? trainingStep)(arrays)[0]
                     // Each compiled invocation observes the lazy state produced
                     // by the preceding invocation. Start it immediately so CPU
                     // mapped-data gathering for the next batch overlaps Metal,
@@ -689,7 +775,12 @@ final class TrainingEngine: @unchecked Sendable {
                         validationLoss: state.validationHistory.last,
                         validationReport: state.currentValidationReport,
                         trainingDataCoverage: trainingDataCoverage,
-                        effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
+                        effectiveLearningRate: Double(
+                            optimizer.effectiveLearningRate()
+                                * (visualGroundingStep == nil
+                                    ? 1
+                                    : visualGroundingLearningRateMultiplier)
+                        ),
                         learningRateScale: Double(optimizer.learningRateScale),
                         samplesPerSecond: performance.samplesPerSecond,
                         trainingStepMilliseconds: performance.stepMilliseconds,
@@ -733,8 +824,11 @@ final class TrainingEngine: @unchecked Sendable {
                     }
                     metrics(
                         report,
-                        performanceLimit
-                            ?? "Ordered \(optimizerPipelineDepth)-step MLX pipeline on Apple-silicon GPU\(visionStatus)"
+                        (performanceLimit
+                            ?? "Ordered \(optimizerPipelineDepth)-step MLX pipeline on Apple-silicon GPU\(visionStatus)")
+                            + (visualGroundingStep == nil
+                                ? ""
+                                : " • visual-grounding epoch")
                     )
                 }
 
@@ -743,7 +837,12 @@ final class TrainingEngine: @unchecked Sendable {
                 if shouldCheckpoint || shouldPause {
                     state.elapsed = baseElapsed + started.duration(to: .now).seconds
                     try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer, randomState: randomState, state: state)
-                    latestSnapshot = try await publishRunnableSnapshot(profile: profile, state: state, completed: false)
+                    latestSnapshot = try await publishRunnableSnapshot(
+                        profile: profile,
+                        state: state,
+                        completed: false,
+                        preferBest: !split.validation.isEmpty
+                    )
                     autosavesPublished += 1
                     if shouldCheckpoint {
                         nextAutosaveStep = saturatingAdd(state.globalStep, autosaveInterval)
@@ -791,6 +890,7 @@ final class TrainingEngine: @unchecked Sendable {
                 monitorMetric = validationLoss
                 state.currentValidationReport = validation.report
                 state.currentValidationGlobalStep = state.globalStep
+                state.currentBinaryDecisionThresholds = validation.binaryDecisionThresholds
                 state.validationHistory.append(validationLoss)
                 if state.validationHistory.count > 2_048 { state.validationHistory.removeFirst(1_024) }
                 let improvesAggregate = validationLoss < (state.bestValidationLoss ?? .infinity)
@@ -812,6 +912,7 @@ final class TrainingEngine: @unchecked Sendable {
                     state.bestElapsed = baseElapsed + started.duration(to: .now).seconds
                     state.bestExperienceSeconds = state.experienceSeconds
                     state.bestValidationReport = validation.report
+                    state.bestBinaryDecisionThresholds = validation.binaryDecisionThresholds
                     capturedBest = true
                     if hasActionCollapse {
                         validationSelectionStatus = "Saved the best available brain • one or more control heads remain below the execution threshold"
@@ -825,6 +926,13 @@ final class TrainingEngine: @unchecked Sendable {
                     validationSelectionStatus = "Zero-history loss improved, but the best brain was retained because a sparse control head regressed sharply"
                 }
             }
+            if state.visualGroundingComplete != true {
+                state.visualGroundingComplete = true
+                visualGroundingStep = nil
+                model.train(true)
+                validationSelectionStatus = validationSelectionStatus
+                    ?? "Completed the visual-grounding epoch; later epochs can relearn bounded self-history"
+            }
             let schedulerStatus = updateAdaptiveLearningRate(
                 optimizer: optimizer,
                 metric: monitorMetric,
@@ -837,6 +945,19 @@ final class TrainingEngine: @unchecked Sendable {
             state.learningRateHistory = learningRateHistory
             state.elapsed = baseElapsed + started.duration(to: .now).seconds
             try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer, randomState: randomState, state: state, captureBest: capturedBest)
+            if capturedBest {
+                // Make an epoch's newly validated runner active immediately.
+                // The exact checkpoint still keeps the newest optimizer state,
+                // while a later unstable step cannot strand the profile on the
+                // preceding unvalidated periodic autosave.
+                latestSnapshot = try await publishRunnableSnapshot(
+                    profile: profile,
+                    state: state,
+                    completed: false,
+                    preferBest: true
+                )
+                autosavesPublished += 1
+            }
             let memory = Memory.snapshot()
             metrics(TrainingMetrics(
                 epoch: state.epoch,
@@ -1089,9 +1210,11 @@ final class TrainingEngine: @unchecked Sendable {
                 rowCount: batch.count
             )
         }
+        let finalized = report.finalize(sampleCount: evaluated)
         return ValidationEvaluation(
             loss: weightedLoss / Double(max(1, evaluated)),
-            report: report.finalize(sampleCount: evaluated)
+            report: finalized.report,
+            binaryDecisionThresholds: finalized.binaryDecisionThresholds
         )
     }
 
@@ -1120,6 +1243,69 @@ final class TrainingEngine: @unchecked Sendable {
         return min(total, max(baseline, diversity, statistical))
     }
 
+    /// Underrepresented enabled heads retain a bounded share of any applicable
+    /// safety/learning loss, but must not consume the same shared-encoder
+    /// gradient budget as a well-demonstrated control family. Completely unseen
+    /// keyboard/modifier dimensions remain excluded by the capability firewall.
+    static func objectiveHeadLossWeights(
+        coverage: TrainingDataCoverage,
+        channels: ActionChannels
+    ) -> ActionHeadLossWeights {
+        // Sixteen rows are enough to avoid a meaningless warning in a tiny
+        // fixture, but they are not enough to give a head equal influence over
+        // a shared encoder trained on hundreds of thousands of labels. A
+        // square-root support target grows conservatively with the library and
+        // prevents a few accidental modifier/mouse rows from competing with a
+        // genuinely demonstrated keyboard head.
+        let reliableRows = coverage.reliableActiveRowTarget
+        func weight(enabled: Bool, activeRows: Int) -> Float {
+            guard enabled else { return 0 }
+            return min(
+                1,
+                max(
+                    0.1,
+                    Float(max(0, activeRows))
+                        / Float(reliableRows)
+                )
+            )
+        }
+        return ActionHeadLossWeights(
+            mouseMovement: weight(
+                enabled: channels.mouseMovement,
+                activeRows: coverage.mouseMovementRows
+            ),
+            buttons: weight(
+                enabled: channels.buttons,
+                activeRows: coverage.mouseButtonRows
+            ),
+            scroll: weight(
+                enabled: channels.scroll,
+                activeRows: coverage.scrollRows
+            ),
+            keyboard: weight(
+                enabled: channels.keyboard,
+                activeRows: coverage.keyboardRows
+            ),
+            modifiers: weight(
+                enabled: channels.modifiers,
+                activeRows: coverage.modifierRows
+            )
+        )
+    }
+
+    static func visualGroundingLearningRateMultiplier(
+        configuredLearningRate: Double
+    ) -> Float {
+        let configured = configuredLearningRate.isFinite
+            ? max(0.000_000_1, configuredLearningRate)
+            : TrainingObjectiveContract.maximumVisualGroundingLearningRate
+        return Float(min(
+            1,
+            TrainingObjectiveContract.maximumVisualGroundingLearningRate
+                / configured
+        ))
+    }
+
     /// A finite first candidate is always worth preserving. Once a best brain
     /// exists, complete discrete-head responsiveness outranks aggregate loss;
     /// among equally responsive candidates, lower loss wins unless a supported
@@ -1135,6 +1321,11 @@ final class TrainingEngine: @unchecked Sendable {
         if let bestReport {
             guard !report.hasSevereBinaryRegression(comparedTo: bestReport) else {
                 return false
+            }
+            if let candidateResponsive = report.responsiveBinaryOutputCount,
+               let bestResponsive = bestReport.responsiveBinaryOutputCount,
+               candidateResponsive != bestResponsive {
+                return candidateResponsive > bestResponsive
             }
             let candidateHasCollapse = report.hasExecutableBinaryCollapse
             let bestHasCollapse = bestReport.hasExecutableBinaryCollapse
@@ -1564,7 +1755,9 @@ final class TrainingEngine: @unchecked Sendable {
     private func publishRunnableSnapshot(profile: AIProfile, state: CheckpointState, completed: Bool, preferBest: Bool = false) async throws -> TrainingCompletion {
         let checkpoint = await WorkspaceStore.shared.checkpointDirectory(profileID: profile.id)
         let bestWeights = checkpoint.appendingPathComponent("best.weights.safetensors")
-        let usesBest = completed && preferBest && state.bestGlobalStep != nil && FileManager.default.fileExists(atPath: bestWeights.path)
+        let usesBest = preferBest
+            && state.bestGlobalStep != nil
+            && FileManager.default.fileExists(atPath: bestWeights.path)
         let currentEpoch = state.batchOffset > 0 ? state.epoch + 1 : state.epoch
         let displayedEpoch = usesBest ? state.bestEpoch ?? currentEpoch : currentEpoch
         let displayedStep = usesBest ? state.bestGlobalStep ?? state.globalStep : state.globalStep
@@ -1574,9 +1767,16 @@ final class TrainingEngine: @unchecked Sendable {
         let displayedValidationLoss = usesBest ? state.bestValidationLoss : state.validationHistory.last
         let displayedValidationReport = usesBest ? state.bestValidationReport : state.currentValidationReport
         let displayedValidationStep = usesBest ? state.bestGlobalStep : state.currentValidationGlobalStep
+        let displayedBinaryDecisionThresholds = usesBest
+            ? state.bestBinaryDecisionThresholds
+            : state.currentBinaryDecisionThresholds
         let version = ModelVersionManifest(
             id: UUID(),
-            name: usesBest ? "Best Brain • Epoch \(displayedEpoch) • Step \(displayedStep)" : completed ? "Brain • Epoch \(displayedEpoch) • Step \(displayedStep)" : "Autosave • Epoch \(displayedEpoch) • Step \(displayedStep)",
+            name: usesBest
+                ? "Best \(completed ? "Brain" : "Autosave") • Epoch \(displayedEpoch) • Step \(displayedStep)"
+                : completed
+                    ? "Brain • Epoch \(displayedEpoch) • Step \(displayedStep)"
+                    : "Autosave • Epoch \(displayedEpoch) • Step \(displayedStep)",
             createdAt: Date(),
             globalStep: displayedStep,
             trainingLoss: displayedLoss,
@@ -1593,11 +1793,18 @@ final class TrainingEngine: @unchecked Sendable {
             relativeMouseScale: GameCameraContract.deltaScale,
             trainingDataSchema: TrainingDataContract.schemaVersion,
             trainingObjectiveSchema: TrainingObjectiveContract.schemaVersion,
+            visualGroundingComplete: state.visualGroundingComplete,
             trainingDurationSeconds: usesBest ? state.bestElapsed : state.elapsed,
             experienceDurationSeconds: usesBest ? state.bestExperienceSeconds : state.experienceSeconds ?? 0,
             trainingShowsCursor: state.trainingShowsCursor,
             recommendedMouseMode: state.recommendedMouseMode,
             validationReport: displayedValidationReport,
+            binaryDecisionSchema: displayedBinaryDecisionThresholds == nil
+                ? nil
+                : BinaryDecisionContract.schemaVersion,
+            binaryDecisionThresholds: displayedBinaryDecisionThresholds.map {
+                BinaryDecisionCalibration.normalized($0)
+            },
             validationGlobalStep: displayedValidationStep,
             trainingDataCoverage: state.trainingDataCoverage
         )
@@ -1687,6 +1894,17 @@ final class TrainingEngine: @unchecked Sendable {
            version.schemaVersion == ModelContract.schemaVersion,
            version.preprocessing == profile.preprocessing,
            version.training.architecture.weightLayout == profile.training.architecture.weightLayout {
+            if version.requiresFreshSupervisedTrainingRestart {
+                // Real record-disjoint diagnostics showed that pre-v4 policies
+                // could collapse the visual projection as well as poison the
+                // convolutional and recurrent readouts. The old brain remains
+                // runnable, but objective v4 must start with a coherent fresh
+                // model rather than inherit an all-no-op fixed point.
+                return CheckpointRestore(
+                    status: "Preserved the selected legacy brain; starting clean objective-v4 visual grounding because its old weights can encode a no-action fixed point",
+                    captureValidationBaseline: false
+                )
+            }
             let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: versionID)
             try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
             state.epoch = max(0, version.epoch ?? 0)
@@ -1699,6 +1917,12 @@ final class TrainingEngine: @unchecked Sendable {
             state.validationHistory = version.validationLoss.map { [$0] } ?? []
             state.currentValidationReport = version.validationReport
             state.currentValidationGlobalStep = version.validationGlobalStep
+            state.visualGroundingComplete = version.visualGroundingComplete
+            state.currentBinaryDecisionThresholds = BinaryDecisionCalibration.normalized(
+                version.hasCurrentBinaryDecisionContract
+                    ? version.binaryDecisionThresholds
+                    : nil
+            )
             if let validationLoss = version.validationLoss, validationLoss.isFinite {
                 state.bestValidationLoss = validationLoss
                 state.bestGlobalStep = state.globalStep
@@ -1707,11 +1931,21 @@ final class TrainingEngine: @unchecked Sendable {
                 state.bestElapsed = state.elapsed
                 state.bestExperienceSeconds = state.experienceSeconds
                 state.bestValidationReport = version.validationReport
-                return CheckpointRestore(status: "Loaded the selected best brain; optimizer restarted safely", captureValidationBaseline: true)
+                state.bestBinaryDecisionThresholds = state.currentBinaryDecisionThresholds
+                return CheckpointRestore(
+                    status: "Loaded the selected brain's compatible visual and action weights; optimizer restarted safely",
+                    captureValidationBaseline: true
+                )
             }
-            return CheckpointRestore(status: "Loaded the active brain for fine-tuning; optimizer restarted safely", captureValidationBaseline: true)
+            return CheckpointRestore(
+                status: "Loaded the active brain's compatible visual and action weights; optimizer restarted safely",
+                captureValidationBaseline: true
+            )
         }
-        return CheckpointRestore(status: "Compiling fused MLX training graph on Apple GPU", captureValidationBaseline: false)
+        return CheckpointRestore(
+            status: "Compiling fused MLX training graph on Apple GPU",
+            captureValidationBaseline: false
+        )
     }
 
 }
@@ -1802,6 +2036,7 @@ private struct ScheduledTrainingStep {
 private struct ValidationEvaluation {
     var loss: Double
     var report: ValidationReport
+    var binaryDecisionThresholds: [Float]
 }
 
 private struct BinaryValidationAccumulator {
@@ -1834,10 +2069,7 @@ private struct BinaryValidationAccumulator {
 private struct ValidationAccumulator {
     let profile: AIProfile
     let activeBinaryIndices: Set<Int>
-    private var binary = BinaryValidationAccumulator()
-    private var buttons = BinaryValidationAccumulator()
-    private var keyboard = BinaryValidationAccumulator()
-    private var modifiers = BinaryValidationAccumulator()
+    private var binaryObservations: [Int: [BinaryDecisionObservation]]
     private var absoluteError = 0.0
     private var absoluteCount = 0
     private var relativeError = 0.0
@@ -1850,6 +2082,9 @@ private struct ValidationAccumulator {
     init(profile: AIProfile, activeBinaryIndices: Set<Int>) {
         self.profile = profile
         self.activeBinaryIndices = activeBinaryIndices
+        binaryObservations = Dictionary(
+            uniqueKeysWithValues: activeBinaryIndices.map { ($0, []) }
+        )
     }
 
     mutating func consume(predictions: [Float], targets: [Float], rowCount: Int) {
@@ -1858,15 +2093,13 @@ private struct ValidationAccumulator {
         for row in 0..<rowCount {
             let base = row * ActionLayout.count
             for index in activeBinaryIndices {
-                let predicted = predictions[base + index] >= 0.5
                 let target = targets[base + index] >= 0.5
-                binary.consume(predicted: predicted, target: target)
-                switch index {
-                case ActionLayout.buttons: buttons.consume(predicted: predicted, target: target)
-                case ActionLayout.keyboardAndShift: keyboard.consume(predicted: predicted, target: target)
-                case ActionLayout.commandOptionControl: modifiers.consume(predicted: predicted, target: target)
-                default: break
-                }
+                binaryObservations[index, default: []].append(
+                    BinaryDecisionObservation(
+                        score: predictions[base + index],
+                        target: target
+                    )
+                )
             }
             if profile.channels.mouseMovement {
                 for index in ActionLayout.absoluteMouse {
@@ -1918,8 +2151,79 @@ private struct ValidationAccumulator {
         }
     }
 
-    func finalize(sampleCount: Int) -> ValidationReport {
-        ValidationReport(
+    func finalize(sampleCount: Int) -> (
+        report: ValidationReport,
+        binaryDecisionThresholds: [Float]
+    ) {
+        var thresholds = BinaryDecisionCalibration.defaultThresholds
+        var binary = BinaryValidationAccumulator()
+        var buttons = BinaryValidationAccumulator()
+        var keyboard = BinaryValidationAccumulator()
+        var modifiers = BinaryValidationAccumulator()
+        var calibratedOutputCount = 0
+        var safetyDisabledOutputCount = 0
+        var supportedOutputCount = 0
+        var responsiveOutputCount = 0
+        for index in activeBinaryIndices.sorted() {
+            let observations = binaryObservations[index] ?? []
+            let calibration = BinaryDecisionCalibration.calibrate(observations)
+            thresholds[index] = calibration.threshold
+            if calibration.disabledForSafety,
+               calibration.positiveSupport > 0 {
+                safetyDisabledOutputCount += 1
+            } else if calibration.usedCalibratedThreshold {
+                calibratedOutputCount += 1
+            }
+            let isSupported = calibration.positiveSupport
+                >= BinaryDecisionContract.minimumPositiveSupport
+                && calibration.negativeSupport
+                    >= BinaryDecisionContract.minimumNegativeSupport
+            if isSupported { supportedOutputCount += 1 }
+            var outputTruePositives = 0
+            var outputFalsePositives = 0
+            var outputFalseNegatives = 0
+            var outputTrueNegatives = 0
+            for observation in observations {
+                let predicted = BinaryDecisionCalibration.isActive(
+                    score: observation.score,
+                    threshold: calibration.threshold
+                )
+                switch (predicted, observation.target) {
+                case (true, true): outputTruePositives += 1
+                case (true, false): outputFalsePositives += 1
+                case (false, true): outputFalseNegatives += 1
+                case (false, false): outputTrueNegatives += 1
+                }
+                binary.consume(predicted: predicted, target: observation.target)
+                switch index {
+                case ActionLayout.buttons:
+                    buttons.consume(predicted: predicted, target: observation.target)
+                case ActionLayout.keyboardAndShift:
+                    keyboard.consume(predicted: predicted, target: observation.target)
+                case ActionLayout.commandOptionControl:
+                    modifiers.consume(predicted: predicted, target: observation.target)
+                default:
+                    break
+                }
+            }
+            let outputRecall = Double(outputTruePositives)
+                / Double(max(1, outputTruePositives + outputFalseNegatives))
+            let outputPrecision = Double(outputTruePositives)
+                / Double(max(1, outputTruePositives + outputFalsePositives))
+            let outputFalsePositiveRate = Double(outputFalsePositives)
+                / Double(max(1, outputFalsePositives + outputTrueNegatives))
+            let outputIsSafe = calibration.matthewsCorrelation
+                    >= BinaryDecisionContract.minimumUsefulMatthewsCorrelation
+                && outputRecall >= BinaryDecisionContract.minimumUsefulRecall
+                && outputPrecision
+                    >= BinaryDecisionContract.minimumUsefulPrecision
+                && outputFalsePositiveRate
+                    <= BinaryDecisionContract.maximumUsefulFalsePositiveRate
+            if isSupported && outputIsSafe {
+                responsiveOutputCount += 1
+            }
+        }
+        let report = ValidationReport(
             sampleCount: sampleCount,
             binary: binary.metrics,
             buttons: buttons.metrics,
@@ -1930,8 +2234,13 @@ private struct ValidationAccumulator {
             activeScrollMAE: scrollCount > 0 ? scrollError / Double(scrollCount) : nil,
             idleContinuousFalseActionRate: idleContinuousCount > 0
                 ? Double(idleContinuousFalseActions) / Double(idleContinuousCount)
-                : nil
+                : nil,
+            calibratedBinaryOutputCount: calibratedOutputCount,
+            safetyDisabledBinaryOutputCount: safetyDisabledOutputCount,
+            supportedBinaryOutputCount: supportedOutputCount,
+            responsiveBinaryOutputCount: responsiveOutputCount
         )
+        return (report, thresholds)
     }
 }
 
@@ -1952,6 +2261,8 @@ private struct CheckpointState: Codable {
     var currentValidationReport: ValidationReport? = nil
     var currentValidationGlobalStep: Int? = nil
     var bestValidationReport: ValidationReport? = nil
+    var currentBinaryDecisionThresholds: [Float]? = nil
+    var bestBinaryDecisionThresholds: [Float]? = nil
     var schedulerBestMetric: Double? = nil
     var schedulerPlateauEpochs: Int? = nil
     var schedulerReductions: Int? = nil
@@ -1986,6 +2297,10 @@ private struct CheckpointState: Codable {
     /// Changes to held-out context or comparison semantics refresh the baseline
     /// without discarding otherwise compatible model and optimizer state.
     var validationStrategy: Int? = nil
+    /// The first complete objective-v4 epoch deterministically learns through
+    /// current pixels (with an exact zero recurrent state when temporal).
+    /// Persisting this flag makes a mid-epoch pause resume that curriculum.
+    var visualGroundingComplete: Bool? = nil
 }
 
 private struct SplitMix64 {

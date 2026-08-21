@@ -55,6 +55,7 @@ final class AgentRuntime: @unchecked Sendable {
     private var outputPermissionsRevision = 0
     private var allowedKeyCodes: Set<UInt16> = []
     private var shiftUsesKeyboardChannel = false
+    private var binaryDecisionThresholds = BinaryDecisionCalibration.defaultThresholds
     private var latestFrame: CVPixelBuffer?
     private var lastUsableCaptureFrame: CVPixelBuffer?
     private var processing = false
@@ -229,6 +230,11 @@ final class AgentRuntime: @unchecked Sendable {
             reinforcementTrainer = nil
         }
         let reinforcementIsActive = reinforcementTrainer != nil
+        let binaryDecisionThresholds = BinaryDecisionCalibration.normalized(
+            version?.hasCurrentBinaryDecisionContract == true
+                ? version?.binaryDecisionThresholds
+                : nil
+        )
         let temporal = runtimeProfile.training.effectiveTemporalVision
         let hasTemporalMemory = temporal.pastFrameCount > 0
         let pastSpec = temporal.pastFrameSpec(from: runtimeProfile.preprocessing)
@@ -366,6 +372,7 @@ final class AgentRuntime: @unchecked Sendable {
             self.profile = runtimeProfile
             self.allowedKeyCodes = allowedKeyCodes
             self.shiftUsesKeyboardChannel = (version?.trainingDataSchema ?? TrainingDataContract.schemaVersion) >= 7
+            self.binaryDecisionThresholds = binaryDecisionThresholds
             self.safety = safety
             self.captureRect = captureRect
             self.mode = mode
@@ -640,9 +647,26 @@ final class AgentRuntime: @unchecked Sendable {
             }
         }
         lock.withLock {
-            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; reinforcementTrainer = nil; pendingReinforcementSignals.removeAll(keepingCapacity: false); reinforcementScroll = ReinforcementScrollAccumulator(); model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
-            latestFrame = nil; lastUsableCaptureFrame = nil; temporalFrames.reset(); predictionLatch.reset(); processing = false
-            visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
+            predictionFunction = nil
+            activationVisualizationFunctions.removeAll(keepingCapacity: false)
+            channelVisualizationFunction = nil
+            saliencyVisualizationFunction = nil
+            saliencyGradientFunction = nil
+            reinforcementTrainer = nil
+            pendingReinforcementSignals.removeAll(keepingCapacity: false)
+            reinforcementScroll = ReinforcementScrollAccumulator()
+            model = nil
+            profile = nil
+            allowedKeyCodes.removeAll(keepingCapacity: false)
+            shiftUsesKeyboardChannel = false
+            binaryDecisionThresholds = BinaryDecisionCalibration.defaultThresholds
+            latestFrame = nil
+            lastUsableCaptureFrame = nil
+            temporalFrames.reset()
+            predictionLatch.reset()
+            processing = false
+            visualizationSettings = CNNVisualizationSettings()
+            lastVisualizationTime = 0
         }
         onReinforcementMetrics?(ReinforcementMetrics())
         MLXMemoryLifecycle.reclaimCaches(after: "agent runtime")
@@ -892,7 +916,8 @@ final class AgentRuntime: @unchecked Sendable {
                 restrictions: profile.effectiveRestrictions,
                 allowedKeyCodes: allowedKeyCodes,
                 outputPermissions: transitionOutputPermissions,
-                shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
+                shiftUsesKeyboardChannel: shiftUsesKeyboardChannel,
+                binaryDecisionThresholds: binaryDecisionThresholds
             )
             if hasTemporalMemory {
                 let retainedFrameCount = temporal.pastFrameCount * temporal.frameSpacing
@@ -995,7 +1020,14 @@ final class AgentRuntime: @unchecked Sendable {
         lock.lock()
         guard !stopped, let latched = predictionLatch.consume(), let profile else { lock.unlock(); return }
         let prediction = latched.values
-        let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes, shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel
+        let safety = self.safety
+        let rect = captureRect
+        let targetPID = self.targetPID
+        let mouseMode = self.mouseMode
+        let gameCamera = self.gameCamera
+        let allowedKeyCodes = self.allowedKeyCodes
+        let shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel
+        let binaryDecisionThresholds = self.binaryDecisionThresholds
         let now = CACurrentMediaTime()
         let maximumPredictionAge = max(0.35, 3 / max(0.0001, profile.training.perceptionFPS))
         if now - latched.publishedAt > maximumPredictionAge {
@@ -1029,7 +1061,8 @@ final class AgentRuntime: @unchecked Sendable {
             safety: safety,
             gameCamera: gameCamera,
             predictionIsFresh: latched.isFresh,
-            shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
+            shiftUsesKeyboardChannel: shiftUsesKeyboardChannel,
+            binaryDecisionThresholds: binaryDecisionThresholds
         )
         if let snapshot { onMetrics?(snapshot) }
     }
@@ -1138,7 +1171,8 @@ enum RuntimeActionSemantics {
         restrictions: ActionRestrictions = ActionRestrictions(),
         allowedKeyCodes: Set<UInt16>? = nil,
         outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions(),
-        shiftUsesKeyboardChannel: Bool = true
+        shiftUsesKeyboardChannel: Bool = true,
+        binaryDecisionThresholds: [Float]? = nil
     ) -> [Float] {
         guard prediction.count >= ActionLayout.count else { return prediction }
         var values = prediction
@@ -1158,7 +1192,12 @@ enum RuntimeActionSemantics {
         }
         for button in 0..<8 {
             let allowed = buttonsEnabled && restrictions.allowsButton(UInt8(button))
-            values[ActionLayout.buttons.lowerBound + button] = allowed && values[ActionLayout.buttons.lowerBound + button] >= 0.5 ? 1 : 0
+            let index = ActionLayout.buttons.lowerBound + button
+            values[index] = allowed && BinaryDecisionCalibration.isActive(
+                score: values[index],
+                for: index,
+                in: binaryDecisionThresholds
+            ) ? 1 : 0
         }
         for index in ActionLayout.scroll {
             values[index] = scrollEnabled ? min(1, max(-1, values[index])) : 0
@@ -1173,7 +1212,11 @@ enum RuntimeActionSemantics {
                 && restrictions.allowsKey(code)
                 && !ActionLayout.commandOptionControlKeyCodeSet.contains(code)
             let index = ActionLayout.keyboard.lowerBound + key
-            values[index] = allowed && values[index] >= 0.5 ? 1 : 0
+            values[index] = allowed && BinaryDecisionCalibration.isActive(
+                score: values[index],
+                for: index,
+                in: binaryDecisionThresholds
+            ) ? 1 : 0
         }
 
         let modifierEquivalents: [[UInt16]] = [[56, 60], [59, 62], [58, 61], [55, 54]]
@@ -1188,7 +1231,11 @@ enum RuntimeActionSemantics {
                 && capabilityAllows
                 && restrictions.allowsModifier(modifier)
             let index = ActionLayout.modifiers.lowerBound + modifier
-            values[index] = allowed && values[index] >= 0.5 ? 1 : 0
+            values[index] = allowed && BinaryDecisionCalibration.isActive(
+                score: values[index],
+                for: index,
+                in: binaryDecisionThresholds
+            ) ? 1 : 0
         }
         return values
     }

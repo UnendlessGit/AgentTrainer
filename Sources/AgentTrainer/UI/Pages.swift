@@ -432,7 +432,7 @@ private struct ProfileEditor: View {
                                                 StatusPill(text: "RL", color: ATColor.violet)
                                             }
                                         }
-                                        Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • \((version.trainingObjectiveSchema ?? 0) >= 2 ? "zero-history " : "")validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "")\(version.reinforcementFeedbackCount.map { " • RL \($0) feedback / \(version.reinforcementUpdateCount ?? 0) updates / net \((version.reinforcementNetReward ?? 0).formatted(.number.sign(strategy: .always()).precision(.fractionLength(0...2))))" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                                        Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • \((version.trainingObjectiveSchema ?? 0) >= 2 ? "zero-history " : "")validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "")\(version.validationReport?.calibratedBinaryOutputCount.map { " • \($0) calibrated control\($0 == 1 ? "" : "s")" } ?? "")\(version.validationReport?.safetyDisabledBinaryOutputCount.flatMap { $0 > 0 ? " • \($0) safety-disabled" : nil } ?? "")\(version.reinforcementFeedbackCount.map { " • RL \($0) feedback / \(version.reinforcementUpdateCount ?? 0) updates / net \((version.reinforcementNetReward ?? 0).formatted(.number.sign(strategy: .always()).precision(.fractionLength(0...2))))" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))")
                                             .font(.caption).foregroundStyle(.secondary)
                                         ForEach(version.autonomousRunQualityWarnings, id: \.self) { warning in
                                             Text("⚠︎ \(warning)").font(.caption2).foregroundStyle(ATColor.amber)
@@ -1426,6 +1426,16 @@ struct TrainingView: View {
             components.append("F1 \((100 * binary.f1).formatted(.number.precision(.fractionLength(1))))%")
             components.append("false-positive rate \((100 * binary.falsePositiveRate).formatted(.number.precision(.fractionLength(2))))%")
         }
+        if let count = report.calibratedBinaryOutputCount {
+            components.append("\(count) per-control threshold\(count == 1 ? "" : "s") calibrated")
+        }
+        if let count = report.safetyDisabledBinaryOutputCount, count > 0 {
+            components.append("\(count) unsafe output\(count == 1 ? "" : "s") disabled")
+        }
+        if let supported = report.supportedBinaryOutputCount,
+           let responsive = report.responsiveBinaryOutputCount {
+            components.append("\(responsive)/\(supported) demonstrated discrete controls responsive")
+        }
         if let value = report.activeRelativeMouseMAE { components.append("active mouse MAE \(value.formatted(.number.precision(.fractionLength(4))))") }
         if let value = report.activeScrollMAE { components.append("active scroll MAE \(value.formatted(.number.precision(.fractionLength(4))))") }
         return components.joined(separator: " • ")
@@ -1434,7 +1444,7 @@ struct TrainingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                SectionTitle("Training", "Compiled MLX training uses an efficient residual vision encoder, causal temporal memory, autonomous-start history exposure, pixel and trajectory perturbations, class-balanced sparse controls, transition-balanced batches, disjoint visual validation, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
+                SectionTitle("Training", "Compiled MLX training uses an efficient residual vision encoder, a first visual-grounding epoch, visual-representation retention, per-control score ranking, a persistent visual-only auxiliary, causal temporal memory, autonomous-start history exposure, class-balanced sparse controls, held-out fail-closed decision calibration, disjoint visual validation, and leak-resistant best-brain selection. Another trained AI can run simultaneously.")
                 HStack {
                     if model.isTraining, let profile = displayedProfile {
                         Text(profile.name).font(.title2.bold())
@@ -1547,7 +1557,7 @@ struct TrainingView: View {
                                     .font(.caption).foregroundStyle(ATColor.amber)
                             }
                         }
-                        Text("Exact continuation always uses the latest optimizer and adaptive-scheduler checkpoint. With validation data, completed training prefers a brain whose supported discrete heads cross the execution threshold, then the lowest-loss non-regressing checkpoint. If a head remains weak, the best available brain is still saved and the limitation is shown as a quality warning.").font(.caption2).foregroundStyle(.secondary)
+                        Text("Exact continuation always uses the latest optimizer and adaptive-scheduler checkpoint. With validation data, each supported key or button receives a zero-history decision threshold only when recall, precision, Matthews correlation, and the 1% false-action limit remain safe; an unsafe output is explicitly disabled. Published autosaves and completed runs activate the best validated weights and matching thresholds, while incomplete controls remain visible as quality warnings.").font(.caption2).foregroundStyle(.secondary)
                         Text("MLX reports allocator-backed unified memory: active arrays, reusable cache, and process-lifetime peak. It is not separate VRAM on Apple silicon.").font(.caption2).foregroundStyle(.tertiary)
                     }
                 }

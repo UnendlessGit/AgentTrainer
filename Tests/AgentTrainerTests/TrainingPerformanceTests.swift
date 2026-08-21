@@ -262,6 +262,9 @@ final class TrainingPerformanceTests: XCTestCase {
             let mappingData = mapping.withUnsafeBytes { Data($0) }
             let actionData = actionRows.withUnsafeBytes { Data($0) }
             let positiveWeights = MLXArray.ones([ActionLayout.count])
+            let supportedBinaryIndices = (0..<32).map {
+                ActionLayout.keyboard.lowerBound + $0
+            }
             let bufferPool = try MetalArrayBufferPool(maximumCachedBytes: 512 * 1_024 * 1_024)
 
             func copied(_ source: Data) -> Data {
@@ -327,18 +330,28 @@ final class TrainingPerformanceTests: XCTestCase {
             ) -> @Sendable ([MLXArray]) -> [MLXArray] {
                 compile(inputs: [model, optimizer], outputs: [model, optimizer]) { arrays in
                     let result = valueAndGrad(model: model) { model, inputs in
+                        let currentEmbedding = model.currentVisualEmbedding(
+                            currentImages: inputs[0]
+                        )
                         let temporalFeatures = model.temporalFeatures(
-                            currentImages: inputs[0],
+                            currentVisualEmbedding: currentEmbedding,
                             pastImages: inputs[1],
                             pastControls: inputs[2]
                         )
-                        return [model.loss(
-                            logits: model.referenceLogits(
+                        return [model.supervisedTrainingObjective(
+                            primaryLogits: model.referenceLogits(
                                 temporalFeatures: temporalFeatures
                             ),
+                            visualLogits: model.referenceLogits(
+                                temporalFeatures: model.visualGroundingFeatures(
+                                    currentVisualEmbedding: currentEmbedding
+                                )
+                            ),
+                            currentVisualEmbedding: currentEmbedding,
                             targets: inputs[3],
                             positiveWeights: positiveWeights,
-                            previousTargets: inputs[4]
+                            previousTargets: inputs[4],
+                            supportedBinaryIndices: supportedBinaryIndices
                         )]
                     }(model, arrays)
                     optimizer.update(
@@ -365,13 +378,28 @@ final class TrainingPerformanceTests: XCTestCase {
                         actions[0..., 1, 0...]
                     ]
                     let result = valueAndGrad(model: model) { model, values in
-                        [model.loss(
-                            currentImages: values[0],
+                        let currentEmbedding = model.currentVisualEmbedding(
+                            currentImages: values[0]
+                        )
+                        let temporalFeatures = model.temporalFeatures(
+                            currentVisualEmbedding: currentEmbedding,
                             pastImages: values[1],
                             pastControls: values[2],
+                        )
+                        return [model.supervisedTrainingObjective(
+                            primaryLogits: model.logits(
+                                temporalFeatures: temporalFeatures
+                            ),
+                            visualLogits: model.logits(
+                                temporalFeatures: model.visualGroundingFeatures(
+                                    currentVisualEmbedding: currentEmbedding
+                                )
+                            ),
+                            currentVisualEmbedding: currentEmbedding,
                             targets: values[3],
                             positiveWeights: positiveWeights,
-                            previousTargets: values[4]
+                            previousTargets: values[4],
+                            supportedBinaryIndices: supportedBinaryIndices
                         )]
                     }(model, inputs)
                     optimizer.update(
@@ -402,19 +430,31 @@ final class TrainingPerformanceTests: XCTestCase {
                     let targets = actions[0..., 0, 0...]
                     let previousTargets = actions[0..., 1, 0...]
                     let result = valueAndGrad(model: model) { model, values in
+                        let currentEmbedding = model.currentVisualEmbedding(
+                            currentImages: values[0]
+                        )
                         let uniqueTemporal = model.temporalFeatures(
-                            currentImages: values[0],
+                            currentVisualEmbedding: currentEmbedding,
                             pastImages: values[1],
                             pastControls: values[2],
                             visionToPast: arrays[3],
                             sampleToVision: arrays[4]
                         )
                         let logits = model.logits(temporalFeatures: uniqueTemporal)
-                        return [model.loss(
-                            logits: logits,
+                        let visualLogits = model.logits(
+                            temporalFeatures: model.visualGroundingFeatures(
+                                currentVisualEmbedding: currentEmbedding,
+                                sampleToVision: arrays[4]
+                            )
+                        )
+                        return [model.supervisedTrainingObjective(
+                            primaryLogits: logits,
+                            visualLogits: visualLogits,
+                            currentVisualEmbedding: currentEmbedding,
                             targets: targets,
                             positiveWeights: positiveWeights,
-                            previousTargets: previousTargets
+                            previousTargets: previousTargets,
+                            supportedBinaryIndices: supportedBinaryIndices
                         )]
                     }(model, uniqueInputs)
                     optimizer.update(
