@@ -31,6 +31,7 @@ final class HEVCWriter: @unchecked Sendable {
     private var firstPTS: CMTime?
     private var lastPTS: CMTime?
     private var sessionEndPTS: CMTime?
+    private var generatedFormatDescription: CMVideoFormatDescription?
     private(set) var frameCount = 0
     private(set) var droppedFrameCount = 0
 
@@ -72,6 +73,10 @@ final class HEVCWriter: @unchecked Sendable {
     }
 
     func append(_ sampleBuffer: CMSampleBuffer) {
+        append(sampleBuffer, waitsForCapacity: false)
+    }
+
+    private func append(_ sampleBuffer: CMSampleBuffer, waitsForCapacity: Bool) {
         guard CMSampleBufferDataIsReady(sampleBuffer) else {
             droppedFrameCount += 1
             return
@@ -82,6 +87,14 @@ final class HEVCWriter: @unchecked Sendable {
             writer.startSession(atSourceTime: pts)
             firstPTS = pts
             started = true
+        }
+        if waitsForCapacity {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while !input.isReadyForMoreMediaData,
+                  writer.status == .writing,
+                  ContinuousClock.now < deadline {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
         }
         guard input.isReadyForMoreMediaData else {
             droppedFrameCount += 1
@@ -96,7 +109,46 @@ final class HEVCWriter: @unchecked Sendable {
         }
     }
 
-    func finish() async throws -> (duration: Double, deliveredFPS: Double, frames: Int) {
+    /// DAgger already owns exact model-ready frames. Rewrapping a reconstructed
+    /// bi-planar surface as a timed sample lets it use the same required
+    /// hardware HEVC path without starting a second ScreenCaptureKit stream.
+    func append(_ pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
+        if generatedFormatDescription == nil {
+            var description: CMVideoFormatDescription?
+            guard CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: pixelBuffer,
+                formatDescriptionOut: &description
+            ) == noErr else {
+                droppedFrameCount += 1
+                return
+            }
+            generatedFormatDescription = description
+        }
+        guard let generatedFormatDescription else {
+            droppedFrameCount += 1
+            return
+        }
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: presentationTimeStamp,
+            decodeTimeStamp: .invalid
+        )
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescription: generatedFormatDescription,
+            sampleTiming: &timing,
+            sampleBufferOut: &sample
+        ) == noErr, let sample else {
+            droppedFrameCount += 1
+            return
+        }
+        append(sample, waitsForCapacity: true)
+    }
+
+    func finish(endPTS requestedEndPTS: CMTime? = nil) async throws -> (duration: Double, deliveredFPS: Double, frames: Int) {
         guard started else {
             if writer.status == .failed {
                 throw writer.error ?? AgentTrainerError.capture("HEVC encoding failed before the first frame was written.")
@@ -111,7 +163,7 @@ final class HEVCWriter: @unchecked Sendable {
         // selected content is static. Ending the writer session at the current
         // host time makes the final encoded frame persist for the real recording
         // duration instead of collapsing a long idle recording to one frame.
-        let hostEnd = CMClockGetTime(CMClockGetHostTimeClock())
+        let hostEnd = requestedEndPTS ?? CMClockGetTime(CMClockGetHostTimeClock())
         if let firstPTS, hostEnd.isNumeric, CMTimeCompare(hostEnd, firstPTS) > 0 {
             writer.endSession(atSourceTime: hostEnd)
             sessionEndPTS = hostEnd

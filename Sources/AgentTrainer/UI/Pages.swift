@@ -211,6 +211,7 @@ struct ModelsView: View {
                                     .buttonStyle(.borderless)
                                     .foregroundStyle(ATColor.coral)
                                     .help("Delete this AI and its saved brains")
+                                    .disabled(model.isProfileBusy(profile.id))
                                 }
                             }
                             .tag(profile.id)
@@ -306,6 +307,54 @@ private struct ProfileEditor: View {
                         }
                         .padding(11)
                         .raisedGlassSurface(cornerRadius: 11, tint: ATColor.cyan)
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack {
+                                Text("Generalization and predictive learning").font(.subheadline.bold()).foregroundStyle(ATColor.violet)
+                                InfoTip("These are training-only objectives. Run still emits the immediate action directly, so future prediction can add intent without delaying reactions.")
+                                Spacer()
+                            }
+                            HStack {
+                                Toggle("Visual Augmentation", isOn: visualAugmentationBinding(\.enabled)).tint(ATColor.violet)
+                                DoubleField("Probability", value: visualAugmentationBinding(\.probability))
+                                DoubleField("Brightness", value: visualAugmentationBinding(\.brightness))
+                                DoubleField("Contrast", value: visualAugmentationBinding(\.contrast))
+                                DoubleField("Saturation", value: visualAugmentationBinding(\.saturation))
+                                DoubleField("Hue °", value: visualAugmentationBinding(\.hueDegrees))
+                                DoubleField("Gamma", value: visualAugmentationBinding(\.gamma))
+                            }
+                            Text("One conservative color/luminance transform is shared by every current, past, and future frame in an optimizer batch. No spatial transform can desynchronize cursor or action meaning.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Divider()
+                            HStack {
+                                Toggle("Future Action Prediction", isOn: futureActionBinding(\.enabled)).tint(ATColor.green)
+                                DoubleArrayField("Horizons (seconds)", values: futureActionBinding(\.horizonsSeconds))
+                                DoubleField("Loss weight", value: futureActionBinding(\.lossWeight))
+                                Spacer()
+                                Text("up to \(FutureActionPredictionConfiguration.maximumHorizonCount) horizons")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Text("A fixed training-only head predicts controls shortly after the current action. Near horizons receive more weight; runtime never averages them into the immediate output.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Divider()
+                            HStack {
+                                Toggle("Future State Prediction", isOn: futureStateBinding(\.enabled)).tint(ATColor.cyan)
+                                DoubleField("Horizon (seconds)", value: futureStateBinding(\.horizonSeconds))
+                                DoubleField("Loss weight", value: futureStateBinding(\.lossWeight))
+                                IntField("Sample stride", value: futureStateBinding(\.sampleStride))
+                                Spacer()
+                            }
+                            Text("The model predicts an action-conditioned change in its own visual embedding. It never generates or stores future images; repeated target frames are deduplicated before encoding.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Divider()
+                            HStack {
+                                Text("DAgger corrections").font(.subheadline.bold()).foregroundStyle(ATColor.coral)
+                                DoubleField("Lead-up seconds", value: daggerBinding(\.preRollSeconds), help: "Minimum context retained before the explicit correction. The runtime automatically extends this to cover the model's full temporal lookback.")
+                                DoubleField("Correction weight", value: daggerBinding(\.correctionWeight), help: "Loss emphasis for short expert corrections so ordinary demonstration volume does not drown them out.")
+                                Spacer()
+                            }
+                        }
+                        .padding(11)
+                        .raisedGlassSurface(cornerRadius: 11, tint: ATColor.violet)
                         HStack { DoubleField("Learning rate", value: $draft.training.learningRate, help: "Peak AdamW update size. Adaptive scheduling warms up, uses bounded cosine restarts so updates never decay silently to zero, and reduces its envelope only after a measured plateau."); DoubleField("Weight decay", value: $draft.training.weightDecay, help: "Regularization applied by AdamW."); DoubleField("Validation", value: $draft.training.validationSplit, help: "Fraction of whole recordings held out. Splits target sample count, keep rare controls in training, purge shared context, and score diverse examples from every held-out recording.") }
                         HStack {
                             Picker("Learning-rate schedule", selection: Binding(get: { draft.training.effectiveLearningRateSchedule }, set: { draft.training.learningRateSchedule = $0 })) { ForEach(LearningRateSchedule.allCases) { Text($0.rawValue).tag($0) } }
@@ -368,7 +417,7 @@ private struct ProfileEditor: View {
                         } else {
                             ForEach(model.versions) { version in
                                 HStack {
-                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
+                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.correctionLoss.map { " • correction \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
                                     Spacer(); Button(version.optimizerFile == nil ? "Run this" : "Revert & Resume") {
                                         Task {
                                             if await model.activateVersion(version) { draft.activeVersionID = version.id }
@@ -410,6 +459,58 @@ private struct ProfileEditor: View {
                 var temporal = draft.training.effectiveTemporalVision
                 temporal[keyPath: keyPath] = value
                 draft.training.temporalVision = temporal
+            }
+        )
+    }
+
+    private func visualAugmentationBinding<Value>(
+        _ keyPath: WritableKeyPath<VisualAugmentationConfiguration, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { draft.training.effectiveVisualAugmentation[keyPath: keyPath] },
+            set: { value in
+                var configuration = draft.training.effectiveVisualAugmentation
+                configuration[keyPath: keyPath] = value
+                draft.training.visualAugmentation = configuration
+            }
+        )
+    }
+
+    private func futureActionBinding<Value>(
+        _ keyPath: WritableKeyPath<FutureActionPredictionConfiguration, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { draft.training.effectiveFutureActionPrediction[keyPath: keyPath] },
+            set: { value in
+                var configuration = draft.training.effectiveFutureActionPrediction
+                configuration[keyPath: keyPath] = value
+                draft.training.futureActionPrediction = configuration
+            }
+        )
+    }
+
+    private func futureStateBinding<Value>(
+        _ keyPath: WritableKeyPath<FutureStatePredictionConfiguration, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { draft.training.effectiveFutureStatePrediction[keyPath: keyPath] },
+            set: { value in
+                var configuration = draft.training.effectiveFutureStatePrediction
+                configuration[keyPath: keyPath] = value
+                draft.training.futureStatePrediction = configuration
+            }
+        )
+    }
+
+    private func daggerBinding<Value>(
+        _ keyPath: WritableKeyPath<DAggerConfiguration, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { draft.training.effectiveDAgger[keyPath: keyPath] },
+            set: { value in
+                var configuration = draft.training.effectiveDAgger
+                configuration[keyPath: keyPath] = value
+                draft.training.dagger = configuration
             }
         )
     }
@@ -988,6 +1089,39 @@ private struct IntArrayField: View {
     private func commit() { let parsed = text.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }; if !parsed.isEmpty { values = parsed; text = parsed.map(String.init).joined(separator: ", ") } }
 }
 
+private struct DoubleArrayField: View {
+    let title: String
+    @Binding var values: [Double]
+    @State private var text: String
+
+    init(_ title: String, values: Binding<[Double]>) {
+        self.title = title
+        _values = values
+        _text = State(initialValue: values.wrappedValue.map { $0.formatted(.number.precision(.fractionLength(3))) }.joined(separator: ", "))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            TextField("comma separated", text: $text)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { commit() }
+                .onDisappear { commit() }
+        }
+        .frame(minWidth: 180)
+    }
+
+    private func commit() {
+        let parsed = text.split(separator: ",").compactMap {
+            Double($0.trimmingCharacters(in: .whitespaces))
+        }
+        if !parsed.isEmpty {
+            values = parsed
+            text = parsed.map { $0.formatted(.number.precision(.fractionLength(3))) }.joined(separator: ", ")
+        }
+    }
+}
+
 struct TrainingView: View {
     private enum GraphKind: String, CaseIterable, Identifiable {
         case current = "Batch Loss"
@@ -1081,7 +1215,10 @@ struct TrainingView: View {
                     if model.isTraining { Button("Pause → Runnable Brain") { model.pauseTraining() }.primaryButton(color: ATColor.amber); Button("Stop") { model.stopTraining() }.primaryButton(color: ATColor.coral) }
                     else {
                         Button("Start / Exact Resume") { model.startTraining() }.primaryButton(color: ATColor.green)
-                        Button("Auto Train") { model.startAutoTraining() }.primaryButton(color: ATColor.cyan).help("Keep starting another configured epoch block whenever training completes, until paused or stopped.")
+                            .disabled(displayedProfile.map { model.isProfileBusy($0.id) } ?? false)
+                        Button("Auto Train") { model.startAutoTraining() }.primaryButton(color: ATColor.cyan)
+                            .disabled(displayedProfile.map { model.isProfileBusy($0.id) } ?? false)
+                            .help("Keep starting another configured epoch block whenever training completes, until paused or stopped.")
                     }
                 }
                 OLEDCard {
@@ -1120,6 +1257,13 @@ struct TrainingView: View {
                     MetricCard(title: "Equivalent experience", value: (displayedTiming.experienceIsEstimated ? "~" : "") + TrainingDurationFormatter.string(seconds: displayedTiming.experienceSeconds), symbol: "brain.head.profile.fill", color: ATColor.violet)
                     MetricCard(title: "Samples / sec", value: model.trainingMetrics.samplesPerSecond.formatted(.number.precision(.fractionLength(0))), symbol: "bolt.fill", color: ATColor.amber)
                     MetricCard(title: "Optimizer steps", value: displayedSteps.formatted(), symbol: "arrow.triangle.2.circlepath", color: ATColor.green)
+                }
+                HStack(spacing: 12) {
+                    MetricCard(title: "Immediate action loss", value: lossText(model.trainingMetrics.immediateActionLoss), symbol: "bolt.horizontal.fill", color: ATColor.green)
+                    MetricCard(title: "Future action loss", value: lossText(model.trainingMetrics.futureActionLoss), symbol: "arrow.right.to.line.compact", color: ATColor.violet)
+                    MetricCard(title: "Future state loss", value: lossText(model.trainingMetrics.futureStateLoss), symbol: "point.3.connected.trianglepath.dotted", color: ATColor.cyan)
+                    MetricCard(title: "DAgger correction fit", value: lossText(model.trainingMetrics.correctionLoss), symbol: "arrow.triangle.branch", color: ATColor.coral)
+                    MetricCard(title: "Total objective", value: lossText(model.trainingMetrics.trainingLoss), symbol: "sum", color: ATColor.amber)
                 }
                 HStack(spacing: 12) {
                     MetricCard(title: "Pipelined step", value: "\(model.trainingMetrics.trainingStepMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms", symbol: "timer", color: ATColor.cyan)
@@ -1481,7 +1625,32 @@ struct RunView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                             Divider()
                             Text("Per-AI key and mouse-button restrictions").font(.subheadline.bold())
-                            KeyRestrictionGrid(restrictions: Binding(get: { profile.effectiveRestrictions }, set: { value in var changed = profile; changed.restrictions = value; model.saveProfile(changed) }), model: model).disabled(model.agentIsActiveOrStarting)
+                            KeyRestrictionGrid(restrictions: Binding(get: { profile.effectiveRestrictions }, set: { value in var changed = profile; changed.restrictions = value; model.saveProfile(changed) }), model: model).disabled(model.isProfileBusy(profile.id))
+                        }
+                    }
+                    OLEDCard {
+                        HStack(alignment: .top, spacing: 16) {
+                            VStack(alignment: .leading, spacing: 7) {
+                                HStack {
+                                    Text("DAgger correction capture").font(.headline).foregroundStyle(ATColor.coral)
+                                    StatusPill(
+                                        text: model.isDAggerRecording ? "Recording expert correction" : model.isStartingDAgger ? "Starting" : model.isSavingDAgger ? "Saving" : "Explicit only",
+                                        color: model.isDAggerRecording ? ATColor.coral : ATColor.violet
+                                    )
+                                }
+                                Text("While Run is active, the normal Record keybind starts or stops DAgger instead of an ordinary recording. Starting it preserves the configured lead-up, pauses AI output, and records your correction. The saved correction is automatically added to this AI for warm-start fine-tuning.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Text("Ordinary physical takeover still follows “Stop immediately on my input” and never starts recording by itself.")
+                                    .font(.caption.bold()).foregroundStyle(ATColor.amber)
+                            }
+                            Spacer()
+                            if model.isRunning {
+                                Button(model.isDAggerRecording ? "Stop & Save Correction" : "Record DAgger Correction") {
+                                    Task { await model.toggleDAggerRecording() }
+                                }
+                                .primaryButton(color: model.isDAggerRecording ? ATColor.coral : ATColor.violet)
+                                .disabled(model.isStartingDAgger || model.isSavingDAgger)
+                            }
                         }
                     }
                     HStack { StatusPill(text: model.isTraining ? "Background training remains active" : "Custom panic shortcut armed", color: model.isTraining ? ATColor.cyan : ATColor.coral); Spacer(); if model.agentIsActiveOrStarting { Button(model.isStartingAgent ? "Cancel AI Start & Release Inputs" : "Stop AI & Disable All Hooks") { Task { await model.stopAgent() } }.primaryButton(color: ATColor.coral) } else { Button("Run AI") { Task { await model.startAgent() } }.primaryButton(color: ATColor.green).disabled(profile.activeVersionID == nil || model.trainingProfileID == profile.id || model.recordingIsActiveOrStarting || model.isReplaying) } }

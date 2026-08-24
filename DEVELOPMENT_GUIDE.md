@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.0.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.1.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -21,7 +21,8 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Storage/InputEventFile.swift` — fixed-width binary event writer and validated mapped reader
 - `Preprocessing/VisionPreprocessor.swift` — Metal resize, color conversion, packing, and MLX expansion
 - `Training/DatasetCache.swift` — causal frame/action pairing and memory-mapped datasets
-- `Training/PolicyNetwork.swift` — Policy v5 and resumable AdamW
+- `Training/DAggerRecorder.swift` — bounded correction video/input publication from live processed frames
+- `Training/PolicyNetwork.swift` — Policy v6, predictive objectives, augmentation, and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
 - `Agent/AgentRuntime.swift` — capture, inference scheduling, prediction latching, and teardown
@@ -46,6 +47,8 @@ Capture, runtime, training, and injection use dedicated locks and queues because
 - Keep callbacks to UI state outside low-level locks.
 - Treat start and stop as re-entrant operations; duplicate requests must coalesce or return.
 - A background task may publish only bounded snapshots to the main actor.
+- An explicit DAgger trigger must synchronously stop new AI action admission before recorder construction. Buffer early physical samples and inferred frames until the recorder is installed; ordinary takeover must never enter correction mode.
+- Close DAgger frame admission and enqueue the video-queue drain marker under the same lock ordering. Input events stream to disk; visual queue/ring payloads stay within the shared 512 MB context bound.
 
 ## Capture and recording contracts
 
@@ -78,6 +81,12 @@ Live HUD state and persisted recording state are intentionally separate. The HUD
 
 Saved HEVC sessions end on the shared host clock even when ScreenCaptureKit reports only idle frames. Dataset construction materializes the last decoded frame at every configured perception interval until a newer frame becomes causal; a static screen must not collapse temporal spacing or observation count.
 
+DAgger uses the normal Record shortcut only while Run is active. Triggering it pauses and drains AI output, then records physical expert input while inference/capture continue. Its native schema-3 recording manifest stores `.daggerCorrection`, source profile/version, supervision start, and bounded training weight. Pre-trigger AI/human controls are causal context only; action labels begin at `supervisionStart`. Recent full-resolution frames are combined with the exact reduced frames selected from the temporal ring, so spacing beyond the 15-second recent window remains represented without retaining every old full-resolution frame. Mixed-resolution pre-roll is reconstructed into one fixed-size HEVC timeline; training downsamples selected past frames back to their native contract.
+
+DAgger packages receive balanced terminal releases, follow recording shortcut/blacklist filtering, are automatically attached to their source profile, and remain normal Library/import/export artifacts. Starting, saving, or stopping a correction is single-flight. A failed start resumes output; panic/Run stop finalizes any admitted correction after releasing synthetic controls.
+
+Startup buffering is byte/count bounded and overflow is a surfaced failure, never silent truncation. Encoder/queue drops are persisted in the manifest: discard a correction above 5% visual drops because continuing expert events against stale held video can poison causal alignment; smaller drop counts remain visible in Library and diagnostics. A pending DAgger directory keeps storage relocation, folder deletion, profile deletion/editing, and application termination busy through manifest/thumbnail/profile publication. If its destination folder vanished externally, publication remaps to a live fallback.
+
 ## Vision and dataset contracts
 
 Packed observations are `UInt8`:
@@ -97,13 +106,17 @@ Temporal vision is either current-only or an explicit three-part input:
 
 The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context. Zero frames disables the temporal branch: runtime and training consume only current vision and do not allocate past-image or past-control input buffers.
 
-`TrainingDataContract.schemaVersion` is 10. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, or target meaning changes. A cache has:
+`TrainingDataContract.schemaVersion` is 11. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, supervision boundaries, weighting, or target meaning changes. A cache has:
 
 - `current-observations.bin` — one full-resolution packed image per perception
 - `past-observations.bin` — one reduced packed image of the same perception
 - `observation-indices.bin` — current plus configured past indices for every action row; unavailable segment-leading frames use `UInt32.max`
 - `frame-actions.bin` — one complete control row per perception interval
 - `actions.bin` — action-rate targets; the immediately preceding target remains separate for transition weighting
+
+Each `CacheSegment` owns both an action-row start and an observation start. They are equal for ordinary demonstrations; DAgger observation context may begin earlier. Cache validation derives past indices from the observation start, never the first supervised row. Segment purpose and training weight are persisted. Weight reduction normalizes over included unweighted rows so homogeneous correction batches retain their intended emphasis.
+
+Future action rows/previous rows and future observation maps are gathered from existing cache data at training time. Every horizon is masked at segment boundaries. Future-state targets use a configurable stride and deduplicate repeated observation indices before visual encoding. No future label or image may cross a recording boundary.
 
 For a current-only profile, each observation-index row contains only its current index; `past-observations.bin` and `frame-actions.bin` remain zero-byte compatibility placeholders, and their manifest byte stride is zero. No synthetic zero-sized Metal buffer is created.
 
@@ -123,13 +136,13 @@ Every frame-control row includes normalized absolute cursor position, raw relati
 
 ## Model and training contracts
 
-`ModelContract.schemaVersion` is 5 and the weight format is `AgentTrainer.Policy.v5`.
+`ModelContract.schemaVersion` is 6 and the weight format is `AgentTrainer.Policy.v6`.
 
 A runnable version is immutable. Runtime current vision, temporal vision, architecture, precision, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
 
 Dropout is stochastic training regularization, not part of the learned tensor layout. It is normalized out of `LearnedBrainContract`: editing only dropout must preserve the active brain and load its weights into the next run. Because the stochastic objective changed, the exact optimizer/checkpoint signature still includes dropout and begins a fresh optimizer sequence rather than claiming an invalid exact resume.
 
-Current Policy v5 combines:
+Current Policy v6 combines:
 
 - one shared convolutional encoder for the real current and past images
 - independent X/Y coordinate planes at each image's native resolution
@@ -137,10 +150,13 @@ Current Policy v5 combines:
 - a GRU/LSTM sequence over each past visual embedding concatenated with that frame's 146 controls
 - fusion of the current visual embedding with the final temporal state
 - per-head bounded activations
+- a fixed four-horizon future-action head and an action-conditioned latent-state-delta head; both are training-only and add no runtime action latency
 
 Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. Past control rows are masked for half of training samples while past images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
 
-Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced locality order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Do not change those semantics without updating tests and the relevant schema.
+Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced locality order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Configurable photometric augmentation samples one batch transform and applies it identically to current, past, and future frames. It never moves pixels. Future-action loss weights near horizons more strongly. Future-state loss predicts a stopped-gradient latent change from fused context plus the demonstrated current action; it never generates pixels. Conservative default auxiliary weights are gated by a matched-update causal held-out test at 1% immediate-loss drift. Do not change these semantics without updating tests and the relevant schema.
+
+DAgger rows are always training data, but at least one ordinary demonstration must also remain for rehearsal whenever one exists. On a warm start, fixed ordinary and correction probes score the unmodified source brain. A candidate replaces it only when correction fit improves materially and ordinary loss/per-head behavior remains inside the regression guard. `best.weights` must snapshot the exact demonstrated keys, channels, training/runtime contract, cursor visibility, and mouse recommendation belonging to those weights; never pair an old baseline with current capabilities.
 
 The performance path preserves those semantics:
 
@@ -152,6 +168,7 @@ The performance path preserves those semantics:
 - Validation shares deterministic temporal work and head logits before gathering them back to every held-out label, then derives loss and predictions from that one compiled forward graph.
 - CPU gathering of the next batch overlaps the current Metal graph. Every optimizer step still evaluates the complete model, AdamW moments, scheduler, and MLX random state before advancing the checkpoint cursor.
 - Live diagnostics publish a rolling pipelined-step time, mapped-input time, peak-throughput retention, MLX active/cache/peak memory, and macOS thermal pressure. Metrics are rate-limited and chart histories are presentation-bounded so observing a run does not grow UI work with optimizer-step count.
+- The release benchmark separately executes the complete Policy-v6 stochastic objective, gates overhead at 2.5× the optimized core step, and runs the same sustained-window retention/memory/thermal checks. The immediate-only reference/optimized paths still isolate encoder equivalence and throughput.
 
 Do not queue stateful optimizer steps merely to improve a benchmark. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
 
@@ -159,11 +176,11 @@ Performance work may change graph operation order, grouped sample order, and low
 
 For a longer power/thermal comparison of the optimized and reference 16-frame paths, run `AGENTTRAINER_BENCHMARK_STRESS_STEPS=2048 AGENTTRAINER_BENCHMARK_STRESS_BASELINE_STEPS=1024 ./benchmark.sh`. Compare first/last-window retention as well as thermal state and cache memory; a coarse nominal macOS thermal state does not prove that sustained GPU clocks remained at their initial boost level.
 
-An exact checkpoint contains weights, both AdamW moment sets, optimizer metadata, scheduler state, training state, model schema, and MLX random state. Missing or mismatched moment pairs/random state are corruption, not a silent fresh start.
+An exact checkpoint contains weights, both AdamW moment sets, optimizer metadata, scheduler state, training state, model schema, and MLX random state. A resumable immutable version must name and contain all three optimizer, state, and random artifacts; missing or mismatched moment pairs/random state are corruption, not a silent fresh start.
 
 Checkpoint and version activation are transactions. A profile must never point at one brain while its checkpoint resumes another. Weights-only activation intentionally removes an unrelated resumable checkpoint so later training begins a fresh optimizer from the selected brain.
 
-Completed training publishes an immutable version. With honest held-out data, the lowest acceptable validation brain is activated; periodic autosaves are bounded and never prune the active or protected brain.
+Completed ordinary training publishes the lowest acceptable held-out-validation brain. Correction training publishes the best correction-improving candidate that passes its ordinary regression guard. Periodic autosaves are bounded and never prune the active or protected brain.
 
 ## Runtime safety contracts
 
@@ -175,6 +192,8 @@ The final executable action is the intersection of:
 4. demonstrated key codes
 5. live cursor and keyboard permissions
 6. the allowed control region unless full-Mac control is enabled
+
+Every mutable profile channel is a disable-only runtime firewall over the immutable saved channels—including mouse movement, buttons, scroll, keyboard, and modifiers. A current editor switch may never enable a head the saved brain did not learn or continue executing a head the user disabled.
 
 Predictions must contain 146 finite values. Held keys/buttons may persist between fresh predictions, but cursor deltas and scroll are transient. The prediction latch consumes transient outputs once.
 
@@ -233,12 +252,12 @@ Recording presets are user-owned, editable snapshots of Record-page settings. Ap
 Before release:
 
 1. Run `./test.sh`.
-2. Run `./benchmark.sh` and compare original/optimized throughput plus matched-update training and validation loss on the same idle Mac. Check every sustained window for stable throughput, bounded MLX cache, and nominal thermal pressure.
+2. Run `./benchmark.sh` and compare original/optimized throughput plus matched-update training and validation loss on the same idle Mac. Check the full auxiliary-objective overhead/memory line and every sustained window for stable throughput, bounded MLX cache, and nominal thermal pressure.
 3. Run `git diff --check`.
 4. Confirm `CFBundleShortVersionString` and `CFBundleVersion`.
 5. Quit AgentTrainer and run `./build.sh`.
 6. Verify `/Applications/AgentTrainer.app` launches and reports the intended version.
-7. Exercise permission refresh, recording start/stop, training pause/resume, agent panic, and updater UI.
+7. Exercise permission refresh, ordinary recording start/stop, explicit DAgger start/correct/stop, ordinary takeover without recording, correction warm-start, training pause/resume, agent panic, and updater UI.
 8. Verify the DMG and `SHA256SUMS.txt` in `outputs`.
 9. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
 

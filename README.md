@@ -1,4 +1,4 @@
-# AgentTrainer 2.0.0
+# AgentTrainer 2.1.0
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -22,11 +22,28 @@ The package pins MLX Swift exactly in `Package.resolved`.
 3. Create an AI profile, select recording folders, and configure its vision, controls, and network.
 4. Train the profile. Pause publishes a runnable brain and retains an exact checkpoint.
 5. In Run, choose cursor mode and output permissions, then start the AI.
-6. Use the configured panic shortcut at any time to stop hooks and release held controls.
+6. When the AI makes a mistake, press the normal Record shortcut while Run is active. AI output pauses, the causal lead-up is retained, and your physical correction is saved as DAgger experience for that AI. Press Record again to finish and resume Run.
+7. Resume training. Existing compatible weights are warm-started; correction-aware best-brain selection requires improved correction fit without a meaningful ordinary-behavior regression.
+8. Use the configured panic shortcut at any time to stop hooks and release held controls.
 
 Training and another already-trained AI may run at the same time when they use different profiles.
 
 The capture-source picker refreshes while Record or Run is visible, and reacts immediately when apps launch or quit, displays change, or AgentTrainer becomes active again. A closed window is removed and the picker falls back to another valid source of the same kind.
+
+## DAgger corrections
+
+DAgger is explicit. The Record shortcut creates an ordinary demonstration when no AI is running and toggles correction capture during Run. Ordinary physical takeover still follows the Run safety setting and never starts a recording by itself.
+
+At the trigger, AgentTrainer stops new AI output before preparing the recorder, drains any action already in flight, releases held synthetic controls, and buffers the first expert inputs and frames. A correction package contains:
+
+- recent full-resolution processed vision plus the exact spaced temporal frames the policy used, including lookbacks longer than the recent-window setting
+- the AI or human controls actually associated with those causal frames
+- expert action targets beginning only at the explicit trigger, so the mistake is context rather than a label to imitate
+- a bounded correction weight so short interventions are not drowned by ordinary recording volume
+
+DAgger packages are ordinary native recordings in the Library, are automatically attached to the running AI, and remain exportable. Training always keeps corrections and at least one ordinary demonstration in the training split. A fixed correction probe and an ordinary validation/rehearsal guard select the runnable brain together; the exact key capabilities and runtime semantics belonging to the chosen weights are published with them.
+
+Correction buffers and video admission are bounded. A package with more than 5% visual-frame loss is discarded instead of learning expert events against stale held video; smaller drop counts are recorded and shown. Quit, storage moves, folder deletion, and profile deletion wait for pending correction publication.
 
 ## Recording efficiency
 
@@ -46,6 +63,16 @@ Every decision uses one exact-resolution current frame. Temporal memory can be d
 - carry the complete controls from their own perception interval: cursor position and raw movement, mouse buttons, scroll, keyboard, Shift, Control, Option, and Command
 
 The default context is four past frames, two perception intervals apart, at half width and half height. The current frame always remains at the exact configured model resolution. Changing temporal vision creates a new model contract, and older incompatible brains are archived while recordings remain available for retraining. Changing dropout does not change learned tensor shapes, so existing brain weights are retained; the next training run starts a fresh optimizer sequence for the new regularization setting.
+
+## Generalization and predictive learning
+
+The AI editor independently configures three training-only features. None delays or averages the immediate runtime action:
+
+- **Visual Augmentation** varies luminance, contrast, saturation, hue, and gamma within conservative bounds. Spatial transforms are intentionally excluded because they would change cursor/action meaning. One transform is shared across every current, past, and future frame in a training batch, preserving temporal consistency.
+- **Future Action Prediction** predicts up to four configurable action horizons. Near horizons receive more weight, teaching intent and smoother continuation while the immediate head remains the sole runtime output.
+- **Future State Prediction** predicts an action-conditioned change in the learned visual state. It uses stopped-gradient latent targets and never generates future images; repeated future observations are deduplicated before encoding.
+
+The auxiliary heads have a fixed Policy-v6 layout, so these settings can warm-start compatible brain weights. Conservative default loss weights passed a matched-update causal held-out test with no more than 1% immediate-policy loss drift while both auxiliary objectives improved.
 
 ## Safety
 
@@ -74,7 +101,7 @@ Run the opt-in release benchmark for a compact fixture, the default vision/model
 ./benchmark.sh
 ```
 
-The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. Default and temporal-stress runs also report sustained throughput windows, MLX memory, and thermal pressure. It compares training and validation loss after matched update counts; low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
+The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. It also executes the complete Policy-v6 objective—including augmentation and both predictive heads—and reports its overhead, memory, and thermal state. Default and temporal-stress runs report sustained windows for both the optimized core path and the full Policy-v6 objective. Low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
 
 Build, sign, package, and install:
 
@@ -97,7 +124,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.0.0.dmg`
+- `AgentTrainer-2.1.0.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

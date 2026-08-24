@@ -207,9 +207,10 @@ struct TemporalVisionConfiguration: Codable, Hashable, Sendable {
             )
         }
         let past = try pastFrameSpec(from: current).validated()
-        let retainedFrameCount = pastFrameCount.multipliedReportingOverflow(by: frameSpacing)
+        let spacedFrameCount = pastFrameCount.multipliedReportingOverflow(by: frameSpacing)
+        let retainedFrameCount = spacedFrameCount.partialValue.addingReportingOverflow(pastFrameCount > 0 ? 1 : 0)
         let retainedBytes = retainedFrameCount.partialValue.multipliedReportingOverflow(by: past.sampleByteCount)
-        guard !retainedFrameCount.overflow, !retainedBytes.overflow,
+        guard !spacedFrameCount.overflow, !retainedFrameCount.overflow, !retainedBytes.overflow,
               retainedBytes.partialValue <= Self.maximumRuntimeTemporalBytes else {
             throw AgentTrainerError.invalidConfiguration(
                 "This temporal spacing would retain more than 512 MB of past vision while running. Reduce past frames, spacing, resolution, color detail, or increase the past-frame downscale."
@@ -248,22 +249,22 @@ enum MouseControlMode: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 enum ModelContract {
-    /// Version 5 replaces signed frame differencing and free-running action
-    /// history with native current vision plus lower-resolution causal frames,
-    /// each paired with the complete controls demonstrated for that frame.
-    static let schemaVersion = 5
-    static let weightFormat = "AgentTrainer.Policy.v5"
+    /// Version 6 adds fixed-layout multi-horizon action and action-conditioned
+    /// latent-dynamics heads. They are training-only auxiliaries: the immediate
+    /// action path stays direct and remains the only runtime output.
+    static let schemaVersion = 6
+    static let weightFormat = "AgentTrainer.Policy.v6"
 }
 
 /// Version of the causal pairing between a captured frame and the controls the
 /// model should perform next. This remains separate from the weight format so
 /// a data-only correction can invalidate caches/checkpoints without needlessly
-/// changing tensor shapes. Policy v5 itself is an intentional weight break.
+/// changing tensor shapes. Policy v6 itself is an intentional weight break.
 enum TrainingDataContract {
-    /// Version 10 adds a current-frame-only cache layout for disabled temporal
-    /// memory. Version 9's causal cadence remains unchanged when past frames are
-    /// enabled.
-    static let schemaVersion = 10
+    /// Version 11 lets a correction recording retain pre-mistake observations
+    /// and executed controls as causal context while beginning supervised action
+    /// targets only when the expert explicitly starts correcting.
+    static let schemaVersion = 11
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -476,6 +477,160 @@ struct CNNVisualizationSettings: Codable, Hashable, Sendable {
     }
 }
 
+/// Training-only photometric variation. Spatial transforms are deliberately
+/// excluded because moving pixels without transforming cursor/action labels can
+/// change the meaning of a demonstration. One sampled transform is shared by
+/// the complete batch, so current, causal-past, and future-target frames remain
+/// temporally coherent and the visual encoder can retain its deduplicated path.
+struct VisualAugmentationConfiguration: Codable, Hashable, Sendable {
+    var enabled = true
+    var probability = 0.8
+    /// Maximum additive luminance shift in normalized Y space.
+    var brightness = 0.06
+    /// Maximum proportional distance from neutral contrast (1.0).
+    var contrast = 0.12
+    /// Maximum proportional distance from neutral chroma saturation (1.0).
+    var saturation = 0.10
+    /// Maximum Cb/Cr rotation. Small rotations emulate ordinary display and
+    /// capture color differences without changing object identity.
+    var hueDegrees = 4.0
+    /// Maximum proportional distance from a neutral gamma of 1.0.
+    var gamma = 0.08
+
+    func validated() throws -> Self {
+        guard probability.isFinite, brightness.isFinite, contrast.isFinite,
+              saturation.isFinite, hueDegrees.isFinite, gamma.isFinite,
+              (0...1).contains(probability), (0...0.25).contains(brightness),
+              (0...0.5).contains(contrast), (0...0.5).contains(saturation),
+              (0...20).contains(hueDegrees), (0...0.35).contains(gamma) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "Visual augmentation requires probability 0–1, brightness 0–0.25, contrast and saturation 0–0.5, hue 0–20°, and gamma variation 0–0.35."
+            )
+        }
+        return self
+    }
+}
+
+/// Predicts several action rows after the immediate decision. The auxiliary
+/// head has a fixed maximum layout so changing horizons or disabling the loss
+/// can retain compatible learned weights and never adds latency to Run.
+struct FutureActionPredictionConfiguration: Codable, Hashable, Sendable {
+    static let maximumHorizonCount = 4
+    static let maximumHorizonSeconds = 2.0
+
+    var enabled = true
+    var horizonsSeconds: [Double] = [0.10, 0.25, 0.50]
+    var lossWeight = 0.05
+
+    func validated() throws -> Self {
+        guard !enabled || !horizonsSeconds.isEmpty,
+              horizonsSeconds.count <= Self.maximumHorizonCount,
+              lossWeight.isFinite, (0...2).contains(lossWeight),
+              horizonsSeconds.allSatisfy({ $0.isFinite && $0 > 0 && $0 <= Self.maximumHorizonSeconds }),
+              zip(horizonsSeconds, horizonsSeconds.dropFirst()).allSatisfy({ $0 < $1 }) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "Future Action Prediction supports 1–\(Self.maximumHorizonCount) strictly increasing horizons up to \(Self.maximumHorizonSeconds) seconds and a loss weight from 0 through 2."
+            )
+        }
+        return self
+    }
+
+    func actionOffsets(actionFPS: Double) -> [Int] {
+        let fps = actionFPS.isFinite ? max(0.0001, actionFPS) : 60
+        return horizonsSeconds.map { max(1, Int(($0 * fps).rounded())) }
+    }
+}
+
+/// Learns an action-conditioned change in the visual latent state instead of
+/// generating pixels. A sampling stride bounds the extra encoder work while
+/// still distributing dynamics targets across every epoch.
+struct FutureStatePredictionConfiguration: Codable, Hashable, Sendable {
+    var enabled = true
+    var horizonSeconds = 0.25
+    var lossWeight = 0.025
+    var sampleStride = 2
+
+    func validated() throws -> Self {
+        guard horizonSeconds.isFinite, horizonSeconds > 0, horizonSeconds <= 2,
+              lossWeight.isFinite, (0...2).contains(lossWeight),
+              (1...16).contains(sampleStride) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "Future State Prediction requires a horizon above 0 and at most 2 seconds, a loss weight from 0 through 2, and a sampling stride from 1 through 16."
+            )
+        }
+        return self
+    }
+
+    func actionOffset(actionFPS: Double) -> Int {
+        let fps = actionFPS.isFinite ? max(0.0001, actionFPS) : 60
+        return max(1, Int((horizonSeconds * fps).rounded()))
+    }
+}
+
+/// Explicit correction capture settings. The effective pre-roll is always at
+/// least the model's temporal lookback so the first expert label can see the
+/// complete sequence that led to the intervention.
+struct DAggerConfiguration: Codable, Hashable, Sendable {
+    static let maximumBufferedContextBytes = 512 * 1_024 * 1_024
+    var preRollSeconds = 3.0
+    var correctionWeight = 4.0
+
+    func validated() throws -> Self {
+        guard preRollSeconds.isFinite, (0.25...15).contains(preRollSeconds),
+              correctionWeight.isFinite, (1...20).contains(correctionWeight) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "DAgger pre-roll must be 0.25–15 seconds and correction weight must be 1–20."
+            )
+        }
+        return self
+    }
+}
+
+enum DAggerContextSizing {
+    static func recentFrameCapacity(
+        preprocessing: PreprocessingSpec,
+        temporal: TemporalVisionConfiguration,
+        perceptionFPS: Double,
+        configuration: DAggerConfiguration
+    ) -> (requested: Int, maximum: Int, temporalBytes: Int) {
+        guard perceptionFPS.isFinite, perceptionFPS > 0 else { return (0, 0, 0) }
+        let overhead = ActionLayout.count * MemoryLayout<Float>.size + 64
+        let requested = max(2, Int(ceil(configuration.preRollSeconds * perceptionFPS)) + 2)
+        let pastSpec = temporal.pastFrameSpec(from: preprocessing)
+        let spaced = temporal.pastFrameCount.multipliedReportingOverflow(by: temporal.frameSpacing)
+        let retained = spaced.partialValue.addingReportingOverflow(temporal.pastFrameCount > 0 ? 1 : 0)
+        let pastStride = pastSpec.sampleByteCount.addingReportingOverflow(overhead)
+        let temporalBytes = retained.partialValue.multipliedReportingOverflow(by: pastStride.partialValue)
+        guard !spaced.overflow, !retained.overflow, !pastStride.overflow, !temporalBytes.overflow else {
+            return (requested, 0, Int.max)
+        }
+        let available = max(0, DAggerConfiguration.maximumBufferedContextBytes - temporalBytes.partialValue)
+        let currentStride = preprocessing.sampleByteCount.addingReportingOverflow(overhead)
+        guard !currentStride.overflow, currentStride.partialValue > 0 else {
+            return (requested, 0, temporalBytes.partialValue)
+        }
+        return (
+            requested,
+            available / currentStride.partialValue,
+            temporalBytes.partialValue
+        )
+    }
+}
+
+enum DAggerCaptureQuality {
+    static let maximumDroppedFrameFraction = 0.05
+
+    static func droppedFrameFraction(encoded: Int, dropped: Int) -> Double {
+        Double(max(0, dropped)) / Double(max(1, max(0, encoded) + max(0, dropped)))
+    }
+
+    static func accepts(encoded: Int, dropped: Int) -> Bool {
+        encoded > 0
+            && droppedFrameFraction(encoded: encoded, dropped: dropped)
+                <= maximumDroppedFrameFraction
+    }
+}
+
 struct TrainingConfiguration: Codable, Hashable, Sendable {
     var epochs = 40
     var batchSize = 32
@@ -503,6 +658,12 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     var plateauPatience: Int? = 5
     var minimumLearningRateRatio: Double? = 0.05
     var binaryFocalGamma: Double? = 1.5
+    /// Optional fields preserve decoding of profile metadata created before
+    /// these training features existed. Fresh profiles persist all four.
+    var visualAugmentation: VisualAugmentationConfiguration? = VisualAugmentationConfiguration()
+    var futureActionPrediction: FutureActionPredictionConfiguration? = FutureActionPredictionConfiguration()
+    var futureStatePrediction: FutureStatePredictionConfiguration? = FutureStatePredictionConfiguration()
+    var dagger: DAggerConfiguration? = DAggerConfiguration()
 
     var effectiveMaximumSteps: Int { maximumSteps ?? 10_000 }
     var effectiveTemporalVision: TemporalVisionConfiguration {
@@ -519,6 +680,16 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
         let value = binaryFocalGamma ?? 0
         return value.isFinite ? min(4, max(0, value)) : 0
     }
+    var effectiveVisualAugmentation: VisualAugmentationConfiguration {
+        visualAugmentation ?? VisualAugmentationConfiguration(enabled: false)
+    }
+    var effectiveFutureActionPrediction: FutureActionPredictionConfiguration {
+        futureActionPrediction ?? FutureActionPredictionConfiguration(enabled: false)
+    }
+    var effectiveFutureStatePrediction: FutureStatePredictionConfiguration {
+        futureStatePrediction ?? FutureStatePredictionConfiguration(enabled: false)
+    }
+    var effectiveDAgger: DAggerConfiguration { dagger ?? DAggerConfiguration() }
 }
 
 struct TrainingRunSettings: Codable, Hashable, Sendable {
@@ -580,8 +751,13 @@ struct InputState: Equatable, Sendable {
     static let empty = InputState()
 }
 
+enum RecordingPurpose: String, Codable, Sendable {
+    case demonstration
+    case daggerCorrection
+}
+
 struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
-    var schemaVersion = 2
+    var schemaVersion = 3
     var id: UUID
     var name: String
     var createdAt: Date
@@ -596,6 +772,7 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
     /// versions. Older manifests derive the same value from duration and the
     /// persisted delivered-frame rate.
     var frameCount: Int? = nil
+    var droppedFrameCount: Int? = nil
     var eventCount: Int
     var videoFile = "capture.mov"
     var eventFile = "events.atrevents"
@@ -604,12 +781,32 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
     var folderID: UUID?
     var thumbnailFile: String?
     var excludedKeyCodes: Set<UInt16>?
+    /// DAgger packages begin video/context before expert supervision. Ordinary
+    /// demonstrations leave this nil and supervise from trimStart as before.
+    var supervisionStart: Double? = nil
+    var purpose: RecordingPurpose? = nil
+    var sourceProfileID: UUID? = nil
+    var sourceVersionID: UUID? = nil
+    /// Per-row loss emphasis. Corrections default above one so a short, valuable
+    /// intervention is not drowned by hours of ordinary demonstrations.
+    var trainingWeight: Double? = nil
+
+    var effectivePurpose: RecordingPurpose { purpose ?? .demonstration }
+    var effectiveSupervisionStart: Double { supervisionStart ?? trimStart }
+    var effectiveTrainingWeight: Double {
+        let value = trainingWeight ?? 1
+        return value.isFinite ? min(20, max(1, value)) : 1
+    }
 
     var isStructurallyValid: Bool {
         let rect = globalRect.cgRect
         let end = trimEnd ?? duration
         let safeFileNames = [videoFile, eventFile] + (thumbnailFile.map { [$0] } ?? [])
-        return (1...2).contains(schemaVersion)
+        let supervision = effectiveSupervisionStart
+        let weight = trainingWeight ?? 1
+        let daggerMetadataIsValid = effectivePurpose != .daggerCorrection
+            || (sourceProfileID != nil && sourceVersionID != nil && supervisionStart != nil)
+        return (1...3).contains(schemaVersion)
             && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && duration.isFinite && duration >= 0
             && capture.requestedFPS.isFinite && capture.requestedFPS > 0 && capture.requestedFPS <= 1_000
@@ -617,9 +814,13 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
             && pixelWidth > 0 && pixelHeight > 0 && pixelWidth <= 32_768 && pixelHeight <= 32_768
             && deliveredFPS.isFinite && deliveredFPS >= 0 && deliveredFPS <= 1_000
             && (frameCount.map { $0 >= 0 } ?? true)
+            && (droppedFrameCount.map { $0 >= 0 } ?? true)
             && eventCount >= 0
             && trimStart.isFinite && trimStart >= 0 && trimStart <= duration
             && end.isFinite && end >= trimStart && end <= duration
+            && supervision.isFinite && supervision >= trimStart && supervision <= end
+            && weight.isFinite && (1...20).contains(weight)
+            && daggerMetadataIsValid
             && safeFileNames.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0") }
     }
 
@@ -788,6 +989,9 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Optional keeps existing manifests decodable. New brains retain the
     /// per-head held-out report that justified best-brain selection.
     var validationReport: ValidationReport? = nil
+    /// Fixed DAgger correction-probe loss used alongside ordinary validation
+    /// when publishing a correction-aware best brain.
+    var correctionLoss: Double? = nil
 
     /// Manifest filenames are treated as leaf names, never paths. A damaged or
     /// hand-edited manifest must not escape its immutable version directory.
@@ -936,8 +1140,12 @@ struct TrainingMetrics: Sendable {
     var nextAutosaveStep: Int?
     var autosavesPublished = 0
     var trainingLoss = 0.0
+    var immediateActionLoss = 0.0
+    var futureActionLoss = 0.0
+    var futureStateLoss = 0.0
     var epochTrainingLoss: Double?
     var validationLoss: Double?
+    var correctionLoss: Double?
     var validationReport: ValidationReport?
     var effectiveLearningRate = 0.0
     var learningRateScale = 1.0
@@ -1051,7 +1259,7 @@ enum ModelSizing {
         var total: Int64 = 0
         // Current and past frames share the same convolutional weights. Each
         // carries its real color planes plus generated X/Y coordinates; there
-        // are no synthetic motion-difference channels in Policy v5.
+        // are no synthetic motion-difference channels in Policy v6.
         var input = profile.preprocessing.channelCount + 2
         for i in architecture.convolutionChannels.indices {
             let output = max(1, architecture.convolutionChannels[i])
@@ -1101,6 +1309,16 @@ enum ModelSizing {
             fusionInput = max(1, width)
         }
         total = add(total, multiply(add(Int64(fusionInput), 1), Int64(ActionLayout.count)))
+        // Policy v6 keeps fixed auxiliary layouts even when their losses are
+        // disabled, allowing configuration changes to warm-start the same brain.
+        total = add(total, multiply(
+            add(Int64(fusionInput), 1),
+            Int64(ActionLayout.count * FutureActionPredictionConfiguration.maximumHorizonCount)
+        ))
+        total = add(total, multiply(
+            add(Int64(fusionInput + ActionLayout.count), 1),
+            Int64(max(1, architecture.visualEmbedding))
+        ))
         return total
     }
 

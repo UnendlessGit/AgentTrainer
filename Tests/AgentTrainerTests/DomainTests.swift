@@ -190,6 +190,10 @@ final class DomainTests: XCTestCase {
         manifest.trimStart = 0.25
         let changedSampling = try RecordingTrainingIdentity(recording: RecordingItem(manifest: manifest, directory: directory))
         XCTAssertNotEqual(original, changedSampling)
+        manifest.trimStart = 0
+        manifest.trainingWeight = 4
+        let changedCorrectionWeight = try RecordingTrainingIdentity(recording: RecordingItem(manifest: manifest, directory: directory))
+        XCTAssertNotEqual(original, changedCorrectionWeight)
     }
 
     func testInputMonitorSessionsJoinBeforeTheyCanRestart() async throws {
@@ -1468,7 +1472,8 @@ final class DomainTests: XCTestCase {
         try Data("brain".utf8).write(to: directory.appendingPathComponent("weights.safetensors"))
         try Data("optimizer".utf8).write(to: directory.appendingPathComponent("optimizer.safetensors"))
         try Data("state".utf8).write(to: directory.appendingPathComponent("state.json"))
-        let version = ModelVersionManifest(id: versionID, name: "Epoch 120", createdAt: Date(), globalStep: 240, trainingLoss: 0.2, validationLoss: nil, preprocessing: profile.preprocessing, channels: profile.channels, training: profile.training, optimizerFile: "optimizer.safetensors", trainingStateFile: "state.json", epoch: 120, isAutosave: true)
+        try Data("random".utf8).write(to: directory.appendingPathComponent("random.safetensors"))
+        let version = ModelVersionManifest(id: versionID, name: "Epoch 120", createdAt: Date(), globalStep: 240, trainingLoss: 0.2, validationLoss: nil, preprocessing: profile.preprocessing, channels: profile.channels, training: profile.training, optimizerFile: "optimizer.safetensors", trainingStateFile: "state.json", randomStateFile: "random.safetensors", epoch: 120, isAutosave: true)
         try await store.saveVersionManifest(version, profileID: profile.id)
         let restored = try await store.activateVersion(profile: profile, versionID: version.id)
         XCTAssertTrue(restored.checkpointIsResumable)
@@ -1478,6 +1483,20 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: checkpoint.appendingPathComponent("weights.safetensors")), Data("brain".utf8))
         XCTAssertEqual(try Data(contentsOf: checkpoint.appendingPathComponent("optimizer.safetensors")), Data("optimizer".utf8))
         XCTAssertEqual(try Data(contentsOf: checkpoint.appendingPathComponent("state.json")), Data("state".utf8))
+        XCTAssertEqual(try Data(contentsOf: checkpoint.appendingPathComponent("random.safetensors")), Data("random".utf8))
+
+        let incomplete = ModelVersionManifest(id: UUID(), name: "Incomplete", createdAt: Date(), globalStep: 241, trainingLoss: 0.2, validationLoss: nil, preprocessing: profile.preprocessing, channels: profile.channels, training: profile.training, optimizerFile: "optimizer.safetensors", trainingStateFile: "state.json", epoch: 120, isAutosave: true)
+        try await store.saveVersionManifest(incomplete, profileID: profile.id)
+        let incompleteDirectory = await store.versionDirectory(profileID: profile.id, versionID: incomplete.id)
+        try Data("brain".utf8).write(to: incompleteDirectory.appendingPathComponent(incomplete.weightsFile))
+        try Data("optimizer".utf8).write(to: incompleteDirectory.appendingPathComponent("optimizer.safetensors"))
+        try Data("state".utf8).write(to: incompleteDirectory.appendingPathComponent("state.json"))
+        do {
+            _ = try await store.activateVersion(profile: restored.profile, versionID: incomplete.id)
+            XCTFail("A checkpoint without random state must not be resumable.")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("incomplete"))
+        }
 
         let best = ModelVersionManifest(id: UUID(), name: "Best", createdAt: Date(), globalStep: 120, trainingLoss: 0.1, validationLoss: 0.1, preprocessing: profile.preprocessing, channels: profile.channels, training: profile.training)
         try await store.saveVersionManifest(best, profileID: profile.id)
@@ -2321,15 +2340,39 @@ final class DomainTests: XCTestCase {
         }
     }
 
-    func testCurrentModifierToggleCanDisableButNeverEnableAnOldBrainHead() {
+    func testCurrentChannelTogglesCanDisableButNeverEnableSavedBrainHeads() {
         let savedEnabled = ActionChannels(absoluteMouse: true, relativeMouse: true, buttons: true, scroll: true, keyboard: true, modifiers: true)
         var currentDisabled = savedEnabled
+        currentDisabled.mouseMovement = false
+        currentDisabled.buttons = false
+        currentDisabled.scroll = false
+        currentDisabled.keyboard = false
         currentDisabled.modifiers = false
-        XCTAssertFalse(RuntimeActionSemantics.effectiveChannels(saved: savedEnabled, current: currentDisabled).modifiers)
+        let disabledByCurrent = RuntimeActionSemantics.effectiveChannels(
+            saved: savedEnabled,
+            current: currentDisabled
+        )
+        XCTAssertFalse(disabledByCurrent.mouseMovement)
+        XCTAssertFalse(disabledByCurrent.buttons)
+        XCTAssertFalse(disabledByCurrent.scroll)
+        XCTAssertFalse(disabledByCurrent.keyboard)
+        XCTAssertFalse(disabledByCurrent.modifiers)
 
         var savedDisabled = savedEnabled
+        savedDisabled.mouseMovement = false
+        savedDisabled.buttons = false
+        savedDisabled.scroll = false
+        savedDisabled.keyboard = false
         savedDisabled.modifiers = false
-        XCTAssertFalse(RuntimeActionSemantics.effectiveChannels(saved: savedDisabled, current: savedEnabled).modifiers)
+        let disabledByBrain = RuntimeActionSemantics.effectiveChannels(
+            saved: savedDisabled,
+            current: savedEnabled
+        )
+        XCTAssertFalse(disabledByBrain.mouseMovement)
+        XCTAssertFalse(disabledByBrain.buttons)
+        XCTAssertFalse(disabledByBrain.scroll)
+        XCTAssertFalse(disabledByBrain.keyboard)
+        XCTAssertFalse(disabledByBrain.modifiers)
     }
 
     func testInjectorCannotEmitAKeyMissingFromTraining() {
@@ -2776,6 +2819,23 @@ final class DomainTests: XCTestCase {
         XCTAssertThrowsError(try TrainingRandomState.load(from: url))
     }
 
+    func testTrainingRandomStateRejectsMalformedTensorWithoutMutatingCurrentState() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("malformed-random-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let randomState = MLXRandom.RandomState(seed: 991)
+        let current = try XCTUnwrap(randomState.innerState().first)
+        MLX.eval(current)
+        let originalShape = current.shape
+        let originalDType = current.dtype
+        let originalValues = current.asArray(UInt32.self)
+        try MLX.save(arrays: ["state": MLXArray.zeros([2], dtype: .float32)], url: url)
+        XCTAssertThrowsError(try TrainingRandomState.load(randomState, from: url))
+        MLX.eval(current)
+        XCTAssertEqual(current.shape, originalShape)
+        XCTAssertEqual(current.dtype, originalDType)
+        XCTAssertEqual(current.asArray(UInt32.self), originalValues)
+    }
+
     func testPackedTemporalBatchesKeepFramesControlsAndTargetsAligned() throws {
         let sequences: [[UInt32]] = [
             [0, .max, .max],
@@ -3096,6 +3156,64 @@ final class DomainTests: XCTestCase {
             ).asArray(Float.self).contains { $0 != 0 },
             "Frame-aligned controls should retain short demonstrated inputs instead of storing only model outputs."
         )
+    }
+
+    func testDAggerCacheUsesPreTriggerFramesAsContextButNotAsTargets() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dagger-cache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let recordingID = UUID()
+        let directory = try await store.createRecordingDirectory(id: recordingID)
+        try await writeTestMovie(
+            to: directory.appendingPathComponent("capture.mov"),
+            width: 16, height: 16, frameCount: 11, fps: 10
+        )
+        let base: UInt64 = 3_000_000_000
+        let writer = try InputEventWriter(url: directory.appendingPathComponent("events.atrevents"))
+        writer.append(InputSample(timestampNanos: base, kind: .mouseMove, x: 8, y: 8))
+        // AI-executed pre-roll control. It may inform the recurrent context but
+        // must never become an imitation target for the correction segment.
+        writer.append(InputSample(timestampNanos: base + 100_000_000, kind: .key, keyCode: 10, isDown: true))
+        writer.append(InputSample(timestampNanos: base + 550_000_000, kind: .key, keyCode: 10, isDown: false))
+        // Explicit expert correction after the supervision boundary.
+        writer.append(InputSample(timestampNanos: base + 650_000_000, kind: .key, keyCode: 13, isDown: true))
+        writer.append(InputSample(timestampNanos: base + 800_000_000, kind: .key, keyCode: 13, isDown: false))
+        let eventCount = try writer.finish()
+        let manifest = RecordingManifest(
+            id: recordingID, name: "DAgger cache", createdAt: Date(),
+            hostStartNanos: base, duration: 1,
+            capture: CaptureSpec(requestedFPS: 10),
+            globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
+            pixelWidth: 16, pixelHeight: 16, deliveredFPS: 10,
+            frameCount: 11, eventCount: eventCount,
+            trimStart: 0, trimEnd: 1, supervisionStart: 0.6,
+            purpose: .daggerCorrection, sourceProfileID: UUID(), sourceVersionID: UUID(), trainingWeight: 4
+        )
+        try await store.writeRecording(manifest, to: directory)
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        profile.training.perceptionFPS = 10
+        profile.training.actionFPS = 20
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 1, downsampleFactor: 2)
+        let dataset = try await DatasetCacheBuilder(workspace: store).cache(
+            for: profile,
+            recordings: [RecordingItem(manifest: manifest, directory: directory)]
+        ) { _, _ in }
+
+        XCTAssertEqual(dataset.manifest.segments.first?.observationStart, 0)
+        XCTAssertEqual(dataset.manifest.segments.first?.effectivePurpose, .daggerCorrection)
+        XCTAssertEqual(dataset.manifest.segments.first?.effectiveTrainingWeight, 4)
+        XCTAssertEqual(dataset.count, 9, "Only 0.6s through 1.0s should produce 20 FPS expert targets, inclusive.")
+        XCTAssertFalse(dataset.demonstratedKeyCodes().contains(10), "Pre-roll AI actions are context, not supervised capability.")
+        XCTAssertTrue(dataset.demonstratedKeyCodes().contains(13))
+        let firstContext = MLXArray(
+            dataset.pastControlBatch(at: [0]),
+            [1, 2, ActionLayout.count],
+            type: Float.self
+        ).asArray(Float.self)
+        XCTAssertTrue(firstContext[ActionLayout.keyboard.lowerBound + 10] > 0.5)
+        XCTAssertEqual(dataset.trainingWeightBatch(at: [0]).withUnsafeBytes { $0.load(as: Float.self) }, 4)
     }
 
     func testRealVideoCacheSupportsCurrentOnlyProfilesWithoutPastArtifacts() async throws {
@@ -4105,6 +4223,612 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(optimizerA.step, optimizerB.step)
     }
 
+    func testVisualAugmentationIsPhotometricAndTemporallyConsistent() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(
+            width: 2, height: 2, colorMode: .color, bitDepth: 8, chroma: .yuv444
+        )
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 0, frameSpacing: 1, downsampleFactor: 1
+        )
+        profile.training.architecture = .small
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        let parameters = VisualAugmentationParameters(
+            brightness: MLXArray(Float(0.04)),
+            contrast: MLXArray(Float(1.1)),
+            saturation: MLXArray(Float(0.9)),
+            hueRadians: MLXArray(Float(0.05)),
+            gamma: MLXArray(Float(1.04))
+        )
+        let pixel: [Float] = [0.4, 0.3, 0.7]
+        let current = MLXArray(Array(repeating: pixel, count: 4).flatMap { $0 }, [1, 2, 2, 3])
+        let past = MLXArray(pixel, [1, 1, 1, 3])
+        let augmentedCurrent = model.augmentedVision(current, parameters: parameters)
+        let augmentedPast = model.augmentedVision(past, parameters: parameters)
+        MLX.eval(augmentedCurrent, augmentedPast)
+        XCTAssertEqual(augmentedCurrent.shape, current.shape)
+        XCTAssertEqual(augmentedPast.shape, past.shape)
+        let currentPixel = Array(augmentedCurrent.asArray(Float.self).prefix(3))
+        let pastPixel = augmentedPast.asArray(Float.self)
+        XCTAssertTrue(zip(currentPixel, pastPixel).allSatisfy { abs($0 - $1) < 1e-6 })
+        XCTAssertTrue(augmentedCurrent.asArray(Float.self).allSatisfy { $0.isFinite && (0...1).contains($0) })
+    }
+
+    func testFuturePredictionLossesAreMaskedFiniteAndDoNotChangeImmediateShape() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale, bitDepth: 8)
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 0, frameSpacing: 1, downsampleFactor: 1)
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.precision = .float32
+        profile.training.futureActionPrediction = FutureActionPredictionConfiguration(
+            enabled: true, horizonsSeconds: [0.1, 0.2], lossWeight: 0.2
+        )
+        profile.training.futureStatePrediction = FutureStatePredictionConfiguration(
+            enabled: true, horizonSeconds: 0.2, lossWeight: 0.1, sampleStride: 1
+        )
+        let model = AgentPolicy(profile: profile)
+        model.train(false)
+        let batch = 2
+        let images = MLXArray([Float](repeating: 0.35, count: batch * 8 * 8), [batch, 8, 8, 1])
+        let temporal = model.currentOnlyTemporalFeatures(currentImages: images)
+        let fused = model.fusedFeatures(temporalFeatures: temporal)
+        let immediate = model.logits(fusedFeatures: fused)
+        let targets = MLXArray.zeros([batch, 2, ActionLayout.count])
+        let masks = MLXArray.ones([batch, 2])
+        let rowWeights = MLXArray.ones([batch])
+        let classWeights = MLXArray.ones([ActionLayout.count])
+        let futureActionLoss = model.futureActionLoss(
+            fusedFeatures: fused,
+            futureTargets: targets,
+            futurePreviousTargets: targets,
+            masks: masks,
+            trainingSampleWeights: rowWeights,
+            positiveWeights: classWeights
+        )
+        let futureStateLoss = model.futureStateLoss(
+            fusedFeatures: fused,
+            temporalFeatures: temporal,
+            currentActions: MLXArray.zeros([batch, ActionLayout.count]),
+            futureImages: images + 0.1,
+            sampleToFuture: MLXArray([Int32(0), Int32(1)]),
+            masks: MLXArray.ones([batch]),
+            trainingSampleWeights: rowWeights
+        )
+        let maskedActionLoss = model.futureActionLoss(
+            fusedFeatures: fused,
+            futureTargets: targets,
+            futurePreviousTargets: targets,
+            masks: MLXArray.zeros([batch, 2]),
+            trainingSampleWeights: rowWeights,
+            positiveWeights: classWeights
+        )
+        MLX.eval(immediate, futureActionLoss, futureStateLoss, maskedActionLoss)
+        XCTAssertEqual(immediate.shape, [batch, ActionLayout.count])
+        XCTAssertTrue(futureActionLoss.item(Float.self).isFinite)
+        XCTAssertTrue(futureStateLoss.item(Float.self).isFinite)
+        XCTAssertGreaterThanOrEqual(futureActionLoss.item(Float.self), 0)
+        XCTAssertGreaterThanOrEqual(futureStateLoss.item(Float.self), 0)
+        XCTAssertEqual(maskedActionLoss.item(Float.self), 0, accuracy: 1e-7)
+
+        let currentTargets = MLXArray.zeros([batch, ActionLayout.count])
+        let ordinaryLoss = model.loss(
+            logits: immediate,
+            targets: currentTargets,
+            positiveWeights: classWeights,
+            sampleWeights: MLXArray.ones([batch])
+        )
+        let correctionLoss = model.loss(
+            logits: immediate,
+            targets: currentTargets,
+            positiveWeights: classWeights,
+            sampleWeights: MLXArray([Float](repeating: 4, count: batch))
+        )
+        MLX.eval(ordinaryLoss, correctionLoss)
+        XCTAssertEqual(
+            correctionLoss.item(Float.self),
+            4 * ordinaryLoss.item(Float.self),
+            accuracy: 1e-4,
+            "A homogeneous DAgger batch must retain correction emphasis after reduction."
+        )
+        let auxiliaryGradient = valueAndGrad(model: model) { model, arrays in
+            let temporal = model.currentOnlyTemporalFeatures(currentImages: arrays[0])
+            let fused = model.fusedFeatures(temporalFeatures: temporal)
+            let immediate = model.loss(
+                logits: model.logits(fusedFeatures: fused),
+                targets: arrays[1],
+                positiveWeights: classWeights,
+                sampleWeights: rowWeights
+            )
+            let futureAction = model.futureActionLoss(
+                fusedFeatures: fused,
+                futureTargets: arrays[2],
+                futurePreviousTargets: arrays[2],
+                masks: masks,
+                trainingSampleWeights: rowWeights,
+                positiveWeights: classWeights
+            )
+            let futureState = model.futureStateLoss(
+                fusedFeatures: fused,
+                temporalFeatures: temporal,
+                currentActions: arrays[1],
+                futureImages: arrays[3],
+                sampleToFuture: MLXArray([Int32(0), Int32(1)]),
+                masks: MLXArray.ones([batch]),
+                trainingSampleWeights: rowWeights
+            )
+            return [immediate + 0.2 * futureAction + 0.1 * futureState]
+        }(model, [images, currentTargets, targets, images + 0.1])
+        MLX.eval(auxiliaryGradient.0, auxiliaryGradient.1)
+        let gradients = Dictionary(uniqueKeysWithValues: auxiliaryGradient.1.flattened())
+        let futureActionGradient = gradients.first { $0.key.contains("futureActionHead") }?.value
+        let futureStateGradient = gradients.first { $0.key.contains("futureStateHead") }?.value
+        XCTAssertNotNil(futureActionGradient)
+        XCTAssertNotNil(futureStateGradient)
+        XCTAssertGreaterThan(futureActionGradient?.asArray(Float.self).reduce(0) { $0 + abs($1) } ?? 0, 0)
+        XCTAssertGreaterThan(futureStateGradient?.asArray(Float.self).reduce(0) { $0 + abs($1) } ?? 0, 0)
+    }
+
+    func testCompiledAugmentedAuxiliaryObjectiveUpdatesBothPredictionHeads() throws {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale, bitDepth: 8)
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 0, frameSpacing: 1, downsampleFactor: 1)
+        profile.training.architecture = .small
+        profile.training.architecture.dropout = 0
+        profile.training.precision = .float32
+        profile.training.visualAugmentation = VisualAugmentationConfiguration(
+            enabled: true, probability: 1, brightness: 0.05,
+            contrast: 0.1, saturation: 0, hueDegrees: 0, gamma: 0.05
+        )
+        profile.training.futureActionPrediction = FutureActionPredictionConfiguration(
+            enabled: true, horizonsSeconds: [0.1, 0.2], lossWeight: 0.2
+        )
+        profile.training.futureStatePrediction = FutureStatePredictionConfiguration(
+            enabled: true, horizonSeconds: 0.2, lossWeight: 0.1, sampleStride: 1
+        )
+        let model = AgentPolicy(profile: profile)
+        model.train(true)
+        let optimizer = ResumableAdamW(learningRate: 0.0003, weightDecay: 0.01)
+        optimizer.initialize(model: model)
+        let randomState = MLXRandom.RandomState(seed: 8_123)
+        let batch = 2
+        let inputs: [MLXArray] = [
+            MLXArray([Float](repeating: 0.3, count: batch * 8 * 8), [batch, 8, 8, 1]),
+            MLXArray.zeros([batch, ActionLayout.count]),
+            MLXArray.zeros([batch, 2, ActionLayout.count]),
+            MLXArray.ones([batch, 2]),
+            MLXArray([Float](repeating: 0.6, count: batch * 8 * 8), [batch, 8, 8, 1])
+        ]
+        let step = compile(
+            inputs: [model, optimizer, randomState],
+            outputs: [model, optimizer, randomState]
+        ) { arrays in
+            let parameters = model.sampleVisualAugmentation()
+            let current = model.augmentedVision(arrays[0], parameters: parameters)
+            let futureImages = model.augmentedVision(arrays[4], parameters: parameters)
+            let positiveWeights = MLXArray.ones([ActionLayout.count])
+            let rowWeights = MLXArray.ones([batch])
+            let result = valueAndGrad(model: model) { candidate, values in
+                let temporal = candidate.currentOnlyTemporalFeatures(currentImages: values[0])
+                let fused = candidate.fusedFeatures(temporalFeatures: temporal)
+                let immediate = candidate.loss(
+                    logits: candidate.logits(fusedFeatures: fused),
+                    targets: values[1],
+                    positiveWeights: positiveWeights,
+                    sampleWeights: rowWeights
+                )
+                let futureAction = candidate.futureActionLoss(
+                    fusedFeatures: fused,
+                    futureTargets: values[2],
+                    futurePreviousTargets: values[2],
+                    masks: values[3],
+                    trainingSampleWeights: rowWeights,
+                    positiveWeights: positiveWeights
+                )
+                let futureState = candidate.futureStateLoss(
+                    fusedFeatures: fused,
+                    temporalFeatures: temporal,
+                    currentActions: values[1],
+                    futureImages: values[4],
+                    sampleToFuture: MLXArray([Int32(0), Int32(1)]),
+                    masks: rowWeights,
+                    trainingSampleWeights: rowWeights
+                )
+                return [immediate + 0.2 * futureAction + 0.1 * futureState]
+            }(model, [current, arrays[1], arrays[2], arrays[3], futureImages])
+            optimizer.update(
+                model: model,
+                gradients: result.1,
+                targetType: model.dtype,
+                gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
+                maxGradientNorm: 1
+            )
+            return result.0
+        }
+        let before = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        MLX.eval(Array(before.values))
+        let beforeSnapshots = Dictionary(uniqueKeysWithValues: ["futureActionHead.weight", "futureStateHead.weight"].map { name in
+            (name, before.first { $0.key.contains(name) }?.value.asArray(Float.self) ?? [])
+        })
+        let output = withRandomState(randomState) { step(inputs) }
+        MLX.eval(output, model.parameters(), optimizer.stateArrays(), randomState.innerState())
+        XCTAssertTrue(output[0].item(Float.self).isFinite)
+        XCTAssertEqual(optimizer.step, 1)
+        let after = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        for name in ["futureActionHead.weight", "futureStateHead.weight"] {
+            let beforeValues = try XCTUnwrap(beforeSnapshots[name])
+            let afterValues = try XCTUnwrap(after.first { $0.key.contains(name) }?.value).asArray(Float.self)
+            XCTAssertTrue(zip(beforeValues, afterValues).contains { $0 != $1 }, "Compiled training did not update \(name)")
+        }
+    }
+
+    func testPredictiveAuxiliariesLearnCausalSequenceWithoutRegressingImmediatePolicy() throws {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale, bitDepth: 8)
+        profile.channels = ActionChannels(absoluteMouse: true, relativeMouse: true, buttons: false, scroll: false, keyboard: false, modifiers: false)
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 0, frameSpacing: 1, downsampleFactor: 1)
+        profile.training.architecture = ArchitectureSpec(
+            convolutionChannels: [8, 12], kernelSizes: [3, 3], strides: [2, 2],
+            visualEmbedding: 32, recurrentKind: .gru, recurrentWidth: 16,
+            fusionWidths: [32], dropout: 0, visualPooling: .attention, attentionHeads: 4
+        )
+        profile.training.precision = .float32
+        profile.training.visualAugmentation = VisualAugmentationConfiguration(enabled: false)
+        profile.training.futureActionPrediction = FutureActionPredictionConfiguration(enabled: true, horizonsSeconds: [0.1], lossWeight: 0.05)
+        profile.training.futureStatePrediction = FutureStatePredictionConfiguration(enabled: true, horizonSeconds: 0.1, lossWeight: 0.025, sampleStride: 1)
+
+        func image(position: Int, direction: Int) -> [Float] {
+            var values = [Float](repeating: 0.05, count: 64)
+            for y in 1..<7 { values[y * 8 + min(7, max(0, position))] = 0.95 }
+            values[direction > 0 ? 7 : 0] = 0.8
+            return values
+        }
+        let positions = [1, 2, 3, 4, 5, 6, 2, 5]
+        let directions = [1, 1, 1, 1, -1, -1, -1, 1]
+        var currentImages: [Float] = [], futureImages: [Float] = []
+        var currentTargets = [Float](repeating: 0, count: positions.count * ActionLayout.count)
+        var futureTargets = [Float](repeating: 0, count: positions.count * ActionLayout.count)
+        for row in positions.indices {
+            let next = min(6, max(1, positions[row] + directions[row]))
+            currentImages += image(position: positions[row], direction: directions[row])
+            futureImages += image(position: next, direction: directions[row])
+            let base = row * ActionLayout.count
+            currentTargets[base] = Float(positions[row]) / 7
+            currentTargets[base + 1] = 0.5
+            currentTargets[base + 2] = Float(directions[row]) * 0.2
+            futureTargets[base] = Float(next) / 7
+            futureTargets[base + 1] = 0.5
+            futureTargets[base + 2] = Float(directions[row]) * 0.2
+        }
+        let batch = positions.count
+        let inputs = [
+            MLXArray(currentImages, [batch, 8, 8, 1]),
+            MLXArray(currentTargets, [batch, ActionLayout.count]),
+            MLXArray(futureTargets, [batch, 1, ActionLayout.count]),
+            MLXArray(futureImages, [batch, 8, 8, 1])
+        ]
+        let heldOutPositions = [1, 3, 4, 6]
+        let heldOutDirections = [-1, -1, -1, 1]
+        var heldOutImages: [Float] = []
+        var heldOutTargets = [Float](repeating: 0, count: heldOutPositions.count * ActionLayout.count)
+        for row in heldOutPositions.indices {
+            heldOutImages += image(position: heldOutPositions[row], direction: heldOutDirections[row])
+            let base = row * ActionLayout.count
+            heldOutTargets[base] = Float(heldOutPositions[row]) / 7
+            heldOutTargets[base + 1] = 0.5
+            heldOutTargets[base + 2] = Float(heldOutDirections[row]) * 0.2
+        }
+        let heldOutInputs = [
+            MLXArray(heldOutImages, [heldOutPositions.count, 8, 8, 1]),
+            MLXArray(heldOutTargets, [heldOutPositions.count, ActionLayout.count])
+        ]
+        MLXRandom.seed(45_123)
+        let baseline = AgentPolicy(profile: profile)
+        let predictive = AgentPolicy(profile: profile)
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("predictive-ab-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: temp) }
+        try baseline.saveWeights(to: temp)
+        try predictive.loadWeights(from: temp)
+        baseline.train(false); predictive.train(false)
+        let baselineOptimizer = ResumableAdamW(learningRate: 0.001, weightDecay: 0)
+        let predictiveOptimizer = ResumableAdamW(learningRate: 0.001, weightDecay: 0)
+        baselineOptimizer.initialize(model: baseline)
+        predictiveOptimizer.initialize(model: predictive)
+        let positiveWeights = MLXArray.ones([ActionLayout.count])
+        let rowWeights = MLXArray.ones([batch])
+        let masks = MLXArray.ones([batch, 1])
+        let futureMap = MLXArray((0..<batch).map(Int32.init))
+
+        func compiledStep(
+            model: AgentPolicy,
+            optimizer: ResumableAdamW,
+            auxiliaries: Bool
+        ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+            compile(inputs: [model, optimizer], outputs: [model, optimizer]) { arrays in
+                let result = valueAndGrad(model: model) { candidate, values in
+                    let temporal = candidate.currentOnlyTemporalFeatures(currentImages: values[0])
+                    let fused = candidate.fusedFeatures(temporalFeatures: temporal)
+                    let immediate = candidate.loss(
+                        logits: candidate.logits(fusedFeatures: fused),
+                        targets: values[1], positiveWeights: positiveWeights,
+                        sampleWeights: rowWeights
+                    )
+                    guard auxiliaries else { return [immediate] }
+                    let futureAction = candidate.futureActionLoss(
+                        fusedFeatures: fused, futureTargets: values[2],
+                        futurePreviousTargets: values[2], masks: masks,
+                        trainingSampleWeights: rowWeights,
+                        positiveWeights: positiveWeights
+                    )
+                    let futureState = candidate.futureStateLoss(
+                        fusedFeatures: fused, temporalFeatures: temporal,
+                        currentActions: values[1], futureImages: values[3],
+                        sampleToFuture: futureMap, masks: rowWeights,
+                        trainingSampleWeights: rowWeights
+                    )
+                    return [immediate + 0.05 * futureAction + 0.025 * futureState]
+                }(model, arrays)
+                optimizer.update(
+                    model: model, gradients: result.1, targetType: .float32,
+                    gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
+                    maxGradientNorm: 1
+                )
+                return result.0
+            }
+        }
+        func immediateLoss(_ model: AgentPolicy, evaluation: [MLXArray], rows: Int) -> Float {
+            let temporal = model.currentOnlyTemporalFeatures(currentImages: evaluation[0])
+            let loss = model.loss(
+                logits: model.logits(temporalFeatures: temporal),
+                targets: evaluation[1], positiveWeights: positiveWeights,
+                sampleWeights: MLXArray.ones([rows])
+            )
+            MLX.eval(loss)
+            return loss.item(Float.self)
+        }
+        func auxiliaryLosses(_ model: AgentPolicy) -> (Float, Float) {
+            let temporal = model.currentOnlyTemporalFeatures(currentImages: inputs[0])
+            let fused = model.fusedFeatures(temporalFeatures: temporal)
+            let action = model.futureActionLoss(
+                fusedFeatures: fused, futureTargets: inputs[2],
+                futurePreviousTargets: inputs[2], masks: masks,
+                trainingSampleWeights: rowWeights, positiveWeights: positiveWeights
+            )
+            let state = model.futureStateLoss(
+                fusedFeatures: fused, temporalFeatures: temporal,
+                currentActions: inputs[1], futureImages: inputs[3],
+                sampleToFuture: futureMap, masks: rowWeights,
+                trainingSampleWeights: rowWeights
+            )
+            MLX.eval(action, state)
+            return (action.item(Float.self), state.item(Float.self))
+        }
+        let baselineStep = compiledStep(model: baseline, optimizer: baselineOptimizer, auxiliaries: false)
+        let predictiveStep = compiledStep(model: predictive, optimizer: predictiveOptimizer, auxiliaries: true)
+        let initialAuxiliary = auxiliaryLosses(predictive)
+        for _ in 0..<40 {
+            let baselineLoss = baselineStep(inputs)[0]
+            let predictiveLoss = predictiveStep(inputs)[0]
+            MLX.eval(
+                baselineLoss, predictiveLoss,
+                baseline.parameters(), predictive.parameters(),
+                baselineOptimizer.stateArrays(), predictiveOptimizer.stateArrays()
+            )
+        }
+        let finalBaseline = immediateLoss(baseline, evaluation: heldOutInputs, rows: heldOutPositions.count)
+        let finalPredictive = immediateLoss(predictive, evaluation: heldOutInputs, rows: heldOutPositions.count)
+        let finalAuxiliary = auxiliaryLosses(predictive)
+        XCTAssertLessThan(finalAuxiliary.0, initialAuxiliary.0)
+        XCTAssertLessThan(finalAuxiliary.1, initialAuxiliary.1)
+        XCTAssertLessThanOrEqual(
+            finalPredictive,
+            finalBaseline * 1.01 + 0.0001,
+            "Predictive representation learning regressed the immediate policy beyond the 1% quality gate."
+        )
+    }
+
+    func testDAggerRowsKeepCorrectionWeightFutureBoundariesAndTrainingOnlySplit() throws {
+        let rowCount = 8
+        let sequences = (0..<rowCount).map { [UInt32($0)] }
+        let actions = (0..<rowCount).map { row -> [Float] in
+            var values = [Float](repeating: 0, count: ActionLayout.count)
+            values[0] = Float(row) / Float(rowCount)
+            return values
+        }
+        let demonstrationID = UUID(), correctionID = UUID()
+        let fixture = try makeSyntheticDataset(
+            name: "dagger-boundaries",
+            pastFrameCount: 0,
+            sequences: sequences,
+            actionRows: actions,
+            segments: [
+                CacheSegment(recordingID: demonstrationID, start: 0, count: 4, observationStart: 0, purpose: .demonstration, trainingWeight: 1),
+                CacheSegment(recordingID: correctionID, start: 4, count: 4, observationStart: 4, purpose: .daggerCorrection, trainingWeight: 4)
+            ]
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let weights = fixture.dataset.trainingWeightBatch(at: [0, 4]).withUnsafeBytes {
+            Array($0.bindMemory(to: Float.self))
+        }
+        XCTAssertEqual(weights, [1, 4])
+
+        let future = fixture.dataset.futureActionBatch(at: [2, 3, 4, 7], offsets: [1, 2])
+        let masks = future.masks.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        XCTAssertEqual(masks, [1, 0, 0, 0, 1, 1, 0, 0])
+        let state = fixture.dataset.futureStateBatchPlan(at: [2, 3, 4, 7], offset: 1, sampleStride: 1)
+        XCTAssertEqual(state.masks, [1, 0, 1, 0])
+
+        let split = TrainingEngine().splitIndices(dataset: fixture.dataset, fraction: 0.5, seed: 9)
+        XCTAssertTrue(Set(4..<8).isSubset(of: Set(split.train)))
+        XCTAssertTrue(Set(0..<4).isSubset(of: Set(split.train)), "The sole ordinary demonstration must remain rehearsal data.")
+        XCTAssertTrue(split.validation.allSatisfy { $0 < 4 })
+    }
+
+    func testCorrectionAwareBestBrainAcceptsSmallOrdinaryTradeoffButRejectsRegression() {
+        let acceptable = TrainingEngine.correctionCandidateDecision(
+            correctionLoss: 0.7,
+            bestCorrectionLoss: 1,
+            ordinaryLoss: 0.505,
+            baselineOrdinaryLoss: 0.5,
+            ordinaryReport: nil,
+            baselineOrdinaryReport: nil
+        )
+        XCTAssertTrue(acceptable.accepts)
+        XCTAssertTrue(acceptable.correctionImproved)
+
+        let regressed = TrainingEngine.correctionCandidateDecision(
+            correctionLoss: 0.6,
+            bestCorrectionLoss: 1,
+            ordinaryLoss: 0.52,
+            baselineOrdinaryLoss: 0.5,
+            ordinaryReport: nil,
+            baselineOrdinaryReport: nil
+        )
+        XCTAssertFalse(regressed.accepts)
+        XCTAssertTrue(regressed.correctionImproved)
+
+        let noCorrectionGain = TrainingEngine.correctionCandidateDecision(
+            correctionLoss: 0.9995,
+            bestCorrectionLoss: 1,
+            ordinaryLoss: 0.49,
+            baselineOrdinaryLoss: 0.5,
+            ordinaryReport: nil,
+            baselineOrdinaryReport: nil
+        )
+        XCTAssertFalse(noCorrectionGain.accepts)
+        XCTAssertFalse(noCorrectionGain.correctionImproved)
+    }
+
+    func testDAggerManifestRequiresExplicitValidSupervisionMetadata() {
+        var manifest = RecordingManifest(
+            id: UUID(), name: "Correction", createdAt: Date(), hostStartNanos: 10,
+            duration: 3, capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 100, height: 100)),
+            pixelWidth: 64, pixelHeight: 64, deliveredFPS: 30, eventCount: 2,
+            trimStart: 0, trimEnd: 3, supervisionStart: 2,
+            purpose: .daggerCorrection, sourceProfileID: UUID(), sourceVersionID: UUID(), trainingWeight: 4
+        )
+        XCTAssertTrue(manifest.isStructurallyValid)
+        manifest.supervisionStart = 3.1
+        XCTAssertFalse(manifest.isStructurallyValid)
+        manifest.supervisionStart = 2
+        manifest.sourceVersionID = nil
+        XCTAssertFalse(manifest.isStructurallyValid)
+        manifest.sourceVersionID = UUID()
+        manifest.droppedFrameCount = -1
+        XCTAssertFalse(manifest.isStructurallyValid)
+    }
+
+    func testDAggerContextSizingSupportsLongSparseTemporalLookbackWithinBound() throws {
+        let preprocessing = PreprocessingSpec(width: 16, height: 16, colorMode: .grayscale)
+        let temporal = TemporalVisionConfiguration(
+            pastFrameCount: 4,
+            frameSpacing: 120,
+            downsampleFactor: 2
+        )
+        _ = try temporal.validated(current: preprocessing)
+        XCTAssertGreaterThan(temporal.lookbackSeconds(perceptionFPS: 30), 15)
+        let sizing = DAggerContextSizing.recentFrameCapacity(
+            preprocessing: preprocessing,
+            temporal: temporal,
+            perceptionFPS: 30,
+            configuration: DAggerConfiguration(preRollSeconds: 3, correctionWeight: 4)
+        )
+        XCTAssertGreaterThanOrEqual(sizing.maximum, sizing.requested)
+        XCTAssertLessThanOrEqual(sizing.temporalBytes, DAggerConfiguration.maximumBufferedContextBytes)
+    }
+
+    func testDAggerStartupBufferIsByteBoundedAndReportsOverflowWithoutDiscardingAcceptedData() {
+        let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale)
+        let controls = [Float](repeating: 0, count: ActionLayout.count)
+        let frame = DAggerFrame(
+            timestampNanos: 1,
+            packedVision: Data([128]),
+            preprocessing: spec,
+            executedControls: controls
+        )
+        let frameBytes = frame.packedVision.count
+            + controls.count * MemoryLayout<Float>.size + 64
+        var frames = DAggerStartupBuffer(
+            maximumSamples: 4,
+            maximumFrameBytes: frameBytes * 2
+        )
+        frames.append(frame)
+        var second = frame; second.timestampNanos = 2; frames.append(second)
+        var third = frame; third.timestampNanos = 3; frames.append(third)
+        XCTAssertEqual(frames.frames.map(\.timestampNanos), [1, 2])
+        XCTAssertTrue(frames.overflowed)
+
+        var samples = DAggerStartupBuffer(maximumSamples: 2, maximumFrameBytes: frameBytes)
+        samples.append(InputSample(timestampNanos: 1, kind: .key, keyCode: 1, isDown: true))
+        samples.append(InputSample(timestampNanos: 2, kind: .key, keyCode: 1, isDown: false))
+        samples.append(InputSample(timestampNanos: 3, kind: .key, keyCode: 2, isDown: true))
+        XCTAssertEqual(samples.samples.count, 2)
+        XCTAssertTrue(samples.overflowed)
+        samples.reset()
+        XCTAssertTrue(samples.samples.isEmpty)
+        XCTAssertTrue(samples.frames.isEmpty)
+        XCTAssertFalse(samples.overflowed)
+    }
+
+    func testDAggerCaptureQualityRejectsStaleVideoAboveFivePercentDrops() {
+        XCTAssertTrue(DAggerCaptureQuality.accepts(encoded: 95, dropped: 5))
+        XCTAssertFalse(DAggerCaptureQuality.accepts(encoded: 94, dropped: 6))
+        XCTAssertFalse(DAggerCaptureQuality.accepts(encoded: 0, dropped: 0))
+        XCTAssertEqual(
+            DAggerCaptureQuality.droppedFrameFraction(encoded: 90, dropped: 10),
+            0.1,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testDAggerRecorderProducesNativeVideoAndBalancedExpertEvents() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("dagger-recorder-\(UUID().uuidString).atrrecord", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let profileID = UUID(), versionID = UUID(), recordingID = UUID()
+        let spec = PreprocessingSpec(width: 4, height: 4, colorMode: .grayscale, bitDepth: 8)
+        let rect = CGRect(x: 20, y: 30, width: 100, height: 80)
+        let request = DAggerCaptureRequest(
+            recordingID: recordingID,
+            directory: directory,
+            profileID: profileID,
+            versionID: versionID,
+            profileName: "Test",
+            destinationFolderID: UUID(),
+            excludedKeyCodes: [],
+            preprocessing: spec,
+            capture: CaptureSpec(requestedFPS: 30),
+            captureRect: rect,
+            perceptionFPS: 30,
+            actionFPS: 60,
+            correctionWeight: 4
+        )
+        var controls = [Float](repeating: 0, count: ActionLayout.count)
+        controls[0] = 0.5; controls[1] = 0.5
+        let base: UInt64 = 1_000_000_000
+        let recorder = try DAggerRecorder(
+            request: request,
+            correctionStartHostNanos: base + 70_000_000,
+            preRoll: [
+                DAggerFrame(timestampNanos: base, packedVision: Data(repeating: 80, count: spec.sampleByteCount), preprocessing: spec, executedControls: controls),
+                DAggerFrame(timestampNanos: base + 35_000_000, packedVision: Data(repeating: 100, count: spec.sampleByteCount), preprocessing: spec, executedControls: controls)
+            ]
+        )
+        recorder.append(InputSample(timestampNanos: base + 75_000_000, kind: .key, keyCode: 12, isDown: true))
+        recorder.append(DAggerFrame(timestampNanos: base + 90_000_000, packedVision: Data(repeating: 130, count: spec.sampleByteCount), preprocessing: spec, executedControls: controls))
+        let result = try await recorder.finish(endHostNanos: base + 120_000_000)
+        XCTAssertEqual(result.frameCount, 3)
+        XCTAssertEqual(result.firstFrameHostNanos, base)
+        XCTAssertEqual(result.supervisionStart, 0.07, accuracy: 0.000_001)
+        let events = try InputEventReader.read(url: directory.appendingPathComponent("events.atrevents"))
+        XCTAssertTrue(events.contains { $0.kind == .key && $0.keyCode == 12 && $0.isDown })
+        XCTAssertTrue(events.contains { $0.kind == .key && $0.keyCode == 12 && !$0.isDown })
+        let asset = AVURLAsset(url: directory.appendingPathComponent("capture.mov"))
+        let track = try await asset.loadTracks(withMediaType: .video).first
+        XCTAssertNotNil(track)
+    }
+
     private func actionFloat(_ data: Data, index: Int) -> Float {
         let bits = data.withUnsafeBytes {
             $0.loadUnaligned(fromByteOffset: index * MemoryLayout<UInt32>.size, as: UInt32.self)
@@ -4207,7 +4931,7 @@ final class DomainTests: XCTestCase {
                 sampleCount: sequences.count,
                 observationCount: observationCount,
                 currentObservationBytesPerSample: 1,
-                pastObservationBytesPerSample: 1,
+                pastObservationBytesPerSample: pastFrameCount > 0 ? 1 : 0,
                 actionValuesPerSample: ActionLayout.count,
                 segments: segments
             )
@@ -4215,7 +4939,7 @@ final class DomainTests: XCTestCase {
             try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
             let observations = Data((0..<observationCount).map { UInt8(clamping: $0) })
             try observations.write(to: directory.appendingPathComponent("current-observations.bin"))
-            try observations.write(to: directory.appendingPathComponent("past-observations.bin"))
+            try (pastFrameCount > 0 ? observations : Data()).write(to: directory.appendingPathComponent("past-observations.bin"))
             try observationSequenceData(sequences).write(to: directory.appendingPathComponent("observation-indices.bin"))
             let frameActionRows: [[Float]]
             if let suppliedFrameActionRows {
@@ -4232,7 +4956,7 @@ final class DomainTests: XCTestCase {
             }
             var frameActions = Data(capacity: frameActionRows.count * ActionLayout.count * MemoryLayout<Float>.size)
             for row in frameActionRows { row.withUnsafeBytes { frameActions.append(contentsOf: $0) } }
-            try frameActions.write(to: directory.appendingPathComponent("frame-actions.bin"))
+            try (pastFrameCount > 0 ? frameActions : Data()).write(to: directory.appendingPathComponent("frame-actions.bin"))
             var actions = Data(capacity: actionRows.count * ActionLayout.count * MemoryLayout<Float>.size)
             for row in actionRows { row.withUnsafeBytes { actions.append(contentsOf: $0) } }
             try actions.write(to: directory.appendingPathComponent("actions.bin"))

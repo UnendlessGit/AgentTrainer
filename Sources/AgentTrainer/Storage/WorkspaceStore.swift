@@ -289,6 +289,10 @@ actor WorkspaceStore {
             if compatibleVersionIDs.isEmpty && !keepsCheckpoint {
                 profile.training.architecture = migratedArchitecture(profile.training.architecture)
                 profile.training.temporalVision = TemporalVisionConfiguration()
+                profile.training.visualAugmentation = VisualAugmentationConfiguration()
+                profile.training.futureActionPrediction = FutureActionPredictionConfiguration()
+                profile.training.futureStatePrediction = FutureStatePredictionConfiguration()
+                profile.training.dagger = DAggerConfiguration()
                 if !profile.training.learningRate.isFinite || profile.training.learningRate <= 0 {
                     profile.training.learningRate = 0.0003
                 } else {
@@ -556,7 +560,7 @@ actor WorkspaceStore {
             guard let originalData = try? Data(contentsOf: manifestURL),
                   var manifest = try? decoder.decode(RecordingManifest.self, from: originalData),
                   !manifest.isStructurallyValid,
-                  (1...2).contains(manifest.schemaVersion),
+                  (1...3).contains(manifest.schemaVersion),
                   Self.isSafeLeafName(manifest.videoFile), Self.isSafeLeafName(manifest.eventFile),
                   manifest.thumbnailFile.map(Self.isSafeLeafName) ?? true else { continue }
 
@@ -1163,7 +1167,7 @@ actor WorkspaceStore {
         switch checkpointMetadata {
         case (nil, nil, nil):
             resumable = false
-        case (.some, .some, _):
+        case (.some, .some, .some):
             resumable = true
         default:
             throw AgentTrainerError.storage("The selected model version has an incomplete training checkpoint.")
@@ -1172,7 +1176,10 @@ actor WorkspaceStore {
         let destination = checkpointDirectory(profileID: profile.id)
         let parent = destination.deletingLastPathComponent()
         var temporary: URL?
-        if resumable, let optimizerFile = version.optimizerFile, let stateFile = version.trainingStateFile {
+        if resumable,
+           let optimizerFile = version.optimizerFile,
+           let stateFile = version.trainingStateFile,
+           let randomStateFile = version.randomStateFile {
             let candidate = parent.appendingPathComponent(".Checkpoint.restore.\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
             do {
@@ -1180,9 +1187,7 @@ actor WorkspaceStore {
                 try FileManager.default.copyItem(at: source.appendingPathComponent(optimizerFile), to: candidate.appendingPathComponent("optimizer.safetensors"))
                 try FileManager.default.copyItem(at: source.appendingPathComponent(stateFile), to: candidate.appendingPathComponent("state.json"))
                 try encoder.encode(version.schemaVersion).write(to: candidate.appendingPathComponent("model-schema.json"), options: .atomic)
-                if let randomStateFile = version.randomStateFile {
-                    try FileManager.default.copyItem(at: source.appendingPathComponent(randomStateFile), to: candidate.appendingPathComponent("random.safetensors"))
-                }
+                try FileManager.default.copyItem(at: source.appendingPathComponent(randomStateFile), to: candidate.appendingPathComponent("random.safetensors"))
                 temporary = candidate
             } catch {
                 try? FileManager.default.removeItem(at: candidate)

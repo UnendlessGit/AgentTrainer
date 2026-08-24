@@ -396,7 +396,8 @@ final class TrainingPerformanceTests: XCTestCase {
                 _ step: @Sendable ([MLXArray]) -> [MLXArray],
                 inputs: () -> [MLXArray],
                 model: AgentPolicy,
-                optimizer: ResumableAdamW
+                optimizer: ResumableAdamW,
+                additionalState: () -> [MLXArray] = { [] }
             ) -> (seconds: Double, loss: Float) {
                 let start = ContinuousClock.now
                 let loss = step(inputs())[0]
@@ -586,7 +587,8 @@ final class TrainingPerformanceTests: XCTestCase {
                 step: @Sendable ([MLXArray]) -> [MLXArray],
                 inputs: () -> [MLXArray],
                 model: AgentPolicy,
-                optimizer: ResumableAdamW
+                optimizer: ResumableAdamW,
+                additionalState: () -> [MLXArray] = { [] }
             ) {
                 guard steps > 0 else { return }
                 Memory.clearCache()
@@ -597,11 +599,12 @@ final class TrainingPerformanceTests: XCTestCase {
                 var peakActiveMemory = 0
                 var peakCacheMemory = 0
                 for index in 0..<steps {
-                    let result = runOne(
-                        step,
-                        inputs: inputs,
-                        model: model,
-                        optimizer: optimizer
+                    let started = ContinuousClock.now
+                    let loss = step(inputs())[0]
+                    MLX.eval(loss, model.parameters(), optimizer.stateArrays(), additionalState())
+                    let result = (
+                        seconds: started.duration(to: .now).benchmarkSeconds,
+                        loss: loss.item(Float.self)
                     )
                     windowSeconds += result.seconds
                     windowSamples += batchSize
@@ -660,6 +663,178 @@ final class TrainingPerformanceTests: XCTestCase {
                 inputs: fusedInputs,
                 model: fusedModel,
                 optimizer: fusedOptimizer
+            )
+
+            // Exercise the complete Policy-v6 production objective as a
+            // separate hardware gate. The core benchmark above isolates the
+            // deduplicated encoder optimization; this path adds shared visual
+            // augmentation, multi-horizon actions, future latent dynamics, and
+            // their optimizer state so release numbers cannot hide auxiliary
+            // throughput or memory costs.
+            Memory.clearCache()
+            let auxiliaryModel = AgentPolicy(profile: profile)
+            try auxiliaryModel.loadWeights(from: initialWeights)
+            auxiliaryModel.train(true)
+            let auxiliaryOptimizer = ResumableAdamW(learningRate: 0.0003, weightDecay: 0.01)
+            auxiliaryOptimizer.initialize(model: auxiliaryModel)
+            let auxiliaryRandomState = MLXRandom.RandomState(seed: 91_337)
+            let horizonCount = profile.training.effectiveFutureActionPrediction.horizonsSeconds.count
+            var futureActionRows = [Float](
+                repeating: 0,
+                count: batchSize * horizonCount * 2 * ActionLayout.count
+            )
+            for row in 0..<batchSize {
+                for horizon in 0..<horizonCount {
+                    let destination = (row * horizonCount + horizon) * 2 * ActionLayout.count
+                    let source = row * 2 * ActionLayout.count
+                    futureActionRows.replaceSubrange(
+                        destination..<(destination + 2 * ActionLayout.count),
+                        with: actionRows[source..<(source + 2 * ActionLayout.count)]
+                    )
+                }
+            }
+            let futureActionData = futureActionRows.withUnsafeBytes { Data($0) }
+            let futureActionMaskData = [Float](repeating: 1, count: batchSize * horizonCount).withUnsafeBytes { Data($0) }
+            let sampleWeightData = [Float](repeating: 1, count: batchSize).withUnsafeBytes { Data($0) }
+            let futureMapData = (0..<batchSize).map(Int32.init).withUnsafeBytes { Data($0) }
+            let futureStateMaskData = [Float](repeating: 1, count: batchSize).withUnsafeBytes { Data($0) }
+
+            func auxiliaryInputs() -> [MLXArray] {
+                try! bufferPool.makeArrays([
+                    .init([uniqueSequenceCount, currentBytesPerSample], dtype: .uint8),
+                    .init([uniquePastFrameCount, pastBytesPerFrame], dtype: .uint8),
+                    .init([uniqueSequenceCount, frameCount, ActionLayout.count], dtype: .float32),
+                    .init([uniqueSequenceCount, frameCount], dtype: .int32),
+                    .init([batchSize], dtype: .int32),
+                    .init([batchSize, 2, ActionLayout.count], dtype: .float32),
+                    .init([batchSize], dtype: .float32),
+                    .init([batchSize, horizonCount, 2, ActionLayout.count], dtype: .float32),
+                    .init([batchSize, horizonCount], dtype: .float32),
+                    .init([batchSize, currentBytesPerSample], dtype: .uint8),
+                    .init([batchSize], dtype: .int32),
+                    .init([batchSize], dtype: .float32)
+                ]) { destinations in
+                    uniqueCurrentData.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
+                    deduplicatedPastData.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
+                    uniqueControlData.withUnsafeBytes { destinations[2].copyMemory(from: $0) }
+                    visionToPastData.withUnsafeBytes { destinations[3].copyMemory(from: $0) }
+                    mappingData.withUnsafeBytes { destinations[4].copyMemory(from: $0) }
+                    actionData.withUnsafeBytes { destinations[5].copyMemory(from: $0) }
+                    sampleWeightData.withUnsafeBytes { destinations[6].copyMemory(from: $0) }
+                    futureActionData.withUnsafeBytes { destinations[7].copyMemory(from: $0) }
+                    futureActionMaskData.withUnsafeBytes { destinations[8].copyMemory(from: $0) }
+                    fullCurrentData.withUnsafeBytes { destinations[9].copyMemory(from: $0) }
+                    futureMapData.withUnsafeBytes { destinations[10].copyMemory(from: $0) }
+                    futureStateMaskData.withUnsafeBytes { destinations[11].copyMemory(from: $0) }
+                }
+            }
+            let auxiliaryStep = compile(
+                inputs: [auxiliaryModel, auxiliaryOptimizer, auxiliaryRandomState],
+                outputs: [auxiliaryModel, auxiliaryOptimizer, auxiliaryRandomState]
+            ) { arrays in
+                let augmentation = auxiliaryModel.sampleVisualAugmentation()
+                let current = auxiliaryModel.augmentedVision(
+                    VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
+                    parameters: augmentation
+                )
+                let past = auxiliaryModel.augmentedVision(
+                    VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec),
+                    parameters: augmentation
+                )
+                let futureImages = auxiliaryModel.augmentedVision(
+                    VisionPreprocessor.mlxTensor(arrays[9], spec: profile.preprocessing),
+                    parameters: augmentation
+                )
+                let actions = arrays[5]
+                let futureActions = arrays[7]
+                let result = valueAndGrad(model: auxiliaryModel) { candidate, values in
+                    let temporalFeatures = candidate.temporalFeatures(
+                        currentImages: values[0], pastImages: values[1],
+                        pastControls: values[2], visionToPast: arrays[3],
+                        sampleToVision: arrays[4]
+                    )
+                    let fused = candidate.fusedFeatures(temporalFeatures: temporalFeatures)
+                    let immediate = candidate.loss(
+                        logits: candidate.logits(fusedFeatures: fused),
+                        targets: actions[0..., 0, 0...],
+                        positiveWeights: positiveWeights,
+                        previousTargets: actions[0..., 1, 0...],
+                        sampleWeights: arrays[6]
+                    )
+                    let futureAction = candidate.futureActionLoss(
+                        fusedFeatures: fused,
+                        futureTargets: futureActions[0..., 0..., 0, 0...],
+                        futurePreviousTargets: futureActions[0..., 0..., 1, 0...],
+                        masks: arrays[8], trainingSampleWeights: arrays[6],
+                        positiveWeights: positiveWeights
+                    )
+                    let futureState = candidate.futureStateLoss(
+                        fusedFeatures: fused, temporalFeatures: temporalFeatures,
+                        currentActions: actions[0..., 0, 0...],
+                        futureImages: values[3], sampleToFuture: arrays[10],
+                        masks: arrays[11], trainingSampleWeights: arrays[6]
+                    )
+                    let futureActionWeight = Float(
+                        profile.training.effectiveFutureActionPrediction.lossWeight
+                    )
+                    let futureStateWeight = Float(
+                        profile.training.effectiveFutureStatePrediction.lossWeight
+                    )
+                    let total = immediate
+                        + futureActionWeight * futureAction
+                        + futureStateWeight * futureState
+                    return [total]
+                }(auxiliaryModel, [current, past, arrays[2], futureImages])
+                auxiliaryOptimizer.update(
+                    model: auxiliaryModel, gradients: result.1,
+                    targetType: auxiliaryModel.dtype,
+                    gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
+                    maxGradientNorm: 1
+                )
+                return result.0
+            }
+            func runAuxiliary() -> (seconds: Double, loss: Float) {
+                let start = ContinuousClock.now
+                let loss = withRandomState(auxiliaryRandomState) { auxiliaryStep(auxiliaryInputs())[0] }
+                MLX.eval(loss, auxiliaryModel.parameters(), auxiliaryOptimizer.stateArrays(), auxiliaryRandomState.innerState())
+                return (start.duration(to: .now).benchmarkSeconds, loss.item(Float.self))
+            }
+            for _ in 0..<2 { _ = runAuxiliary() }
+            let auxiliaryIterations = usesDefaultProfile || usesStressProfile ? 6 : 12
+            var auxiliarySeconds = 0.0
+            var auxiliaryLoss = Float.zero
+            for _ in 0..<auxiliaryIterations {
+                let result = runAuxiliary()
+                auxiliarySeconds += result.seconds
+                auxiliaryLoss = result.loss
+            }
+            let auxiliaryMemory = Memory.snapshot()
+            let coreSecondsPerStep = reusedSeconds / Double(max(1, iterations))
+            let auxiliarySecondsPerStep = auxiliarySeconds / Double(max(1, auxiliaryIterations))
+            XCTAssertTrue(auxiliaryLoss.isFinite)
+            XCTAssertLessThanOrEqual(auxiliarySecondsPerStep, coreSecondsPerStep * 2.5 + 0.002)
+            XCTAssertLessThanOrEqual(
+                auxiliaryMemory.cacheMemory,
+                Memory.cacheLimit + 128 * 1_024 * 1_024
+            )
+            print(
+                "AUXILIARY_TRAINING_BENCHMARK profile=\(profileName) seconds=\(auxiliarySeconds) "
+                    + "samples_per_second=\(Double(auxiliaryIterations * batchSize) / max(0.000_001, auxiliarySeconds)) "
+                    + "overhead_ratio=\(auxiliarySecondsPerStep / max(0.000_001, coreSecondsPerStep)) "
+                    + "loss=\(auxiliaryLoss) active_memory=\(auxiliaryMemory.activeMemory) "
+                    + "cache_memory=\(auxiliaryMemory.cacheMemory) thermal=\(TrainingThermalState.current.rawValue)"
+            )
+            let auxiliarySustainedStep: @Sendable ([MLXArray]) -> [MLXArray] = { arrays in
+                withRandomState(auxiliaryRandomState) { auxiliaryStep(arrays) }
+            }
+            runSustainedBenchmark(
+                path: "policy-v6-full",
+                steps: sustainedSteps,
+                step: auxiliarySustainedStep,
+                inputs: auxiliaryInputs,
+                model: auxiliaryModel,
+                optimizer: auxiliaryOptimizer,
+                additionalState: { auxiliaryRandomState.innerState() }
             )
         }
     }

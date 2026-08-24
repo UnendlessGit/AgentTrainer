@@ -6,8 +6,57 @@ import MLX
 import MLXNN
 @preconcurrency import ScreenCaptureKit
 
+struct DAggerStartupBuffer: Sendable {
+    let maximumSamples: Int
+    let maximumFrameBytes: Int
+    private(set) var samples: [InputSample] = []
+    private(set) var frames: [DAggerFrame] = []
+    private(set) var frameBytes = 0
+    private(set) var overflowed = false
+
+    init(
+        maximumSamples: Int = 131_072,
+        maximumFrameBytes: Int = DAggerConfiguration.maximumBufferedContextBytes
+    ) {
+        self.maximumSamples = max(1, maximumSamples)
+        self.maximumFrameBytes = max(1, maximumFrameBytes)
+    }
+
+    mutating func append(_ sample: InputSample) {
+        guard samples.count < maximumSamples else {
+            overflowed = true
+            return
+        }
+        samples.append(sample)
+    }
+
+    mutating func append(_ frame: DAggerFrame) {
+        let bytes = frame.packedVision.count
+            + frame.executedControls.count * MemoryLayout<Float>.size
+            + 64
+        guard bytes <= maximumFrameBytes - frameBytes else {
+            overflowed = true
+            return
+        }
+        frames.append(frame)
+        frameBytes += bytes
+    }
+
+    mutating func reset() {
+        samples.removeAll(keepingCapacity: true)
+        frames.removeAll(keepingCapacity: true)
+        frameBytes = 0
+        overflowed = false
+    }
+}
+
 final class AgentRuntime: @unchecked Sendable {
     private typealias VisualizationFunction = @Sendable ([MLXArray]) -> [MLXArray]
+    private enum DAggerInstallResult: Equatable {
+        case installed
+        case stopped
+        case overflow
+    }
 
     private enum StopAction {
         case perform(DispatchSourceTimer?)
@@ -21,6 +70,8 @@ final class AgentRuntime: @unchecked Sendable {
     var onStop: (@Sendable (String?) -> Void)?
     var onPreview: (@Sendable (VisionPreviewFrame) -> Void)?
     var onVisualization: (@Sendable (CNNVisualizationFrame) -> Void)?
+    var onDAggerRecordingChanged: (@Sendable (Bool) -> Void)?
+    var onDAggerFinished: (@Sendable (Result<DAggerCaptureResult, Error>) -> Void)?
 
     private let capture = CaptureService()
     private let preprocessor: VisionPreprocessor
@@ -45,14 +96,17 @@ final class AgentRuntime: @unchecked Sendable {
     private var outputPermissions = RuntimeOutputPermissions()
     private var outputPermissionsRevision = 0
     private var allowedKeyCodes: Set<UInt16> = []
+    private var sourceVersionID: UUID?
     private var shiftUsesKeyboardChannel = false
     private var latestFrame: CVPixelBuffer?
+    private var latestFrameHostNanos: UInt64 = 0
     private var lastUsableCaptureFrame: CVPixelBuffer?
     private var processing = false
     private var predictionLatch = RuntimePredictionLatch()
     private struct TemporalFrame: Sendable {
         var packed: Data
         var controls: [Float]
+        var timestampNanos: UInt64
     }
     /// Fixed-capacity circular storage keeps sampling and appending O(1), even
     /// at the largest supported frame count and spacing. Slot zero relative to
@@ -90,6 +144,47 @@ final class AgentRuntime: @unchecked Sendable {
         }
     }
     private var temporalFrames = TemporalFrameRing()
+    private struct DAggerFrameRing: Sendable {
+        private var storage: [DAggerFrame?] = []
+        private var oldest = 0
+        private(set) var count = 0
+
+        mutating func reset() {
+            storage.removeAll(keepingCapacity: false)
+            oldest = 0
+            count = 0
+        }
+
+        mutating func append(_ frame: DAggerFrame, capacity rawCapacity: Int) {
+            let capacity = max(1, rawCapacity)
+            if storage.count != capacity {
+                let retained = frames().suffix(capacity)
+                storage = [DAggerFrame?](repeating: nil, count: capacity)
+                oldest = 0
+                count = 0
+                for frame in retained { append(frame, capacity: capacity) }
+            }
+            if count < capacity {
+                storage[(oldest + count) % capacity] = frame
+                count += 1
+            } else {
+                storage[oldest] = frame
+                oldest = (oldest + 1) % capacity
+            }
+        }
+
+        func frames() -> [DAggerFrame] {
+            guard !storage.isEmpty, count > 0 else { return [] }
+            return (0..<count).compactMap { storage[(oldest + $0) % storage.count] }
+        }
+    }
+    private var daggerFrames = DAggerFrameRing()
+    private var daggerRecorder: DAggerRecorder?
+    private var daggerHumanActions: ActionAccumulator?
+    private var daggerOutputPaused = false
+    private var daggerStarting = false
+    private var daggerStartupBuffer = DAggerStartupBuffer()
+    private var daggerConfiguration = DAggerConfiguration()
     private var actionTimer: DispatchSourceTimer?
     private var nextPerceptionTime = 0.0
     private var metrics = RuntimeMetrics()
@@ -108,6 +203,8 @@ final class AgentRuntime: @unchecked Sendable {
     private var teardownInProgress = false
     private var startupWaiters: [CheckedContinuation<Void, Never>] = []
     private var teardownWaiters: [CheckedContinuation<Void, Never>] = []
+
+    var isDAggerRecording: Bool { lock.withLock { daggerRecorder != nil } }
 
     init() throws {
         MLXMemoryLifecycle.configure()
@@ -146,6 +243,7 @@ final class AgentRuntime: @unchecked Sendable {
         // A runnable brain is immutable. Timing, temporal vision, enabled heads,
         // precision, and architecture must come from the saved version rather
         // than mutable editor fields that may have changed after training.
+        let liveDAggerConfiguration = try profile.training.effectiveDAgger.validated()
         var runtimeProfile = profile
         runtimeProfile.preprocessing = version.preprocessing
         runtimeProfile.channels = RuntimeActionSemantics.effectiveChannels(saved: version.channels, current: profile.channels)
@@ -245,6 +343,8 @@ final class AgentRuntime: @unchecked Sendable {
             self.saliencyVisualizationFunction = saliencyVisualizationFunction
             self.saliencyGradientFunction = saliencyGradient
             self.profile = runtimeProfile
+            self.sourceVersionID = version.id
+            self.daggerConfiguration = liveDAggerConfiguration
             self.allowedKeyCodes = allowedKeyCodes
             self.shiftUsesKeyboardChannel = (version.trainingDataSchema ?? 0) >= 7
             self.safety = safety
@@ -261,7 +361,10 @@ final class AgentRuntime: @unchecked Sendable {
             self.previewFPS = max(0, previewFPS)
             self.lastPreviewTime = 0
             self.lastVisualizationTime = 0
-            latestFrame = nil; lastUsableCaptureFrame = nil; predictionLatch.reset(); temporalFrames.reset()
+            latestFrame = nil; latestFrameHostNanos = 0; lastUsableCaptureFrame = nil
+            predictionLatch.reset(); temporalFrames.reset(); daggerFrames.reset()
+            daggerRecorder = nil; daggerHumanActions = nil; daggerOutputPaused = false
+            daggerStarting = false; daggerStartupBuffer.reset()
             metrics = RuntimeMetrics(); startedAt = CACurrentMediaTime(); nextPerceptionTime = 0; lastMetricsReportTime = 0; lastFocusCheckTime = 0; stopped = false
             // Keep session enablement ordered with live permission changes. A
             // toggle made while model weights are loading must not be replaced
@@ -278,6 +381,20 @@ final class AgentRuntime: @unchecked Sendable {
             safetyMonitor.onSample = { [weak self] sample in
                 guard let self else { return }
                 let panic = sample.kind == .key && sample.isDown && sample.keyCode == self.safety.panicKeyCode && (sample.modifiers & self.safety.panicModifiers) == self.safety.panicModifiers
+                if !panic {
+                    let correctionState = self.lock.withLock { () -> (DAggerRecorder?, Bool) in
+                        if self.daggerStarting {
+                            self.daggerStartupBuffer.append(sample)
+                            return (nil, true)
+                        }
+                        return (self.daggerRecorder, self.daggerRecorder != nil)
+                    }
+                    if correctionState.1 {
+                        correctionState.0?.append(sample)
+                        self.lock.withLock { self.daggerHumanActions?.consume(sample) }
+                        return
+                    }
+                }
                 guard panic || self.safety.stopOnHumanInput else { return }
                 Task { await self.stop(reason: panic ? "Panic stop" : "Stopped on human input") }
             }
@@ -334,17 +451,167 @@ final class AgentRuntime: @unchecked Sendable {
         }
     }
 
+    func startDAggerRecording(
+        request: DAggerCaptureRequest,
+        recordingShortcut: HotkeyBinding
+    ) async throws {
+        let now = Self.hostTimeNanos()
+        let snapshot = try lock.withLock { () throws -> [DAggerFrame] in
+            guard !stopped, daggerRecorder == nil, !daggerStarting, let profile,
+                  sourceVersionID == request.versionID,
+                  profile.id == request.profileID,
+                  profile.preprocessing == request.preprocessing else {
+                throw AgentTrainerError.model("DAgger can start only after this AI has produced a live perception, and only one correction can be recorded at a time.")
+            }
+            let configured = daggerConfiguration
+            let sizing = DAggerContextSizing.recentFrameCapacity(
+                preprocessing: profile.preprocessing,
+                temporal: profile.training.effectiveTemporalVision,
+                perceptionFPS: profile.training.perceptionFPS,
+                configuration: configured
+            )
+            guard sizing.maximum >= sizing.requested else {
+                throw AgentTrainerError.invalidConfiguration("This DAgger context exceeds the 512 MB runtime buffer. Reduce lead-up, temporal context, or vision size.")
+            }
+            let nanos = UInt64((configured.preRollSeconds * 1e9).rounded())
+            let cutoff = now > nanos ? now - nanos : 0
+            let recent = daggerFrames.frames().filter { $0.timestampNanos >= cutoff }
+            let temporal = profile.training.effectiveTemporalVision
+            let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
+            let exactTemporalContext: [DAggerFrame] = (0..<temporal.pastFrameCount).compactMap { frame in
+                // The ring already contains the current frame at trigger time;
+                // add one to the normal inference distance to recover the exact
+                // causal frames the policy would select for this current image.
+                let distance = temporal.frameSpacing * (temporal.pastFrameCount - frame) + 1
+                guard let stored = temporalFrames.frame(distanceBack: distance) else { return nil }
+                return DAggerFrame(
+                    timestampNanos: stored.timestampNanos,
+                    packedVision: stored.packed,
+                    preprocessing: pastSpec,
+                    executedControls: stored.controls
+                )
+            }
+            var byTimestamp: [UInt64: DAggerFrame] = [:]
+            for frame in exactTemporalContext { byTimestamp[frame.timestampNanos] = frame }
+            // Prefer full current-resolution recent frames when the two sources
+            // overlap; older sparse entries exist only to cover long spacing.
+            for frame in recent { byTimestamp[frame.timestampNanos] = frame }
+            let retained = byTimestamp.values.sorted { $0.timestampNanos < $1.timestampNanos }
+            guard !retained.isEmpty else {
+                throw AgentTrainerError.model("Wait for the AI's first complete perception before starting a DAgger correction.")
+            }
+            // This is the explicit trigger boundary. Stop admitting AI action
+            // ticks before constructing encoders or copying pre-roll so the
+            // first expert input can never be mistaken for ordinary takeover.
+            daggerStarting = true
+            daggerOutputPaused = true
+            daggerStartupBuffer.reset()
+            return retained
+        }
+        safetyMonitor.excludedKeyCodes = request.excludedKeyCodes
+        await drain(queue: actionQueue)
+        injector.disableAndReleaseAll()
+        do {
+            let provisional = RecordingManifest(
+                id: UUID(), name: "DAgger", createdAt: Date(), hostStartNanos: now,
+                duration: 1, capture: request.capture, globalRect: CodableRect(request.captureRect),
+                pixelWidth: request.preprocessing.width,
+                pixelHeight: request.preprocessing.height,
+                deliveredFPS: request.perceptionFPS, eventCount: 0
+            )
+            var humanActions = ActionAccumulator(manifest: provisional)
+            let pointer = CGEvent(source: nil)?.location
+                ?? CGPoint(x: request.captureRect.midX, y: request.captureRect.midY)
+            let seed = safetyMonitor.recordingSeedSamples(
+                timestampNanos: now,
+                pointer: pointer,
+                excluding: recordingShortcut
+            )
+            let recorder = try DAggerRecorder(
+                request: request,
+                correctionStartHostNanos: now,
+                preRoll: snapshot
+            )
+            for sample in seed {
+                recorder.append(sample)
+                humanActions.consume(sample)
+            }
+            let installResult = lock.withLock { () -> DAggerInstallResult in
+                guard !stopped, daggerStarting, daggerRecorder == nil else { return .stopped }
+                guard !daggerStartupBuffer.overflowed else { return .overflow }
+                for sample in daggerStartupBuffer.samples {
+                    recorder.append(sample)
+                    humanActions.consume(sample)
+                }
+                for frame in daggerStartupBuffer.frames { recorder.append(frame) }
+                daggerStartupBuffer.reset()
+                daggerRecorder = recorder
+                daggerHumanActions = humanActions
+                daggerStarting = false
+                return .installed
+            }
+            guard installResult == .installed else {
+                _ = try? await recorder.finish(endHostNanos: Self.hostTimeNanos())
+                if installResult == .overflow {
+                    throw AgentTrainerError.capture("DAgger startup could not keep up with the initial correction stream inside its bounded buffer. The partial package was discarded; try again with a shorter lead-up, lower Perception FPS, or smaller vision size.")
+                }
+                throw CancellationError()
+            }
+            onDAggerRecordingChanged?(true)
+        } catch {
+            lock.withLock {
+                daggerStarting = false
+                daggerStartupBuffer.reset()
+                guard !stopped, daggerRecorder == nil else { return }
+                daggerOutputPaused = false
+                injector.enable(outputPermissions: outputPermissions)
+            }
+            safetyMonitor.excludedKeyCodes = []
+            throw error
+        }
+    }
+
+    func stopDAggerRecording() async {
+        let recorder = lock.withLock { () -> DAggerRecorder? in
+            let recorder = daggerRecorder
+            daggerRecorder = nil
+            daggerHumanActions = nil
+            return recorder
+        }
+        guard let recorder else { return }
+        safetyMonitor.excludedKeyCodes = []
+        onDAggerRecordingChanged?(false)
+        let result: Result<DAggerCaptureResult, Error>
+        do {
+            result = .success(try await recorder.finish(endHostNanos: Self.hostTimeNanos()))
+        } catch {
+            result = .failure(error)
+        }
+        onDAggerFinished?(result)
+        lock.withLock {
+            guard !stopped else { return }
+            daggerOutputPaused = false
+            injector.enable(outputPermissions: outputPermissions)
+        }
+    }
+
     func stop(reason: String? = nil) async {
-        let action = lock.withLock { () -> StopAction in
+        let transition = lock.withLock { () -> (StopAction, DAggerRecorder?) in
             launchRevision &+= 1
-            if teardownInProgress { return .waitForTeardown }
-            guard !stopped else { return starting ? .waitForStartup : .finished }
+            if teardownInProgress { return (.waitForTeardown, nil) }
+            guard !stopped else { return (starting ? .waitForStartup : .finished, nil) }
             stopped = true
             teardownInProgress = true
             let timer = actionTimer; actionTimer = nil
-            latestFrame = nil; lastUsableCaptureFrame = nil; temporalFrames.reset(); predictionLatch.reset(); targetPID = nil
-            return .perform(timer)
+            let recorder = daggerRecorder
+            daggerRecorder = nil; daggerHumanActions = nil; daggerOutputPaused = false
+            daggerStarting = false; daggerStartupBuffer.reset()
+            latestFrame = nil; latestFrameHostNanos = 0; lastUsableCaptureFrame = nil
+            temporalFrames.reset(); predictionLatch.reset(); targetPID = nil
+            return (.perform(timer), recorder)
         }
+        let action = transition.0
+        let stoppedDAggerRecorder = transition.1
         let timer: DispatchSourceTimer?
         switch action {
         case .finished:
@@ -366,13 +633,23 @@ final class AgentRuntime: @unchecked Sendable {
         // or leave relative mouse state associated during that wait.
         await drain(queue: actionQueue)
         injector.disableAndReleaseAll()
+        if stoppedDAggerRecorder != nil { onDAggerRecordingChanged?(false) }
         safetyMonitor.stop()
         safetyMonitor.onSample = nil
+        safetyMonitor.excludedKeyCodes = []
         _ = try? await capture.stop()
         await drain(queue: inferenceQueue)
+        if let stoppedDAggerRecorder {
+            do {
+                let result = try await stoppedDAggerRecorder.finish(endHostNanos: Self.hostTimeNanos())
+                onDAggerFinished?(.success(result))
+            } catch {
+                onDAggerFinished?(.failure(error))
+            }
+        }
         lock.withLock {
-            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
-            latestFrame = nil; lastUsableCaptureFrame = nil; temporalFrames.reset(); predictionLatch.reset(); processing = false
+            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; sourceVersionID = nil; daggerConfiguration = DAggerConfiguration(); allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
+            latestFrame = nil; latestFrameHostNanos = 0; lastUsableCaptureFrame = nil; temporalFrames.reset(); daggerFrames.reset(); predictionLatch.reset(); processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
         MLXMemoryLifecycle.reclaimCaches(after: "agent runtime")
@@ -387,15 +664,29 @@ final class AgentRuntime: @unchecked Sendable {
     }
 
     private func receive(_ buffer: CVPixelBuffer, timestamp: CMTime) {
-        schedule(buffer, countThrottledAsDropped: true)
+        schedule(
+            buffer,
+            timestampNanos: Self.hostTimeNanos(timestamp),
+            countThrottledAsDropped: true
+        )
     }
 
     private func receiveIdle(timestamp: CMTime) {
         let frame = lock.withLock { stopped ? nil : lastUsableCaptureFrame }
-        if let frame { schedule(frame, countThrottledAsDropped: false) }
+        if let frame {
+            schedule(
+                frame,
+                timestampNanos: Self.hostTimeNanos(timestamp),
+                countThrottledAsDropped: false
+            )
+        }
     }
 
-    private func schedule(_ buffer: CVPixelBuffer, countThrottledAsDropped: Bool) {
+    private func schedule(
+        _ buffer: CVPixelBuffer,
+        timestampNanos: UInt64,
+        countThrottledAsDropped: Bool
+    ) {
         let now = CACurrentMediaTime()
         lock.lock()
         guard !stopped, let profile else { lock.unlock(); return }
@@ -412,10 +703,13 @@ final class AgentRuntime: @unchecked Sendable {
             lock.unlock()
             // Backpressure the capture callback instead of building an unbounded
             // queue during long ordered-frame runs.
-            inferenceQueue.sync { [weak self] in self?.infer(frame.value) }
+            inferenceQueue.sync { [weak self] in
+                self?.infer(frame.value, timestampNanos: timestampNanos)
+            }
             return
         }
         latestFrame = buffer
+        latestFrameHostNanos = timestampNanos
         if processing { lock.unlock(); return }
         processing = true
         lock.unlock()
@@ -426,16 +720,18 @@ final class AgentRuntime: @unchecked Sendable {
         while true {
             lock.lock()
             guard let frame = latestFrame, !stopped else { processing = false; lock.unlock(); return }
+            let timestampNanos = latestFrameHostNanos
             latestFrame = nil
+            latestFrameHostNanos = 0
             lock.unlock()
-            infer(frame)
+            infer(frame, timestampNanos: timestampNanos)
             lock.lock()
             if latestFrame == nil { processing = false; lock.unlock(); return }
             lock.unlock()
         }
     }
 
-    private func infer(_ buffer: CVPixelBuffer) {
+    private func infer(_ buffer: CVPixelBuffer, timestampNanos: UInt64) {
         lock.lock()
         guard !stopped, let predictionFunction, let model, let profile else { lock.unlock(); return }
         let temporal = profile.training.effectiveTemporalVision
@@ -480,7 +776,11 @@ final class AgentRuntime: @unchecked Sendable {
             }
             let zeroControls = [Float](repeating: 0, count: ActionLayout.count)
             let selectedFrames: [TemporalFrame] = selectedPriorFrames.map { frame in
-                frame ?? TemporalFrame(packed: packedPastFrame, controls: zeroControls)
+                frame ?? TemporalFrame(
+                    packed: packedPastFrame,
+                    controls: zeroControls,
+                    timestampNanos: timestampNanos
+                )
             }
             var descriptors: [MetalArrayBufferPool.Descriptor] = [
                 .init([1, profile.preprocessing.sampleByteCount], dtype: .uint8)
@@ -575,13 +875,44 @@ final class AgentRuntime: @unchecked Sendable {
                 outputPermissions: outputPermissions,
                 shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
             )
+            var contextualControls = frameControls
+            if var humanActions = daggerHumanActions {
+                contextualControls = humanActions.actionValues()
+                humanActions.endTick()
+                daggerHumanActions = humanActions
+            }
+            let frameTimestamp = timestampNanos > 0 ? timestampNanos : Self.hostTimeNanos()
             if hasTemporalMemory {
-                let retainedFrameCount = temporal.pastFrameCount * temporal.frameSpacing
+                let retainedFrameCount = temporal.pastFrameCount * temporal.frameSpacing + 1
                 temporalFrames.append(
-                    TemporalFrame(packed: packedPastFrame, controls: frameControls),
+                    TemporalFrame(
+                        packed: packedPastFrame,
+                        controls: contextualControls,
+                        timestampNanos: frameTimestamp
+                    ),
                     capacity: retainedFrameCount
                 )
             }
+            let daggerFrame = DAggerFrame(
+                timestampNanos: frameTimestamp,
+                packedVision: packed,
+                preprocessing: profile.preprocessing,
+                executedControls: contextualControls
+            )
+            let daggerSizing = DAggerContextSizing.recentFrameCapacity(
+                preprocessing: profile.preprocessing,
+                temporal: temporal,
+                perceptionFPS: profile.training.perceptionFPS,
+                configuration: daggerConfiguration
+            )
+            daggerFrames.append(
+                daggerFrame,
+                capacity: max(1, min(daggerSizing.requested, daggerSizing.maximum))
+            )
+            if daggerStarting {
+                daggerStartupBuffer.append(daggerFrame)
+            }
+            let activeDAggerRecorder = daggerRecorder
             predictionLatch.publish(values)
             metrics.frameCount += 1
             let elapsed = max(0.001, CACurrentMediaTime() - startedAt)
@@ -591,6 +922,7 @@ final class AgentRuntime: @unchecked Sendable {
             let snapshot: RuntimeMetrics? = now - lastMetricsReportTime >= 0.1 ? metrics : nil
             if snapshot != nil { lastMetricsReportTime = now }
             lock.unlock()
+            activeDAggerRecorder?.append(daggerFrame)
             if let snapshot { onMetrics?(snapshot) }
         } catch {
             Task { await stop(reason: error.localizedDescription) }
@@ -651,7 +983,8 @@ final class AgentRuntime: @unchecked Sendable {
 
     private func actionTick() {
         lock.lock()
-        guard !stopped, let latched = predictionLatch.consume(), let profile else { lock.unlock(); return }
+        guard !stopped, !daggerOutputPaused,
+              let latched = predictionLatch.consume(), let profile else { lock.unlock(); return }
         let prediction = latched.values
         let safety = self.safety, rect = captureRect, targetPID = self.targetPID, mouseMode = self.mouseMode, gameCamera = self.gameCamera, allowedKeyCodes = self.allowedKeyCodes, shiftUsesKeyboardChannel = self.shiftUsesKeyboardChannel
         let now = CACurrentMediaTime()
@@ -699,6 +1032,14 @@ final class AgentRuntime: @unchecked Sendable {
               let app = NSRunningApplication(processIdentifier: pid) else { return nil }
         app.activate(options: [.activateAllWindows])
         return pid
+    }
+
+    private static func hostTimeNanos(_ time: CMTime = CMClockGetTime(CMClockGetHostTimeClock())) -> UInt64 {
+        let scaled = CMTimeConvertScale(time, timescale: 1_000_000_000, method: .default)
+        guard scaled.isNumeric, scaled.value > 0 else {
+            return DispatchTime.now().uptimeNanoseconds
+        }
+        return UInt64(scaled.value)
     }
 
     private func drain(queue: DispatchQueue) async {
@@ -778,11 +1119,15 @@ struct RuntimePredictionLatch: Sendable {
 }
 
 enum RuntimeActionSemantics {
-    /// Saved channels define what a brain learned, but the current Modifiers
-    /// off switch is a safety override for every brain generation. Intersection
-    /// semantics prevent a later editor change from enabling an untrained head.
+    /// Saved channels define what a brain learned; every current channel switch
+    /// is also a live safety disable. Intersection semantics prevent both
+    /// re-enabling an untrained head and executing a head the user turned off.
     static func effectiveChannels(saved: ActionChannels, current: ActionChannels) -> ActionChannels {
         var result = saved
+        result.mouseMovement = saved.mouseMovement && current.mouseMovement
+        result.buttons = saved.buttons && current.buttons
+        result.scroll = saved.scroll && current.scroll
+        result.keyboard = saved.keyboard && current.keyboard
         result.modifiers = saved.modifiers && current.modifiers
         return result
     }

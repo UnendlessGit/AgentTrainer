@@ -22,6 +22,11 @@ struct RecordingTrainingIdentity: Codable, Hashable, Sendable {
     let pixelWidth: Int
     let pixelHeight: Int
     let eventCount: Int
+    let supervisionStart: Double
+    let purpose: RecordingPurpose
+    let sourceProfileID: UUID?
+    let sourceVersionID: UUID?
+    let trainingWeight: Double
     let videoFile: String
     let eventFile: String
     let video: ArtifactFingerprint
@@ -45,6 +50,11 @@ struct RecordingTrainingIdentity: Codable, Hashable, Sendable {
         pixelWidth = manifest.pixelWidth
         pixelHeight = manifest.pixelHeight
         eventCount = manifest.eventCount
+        supervisionStart = manifest.effectiveSupervisionStart
+        purpose = manifest.effectivePurpose
+        sourceProfileID = manifest.sourceProfileID
+        sourceVersionID = manifest.sourceVersionID
+        trainingWeight = manifest.effectiveTrainingWeight
         videoFile = manifest.videoFile
         eventFile = manifest.eventFile
         video = try fingerprint(recording.directory.appendingPathComponent(manifest.videoFile))
@@ -151,6 +161,17 @@ struct CacheSegment: Codable, Hashable, Sendable {
     var recordingID: UUID
     var start: Int
     var count: Int
+    /// First perception owned by this recording. It can precede the first
+    /// supervised row when a DAgger package includes pre-mistake context.
+    var observationStart: Int? = nil
+    var purpose: RecordingPurpose? = nil
+    var trainingWeight: Double? = nil
+
+    var effectivePurpose: RecordingPurpose { purpose ?? .demonstration }
+    var effectiveTrainingWeight: Float {
+        let value = trainingWeight ?? 1
+        return Float(value.isFinite ? min(20, max(1, value)) : 1)
+    }
 }
 
 struct DatasetCacheManifest: Codable, Hashable, Sendable {
@@ -181,6 +202,19 @@ struct CachedTrainingBatch: Sendable {
     let packedPastObservations: Data
     let pastControlRows: Data
     let actionRows: Data
+}
+
+struct CachedFutureActionBatch: Sendable {
+    /// Row-major [sample, horizon, target/previous, action].
+    let actionRows: Data
+    /// One Float32 validity value per [sample, horizon].
+    let masks: Data
+}
+
+struct CachedFutureStateBatchPlan: Sendable {
+    let uniqueObservationIndices: [UInt32]
+    let sampleToFuture: [Int32]
+    let masks: [Float]
 }
 
 struct CachedObservationSequence: Hashable, Sendable {
@@ -279,7 +313,11 @@ final class CachedDataset: @unchecked Sendable {
         var segmentEnd = 0
         for segment in decoded.segments {
             let end = segmentEnd.addingReportingOverflow(segment.count)
-            guard segment.start == segmentEnd, segment.count >= 0, !end.overflow else {
+            let observationStart = segment.observationStart ?? 0
+            let weight = segment.trainingWeight ?? 1
+            guard segment.start == segmentEnd, segment.count >= 0, !end.overflow,
+                  observationStart >= 0, observationStart < max(1, decoded.observationCount),
+                  weight.isFinite, (1...20).contains(weight) else {
                 throw AgentTrainerError.storage("The dataset cache segment index is invalid.")
             }
             segmentEnd = end.partialValue
@@ -311,12 +349,14 @@ final class CachedDataset: @unchecked Sendable {
             }
             for segment in decoded.segments {
                 guard segment.count > 0 else { continue }
-                let observationBase = value(sample: segment.start, slot: 0)
-                guard observationBase != UInt32.max, Int(observationBase) < decoded.observationCount else { return false }
+                guard let observationBase = UInt32(exactly: segment.observationStart ?? Int(value(sample: segment.start, slot: 0))),
+                      observationBase != UInt32.max,
+                      Int(observationBase) < decoded.observationCount else { return false }
                 var previousCurrent = observationBase
                 for sample in segment.start..<(segment.start + segment.count) {
                     let current = value(sample: sample, slot: 0)
-                    if current == UInt32.max || Int(current) >= decoded.observationCount || current < previousCurrent {
+                    if current == UInt32.max || Int(current) >= decoded.observationCount
+                        || current < previousCurrent || current < observationBase {
                         return false
                     }
                     previousCurrent = current
@@ -1060,6 +1100,119 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
+    func trainingWeightBatch(at indices: [Int]) -> Data {
+        let values = indices.map { index in
+            let segment = segmentIndex(for: index)
+            return manifest.segments.indices.contains(segment)
+                ? manifest.segments[segment].effectiveTrainingWeight : 1
+        }
+        return values.withUnsafeBytes { Data($0) }
+    }
+
+    /// Gathers future action labels without crossing a recording boundary. Each
+    /// target retains its own immediately preceding row for transition weighting.
+    func futureActionBatch(at indices: [Int], offsets: [Int]) -> CachedFutureActionBatch {
+        let horizons = offsets.count
+        let rowBytes = manifest.actionValuesPerSample * MemoryLayout<Float>.size
+        var rows = Data(count: indices.count * horizons * 2 * rowBytes)
+        var masks = [Float](repeating: 0, count: indices.count * horizons)
+        rows.withUnsafeMutableBytes { destination in
+            actions.withUnsafeBytes { source in
+                guard let destinationBase = destination.baseAddress,
+                      let sourceBase = source.baseAddress else { return }
+                for (batchRow, sample) in indices.enumerated() {
+                    let segment = manifest.segments[segmentIndex(for: sample)]
+                    let segmentEnd = segment.start + segment.count
+                    for (horizon, rawOffset) in offsets.enumerated() {
+                        let target = sample + max(1, rawOffset)
+                        guard target < segmentEnd else { continue }
+                        let destinationRow = (batchRow * horizons + horizon) * 2
+                        memcpy(
+                            destinationBase.advanced(by: destinationRow * rowBytes),
+                            sourceBase.advanced(by: target * rowBytes),
+                            rowBytes
+                        )
+                        if target > segment.start {
+                            memcpy(
+                                destinationBase.advanced(by: (destinationRow + 1) * rowBytes),
+                                sourceBase.advanced(by: (target - 1) * rowBytes),
+                                rowBytes
+                            )
+                        }
+                        masks[batchRow * horizons + horizon] = 1
+                    }
+                }
+            }
+        }
+        return CachedFutureActionBatch(
+            actionRows: rows,
+            masks: masks.withUnsafeBytes { Data($0) }
+        )
+    }
+
+    /// Selects future observations for latent-dynamics supervision. Repeated
+    /// action ticks share one packed frame, so the plan deduplicates targets
+    /// before the visual encoder and maps them back to action rows on the GPU.
+    func futureStateBatchPlan(
+        at indices: [Int],
+        offset rawOffset: Int,
+        sampleStride rawStride: Int
+    ) -> CachedFutureStateBatchPlan {
+        let offset = max(1, rawOffset)
+        let stride = max(1, rawStride)
+        var unique: [UInt32] = []
+        var lookup: [UInt32: Int32] = [:]
+        var map = [Int32](repeating: 0, count: indices.count)
+        var masks = [Float](repeating: 0, count: indices.count)
+        for (row, sample) in indices.enumerated() {
+            let segment = manifest.segments[segmentIndex(for: sample)]
+            guard (sample - segment.start).isMultiple(of: stride) else { continue }
+            let target = sample + offset
+            guard target < segment.start + segment.count else { continue }
+            let observation = UInt32(observationIndex(at: target, slot: 0))
+            let mapped: Int32
+            if let existing = lookup[observation] {
+                mapped = existing
+            } else {
+                mapped = Int32(unique.count)
+                unique.append(observation)
+                lookup[observation] = mapped
+            }
+            map[row] = mapped
+            masks[row] = 1
+        }
+        // Metal arrays cannot have a zero-sized storage allocation. The mask
+        // keeps this placeholder inert when a short final batch has no target.
+        if unique.isEmpty {
+            let fallback = indices.first.map { UInt32(observationIndex(at: $0, slot: 0)) } ?? 0
+            unique = [fallback]
+        }
+        return CachedFutureStateBatchPlan(
+            uniqueObservationIndices: unique,
+            sampleToFuture: map,
+            masks: masks
+        )
+    }
+
+    func populateFutureStateObservations(
+        plan: CachedFutureStateBatchPlan,
+        destination: UnsafeMutableRawBufferPointer
+    ) {
+        let bytes = manifest.currentObservationBytesPerSample
+        precondition(destination.count == plan.uniqueObservationIndices.count * bytes)
+        currentObservations.withUnsafeBytes { source in
+            guard let destinationBase = destination.baseAddress,
+                  let sourceBase = source.baseAddress else { return }
+            for (row, observation) in plan.uniqueObservationIndices.enumerated() {
+                memcpy(
+                    destinationBase.advanced(by: row * bytes),
+                    sourceBase.advanced(by: Int(observation) * bytes),
+                    bytes
+                )
+            }
+        }
+    }
+
     func segmentCount(at indices: [Int]) -> Int {
         var segments: Set<Int> = []
         for index in indices { segments.insert(segmentIndex(for: index)) }
@@ -1160,7 +1313,14 @@ actor DatasetCacheBuilder {
                 observationCount += appended.observations
                 sampleCount += appended.samples
                 if appended.samples > 0 {
-                    segments.append(CacheSegment(recordingID: recording.id, start: start, count: appended.samples))
+                    segments.append(CacheSegment(
+                        recordingID: recording.id,
+                        start: start,
+                        count: appended.samples,
+                        observationStart: observationCount - appended.observations,
+                        purpose: recording.manifest.effectivePurpose,
+                        trainingWeight: recording.manifest.effectiveTrainingWeight
+                    ))
                 }
             }
             try currentObservations.finish(); try pastObservations.finish()
@@ -1235,7 +1395,11 @@ actor DatasetCacheBuilder {
         let reader = try AVAssetReader(asset: asset)
         let trainingStart = max(0, min(recording.manifest.duration, recording.manifest.trimStart))
         let trainingEnd = max(trainingStart, min(recording.manifest.duration, recording.manifest.trimEnd ?? recording.manifest.duration))
-        guard trainingEnd > trainingStart else { return (0, 0) }
+        let supervisionStart = max(
+            trainingStart,
+            min(trainingEnd, recording.manifest.effectiveSupervisionStart)
+        )
+        guard trainingEnd > trainingStart, trainingEnd > supervisionStart else { return (0, 0) }
         reader.timeRange = CMTimeRange(start: CMTime(seconds: trainingStart, preferredTimescale: 1_000_000_000), duration: CMTime(seconds: trainingEnd - trainingStart, preferredTimescale: 1_000_000_000))
         // H.264/HEVC are natively decoded by VideoToolbox into bi-planar YUV.
         // Requesting BGRA forced a full-resolution conversion (about 30 MB for
@@ -1356,11 +1520,11 @@ actor DatasetCacheBuilder {
         guard !observationTimes.isEmpty else { progress(1); return (0, 0) }
 
         let initialPointer = events.first { $0.kind == .mouseMove || $0.kind == .mouseButton || $0.kind == .scroll }
-        let trainingStartNanos = try absoluteHostNanos(recording.manifest, seconds: trainingStart)
-        func makePrimedAccumulator() -> (ActionAccumulator, Int) {
+        func makePrimedAccumulator(at seconds: Double) throws -> (ActionAccumulator, Int) {
+            let startNanos = try absoluteHostNanos(recording.manifest, seconds: seconds)
             var accumulator = ActionAccumulator(manifest: recording.manifest, initialPointer: initialPointer)
             var eventIndex = 0
-            while eventIndex < events.count, events[eventIndex].timestampNanos <= trainingStartNanos {
+            while eventIndex < events.count, events[eventIndex].timestampNanos <= startNanos {
                 accumulator.consume(events[eventIndex])
                 eventIndex += 1
             }
@@ -1370,7 +1534,7 @@ actor DatasetCacheBuilder {
             return (accumulator, eventIndex)
         }
 
-        let primed = makePrimedAccumulator()
+        let primed = try makePrimedAccumulator(at: trainingStart)
         if hasTemporalMemory {
             // Build one comprehensive control row for every perception
             // interval only when a temporal branch can consume it.
@@ -1393,9 +1557,10 @@ actor DatasetCacheBuilder {
         // Action targets retain their independently configured rate. Every row
         // maps its current perception plus the exact requested causal frame
         // spacing; unavailable leading slots use the reserved sentinel.
-        var targetAccumulator = primed.0
-        var targetEventIndex = primed.1
-        var nextAction = trainingStart
+        let targetPrimed = try makePrimedAccumulator(at: supervisionStart)
+        var targetAccumulator = targetPrimed.0
+        var targetEventIndex = targetPrimed.1
+        var nextAction = supervisionStart
         var currentLocalObservation = 0
         var sampleCount = 0
         while nextAction <= trainingEnd + 0.000_001 {
@@ -1495,6 +1660,11 @@ struct ActionAccumulator {
     }
 
     func withActionBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) rethrows -> R {
+        let values = actionValues()
+        return try values.withUnsafeBytes(body)
+    }
+
+    func actionValues() -> [Float] {
         var values = [Float](repeating: 0, count: ActionLayout.count)
         let rect = manifest.globalRect.cgRect
         values[0] = Float((x - rect.minX) / max(1, rect.width)).clamped01
@@ -1508,10 +1678,7 @@ struct ActionAccumulator {
         let masks: [UInt64] = [CGEventFlags.maskShift.rawValue, CGEventFlags.maskControl.rawValue, CGEventFlags.maskAlternate.rawValue, CGEventFlags.maskCommand.rawValue]
         let effectiveFlags = flags | pressedModifierMasksThisTick
         for i in 0..<4 { values[142 + i] = effectiveFlags & masks[i] != 0 ? 1 : 0 }
-        // AgentTrainer is arm64-only, whose native Float representation is the
-        // little-endian cache contract. Copy all 146 values in one operation
-        // instead of growing Data through 146 tiny appends per action sample.
-        return try values.withUnsafeBytes(body)
+        return values
     }
 
     func actionData() -> Data {

@@ -3,6 +3,14 @@ import MLX
 import MLXNN
 import MLXRandom
 
+struct VisualAugmentationParameters {
+    let brightness: MLXArray
+    let contrast: MLXArray
+    let saturation: MLXArray
+    let hueRadians: MLXArray
+    let gamma: MLXArray
+}
+
 final class AgentPolicy: Module, @unchecked Sendable {
     let profile: AIProfile
     let dtype: DType
@@ -32,6 +40,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
     @ModuleInfo var scrollHead: Linear
     @ModuleInfo var keyboardHead: Linear
     @ModuleInfo var modifierHead: Linear
+    @ModuleInfo var futureActionHead: Linear
+    @ModuleInfo var futureStateHead: Linear
     @ModuleInfo var dropout: Dropout
 
     init(profile: AIProfile) {
@@ -110,6 +120,14 @@ final class AgentPolicy: Module, @unchecked Sendable {
         scrollHead = Linear(fusionInput, 2)
         keyboardHead = Linear(fusionInput, 128)
         modifierHead = Linear(fusionInput, 4)
+        futureActionHead = Linear(
+            fusionInput,
+            ActionLayout.count * FutureActionPredictionConfiguration.maximumHorizonCount
+        )
+        futureStateHead = Linear(
+            fusionInput + ActionLayout.count,
+            architecture.visualEmbedding
+        )
         dropout = Dropout(p: Float(min(0.999, max(0, architecture.dropout))))
         super.init()
         if dtype != .float32 { update(parameters: mapParameters { $0.asType(self.dtype) }) }
@@ -134,6 +152,73 @@ final class AgentPolicy: Module, @unchecked Sendable {
     private static func poolCoordinates(size: (width: Int, height: Int), dtype: DType) -> MLXArray {
         coordinateGrid(width: size.width, height: size.height, dtype: dtype)
             .reshaped([1, size.width * size.height, 2])
+    }
+
+    /// Samples one conservative photometric transform for a complete optimizer
+    /// batch. Sharing these scalars across current, past, and future frames keeps
+    /// motion and causal changes real while still presenting new visual domains
+    /// on successive updates.
+    func sampleVisualAugmentation() -> VisualAugmentationParameters {
+        let configuration = profile.training.effectiveVisualAugmentation
+        guard training, configuration.enabled, configuration.probability > 0 else {
+            let zero = MLXArray(0, dtype: .float32)
+            let one = MLXArray(1, dtype: .float32)
+            return VisualAugmentationParameters(
+                brightness: zero, contrast: one, saturation: one,
+                hueRadians: zero, gamma: one
+            )
+        }
+        let applied = MLXRandom.bernoulli(Float(configuration.probability), [1]).asType(.float32)
+        func variation(_ amount: Double, centeredAt center: Float = 0) -> MLXArray {
+            guard amount > 0 else { return MLXArray(center, dtype: .float32) }
+            return MLXArray(center, dtype: .float32)
+                + applied * MLXRandom.uniform(
+                    low: Float(-amount), high: Float(amount), [1], dtype: .float32
+                )
+        }
+        return VisualAugmentationParameters(
+            brightness: variation(configuration.brightness),
+            contrast: variation(configuration.contrast, centeredAt: 1),
+            saturation: variation(configuration.saturation, centeredAt: 1),
+            hueRadians: variation(configuration.hueDegrees * .pi / 180),
+            gamma: variation(configuration.gamma, centeredAt: 1)
+        )
+    }
+
+    func augmentedVision(
+        _ images: MLXArray,
+        parameters: VisualAugmentationParameters
+    ) -> MLXArray {
+        precondition(images.ndim == 4, "Visual augmentation expects NHWC images.")
+        var y = images[.ellipsis, 0..<1].asType(.float32)
+        y = clip((y - 0.5) * parameters.contrast + 0.5 + parameters.brightness, min: 0, max: 1)
+        y = pow(clip(y, min: 0.0001, max: 1), parameters.gamma)
+        guard images.dim(3) >= 3 else { return y }
+        let cb = images[.ellipsis, 1..<2].asType(.float32) - 0.5
+        let cr = images[.ellipsis, 2..<3].asType(.float32) - 0.5
+        let cosine = cos(parameters.hueRadians)
+        let sine = sin(parameters.hueRadians)
+        let rotatedCB = (cb * cosine - cr * sine) * parameters.saturation
+        let rotatedCR = (cb * sine + cr * cosine) * parameters.saturation
+        return concatenated([
+            y,
+            clip(rotatedCB + 0.5, min: 0, max: 1),
+            clip(rotatedCR + 0.5, min: 0, max: 1)
+        ], axis: -1).asType(images.dtype)
+    }
+
+    func augmentedPastVision(
+        _ images: MLXArray,
+        parameters: VisualAugmentationParameters
+    ) -> MLXArray {
+        guard images.ndim == 5 else {
+            return augmentedVision(images, parameters: parameters)
+        }
+        let shape = images.shape
+        return augmentedVision(
+            images.reshaped([shape[0] * shape[1], shape[2], shape[3], shape[4]]),
+            parameters: parameters
+        ).reshaped(shape)
     }
 
     /// Returns every normalized post-SiLU spatial stage without changing the
@@ -536,7 +621,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return concatenated([currentVisualEmbedding, recurrent], axis: -1)
     }
 
-    func logits(temporalFeatures: MLXArray) -> MLXArray {
+    func fusedFeatures(temporalFeatures: MLXArray) -> MLXArray {
         var fused = temporalFeatures
         for (index, layer) in fusion.enumerated() {
             fused = layer(fused)
@@ -545,10 +630,36 @@ final class AgentPolicy: Module, @unchecked Sendable {
             }
             fused = dropout(silu(fused))
         }
+        return fused
+    }
+
+    func logits(fusedFeatures fused: MLXArray) -> MLXArray {
         return concatenated([
             absoluteMouseHead(fused), relativeMouseHead(fused), buttonHead(fused),
             scrollHead(fused), keyboardHead(fused), modifierHead(fused)
         ], axis: -1)
+    }
+
+    func logits(temporalFeatures: MLXArray) -> MLXArray {
+        logits(fusedFeatures: fusedFeatures(temporalFeatures: temporalFeatures))
+    }
+
+    func futureActionLogits(fusedFeatures: MLXArray) -> MLXArray {
+        futureActionHead(fusedFeatures).reshaped([
+            fusedFeatures.dim(0),
+            FutureActionPredictionConfiguration.maximumHorizonCount,
+            ActionLayout.count
+        ])
+    }
+
+    func futureStateDelta(
+        fusedFeatures: MLXArray,
+        currentActions: MLXArray
+    ) -> MLXArray {
+        futureStateHead(concatenated([
+            fusedFeatures,
+            currentActions.asType(dtype)
+        ], axis: -1))
     }
 
     func logits(
@@ -631,7 +742,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
         pastControls: MLXArray,
         targets: MLXArray,
         positiveWeights: MLXArray? = nil,
-        previousTargets: MLXArray? = nil
+        previousTargets: MLXArray? = nil,
+        sampleWeights: MLXArray? = nil
     ) -> MLXArray {
         let logits = callAsFunction(
             currentImages: currentImages,
@@ -642,7 +754,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
             logits: logits,
             targets: targets,
             positiveWeights: positiveWeights,
-            previousTargets: previousTargets
+            previousTargets: previousTargets,
+            sampleWeights: sampleWeights
         )
     }
 
@@ -653,7 +766,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
         logits: MLXArray,
         targets: MLXArray,
         positiveWeights: MLXArray? = nil,
-        previousTargets: MLXArray? = nil
+        previousTargets: MLXArray? = nil,
+        sampleWeights: MLXArray? = nil
     ) -> MLXArray {
         let targets = targets.asType(dtype)
         // Transition weighting uses the immediately preceding action target,
@@ -664,34 +778,45 @@ final class AgentPolicy: Module, @unchecked Sendable {
         var losses: [MLXArray] = []
         let channels = profile.channels
         if channels.mouseMovement {
-            let absolute = smoothL1Loss(predictions: sigmoid(logits[.ellipsis, ActionLayout.absoluteMouse]), targets: targets[.ellipsis, ActionLayout.absoluteMouse], beta: 0.05)
-            let relative = activeContinuousLoss(predictions: tanh(logits[.ellipsis, ActionLayout.relativeMouse]), targets: targets[.ellipsis, ActionLayout.relativeMouse])
+            let absolute = continuousLoss(
+                predictions: sigmoid(logits[.ellipsis, ActionLayout.absoluteMouse]),
+                targets: targets[.ellipsis, ActionLayout.absoluteMouse],
+                sampleWeights: sampleWeights,
+                activeWeight: 1
+            )
+            let relative = activeContinuousLoss(
+                predictions: tanh(logits[.ellipsis, ActionLayout.relativeMouse]),
+                targets: targets[.ellipsis, ActionLayout.relativeMouse],
+                sampleWeights: sampleWeights
+            )
             losses.append((absolute + relative) / 2)
         }
-        if channels.buttons { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.buttons)) }
-        if channels.scroll { losses.append(activeContinuousLoss(predictions: tanh(logits[.ellipsis, ActionLayout.scroll]), targets: targets[.ellipsis, ActionLayout.scroll])) }
-        if channels.keyboard { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, indices: ActionLayout.keyboardAndShiftIndices)) }
-        if channels.modifiers { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, range: ActionLayout.commandOptionControl)) }
+        if channels.buttons { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, sampleWeights: sampleWeights, range: ActionLayout.buttons)) }
+        if channels.scroll { losses.append(activeContinuousLoss(predictions: tanh(logits[.ellipsis, ActionLayout.scroll]), targets: targets[.ellipsis, ActionLayout.scroll], sampleWeights: sampleWeights)) }
+        if channels.keyboard { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, sampleWeights: sampleWeights, indices: ActionLayout.keyboardAndShiftIndices)) }
+        if channels.modifiers { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, sampleWeights: sampleWeights, range: ActionLayout.commandOptionControl)) }
         guard let first = losses.first else { return MLXArray(0, dtype: dtype) }
         return losses.dropFirst().reduce(first, +) / Float(losses.count)
     }
 
-    private func binaryControlLoss(logits: MLXArray, targets: MLXArray, previous: MLXArray, positiveWeights: MLXArray?, range: Range<Int>) -> MLXArray {
+    private func binaryControlLoss(logits: MLXArray, targets: MLXArray, previous: MLXArray, positiveWeights: MLXArray?, sampleWeights: MLXArray?, range: Range<Int>) -> MLXArray {
         binaryControlLoss(
             logits: logits[.ellipsis, range],
             targets: targets[.ellipsis, range],
             previous: previous[.ellipsis, range],
-            positiveWeights: positiveWeights.map { $0[range] }
+            positiveWeights: positiveWeights.map { $0[range] },
+            sampleWeights: sampleWeights
         )
     }
 
-    private func binaryControlLoss(logits: MLXArray, targets: MLXArray, previous: MLXArray, positiveWeights: MLXArray?, indices: [Int]) -> MLXArray {
+    private func binaryControlLoss(logits: MLXArray, targets: MLXArray, previous: MLXArray, positiveWeights: MLXArray?, sampleWeights: MLXArray?, indices: [Int]) -> MLXArray {
         let selection = MLXArray(indices)
         return binaryControlLoss(
             logits: logits[.ellipsis, selection],
             targets: targets[.ellipsis, selection],
             previous: previous[.ellipsis, selection],
-            positiveWeights: positiveWeights.map { $0[selection] }
+            positiveWeights: positiveWeights.map { $0[selection] },
+            sampleWeights: sampleWeights
         )
     }
 
@@ -699,7 +824,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
         logits: MLXArray,
         targets: MLXArray,
         previous: MLXArray,
-        positiveWeights: MLXArray?
+        positiveWeights: MLXArray?,
+        sampleWeights: MLXArray?
     ) -> MLXArray {
         let raw = binaryCrossEntropy(logits: logits, targets: targets, reduction: .none)
         let classWeights: MLXArray
@@ -713,8 +839,18 @@ final class AgentPolicy: Module, @unchecked Sendable {
         // middle of a long hold. Upweighting transitions prevents a policy from
         // learning only action persistence.
         let transitionWeights = 1 + 3 * abs(targets - previous)
-        let weights = classWeights * transitionWeights * binaryFocalWeights(logits: logits, targets: targets)
-        return (raw * weights).sum() / (weights.sum() + 1e-6)
+        let baseWeights = classWeights * transitionWeights * binaryFocalWeights(logits: logits, targets: targets)
+        var weights = baseWeights
+        var normalizationWeights = baseWeights
+        if let sampleWeights {
+            let rowWeights = sampleWeights.asType(dtype).reshaped([-1, 1])
+            weights = weights * rowWeights
+            // A zero row is padding and leaves no denominator. Values above one
+            // are deliberate DAgger emphasis and must not divide themselves
+            // away when a locality batch contains only correction samples.
+            normalizationWeights = normalizationWeights * (rowWeights .> 0).asType(dtype)
+        }
+        return (raw * weights).sum() / (normalizationWeights.sum() + 1e-6)
     }
 
     private func binaryFocalWeights(logits: MLXArray, targets: MLXArray) -> MLXArray {
@@ -726,10 +862,116 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return pow(abs(targets - sigmoid(logits)), Float(gamma))
     }
 
-    private func activeContinuousLoss(predictions: MLXArray, targets: MLXArray) -> MLXArray {
+    private func activeContinuousLoss(
+        predictions: MLXArray,
+        targets: MLXArray,
+        sampleWeights: MLXArray? = nil
+    ) -> MLXArray {
+        continuousLoss(
+            predictions: predictions,
+            targets: targets,
+            sampleWeights: sampleWeights,
+            activeWeight: 8
+        )
+    }
+
+    private func continuousLoss(
+        predictions: MLXArray,
+        targets: MLXArray,
+        sampleWeights: MLXArray?,
+        activeWeight: Float
+    ) -> MLXArray {
         let raw = smoothL1Loss(predictions: predictions, targets: targets, beta: 0.05, reduction: .none)
-        let weights = which(abs(targets) .> 0.0001, MLXArray(8, dtype: dtype), MLXArray(1, dtype: dtype))
-        return (raw * weights).sum() / (weights.sum() + 1e-6)
+        let baseWeights = activeWeight > 1
+            ? which(abs(targets) .> 0.0001, MLXArray(activeWeight, dtype: dtype), MLXArray(1, dtype: dtype))
+            : MLXArray.ones(like: targets)
+        var weights = baseWeights
+        var normalizationWeights = baseWeights
+        if let sampleWeights {
+            let rowWeights = sampleWeights.asType(dtype).reshaped([-1, 1])
+            weights = weights * rowWeights
+            normalizationWeights = normalizationWeights * (rowWeights .> 0).asType(dtype)
+        }
+        return (raw * weights).sum() / (normalizationWeights.sum() + 1e-6)
+    }
+
+    func futureActionLoss(
+        fusedFeatures: MLXArray,
+        futureTargets: MLXArray,
+        futurePreviousTargets: MLXArray,
+        masks: MLXArray,
+        trainingSampleWeights: MLXArray,
+        positiveWeights: MLXArray
+    ) -> MLXArray {
+        let configuration = profile.training.effectiveFutureActionPrediction
+        guard configuration.enabled, configuration.lossWeight > 0,
+              !configuration.horizonsSeconds.isEmpty else {
+            return MLXArray(0, dtype: dtype)
+        }
+        let horizonCount = configuration.horizonsSeconds.count
+        precondition(
+            futureTargets.ndim == 3 && futureTargets.dim(1) == horizonCount
+                && futureTargets.dim(2) == ActionLayout.count,
+            "Future action targets must match the configured horizons."
+        )
+        let allLogits = futureActionLogits(fusedFeatures: fusedFeatures)
+        var weightedLosses: [MLXArray] = []
+        var totalWeight: Float = 0
+        for horizon in 0..<horizonCount {
+            // Near intent matters most for smooth behavior while farther rows
+            // still teach planning. The immediate policy is never blended with
+            // these predictions at runtime, preserving reactivity.
+            let horizonWeight = 1 / Float(horizon + 1)
+            let rowWeights = masks[0..., horizon] * trainingSampleWeights
+            weightedLosses.append(horizonWeight * loss(
+                logits: allLogits[0..., horizon, 0...],
+                targets: futureTargets[0..., horizon, 0...],
+                positiveWeights: positiveWeights,
+                previousTargets: futurePreviousTargets[0..., horizon, 0...],
+                sampleWeights: rowWeights
+            ))
+            totalWeight += horizonWeight
+        }
+        guard let first = weightedLosses.first else { return MLXArray(0, dtype: dtype) }
+        return weightedLosses.dropFirst().reduce(first, +) / max(0.0001, totalWeight)
+    }
+
+    func futureStateLoss(
+        fusedFeatures: MLXArray,
+        temporalFeatures: MLXArray,
+        currentActions: MLXArray,
+        futureImages: MLXArray,
+        sampleToFuture: MLXArray,
+        masks: MLXArray,
+        trainingSampleWeights: MLXArray
+    ) -> MLXArray {
+        let configuration = profile.training.effectiveFutureStatePrediction
+        guard configuration.enabled, configuration.lossWeight > 0 else {
+            return MLXArray(0, dtype: dtype)
+        }
+        let uniqueFutureEmbedding = visualEmbedding(
+            visualFeatures: visualActivations(images: futureImages).last!
+        )
+        let futureEmbedding = uniqueFutureEmbedding.take(sampleToFuture, axis: 0)
+        let width = profile.training.architecture.visualEmbedding
+        let currentEmbedding = temporalFeatures[.ellipsis, 0..<width]
+        let targetDelta = stopGradient(futureEmbedding - currentEmbedding)
+        let predictedDelta = futureStateDelta(
+            fusedFeatures: fusedFeatures,
+            currentActions: currentActions
+        )
+        let raw = smoothL1Loss(
+            predictions: predictedDelta,
+            targets: targetDelta,
+            beta: 0.1,
+            reduction: .none
+        ).mean(axis: -1)
+        // Give visibly changing states more influence without allowing a large
+        // latent outlier to dominate the immediate behavior objective.
+        let change = clip(abs(targetDelta).mean(axis: -1), min: 0, max: 1)
+        let baseWeights = masks.asType(dtype) * (1 + 3 * change)
+        let weights = baseWeights * trainingSampleWeights.asType(dtype)
+        return (raw * weights).sum() / (baseWeights.sum() + 1e-6)
     }
 
     func saveWeights(to url: URL) throws {
