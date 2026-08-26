@@ -1,3 +1,4 @@
+import Accelerate
 @preconcurrency import AVFoundation
 @preconcurrency import CoreVideo
 import Foundation
@@ -22,7 +23,29 @@ struct DAggerCaptureRequest: Sendable {
     var captureRect: CGRect
     var perceptionFPS: Double
     var actionFPS: Double
+    var leadUpSeconds: Double
     var correctionWeight: Double
+}
+
+/// Immutable Record-page snapshot retained for an entire Run. Freezing it at
+/// Run start makes the rolling lead-up and post-trigger frames identical even
+/// if a view is navigated or a preset is selected elsewhere in the app.
+struct DAggerRuntimeCaptureConfiguration: Sendable {
+    var preprocessing: PreprocessingSpec
+    var capture: CaptureSpec
+    var leadUpSeconds: Double
+
+    func validated() throws -> Self {
+        _ = try preprocessing.validated()
+        _ = try capture.effectiveRecordingVisuals.validated()
+        guard capture.requestedFPS.isFinite, (1...240).contains(capture.requestedFPS),
+              leadUpSeconds.isFinite, (0.25...15).contains(leadUpSeconds) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "DAgger recording requires Record FPS from 1 through 240 and lead-up from 0.25 through 15 seconds."
+            )
+        }
+        return self
+    }
 }
 
 struct DAggerCaptureResult: Sendable {
@@ -57,6 +80,7 @@ final class DAggerRecorder: @unchecked Sendable {
     let correctionStartHostNanos: UInt64
 
     private let writer: HEVCWriter
+    private let videoSurface: DAggerVideoSurface
     private let eventWriter: InputEventWriter
     private let videoQueue = DispatchQueue(label: "AgentTrainer.DAgger.Video", qos: .userInitiated)
     private let lock = NSLock()
@@ -73,7 +97,8 @@ final class DAggerRecorder: @unchecked Sendable {
     init(
         request: DAggerCaptureRequest,
         correctionStartHostNanos: UInt64,
-        preRoll: [DAggerFrame]
+        preRoll: [DAggerFrame],
+        initialDroppedFrameCount: Int = 0
     ) throws {
         guard let first = preRoll.first,
               preRoll.allSatisfy({
@@ -93,12 +118,20 @@ final class DAggerRecorder: @unchecked Sendable {
             throw AgentTrainerError.invalidConfiguration("DAgger's buffered visual context exceeds the 512 MB runtime limit.")
         }
         self.request = request
+        droppedQueuedFrames = max(0, initialDroppedFrameCount)
         self.correctionStartHostNanos = max(correctionStartHostNanos, first.timestampNanos)
-        encodedWidth = max(2, request.preprocessing.width - request.preprocessing.width % 2)
-        encodedHeight = max(2, request.preprocessing.height - request.preprocessing.height % 2)
+        guard request.preprocessing.width.isMultiple(of: 2),
+              request.preprocessing.height.isMultiple(of: 2) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "DAgger recording dimensions must both be even."
+            )
+        }
+        encodedWidth = request.preprocessing.width
+        encodedHeight = request.preprocessing.height
         firstFrameHostNanos = first.timestampNanos
         lastFrameHostNanos = preRoll.last?.timestampNanos ?? first.timestampNanos
         lastEventHostNanos = first.timestampNanos
+        videoSurface = try DAggerVideoSurface(width: encodedWidth, height: encodedHeight)
         let provisional = RecordingManifest(
             id: UUID(), name: "DAgger", createdAt: Date(),
             hostStartNanos: first.timestampNanos, duration: 1,
@@ -114,7 +147,11 @@ final class DAggerRecorder: @unchecked Sendable {
             url: request.directory.appendingPathComponent("capture.mov"),
             width: encodedWidth,
             height: encodedHeight,
-            fps: request.perceptionFPS
+            fps: request.perceptionFPS,
+            // VisionPreprocessor already applied the selected Color Bit before
+            // these pooled video surfaces are reconstructed.
+            colorBits: 8,
+            compression: request.capture.effectiveRecordingVisuals.compression
         )
 
         var synthesizer = DAggerActionEventSynthesizer(rect: request.captureRect)
@@ -127,6 +164,13 @@ final class DAggerRecorder: @unchecked Sendable {
 
     func append(_ frame: DAggerFrame) {
         enqueue(frame, requiresAccepting: true)
+    }
+
+    func recordDroppedVisualFrame() {
+        lock.withLock {
+            guard accepting else { return }
+            droppedQueuedFrames += 1
+        }
     }
 
     func append(_ sample: InputSample) {
@@ -194,9 +238,9 @@ final class DAggerRecorder: @unchecked Sendable {
             // Queue the frame while holding the same lock finish uses to close
             // admission. Its drain marker therefore cannot overtake an append
             // that already observed accepting=true.
-            videoQueue.async { [weak self, writer] in
+            videoQueue.async { [weak self, writer, videoSurface] in
                 autoreleasepool {
-                    guard let pixelBuffer = DAggerVideoSurface.make(
+                    guard let pixelBuffer = videoSurface.make(
                         packed: frame.packedVision,
                         spec: frame.preprocessing,
                         width: width,
@@ -333,25 +377,54 @@ private struct DAggerActionEventSynthesizer {
     }
 }
 
-private enum DAggerVideoSurface {
-    static func make(
+private final class DAggerVideoSurface: @unchecked Sendable {
+    private let pool: CVPixelBufferPool
+    private let width: Int
+    private let height: Int
+    private let lumaTable: [UInt8] = (0...255).map {
+        UInt8(clamping: 16 + ($0 * 219 + 127) / 255)
+    }
+    private let chromaTable: [UInt8] = (0...255).map {
+        UInt8(clamping: 16 + ($0 * 224 + 127) / 255)
+    }
+
+    init(width: Int, height: Int) throws {
+        self.width = width
+        self.height = height
+        let poolAttributes: [CFString: Any] = [
+            kCVPixelBufferPoolMinimumBufferCountKey: 4
+        ]
+        let pixelAttributes: [CFString: Any] = [
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey: [:],
+            kCVPixelBufferMetalCompatibilityKey: true
+        ]
+        var optionalPool: CVPixelBufferPool?
+        guard CVPixelBufferPoolCreate(
+            kCFAllocatorDefault,
+            poolAttributes as CFDictionary,
+            pixelAttributes as CFDictionary,
+            &optionalPool
+        ) == kCVReturnSuccess, let optionalPool else {
+            throw AgentTrainerError.capture("The DAgger video-surface pool could not be created.")
+        }
+        pool = optionalPool
+    }
+
+    func make(
         packed: Data,
         spec: PreprocessingSpec,
         width: Int,
         height: Int
     ) -> CVPixelBuffer? {
-        guard packed.count >= spec.sampleByteCount else { return nil }
-        let attributes: [CFString: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey: [:],
-            kCVPixelBufferMetalCompatibilityKey: true
-        ]
+        guard width == self.width, height == self.height,
+              packed.count >= spec.sampleByteCount else { return nil }
         var optionalBuffer: CVPixelBuffer?
-        guard CVPixelBufferCreate(
+        guard CVPixelBufferPoolCreatePixelBuffer(
             kCFAllocatorDefault,
-            width,
-            height,
-            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            attributes as CFDictionary,
+            pool,
             &optionalBuffer
         ) == kCVReturnSuccess, let buffer = optionalBuffer else { return nil }
         CVPixelBufferLockBaseAddress(buffer, [])
@@ -361,8 +434,47 @@ private enum DAggerVideoSurface {
               let uvBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return nil }
         let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
         let uvStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
-        packed.withUnsafeBytes { raw in
-            guard let source = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+        let populated = packed.withUnsafeBytes { raw -> Bool in
+            guard let source = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            if spec.colorMode == .color, spec.chroma == .yuv420,
+               spec.width == width, spec.height == height {
+                var sourceLuma = vImage_Buffer(
+                    data: UnsafeMutableRawPointer(mutating: source),
+                    height: vImagePixelCount(height),
+                    width: vImagePixelCount(width),
+                    rowBytes: width
+                )
+                var destinationLuma = vImage_Buffer(
+                    data: yBase,
+                    height: vImagePixelCount(height),
+                    width: vImagePixelCount(width),
+                    rowBytes: yStride
+                )
+                let lumaResult = lumaTable.withUnsafeBufferPointer {
+                    vImageTableLookUp_Planar8(
+                        &sourceLuma,
+                        &destinationLuma,
+                        $0.baseAddress!,
+                        vImage_Flags(kvImageNoFlags)
+                    )
+                }
+                guard lumaResult == kvImageNoError else { return false }
+                let lumaCount = width * height
+                let chromaWidth = width / 2
+                let chromaHeight = height / 2
+                let chromaCount = chromaWidth * chromaHeight
+                let sourceCB = source.advanced(by: lumaCount)
+                let sourceCR = source.advanced(by: lumaCount + chromaCount)
+                for y in 0..<chromaHeight {
+                    let destination = uvBase.advanced(by: y * uvStride).assumingMemoryBound(to: UInt8.self)
+                    let row = y * chromaWidth
+                    for x in 0..<chromaWidth {
+                        destination[x * 2] = chromaTable[Int(sourceCB[row + x])]
+                        destination[x * 2 + 1] = chromaTable[Int(sourceCR[row + x])]
+                    }
+                }
+                return true
+            }
             for outputY in 0..<height {
                 let sourceY = min(spec.height - 1, outputY * spec.height / height)
                 let destination = yBase.advanced(by: outputY * yStride).assumingMemoryBound(to: UInt8.self)
@@ -398,7 +510,8 @@ private enum DAggerVideoSurface {
                     destination[outputX * 2 + 1] = UInt8(clamping: 16 + (((cr + 2) / 4) * 224 + 127) / 255)
                 }
             }
+            return true
         }
-        return buffer
+        return populated ? buffer : nil
     }
 }

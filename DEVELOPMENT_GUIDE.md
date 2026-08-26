@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.1.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.2.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -21,7 +21,7 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Storage/InputEventFile.swift` — fixed-width binary event writer and validated mapped reader
 - `Preprocessing/VisionPreprocessor.swift` — Metal resize, color conversion, packing, and MLX expansion
 - `Training/DatasetCache.swift` — causal frame/action pairing and memory-mapped datasets
-- `Training/DAggerRecorder.swift` — bounded correction video/input publication from live processed frames
+- `Training/DAggerRecorder.swift` — bounded correction video/input publication from Record-quality live frames
 - `Training/PolicyNetwork.swift` — Policy v6, predictive objectives, augmentation, and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
@@ -47,8 +47,9 @@ Capture, runtime, training, and injection use dedicated locks and queues because
 - Keep callbacks to UI state outside low-level locks.
 - Treat start and stop as re-entrant operations; duplicate requests must coalesce or return.
 - A background task may publish only bounded snapshots to the main actor.
-- An explicit DAgger trigger must synchronously stop new AI action admission before recorder construction. Buffer early physical samples and inferred frames until the recorder is installed; ordinary takeover must never enter correction mode.
-- Close DAgger frame admission and enqueue the video-queue drain marker under the same lock ordering. Input events stream to disk; visual queue/ring payloads stay within the shared 512 MB context bound.
+- An explicit DAgger trigger must synchronously suspend inference and new AI action admission before recorder construction. Buffer early physical samples and Record-quality frames until the recorder is installed; ordinary takeover must never enter correction mode. The main UI and capture-excluded HUD must expose DAgger Recording rather than Run during this interval.
+- Stopping DAgger resumes the resident Run session before publication finishes, but only after clearing its temporal ring and prediction latch. No stale pre-correction action may execute after the transition.
+- Admit DAgger preprocessing work and enqueue it under the same runtime lock that orders the stop drain marker; a marker must never overtake a counted frame. Input events stream to disk. At the trigger, the rolling ring relinquishes its payload to the recorder and startup buffering is limited to the unused part of the single 512 MB visual-payload budget; correction frames are not retained in a second ring.
 
 ## Capture and recording contracts
 
@@ -69,7 +70,9 @@ Recording transfer is producer-neutral. Import accepts a native `.atrrecord` dir
 
 Capture status matters: complete/started frames are usable, idle frames may reuse the last good frame, and blank/suspended/stopped frames are dropped.
 
-New saved video requests a bi-planar video-range 4:2:0 ScreenCaptureKit surface and passes it directly to the required hardware HEVC Main encoder. The resolution/FPS-aware bitrate, six-second GOP, temporal compression, and frame reordering are a high-quality lossy storage contract; do not restore the former near-lossless-sized bitrate or force a full-resolution BGRA conversion without measurement. Live model capture remains BGRA because it is consumed directly rather than encoded. Existing/imported recording artifacts remain byte-preserving and are never migrated implicitly.
+New saved video requests a bi-planar video-range 4:2:0 ScreenCaptureKit surface at the selected even Record resolution and passes the default 8-bit path directly to the required hardware HEVC Main encoder. Lower Color Bit settings use pooled accelerated, legal-range-aware luma/chroma quantization; neutral chroma remains exactly neutral even at one bit. The user-facing compression amount maps monotonically to a resolution/FPS-aware bitrate while codec, GOP, and profile details remain internal. Live model capture remains BGRA because it is consumed directly rather than encoded. Existing/imported recording artifacts remain byte-preserving and are never migrated implicitly.
+
+`RecordingVisualSettings` owns output width/height, ratio-lock state, Color Bit, and compression. Universal DAgger lead-up sits beside it in workflow settings. Recording presets must snapshot both along with the pre-existing source, destination, FPS, cursor, region, trim, and input blacklist; presets saved before 2.2 decode to safe defaults.
 
 Current recording manifests persist the exact successfully encoded frame count. The field is optional for compatibility; Library presentation estimates a missing legacy count from duration and delivered FPS. Package size is the logical recursive byte total collected once during the workspace scan, never a per-row filesystem walk.
 
@@ -81,7 +84,7 @@ Live HUD state and persisted recording state are intentionally separate. The HUD
 
 Saved HEVC sessions end on the shared host clock even when ScreenCaptureKit reports only idle frames. Dataset construction materializes the last decoded frame at every configured perception interval until a newer frame becomes causal; a static screen must not collapse temporal spacing or observation count.
 
-DAgger uses the normal Record shortcut only while Run is active. Triggering it pauses and drains AI output, then records physical expert input while inference/capture continue. Its native schema-3 recording manifest stores `.daggerCorrection`, source profile/version, supervision start, and bounded training weight. Pre-trigger AI/human controls are causal context only; action labels begin at `supervisionStart`. Recent full-resolution frames are combined with the exact reduced frames selected from the temporal ring, so spacing beyond the 15-second recent window remains represented without retaining every old full-resolution frame. Mixed-resolution pre-roll is reconstructed into one fixed-size HEVC timeline; training downsamples selected past frames back to their native contract.
+DAgger uses the normal Record shortcut only while Run is active. Triggering it suspends inference, drains AI output, and records physical expert input while a Record-quality capture pipeline continues. Its native schema-3 recording manifest stores `.daggerCorrection`, source profile/version, supervision start, and bounded training weight. Pre-trigger AI controls are causal context only; action labels begin at `supervisionStart`. The rolling video uses the frozen Record source, FPS, cursor, resolution, Color Bit, compression, and universal lead-up. If the AI's immutable cursor-visibility contract differs from Record, a dedicated capture stream preserves both contracts rather than changing model input.
 
 DAgger packages receive balanced terminal releases, follow recording shortcut/blacklist filtering, are automatically attached to their source profile, and remain normal Library/import/export artifacts. Starting, saving, or stopping a correction is single-flight. A failed start resumes output; panic/Run stop finalizes any admitted correction after releasing synthetic controls.
 
@@ -106,7 +109,7 @@ Temporal vision is either current-only or an explicit three-part input:
 
 The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context. Zero frames disables the temporal branch: runtime and training consume only current vision and do not allocate past-image or past-control input buffers.
 
-`TrainingDataContract.schemaVersion` is 11. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, supervision boundaries, weighting, or target meaning changes. A cache has:
+`TrainingDataContract.schemaVersion` is 12. Version 12 also versions the per-sample augmentation draw/sampling contract, so a 2.1 checkpoint warm-starts compatible weights but never claims an exact optimizer/random-state resume. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, supervision boundaries, weighting, or target meaning changes. A cache has:
 
 - `current-observations.bin` — one full-resolution packed image per perception
 - `past-observations.bin` — one reduced packed image of the same perception
@@ -154,7 +157,7 @@ Current Policy v6 combines:
 
 Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. Past control rows are masked for half of training samples while past images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
 
-Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced locality order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Configurable photometric augmentation samples one batch transform and applies it identically to current, past, and future frames. It never moves pixels. Future-action loss weights near horizons more strongly. Future-state loss predicts a stopped-gradient latent change from fused context plus the demonstrated current action; it never generates pixels. Conservative default auxiliary weights are gated by a matched-update causal held-out test at 1% immediate-loss drift. Do not change these semantics without updating tests and the relevant schema.
+Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Configurable photometric augmentation samples one transform per supervised row and applies it identically to only that row's current, past, and future frames. It never moves pixels. Augmented training expands deduplicated observations to row shape before the CNN and uses the diversity-oriented sampler; validation and augmentation-off training retain deterministic visual reuse. Future-action loss weights near horizons more strongly. Future-state loss predicts a stopped-gradient latent change from fused context plus the demonstrated current action; it never generates pixels. Conservative default auxiliary weights are gated by a matched-update causal held-out test at 1% immediate-loss drift. Do not change these semantics without updating tests and the relevant schema.
 
 DAgger rows are always training data, but at least one ordinary demonstration must also remain for rehearsal whenever one exists. On a warm start, fixed ordinary and correction probes score the unmodified source brain. A candidate replaces it only when correction fit improves materially and ordinary loss/per-head behavior remains inside the regression guard. `best.weights` must snapshot the exact demonstrated keys, channels, training/runtime contract, cursor visibility, and mouse recommendation belonging to those weights; never pair an old baseline with current capabilities.
 
@@ -163,12 +166,12 @@ The performance path preserves those semantics:
 - VideoToolbox decodes directly into native video-range YUV. One CVMetalTexture mapping and Metal command buffer produce both configured output resolutions, while decode, resize/color packing, and cache writes overlap through a bounded ordered pipeline of up to eight observations within a 64 MB cap.
 - When one decoded frame remains causal across many configured perception ticks, Metal packs it once and the cache writer repeats those exact packed bytes. Observation cadence, indices, controls, and every action label remain unchanged.
 - Dataset files are required memory mappings with adaptive VM advice. Epochs randomize small collections of temporally local lanes rather than every row globally, so each optimizer batch remains diverse while macOS can read ahead the contiguous mapped pages inside each lane. A batch gathers packed vision, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
-- Current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those deterministic embeddings to their exact frame slots. Training gathers visual embeddings back to action-row shape *before* control masking, the recurrent network, and dropout, preserving one independent stochastic path per label. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
+- With augmentation off, current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those deterministic embeddings to their exact frame slots. With augmentation on, rows are expanded before encoding so independent sample transforms cannot be collapsed. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
 - Above the measured workload crossover, the coordinate contribution to the first convolution is evaluated once per batch and the established GroupNorm layout uses MLX's fused Metal layer-normalization kernel. Small tensors retain the lower-overhead kernels.
 - Validation shares deterministic temporal work and head logits before gathering them back to every held-out label, then derives loss and predictions from that one compiled forward graph.
 - CPU gathering of the next batch overlaps the current Metal graph. Every optimizer step still evaluates the complete model, AdamW moments, scheduler, and MLX random state before advancing the checkpoint cursor.
 - Live diagnostics publish a rolling pipelined-step time, mapped-input time, peak-throughput retention, MLX active/cache/peak memory, and macOS thermal pressure. Metrics are rate-limited and chart histories are presentation-bounded so observing a run does not grow UI work with optimizer-step count.
-- The release benchmark separately executes the complete Policy-v6 stochastic objective, gates overhead at 2.5× the optimized core step, and runs the same sustained-window retention/memory/thermal checks. The immediate-only reference/optimized paths still isolate encoder equivalence and throughput.
+- The release benchmark separately executes the complete Policy-v6 stochastic objective and runs the same sustained-window retention/memory/thermal checks. It gates the required per-sample augmentation path at 3× the augmentation-off reused core, then gates both predictive heads together at 2× that augmented immediate path. The immediate-only reference/optimized paths still isolate encoder equivalence and throughput, while the two-stage gate prevents one semantic cost from hiding a regression in the other.
 
 Do not queue stateful optimizer steps merely to improve a benchmark. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
 

@@ -163,7 +163,15 @@ final class TrainingEngine: @unchecked Sendable {
             return (encoderReuse, groups)
         }()
         let reusesVisionFeatures = !groupedTrainingObservations.isEmpty
-        let desiredSamplingStrategy = reusesVisionFeatures
+        let augmentationConfiguration = profile.training.effectiveVisualAugmentation
+        let usesPerSampleVisualAugmentation = augmentationConfiguration.enabled
+            && augmentationConfiguration.probability > 0
+        // One observation can back several supervised rows only when its pixels
+        // remain identical. Per-sample augmentation intentionally expands those
+        // rows before the CNN so each gets an independent visual domain.
+        let reusesTrainingVisionFeatures = reusesVisionFeatures
+            && !usesPerSampleVisualAugmentation
+        let desiredSamplingStrategy = reusesTrainingVisionFeatures
             ? TrainingSamplingContract.localityGroupedVision
             : TrainingSamplingContract.salienceBalanced
         // Salience depends only on immutable cached targets and profile output
@@ -457,10 +465,11 @@ final class TrainingEngine: @unchecked Sendable {
             let batch = Self.expandBatch(
                 arrays,
                 profile: profile,
-                reusesVisionFeatures: reusesVisionFeatures,
+                reusesVisionFeatures: reusesTrainingVisionFeatures,
                 includeAuxiliaries: true
             )
-            let augmentation = model.sampleVisualAugmentation()
+            let sampleCount = batch.targets.dim(0)
+            let augmentation = model.sampleVisualAugmentation(batchSize: sampleCount)
             let currentImages = model.augmentedVision(
                 batch.currentImages,
                 parameters: augmentation
@@ -469,8 +478,11 @@ final class TrainingEngine: @unchecked Sendable {
                 batch.pastImages,
                 parameters: augmentation
             )
+            let sampleFutureImages = usesPerSampleVisualAugmentation
+                ? batch.futureStateImages.take(batch.sampleToFutureState, axis: 0)
+                : batch.futureStateImages
             let futureStateImages = model.augmentedVision(
-                batch.futureStateImages,
+                sampleFutureImages,
                 parameters: augmentation
             )
             let gradientInputs = [
@@ -491,7 +503,9 @@ final class TrainingEngine: @unchecked Sendable {
             // to construct a meaningless gradient for it.
             let sampleToVision = batch.sampleToVision
             let visionToPast = batch.visionToPast
-            let sampleToFutureState = batch.sampleToFutureState
+            let sampleToFutureState = usesPerSampleVisualAugmentation
+                ? MLXArray((0..<sampleCount).map(Int32.init), [sampleCount])
+                : batch.sampleToFutureState
             let result = valueAndGrad(model: model) { model, arrays in
                 let temporalFeatures = model.temporalFeatures(
                     currentImages: arrays[0],
@@ -673,7 +687,7 @@ final class TrainingEngine: @unchecked Sendable {
                             indices: batch,
                             profile: profile,
                             inputBufferPool: inputBufferPool,
-                            reusesVisionFeatures: reusesVisionFeatures,
+                            reusesVisionFeatures: reusesTrainingVisionFeatures,
                             includeAuxiliaries: true
                         ),
                         CACurrentMediaTime() - preparationStarted
@@ -708,7 +722,7 @@ final class TrainingEngine: @unchecked Sendable {
                             indices: Array(order[end..<nextEnd]),
                             profile: profile,
                             inputBufferPool: inputBufferPool,
-                            reusesVisionFeatures: reusesVisionFeatures,
+                            reusesVisionFeatures: reusesTrainingVisionFeatures,
                             includeAuxiliaries: true
                         )
                         next = (arrays, CACurrentMediaTime() - preparationStarted)
@@ -795,9 +809,9 @@ final class TrainingEngine: @unchecked Sendable {
                         mlxCacheMemory: memory.cacheMemory,
                         mlxPeakMemory: memory.peakMemory
                     )
-                    let visionStatus = reusesVisionFeatures
+                    let visionStatus = reusesTrainingVisionFeatures
                         ? " • shared temporal work \(observationReuseRatio.formatted(.number.precision(.fractionLength(2))))×"
-                        : ""
+                        : usesPerSampleVisualAugmentation ? " • independent sample augmentation" : ""
                     let performanceLimit = performance.limitingStatus(
                         memory: memory,
                         thermalState: thermalState

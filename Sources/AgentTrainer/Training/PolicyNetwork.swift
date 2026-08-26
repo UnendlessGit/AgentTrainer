@@ -154,26 +154,29 @@ final class AgentPolicy: Module, @unchecked Sendable {
             .reshaped([1, size.width * size.height, 2])
     }
 
-    /// Samples one conservative photometric transform for a complete optimizer
-    /// batch. Sharing these scalars across current, past, and future frames keeps
-    /// motion and causal changes real while still presenting new visual domains
-    /// on successive updates.
-    func sampleVisualAugmentation() -> VisualAugmentationParameters {
+    /// Samples one conservative photometric transform per supervised row.
+    /// Callers reuse each row's parameters for its current, past, and future
+    /// images, preserving temporal truth without correlating an entire batch.
+    func sampleVisualAugmentation(batchSize: Int = 1) -> VisualAugmentationParameters {
         let configuration = profile.training.effectiveVisualAugmentation
+        let count = max(1, batchSize)
+        let shape = [count, 1, 1, 1]
         guard training, configuration.enabled, configuration.probability > 0 else {
-            let zero = MLXArray(0, dtype: .float32)
-            let one = MLXArray(1, dtype: .float32)
+            let zero = MLXArray.zeros(shape, dtype: .float32)
+            let one = MLXArray.ones(shape, dtype: .float32)
             return VisualAugmentationParameters(
                 brightness: zero, contrast: one, saturation: one,
                 hueRadians: zero, gamma: one
             )
         }
-        let applied = MLXRandom.bernoulli(Float(configuration.probability), [1]).asType(.float32)
+        let applied = MLXRandom.bernoulli(Float(configuration.probability), shape).asType(.float32)
         func variation(_ amount: Double, centeredAt center: Float = 0) -> MLXArray {
-            guard amount > 0 else { return MLXArray(center, dtype: .float32) }
-            return MLXArray(center, dtype: .float32)
+            guard amount > 0 else {
+                return MLXArray.full(shape, values: MLXArray(center, dtype: .float32))
+            }
+            return MLXArray.full(shape, values: MLXArray(center, dtype: .float32))
                 + applied * MLXRandom.uniform(
-                    low: Float(-amount), high: Float(amount), [1], dtype: .float32
+                    low: Float(-amount), high: Float(amount), shape, dtype: .float32
                 )
         }
         return VisualAugmentationParameters(
@@ -215,9 +218,23 @@ final class AgentPolicy: Module, @unchecked Sendable {
             return augmentedVision(images, parameters: parameters)
         }
         let shape = images.shape
+        let frameCount = shape[1]
+        func repeated(_ values: MLXArray) -> MLXArray {
+            broadcast(
+                values.reshaped([shape[0], 1, 1, 1, 1]),
+                to: [shape[0], frameCount, 1, 1, 1]
+            ).reshaped([shape[0] * frameCount, 1, 1, 1])
+        }
+        let temporalParameters = VisualAugmentationParameters(
+            brightness: repeated(parameters.brightness),
+            contrast: repeated(parameters.contrast),
+            saturation: repeated(parameters.saturation),
+            hueRadians: repeated(parameters.hueRadians),
+            gamma: repeated(parameters.gamma)
+        )
         return augmentedVision(
             images.reshaped([shape[0] * shape[1], shape[2], shape[3], shape[4]]),
-            parameters: parameters
+            parameters: temporalParameters
         ).reshaped(shape)
     }
 

@@ -19,6 +19,10 @@ private func XCTAssertThrowsErrorAsync<T>(
 }
 
 final class DomainTests: XCTestCase {
+    func testCurrentTrainingDataSchemaVersionsPerSampleAugmentationResumeContract() {
+        XCTAssertEqual(TrainingDataContract.schemaVersion, 12)
+    }
+
     private final class EventCollector: @unchecked Sendable {
         private let lock = NSLock()
         private var stored: [(CGEventType, Int64, Int64, Int64)] = []
@@ -134,6 +138,14 @@ final class DomainTests: XCTestCase {
         let formerUHDTarget = 3_840 * 2_160 * 8
         XCTAssertLessThan(uhd60 * 3, formerUHDTarget)
         XCTAssertLessThanOrEqual(uhd60, 45_000_000)
+        let quality = HEVCEncodingConfiguration.targetBitRate(
+            width: 1_920, height: 1_080, fps: 60, compression: 0
+        )
+        let compact = HEVCEncodingConfiguration.targetBitRate(
+            width: 1_920, height: 1_080, fps: 60, compression: 1
+        )
+        XCTAssertGreaterThan(quality, hd60)
+        XCTAssertLessThan(compact, hd60)
         XCTAssertEqual(HEVCEncodingConfiguration.targetBitRate(width: 0, height: 0, fps: .nan), 1_500_000)
 
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("optimized-hevc-\(UUID().uuidString).mov")
@@ -141,6 +153,112 @@ final class DomainTests: XCTestCase {
         let writer = try HEVCWriter(url: url, width: 1_920, height: 1_080, fps: 60)
         let empty = try await writer.finish()
         XCTAssertEqual(empty.frames, 0)
+
+        let quantizedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quantized-hevc-\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: quantizedURL) }
+        var optionalPixelBuffer: CVPixelBuffer?
+        let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                16,
+                16,
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                attributes,
+                &optionalPixelBuffer
+            ),
+            kCVReturnSuccess
+        )
+        let pixelBuffer = try XCTUnwrap(optionalPixelBuffer)
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        for plane in 0..<2 {
+            memset(
+                CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane),
+                plane == 0 ? 117 : 128,
+                CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
+                    * CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)
+            )
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        var optionalDescription: CMVideoFormatDescription?
+        XCTAssertEqual(
+            CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: pixelBuffer,
+                formatDescriptionOut: &optionalDescription
+            ),
+            noErr
+        )
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 30),
+            presentationTimeStamp: CMTime(value: 1, timescale: 1),
+            decodeTimeStamp: .invalid
+        )
+        var optionalSample: CMSampleBuffer?
+        XCTAssertEqual(
+            CMSampleBufferCreateReadyWithImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: pixelBuffer,
+                formatDescription: try XCTUnwrap(optionalDescription),
+                sampleTiming: &timing,
+                sampleBufferOut: &optionalSample
+            ),
+            noErr
+        )
+        let quantizedWriter = try HEVCWriter(
+            url: quantizedURL,
+            width: 16,
+            height: 16,
+            fps: 30,
+            colorBits: 1,
+            compression: 0.8
+        )
+        quantizedWriter.append(try XCTUnwrap(optionalSample))
+        let quantized = try await quantizedWriter.finish(
+            endPTS: CMTime(value: 31, timescale: 30)
+        )
+        XCTAssertEqual(quantized.frames, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quantizedURL.path))
+
+        let asset = AVURLAsset(url: quantizedURL)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        ])
+        XCTAssertTrue(reader.canAdd(output))
+        reader.add(output)
+        XCTAssertTrue(reader.startReading())
+        let decodedSample = try XCTUnwrap(output.copyNextSampleBuffer())
+        let decodedBuffer = try XCTUnwrap(decodedSample.imageBuffer)
+        CVPixelBufferLockBaseAddress(decodedBuffer, .readOnly)
+        let uv = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(decodedBuffer, 1))
+            .assumingMemoryBound(to: UInt8.self)
+        let decodedCB = Int(uv[0]), decodedCR = Int(uv[1])
+        CVPixelBufferUnlockBaseAddress(decodedBuffer, .readOnly)
+        XCTAssertLessThanOrEqual(abs(decodedCB - 128), 16)
+        XCTAssertLessThanOrEqual(abs(decodedCR - 128), 16)
+
+        let oneBit = RecordingColorQuantizationTables(bits: 1)
+        XCTAssertEqual(oneBit.videoRangeLuma[16], 16)
+        XCTAssertEqual(oneBit.videoRangeLuma[235], 235)
+        XCTAssertEqual(oneBit.videoRangeChroma[16], 16)
+        XCTAssertEqual(oneBit.videoRangeChroma[128], 128)
+        XCTAssertEqual(oneBit.videoRangeChroma[240], 240)
+        XCTAssertTrue(oneBit.videoRangeLuma.allSatisfy { (16...235).contains(Int($0)) })
+        XCTAssertTrue(oneBit.videoRangeChroma.allSatisfy { (16...240).contains(Int($0)) })
+        var packedNeutral = Data([64, 96, 160, 224, 128, 128])
+        try oneBit.quantizePacked(
+            &packedNeutral,
+            spec: PreprocessingSpec(
+                width: 2, height: 2, colorMode: .color,
+                bitDepth: 1, chroma: .yuv420
+            )
+        )
+        XCTAssertEqual(Array(packedNeutral.suffix(2)), [128, 128])
     }
 
     func testRecordingMetricsUseExactFramesBytesAndFolderSeconds() {
@@ -654,17 +772,49 @@ final class DomainTests: XCTestCase {
             id: UUID(), name: "  Gameplay  ", createdAt: Date(), captureKind: .screenRegion,
             captureFPS: 120, showsCursor: false,
             region: CodableRect(CGRect(x: 10, y: 20, width: 800, height: 450)),
-            trimStart: 0.25, trimEnd: 0.5, excludedKeyCodes: [49, 56]
+            trimStart: 0.25, trimEnd: 0.5, excludedKeyCodes: [49, 56],
+            recordingVisuals: RecordingVisualSettings(
+                width: 1600,
+                height: 900,
+                locksAspectRatio: true,
+                colorBits: 6,
+                compression: 0.7
+            ),
+            leadUpSeconds: 4.5
         )
-        XCTAssertEqual(try preset.validated().name, "Gameplay")
+        let validated = try preset.validated()
+        XCTAssertEqual(validated.name, "Gameplay")
+        XCTAssertEqual(validated.effectiveRecordingVisuals.width, 1600)
+        XCTAssertEqual(validated.effectiveRecordingVisuals.colorBits, 6)
+        XCTAssertEqual(validated.effectiveLeadUpSeconds, 4.5)
         var invalid = preset
         invalid.captureFPS = .nan
+        XCTAssertThrowsError(try invalid.validated())
+        invalid = preset
+        invalid.recordingVisuals?.width = 1599
         XCTAssertThrowsError(try invalid.validated())
 
         let legacy = Data("{\"keyCode\":15,\"carbonModifiers\":6400}".utf8)
         let binding = try JSONDecoder().decode(HotkeyBinding.self, from: legacy)
         XCTAssertNil(binding.mouseButton)
         XCTAssertEqual(binding.keyCode, 15)
+
+        let encoded = try JSONEncoder().encode(preset)
+        var legacyPreset = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacyPreset.removeValue(forKey: "recordingVisuals")
+        legacyPreset.removeValue(forKey: "leadUpSeconds")
+        let decodedLegacy = try JSONDecoder().decode(
+            RecordingPreset.self,
+            from: JSONSerialization.data(withJSONObject: legacyPreset)
+        )
+        XCTAssertEqual(decodedLegacy.effectiveRecordingVisuals, RecordingVisualSettings())
+        XCTAssertEqual(decodedLegacy.effectiveLeadUpSeconds, 3)
+
+        let oldDAgger = try JSONDecoder().decode(
+            DAggerConfiguration.self,
+            from: Data("{\"preRollSeconds\":3,\"correctionWeight\":4}".utf8)
+        )
+        XCTAssertEqual(oldDAgger.correctionWeight, 4)
     }
 
     func testInputEventReaderRejectsUnsupportedAndTruncatedFiles() throws {
@@ -1943,6 +2093,15 @@ final class DomainTests: XCTestCase {
         XCTAssertFalse(manifest.isStructurallyValid)
         manifest.eventFile = "events.atrevents"
         manifest.duration = .infinity
+        XCTAssertFalse(manifest.isStructurallyValid)
+        manifest.duration = 1
+        manifest.capture.recordingVisuals = RecordingVisualSettings(
+            width: -1,
+            height: 720,
+            locksAspectRatio: true,
+            colorBits: 8,
+            compression: 0.5
+        )
         XCTAssertFalse(manifest.isStructurallyValid)
     }
 
@@ -4255,6 +4414,45 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(augmentedCurrent.asArray(Float.self).allSatisfy { $0.isFinite && (0...1).contains($0) })
     }
 
+    func testVisualAugmentationIsIndependentPerSampleAndSharedWithinItsTimeline() {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(
+            width: 1, height: 1, colorMode: .color, bitDepth: 8, chroma: .yuv444
+        )
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 2, frameSpacing: 1, downsampleFactor: 1
+        )
+        profile.training.architecture = .small
+        profile.training.precision = .float32
+        let model = AgentPolicy(profile: profile)
+        let parameters = VisualAugmentationParameters(
+            brightness: MLXArray([Float(0.08), Float(-0.08)], [2, 1, 1, 1]),
+            contrast: MLXArray.ones([2, 1, 1, 1]),
+            saturation: MLXArray.ones([2, 1, 1, 1]),
+            hueRadians: MLXArray.zeros([2, 1, 1, 1]),
+            gamma: MLXArray.ones([2, 1, 1, 1])
+        )
+        let pixel: [Float] = [0.5, 0.5, 0.5]
+        let current = MLXArray(pixel + pixel, [2, 1, 1, 3])
+        let past = MLXArray(Array(repeating: pixel, count: 4).flatMap { $0 }, [2, 2, 1, 1, 3])
+        let future = MLXArray(pixel + pixel, [2, 1, 1, 3])
+        let augmentedCurrent = model.augmentedVision(current, parameters: parameters)
+        let augmentedPast = model.augmentedPastVision(past, parameters: parameters)
+        let augmentedFuture = model.augmentedVision(future, parameters: parameters)
+        MLX.eval(augmentedCurrent, augmentedPast, augmentedFuture)
+        let currentValues = augmentedCurrent.asArray(Float.self)
+        let pastValues = augmentedPast.asArray(Float.self)
+        let futureValues = augmentedFuture.asArray(Float.self)
+        XCTAssertNotEqual(currentValues[0], currentValues[3], accuracy: 0.001)
+        for sample in 0..<2 {
+            let expected = currentValues[sample * 3]
+            XCTAssertEqual(futureValues[sample * 3], expected, accuracy: 1e-6)
+            for frame in 0..<2 {
+                XCTAssertEqual(pastValues[(sample * 2 + frame) * 3], expected, accuracy: 1e-6)
+            }
+        }
+    }
+
     func testFuturePredictionLossesAreMaskedFiniteAndDoNotChangeImmediateShape() {
         var profile = AIProfile.fresh()
         profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale, bitDepth: 8)
@@ -4404,7 +4602,7 @@ final class DomainTests: XCTestCase {
             inputs: [model, optimizer, randomState],
             outputs: [model, optimizer, randomState]
         ) { arrays in
-            let parameters = model.sampleVisualAugmentation()
+            let parameters = model.sampleVisualAugmentation(batchSize: batch)
             let current = model.augmentedVision(arrays[0], parameters: parameters)
             let futureImages = model.augmentedVision(arrays[4], parameters: parameters)
             let positiveWeights = MLXArray.ones([ActionLayout.count])
@@ -4719,23 +4917,25 @@ final class DomainTests: XCTestCase {
         XCTAssertFalse(manifest.isStructurallyValid)
     }
 
-    func testDAggerContextSizingSupportsLongSparseTemporalLookbackWithinBound() throws {
-        let preprocessing = PreprocessingSpec(width: 16, height: 16, colorMode: .grayscale)
-        let temporal = TemporalVisionConfiguration(
-            pastFrameCount: 4,
-            frameSpacing: 120,
-            downsampleFactor: 2
-        )
-        _ = try temporal.validated(current: preprocessing)
-        XCTAssertGreaterThan(temporal.lookbackSeconds(perceptionFPS: 30), 15)
-        let sizing = DAggerContextSizing.recentFrameCapacity(
+    func testDAggerRecordQualityLeadUpIsByteBounded() throws {
+        let preprocessing = try PreprocessingSpec(
+            width: 1280,
+            height: 720,
+            colorMode: .color,
+            bitDepth: 8,
+            chroma: .yuv420,
+            resizePolicy: .stretch
+        ).validated()
+        let sizing = DAggerContextSizing.recordingFrameCapacity(
             preprocessing: preprocessing,
-            temporal: temporal,
-            perceptionFPS: 30,
-            configuration: DAggerConfiguration(preRollSeconds: 3, correctionWeight: 4)
+            framesPerSecond: 60,
+            leadUpSeconds: 3
         )
         XCTAssertGreaterThanOrEqual(sizing.maximum, sizing.requested)
-        XCTAssertLessThanOrEqual(sizing.temporalBytes, DAggerConfiguration.maximumBufferedContextBytes)
+        XCTAssertLessThanOrEqual(
+            sizing.requested * preprocessing.sampleByteCount,
+            DAggerConfiguration.maximumBufferedContextBytes
+        )
     }
 
     func testDAggerStartupBufferIsByteBoundedAndReportsOverflowWithoutDiscardingAcceptedData() {
@@ -4787,7 +4987,14 @@ final class DomainTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let profileID = UUID(), versionID = UUID(), recordingID = UUID()
-        let spec = PreprocessingSpec(width: 4, height: 4, colorMode: .grayscale, bitDepth: 8)
+        let spec = PreprocessingSpec(
+            width: 4,
+            height: 4,
+            colorMode: .color,
+            bitDepth: 6,
+            chroma: .yuv420,
+            resizePolicy: .stretch
+        )
         let rect = CGRect(x: 20, y: 30, width: 100, height: 80)
         let request = DAggerCaptureRequest(
             recordingID: recordingID,
@@ -4802,6 +5009,7 @@ final class DomainTests: XCTestCase {
             captureRect: rect,
             perceptionFPS: 30,
             actionFPS: 60,
+            leadUpSeconds: 3,
             correctionWeight: 4
         )
         var controls = [Float](repeating: 0, count: ActionLayout.count)
@@ -4813,12 +5021,14 @@ final class DomainTests: XCTestCase {
             preRoll: [
                 DAggerFrame(timestampNanos: base, packedVision: Data(repeating: 80, count: spec.sampleByteCount), preprocessing: spec, executedControls: controls),
                 DAggerFrame(timestampNanos: base + 35_000_000, packedVision: Data(repeating: 100, count: spec.sampleByteCount), preprocessing: spec, executedControls: controls)
-            ]
+            ],
+            initialDroppedFrameCount: 2
         )
         recorder.append(InputSample(timestampNanos: base + 75_000_000, kind: .key, keyCode: 12, isDown: true))
         recorder.append(DAggerFrame(timestampNanos: base + 90_000_000, packedVision: Data(repeating: 130, count: spec.sampleByteCount), preprocessing: spec, executedControls: controls))
         let result = try await recorder.finish(endHostNanos: base + 120_000_000)
         XCTAssertEqual(result.frameCount, 3)
+        XCTAssertEqual(result.droppedFrameCount, 2)
         XCTAssertEqual(result.firstFrameHostNanos, base)
         XCTAssertEqual(result.supervisionStart, 0.07, accuracy: 0.000_001)
         let events = try InputEventReader.read(url: directory.appendingPathComponent("events.atrevents"))

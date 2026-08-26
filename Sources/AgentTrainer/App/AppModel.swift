@@ -12,6 +12,13 @@ final class AppModel: ObservableObject {
     @Published var selectedSourceID: UInt32?
     @Published var captureFPS = 60.0
     @Published var showsCursor = false
+    @Published private(set) var recordingWidth = 1280
+    @Published private(set) var recordingHeight = 720
+    @Published private(set) var recordingRatioLocked = true
+    @Published var recordingColorBits = 8 { didSet { persistWorkflowSettings() } }
+    /// Zero favors visual quality; one favors smaller files.
+    @Published var recordingCompression = RecordingVisualSettings.defaultCompression { didSet { persistWorkflowSettings() } }
+    @Published var recordingLeadUpSeconds = 3.0 { didSet { persistWorkflowSettings() } }
     @Published var regionX = 0.0
     @Published var regionY = 0.0
     @Published var regionWidth = 1280.0
@@ -98,7 +105,10 @@ final class AppModel: ObservableObject {
     private lazy var recordHotkey = GlobalHotkeyMonitor(identifier: 2, binding: hotkeys.record) { [weak self] in
         Task { @MainActor in
             guard let self else { return }
-            if self.agentIsActiveOrStarting {
+            guard !self.isStartingAgent else { return }
+            if self.isDAggerRecording {
+                await self.toggleDAggerRecording()
+            } else if self.agentIsActiveOrStarting {
                 guard self.isRunning else { return }
                 await self.toggleDAggerRecording()
             } else {
@@ -112,6 +122,7 @@ final class AppModel: ObservableObject {
     private var runningVersion: ModelVersionManifest?
     private var activeRuntimeCaptureSpec: CaptureSpec?
     private var activeRuntimeCaptureRect: CGRect?
+    private var activeDAggerCaptureConfiguration: DAggerRuntimeCaptureConfiguration?
     private var pendingDAggerDirectory: URL?
     private var pendingDAggerProfileID: UUID?
     private var eventWriter: InputEventWriter?
@@ -145,7 +156,7 @@ final class AppModel: ObservableObject {
     var selectedRecordings: [RecordingItem] { recordings.filter { selectedRecordingIDs.contains($0.id) } }
     var selectedProfile: AIProfile? { profiles.first { $0.id == selectedProfileID } }
     var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording || isStoppingRecording }
-    var agentIsActiveOrStarting: Bool { isRunning || isStartingAgent }
+    var agentIsActiveOrStarting: Bool { agent != nil || isStartingAgent }
     var daggerLifecycleIsActive: Bool {
         isStartingDAgger || isDAggerRecording || isSavingDAgger || pendingDAggerDirectory != nil
     }
@@ -166,6 +177,15 @@ final class AppModel: ObservableObject {
             gameCamera = saved.gameCamera ?? GameCameraSettings()
             runtimeOutputPermissions = saved.runtimeOutputPermissions ?? RuntimeOutputPermissions()
             cnnVisualizationSettings = (saved.cnnVisualizationSettings ?? CNNVisualizationSettings()).sanitized()
+            if let visuals = try? (saved.recordingVisuals ?? RecordingVisualSettings()).validated() {
+                recordingWidth = visuals.width
+                recordingHeight = visuals.height
+                recordingRatioLocked = visuals.locksAspectRatio
+                recordingColorBits = visuals.colorBits
+                recordingCompression = visuals.compression
+            }
+            let leadUp = saved.recordingLeadUpSeconds ?? 3
+            recordingLeadUpSeconds = leadUp.isFinite && (0.25...15).contains(leadUp) ? leadUp : 3
         }
         // Absolute Cursor was the old default, even for locked-camera data.
         // Move existing installs once to the safer recording-aware mode; the
@@ -414,26 +434,45 @@ final class AppModel: ObservableObject {
             hudModel.show(source: .human, vision: false)
             try input.start()
             guard recordingLaunchRevision == launchToken else { throw CancellationError() }
-            try await capture.start(spec: spec, recordingURL: directory.appendingPathComponent("capture.mov"), onFirstFrame: { [weak self, weak writer] nanos in
-                let pointer = CGEvent(source: nil)?.location ?? CGPoint(x: captureRect.midX, y: captureRect.midY)
-                // Seed every already-held logical control at the exact first
-                // frame. The Record shortcut itself remains capture-excluded.
-                let initialSamples = self?.input.recordingSeedSamples(timestampNanos: nanos, pointer: pointer, excluding: recordingShortcut) ?? []
-                for sample in initialSamples { writer?.append(sample) }
-                if !initialSamples.isEmpty { eventClock.update(nanos) }
-                clock.set(nanos)
-                Task { @MainActor [weak self] in self?.recordingHostStart = nanos }
-            }, onUnexpectedStop: { [weak self] error in
-                Task { @MainActor [weak self] in
-                    guard let self, self.recordingIsActiveOrStarting else { return }
-                    AppLog.write(.error, category: "Capture", "Recording stream stopped unexpectedly", details: error.localizedDescription)
-                    self.errorMessage = "Screen capture stopped unexpectedly. AgentTrainer is saving every complete frame and input received before the interruption.\n\n\(error.localizedDescription)"
-                    await self.stopRecording()
+            try await capture.start(
+                spec: spec,
+                recordingURL: directory.appendingPathComponent("capture.mov"),
+                exactOutputSize: spec.effectiveRecordingVisuals.outputSize,
+                onFirstFrame: { [weak self, weak writer] nanos in
+                    let pointer = CGEvent(source: nil)?.location
+                        ?? CGPoint(x: captureRect.midX, y: captureRect.midY)
+                    // Seed every already-held logical control at the exact first
+                    // frame. The Record shortcut itself remains capture-excluded.
+                    let initialSamples = self?.input.recordingSeedSamples(
+                        timestampNanos: nanos,
+                        pointer: pointer,
+                        excluding: recordingShortcut
+                    ) ?? []
+                    for sample in initialSamples { writer?.append(sample) }
+                    if !initialSamples.isEmpty { eventClock.update(nanos) }
+                    clock.set(nanos)
+                    Task { @MainActor [weak self] in self?.recordingHostStart = nanos }
+                }, onUnexpectedStop: { [weak self] error in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.recordingIsActiveOrStarting else { return }
+                        AppLog.write(
+                            .error,
+                            category: "Capture",
+                            "Recording stream stopped unexpectedly",
+                            details: error.localizedDescription
+                        )
+                        self.errorMessage = "Screen capture stopped unexpectedly. AgentTrainer is saving every complete frame and input received before the interruption.\n\n\(error.localizedDescription)"
+                        await self.stopRecording()
+                    }
                 }
-            })
+            )
             guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             isRecording = true; activityStatus = "Recording — live keyboard is capture-excluded"
-            AppLog.write(category: "Recording", "Recording started", details: "\(spec.kind.rawValue), \(Int(captureRect.width))×\(Int(captureRect.height)) at \(captureFPS.formatted()) FPS")
+            AppLog.write(
+                category: "Recording",
+                "Recording started",
+                details: "\(spec.kind.rawValue), \(recordingWidth)×\(recordingHeight) output from \(Int(captureRect.width))×\(Int(captureRect.height)) at \(captureFPS.formatted()) FPS"
+            )
         } catch {
             _ = try? await capture.stop()
             input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = try? eventWriter?.finish(); eventWriter = nil
@@ -798,6 +837,8 @@ final class AppModel: ObservableObject {
         guard let profile = selectedProfile, let versionID = profile.activeVersionID,
               let source = selectedSource, !recordingIsActiveOrStarting, !agentIsActiveOrStarting, agent == nil, !isReplaying else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop recording, replay, or any current AI first.")); return }
         guard trainingProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently training. Select another trained AI to run at the same time.")); return }
+        do { try validateCurrentRecordingSettings(source: source) }
+        catch { present(error); return }
         isStartingAgent = true
         runningProfileID = profile.id
         agentLaunchRevision &+= 1
@@ -830,7 +871,18 @@ final class AppModel: ObservableObject {
 
             let runtime = try AgentRuntime()
             attemptedRuntime = runtime
-            runtime.onState = { [weak self] state in Task { @MainActor in self?.hudModel.update(state: state, source: .agent) } }
+            runtime.onState = { [weak self] state in
+                Task { @MainActor in
+                    guard let self, self.isRunning else { return }
+                    self.hudModel.update(state: state, source: .agent)
+                }
+            }
+            runtime.onHumanState = { [weak self] state in
+                Task { @MainActor in
+                    guard let self, self.isDAggerRecording || self.isStartingDAgger else { return }
+                    self.hudModel.update(state: state, source: .dagger)
+                }
+            }
             runtime.onMetrics = { [weak self] value in Task { @MainActor in self?.runtimeMetrics = value } }
             runtime.onPreview = { [weak self] frame in Task { @MainActor in self?.hudModel.updateVision(frame) } }
             runtime.onVisualization = { [weak self] frame in Task { @MainActor in self?.hudModel.updateCNNVisualization(frame) } }
@@ -838,8 +890,22 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     self?.isDAggerRecording = active
                     if active {
+                        self?.isRunning = false
+                        if let self,
+                           !self.hudModel.isVisible || self.hudModel.source != .dagger {
+                            self.hudModel.show(source: .dagger, vision: false)
+                        }
                         self?.runtimeStatus = "DAgger correction recording • AI output paused"
                         self?.activityStatus = self?.runtimeStatus ?? "DAgger correction recording"
+                    } else if let self, self.agent != nil {
+                        self.isRunning = true
+                        self.hudModel.show(
+                            source: .agent,
+                            vision: self.showVisionPreview,
+                            cnnVisualization: self.cnnVisualizationSettings
+                        )
+                        self.runtimeStatus = "Run resumed after DAgger correction"
+                        self.activityStatus = self.runtimeStatus
                     }
                 }
             }
@@ -853,8 +919,33 @@ final class AppModel: ObservableObject {
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
             let runtimeCaptureSpec = captureSpec(source: source)
             let runtimeCaptureRect = effectiveCaptureRect(source)
+            let visuals = try runtimeCaptureSpec.effectiveRecordingVisuals.validated()
+            let daggerPreprocessing = try PreprocessingSpec(
+                width: visuals.width,
+                height: visuals.height,
+                colorMode: .color,
+                bitDepth: visuals.colorBits,
+                chroma: .yuv420,
+                resizePolicy: .stretch
+            ).validated()
+            let daggerCaptureConfiguration = try DAggerRuntimeCaptureConfiguration(
+                preprocessing: daggerPreprocessing,
+                capture: runtimeCaptureSpec,
+                leadUpSeconds: recordingLeadUpSeconds
+            ).validated()
+            let daggerCapacity = DAggerContextSizing.recordingFrameCapacity(
+                preprocessing: daggerPreprocessing,
+                framesPerSecond: runtimeCaptureSpec.requestedFPS,
+                leadUpSeconds: recordingLeadUpSeconds
+            )
+            guard daggerCapacity.maximum >= daggerCapacity.requested else {
+                throw AgentTrainerError.invalidConfiguration(
+                    "This Record resolution, FPS, and lead-up would use more than 512 MB for DAgger context. Reduce one of those Record settings before Run."
+                )
+            }
             agent = runtime; runningVersion = version
             activeRuntimeCaptureSpec = runtimeCaptureSpec; activeRuntimeCaptureRect = runtimeCaptureRect
+            activeDAggerCaptureConfiguration = daggerCaptureConfiguration
             isRunning = true; runningProfileID = profile.id; hudModel.show(source: .agent, vision: showVisionPreview, cnnVisualization: cnnVisualizationSettings)
             installedRuntime = true
             runtimeStatus = "Agent starting at exactly \(version.preprocessing.width) × \(version.preprocessing.height)"; activityStatus = runtimeStatus
@@ -862,7 +953,7 @@ final class AppModel: ObservableObject {
             runtimeSafety.panicKeyCode = UInt16(clamping: hotkeys.panic.keyCode)
             runtimeSafety.panicModifiers = hotkeys.panic.cgEventModifiers
             let previewRate = visionPreviewMatchesPerception ? version.training.perceptionFPS : visionPreviewFPS
-            try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: runtimeCaptureSpec, captureRect: runtimeCaptureRect, mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, safety: runtimeSafety, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run])
+            try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: runtimeCaptureSpec, captureRect: runtimeCaptureRect, mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, safety: runtimeSafety, daggerCaptureConfiguration: daggerCaptureConfiguration, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run])
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
             if isRunning, agent === runtime { runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue)"; activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus; AppLog.write(category: "Runtime", "Agent started", details: "\(profile.name), \(resolvedMouseMode.rawValue), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")") }
         } catch is CancellationError {
@@ -872,7 +963,7 @@ final class AppModel: ObservableObject {
             // or explicit Stop) than replacing it with generic cancellation.
             if !installedRuntime || agent === attemptedRuntime {
                 if agent === attemptedRuntime { agent = nil }
-                isRunning = false; runningProfileID = nil; runningVersion = nil; activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide()
+                isRunning = false; runningProfileID = nil; runningVersion = nil; activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; activeDAggerCaptureConfiguration = nil; isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide()
                 runtimeStatus = "Agent start cancelled; all hooks disabled and held inputs released"
                 activityStatus = isTraining ? trainingStatus : runtimeStatus
             }
@@ -882,7 +973,7 @@ final class AppModel: ObservableObject {
             await attemptedRuntime?.stop(reason: nil)
             guard attemptedRuntime == nil || agent === attemptedRuntime || agent == nil else { return }
             if agent === attemptedRuntime { agent = nil }
-            isRunning = false; runningProfileID = nil; runningVersion = nil; activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide(); runtimeStatus = error.localizedDescription
+            isRunning = false; runningProfileID = nil; runningVersion = nil; activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; activeDAggerCaptureConfiguration = nil; isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide(); runtimeStatus = error.localizedDescription
             if attemptedRuntime != nil { MLXMemoryLifecycle.reclaimCaches(after: "failed agent start") }
             present(error)
         }
@@ -911,21 +1002,21 @@ final class AppModel: ObservableObject {
     }
 
     func toggleDAggerRecording() async {
-        guard let agent, isRunning, !isSavingDAgger else { return }
+        guard let agent, !isSavingDAgger else { return }
         if isDAggerRecording {
-            runtimeStatus = "Saving DAgger correction while Run remains paused…"
+            runtimeStatus = "Resuming Run and saving DAgger correction…"
             activityStatus = runtimeStatus
             isSavingDAgger = true
             await agent.stopDAggerRecording()
             return
         }
-        guard !isStartingDAgger else { return }
+        guard isRunning, !isStartingAgent, !isStartingDAgger else { return }
         isStartingDAgger = true
         defer { isStartingDAgger = false }
         guard let profileID = runningProfileID,
               let profile = profiles.first(where: { $0.id == profileID }),
               let version = runningVersion,
-              let capture = activeRuntimeCaptureSpec,
+              let daggerCapture = activeDAggerCaptureConfiguration,
               let rect = activeRuntimeCaptureRect,
               let folderID = recordingDestinationFolderID,
               recordingFolders.contains(where: { $0.id == folderID }) else {
@@ -940,9 +1031,6 @@ final class AppModel: ObservableObject {
             let directory = try await WorkspaceStore.shared.createRecordingDirectory(id: id)
             pendingDAggerDirectory = directory
             pendingDAggerProfileID = profile.id
-            var recordedCapture = capture
-            recordedCapture.requestedFPS = version.training.perceptionFPS
-            recordedCapture.showsCursor = version.trainingShowsCursor ?? capture.showsCursor
             let request = DAggerCaptureRequest(
                 recordingID: id,
                 directory: directory,
@@ -951,15 +1039,18 @@ final class AppModel: ObservableObject {
                 profileName: profile.name,
                 destinationFolderID: folderID,
                 excludedKeyCodes: recordingExcludedKeyCodes,
-                preprocessing: version.preprocessing,
-                capture: recordedCapture,
+                preprocessing: daggerCapture.preprocessing,
+                capture: daggerCapture.capture,
                 captureRect: rect,
-                perceptionFPS: version.training.perceptionFPS,
+                perceptionFPS: daggerCapture.capture.requestedFPS,
                 actionFPS: version.training.actionFPS,
+                leadUpSeconds: daggerCapture.leadUpSeconds,
                 correctionWeight: configuration.correctionWeight
             )
             runtimeStatus = "Starting DAgger • preserving the lead-up and pausing AI output…"
             activityStatus = runtimeStatus
+            isRunning = false
+            hudModel.show(source: .dagger, vision: false)
             try await agent.startDAggerRecording(
                 request: request,
                 recordingShortcut: hotkeys.record
@@ -977,6 +1068,11 @@ final class AppModel: ObservableObject {
             pendingDAggerProfileID = nil
             isDAggerRecording = false
             isSavingDAgger = false
+            if self.agent != nil {
+                isRunning = true
+                hudModel.show(source: .agent, vision: showVisionPreview, cnnVisualization: cnnVisualizationSettings)
+                runtimeStatus = "Run resumed after DAgger failed to start"
+            }
             present(error)
         }
     }
@@ -1017,7 +1113,7 @@ final class AppModel: ObservableObject {
                     dropped: capture.droppedFrameCount
                 )
                 present(AgentTrainerError.capture(
-                    "The DAgger correction dropped \(percent.formatted(.number.precision(.fractionLength(1))))% of its visual frames, above the 5% integrity limit, so it was discarded instead of training against stale video. Reduce vision size, Perception FPS, or lead-up and try again."
+                    "The DAgger correction dropped \(percent.formatted(.number.precision(.fractionLength(1))))% of its visual frames, above the 5% integrity limit, so it was discarded instead of training against stale video. Reduce Record resolution, FPS, compression workload, or lead-up and try again."
                 ))
                 return
             }
@@ -1104,7 +1200,7 @@ final class AppModel: ObservableObject {
     private func finishAgentRuntime(_ runtime: AgentRuntime, status: String) {
         guard agent === runtime else { return }
         agent = nil; isRunning = false; runningProfileID = nil; runningVersion = nil
-        activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil
+        activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; activeDAggerCaptureConfiguration = nil
         isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide()
         runtimeStatus = status; activityStatus = isTraining ? trainingStatus : runtimeStatus
         let level: AppLogLevel = status == "Agent stopped" || status.contains("all hooks disabled") ? .info : .warning
@@ -1275,6 +1371,13 @@ final class AppModel: ObservableObject {
             captureKind = preset.captureKind
             captureFPS = preset.captureFPS
             showsCursor = preset.showsCursor
+            let visuals = preset.effectiveRecordingVisuals
+            recordingWidth = visuals.width
+            recordingHeight = visuals.height
+            recordingRatioLocked = visuals.locksAspectRatio
+            recordingColorBits = visuals.colorBits
+            recordingCompression = visuals.compression
+            recordingLeadUpSeconds = preset.effectiveLeadUpSeconds
             regionX = preset.region.x; regionY = preset.region.y
             regionWidth = preset.region.width; regionHeight = preset.region.height
             recordingTrimStart = preset.trimStart; recordingTrimEnd = preset.trimEnd
@@ -1308,6 +1411,41 @@ final class AppModel: ObservableObject {
         activityStatus = "Recording preset deleted"
     }
 
+    func updateRecordingWidth(_ rawValue: Int) {
+        let value = normalizedRecordingDimension(rawValue)
+        let ratio = Double(recordingWidth) / Double(max(1, recordingHeight))
+        recordingWidth = value
+        if recordingRatioLocked {
+            recordingHeight = normalizedRecordingDimension(
+                Int((Double(value) / ratio).rounded())
+            )
+        }
+        persistWorkflowSettings()
+    }
+
+    func updateRecordingHeight(_ rawValue: Int) {
+        let value = normalizedRecordingDimension(rawValue)
+        let ratio = Double(recordingWidth) / Double(max(1, recordingHeight))
+        recordingHeight = value
+        if recordingRatioLocked {
+            recordingWidth = normalizedRecordingDimension(
+                Int((Double(value) * ratio).rounded())
+            )
+        }
+        persistWorkflowSettings()
+    }
+
+    func setRecordingRatioLocked(_ locked: Bool) {
+        recordingRatioLocked = locked
+        persistWorkflowSettings()
+    }
+
+    private func normalizedRecordingDimension(_ rawValue: Int) -> Int {
+        let bounded = min(16_384, max(2, rawValue))
+        guard !bounded.isMultiple(of: 2) else { return bounded }
+        return bounded < 16_384 ? bounded + 1 : bounded - 1
+    }
+
     func selectScreenRegion() {
         guard captureKind == .screenRegion, let source = selectedSource else { return }
         regionSelector.select(on: source.frame) { [weak self] rect in
@@ -1320,6 +1458,7 @@ final class AppModel: ObservableObject {
 
     private func captureSpec(source: CaptureSourceOption) -> CaptureSpec {
         var spec = CaptureSpec(kind: captureKind, requestedFPS: captureFPS, showsCursor: showsCursor)
+        spec.recordingVisuals = currentRecordingVisualSettings()
         if source.kind == .display { spec.displayID = source.id } else { spec.windowID = source.id }
         if captureKind == .screenRegion || captureKind == .windowRegion { spec.region = CodableRect(CGRect(x: regionX, y: regionY, width: regionWidth, height: regionHeight)) }
         return spec
@@ -1332,6 +1471,10 @@ final class AppModel: ObservableObject {
         guard recordingTrimStart.isFinite, recordingTrimEnd.isFinite,
               recordingTrimStart >= 0, recordingTrimEnd >= 0 else {
             throw AgentTrainerError.invalidConfiguration("Recording trim values must be finite and non-negative.")
+        }
+        _ = try currentRecordingVisualSettings().validated()
+        guard recordingLeadUpSeconds.isFinite, (0.25...15).contains(recordingLeadUpSeconds) else {
+            throw AgentTrainerError.invalidConfiguration("Recording lead-up must be from 0.25 through 15 seconds.")
         }
         if captureKind == .screenRegion || captureKind == .windowRegion {
             guard [regionX, regionY, regionWidth, regionHeight].allSatisfy(\.isFinite),
@@ -1359,7 +1502,19 @@ final class AppModel: ObservableObject {
             region: CodableRect(CGRect(x: regionX, y: regionY, width: regionWidth, height: regionHeight)),
             trimStart: recordingTrimStart,
             trimEnd: recordingTrimEnd,
-            excludedKeyCodes: recordingExcludedKeyCodes
+            excludedKeyCodes: recordingExcludedKeyCodes,
+            recordingVisuals: currentRecordingVisualSettings(),
+            leadUpSeconds: recordingLeadUpSeconds
+        )
+    }
+
+    private func currentRecordingVisualSettings() -> RecordingVisualSettings {
+        RecordingVisualSettings(
+            width: recordingWidth,
+            height: recordingHeight,
+            locksAspectRatio: recordingRatioLocked,
+            colorBits: recordingColorBits,
+            compression: recordingCompression
         )
     }
 
@@ -1494,19 +1649,7 @@ final class AppModel: ObservableObject {
               binaryFocalGamma >= 0, binaryFocalGamma <= 4 else {
             throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, cosine cycles 1–10,000 epochs, plateau patience 1–1,000, minimum learning-rate ratio 0.001–0.5, focal gamma 0–4, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
         }
-        let dagger = try training.effectiveDAgger.validated()
-        let temporalForDAgger = training.effectiveTemporalVision
-        let daggerSizing = DAggerContextSizing.recentFrameCapacity(
-            preprocessing: profile.preprocessing,
-            temporal: temporalForDAgger,
-            perceptionFPS: training.perceptionFPS,
-            configuration: dagger
-        )
-        guard daggerSizing.maximum >= daggerSizing.requested else {
-            throw AgentTrainerError.invalidConfiguration(
-                "DAgger's recent full-resolution lead-up plus exact temporal context would exceed 512 MB while Run is active. Reduce lead-up seconds, temporal frames/spacing, vision resolution/color, or increase temporal downscale."
-            )
-        }
+        _ = try training.effectiveDAgger.validated()
         let futureAction = training.effectiveFutureActionPrediction
         if futureAction.enabled {
             let offsets = futureAction.actionOffsets(actionFPS: training.actionFPS)
@@ -1550,7 +1693,18 @@ final class AppModel: ObservableObject {
 
     private func persistWorkflowSettings() {
         guard !isRestoringWorkflowSettings else { return }
-        let value = PersistentWorkflowSettings(recordingExcludedKeyCodes: recordingExcludedKeyCodes, recordingTrimStart: recordingTrimStart, recordingTrimEnd: recordingTrimEnd, trainingRunSettings: trainingRunSettings, runMouseMode: runMouseMode, gameCamera: gameCamera, runtimeOutputPermissions: runtimeOutputPermissions, cnnVisualizationSettings: cnnVisualizationSettings)
+        let value = PersistentWorkflowSettings(
+            recordingExcludedKeyCodes: recordingExcludedKeyCodes,
+            recordingTrimStart: recordingTrimStart,
+            recordingTrimEnd: recordingTrimEnd,
+            trainingRunSettings: trainingRunSettings,
+            runMouseMode: runMouseMode,
+            gameCamera: gameCamera,
+            runtimeOutputPermissions: runtimeOutputPermissions,
+            cnnVisualizationSettings: cnnVisualizationSettings,
+            recordingVisuals: currentRecordingVisualSettings(),
+            recordingLeadUpSeconds: recordingLeadUpSeconds
+        )
         if let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: "AgentTrainer.WorkflowSettings") }
     }
 }
@@ -1564,6 +1718,8 @@ private struct PersistentWorkflowSettings: Codable {
     var gameCamera: GameCameraSettings?
     var runtimeOutputPermissions: RuntimeOutputPermissions?
     var cnnVisualizationSettings: CNNVisualizationSettings?
+    var recordingVisuals: RecordingVisualSettings?
+    var recordingLeadUpSeconds: Double?
 }
 
 

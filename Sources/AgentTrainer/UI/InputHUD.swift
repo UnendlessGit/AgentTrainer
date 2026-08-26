@@ -5,7 +5,14 @@ import SwiftUI
 enum HUDInputSource: String {
     case human = "YOUR INPUT"
     case agent = "AI INPUT"
-    var color: Color { self == .human ? .cyan : .purple }
+    case dagger = "DAGGER RECORDING"
+    var color: Color {
+        switch self {
+        case .human: .cyan
+        case .agent: .purple
+        case .dagger: .orange
+        }
+    }
 }
 
 @MainActor

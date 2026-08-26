@@ -86,9 +86,63 @@ struct RecordView: View {
                             }
                             Divider()
                             HStack { LabeledNumber("FPS", value: $model.captureFPS); Toggle("Show cursor in video", isOn: $model.showsCursor); Spacer() }
+                            VStack(alignment: .leading, spacing: 9) {
+                                HStack {
+                                    Text("Recording resolution").font(.subheadline.bold())
+                                    IntField(
+                                        "Width",
+                                        value: Binding(
+                                            get: { model.recordingWidth },
+                                            set: { model.updateRecordingWidth($0) }
+                                        )
+                                    )
+                                    IntField(
+                                        "Height",
+                                        value: Binding(
+                                            get: { model.recordingHeight },
+                                            set: { model.updateRecordingHeight($0) }
+                                        )
+                                    )
+                                    Toggle(
+                                        "Lock ratio",
+                                        isOn: Binding(
+                                            get: { model.recordingRatioLocked },
+                                            set: { model.setRecordingRatioLocked($0) }
+                                        )
+                                    )
+                                    .toggleStyle(.switch)
+                                    Spacer()
+                                }
+                                HStack(spacing: 14) {
+                                    Stepper("Color Bit: \(model.recordingColorBits)-bit", value: $model.recordingColorBits, in: 1...8)
+                                    InfoTip("Reduces recorded color precision before encoding. DAgger uses the same value, while each AI can still choose its own training-time vision format.")
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Text("Compression").font(.caption).foregroundStyle(.secondary)
+                                            Spacer()
+                                            Text("\(Int((model.recordingCompression * 100).rounded()))%")
+                                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                        }
+                                        Slider(value: $model.recordingCompression, in: 0...1)
+                                        HStack {
+                                            Text("Higher quality")
+                                            Spacer()
+                                            Text("Smaller files")
+                                        }
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                    .frame(minWidth: 230)
+                                }
+                            }
+                            Divider()
+                            HStack {
+                                LabeledNumber("Lead-up seconds", value: $model.recordingLeadUpSeconds)
+                                InfoTip("Universal DAgger context retained before you press Record. It is saved with recording presets; correction weight remains specific to each AI.")
+                                Spacer()
+                            }
                             HStack { LabeledNumber("Trim first (seconds)", value: $model.recordingTrimStart); LabeledNumber("Trim last (seconds)", value: $model.recordingTrimEnd); InfoTip("Trimming is non-destructive. Replay and training use only the retained time range; the original HEVC video remains intact."); Spacer() }
                         }
-                    }.frame(maxWidth: .infinity).disabled(model.recordingIsActiveOrStarting)
+                    }.frame(maxWidth: .infinity).disabled(model.recordingIsActiveOrStarting || model.agentIsActiveOrStarting)
                     OLEDCard {
                         VStack(alignment: .leading, spacing: 14) {
                             Label("Synchronized inputs", systemImage: "keyboard.badge.ellipsis").foregroundStyle(ATColor.cyan).font(.headline)
@@ -101,7 +155,7 @@ struct RecordView: View {
                             Text("Recording key blacklist").font(.subheadline.bold()).foregroundStyle(ATColor.coral)
                             RecordingKeyBlacklistEditor(keys: $model.recordingExcludedKeyCodes, model: model)
                         }
-                    }.frame(width: 330).disabled(model.recordingIsActiveOrStarting)
+                    }.frame(width: 330).disabled(model.recordingIsActiveOrStarting || model.agentIsActiveOrStarting)
                 }
                 HStack {
                     Label("The menu bar shows recording status; a compact capture-excluded keyboard shows only keys used in this recording.", systemImage: "keyboard").font(.caption).foregroundStyle(.secondary)
@@ -169,10 +223,10 @@ struct RecordView: View {
                 .primaryButton(color: ATColor.coral)
                 .disabled(model.selectedRecordingPresetID == nil)
                 Spacer(minLength: 0)
-                InfoTip("Save the complete capture type, source, destination, FPS, cursor, region, trim, and input blacklist. Update overwrites the selected preset with the settings currently shown below.")
+                InfoTip("Save the complete capture type, source, destination, FPS, cursor, resolution, ratio lock, Color Bit, compression, DAgger lead-up, trim, and input blacklist. Update overwrites the selected preset with the settings currently shown below.")
             }
         }
-        .disabled(model.recordingIsActiveOrStarting)
+        .disabled(model.recordingIsActiveOrStarting || model.agentIsActiveOrStarting)
     }
 }
 
@@ -322,7 +376,7 @@ private struct ProfileEditor: View {
                                 DoubleField("Hue °", value: visualAugmentationBinding(\.hueDegrees))
                                 DoubleField("Gamma", value: visualAugmentationBinding(\.gamma))
                             }
-                            Text("One conservative color/luminance transform is shared by every current, past, and future frame in an optimizer batch. No spatial transform can desynchronize cursor or action meaning.")
+                            Text("Every supervised sample receives its own conservative color/luminance transform. That sample's current, past, and future frames share it exactly, and no spatial transform can desynchronize cursor or action meaning.")
                                 .font(.caption).foregroundStyle(.secondary)
                             Divider()
                             HStack {
@@ -348,7 +402,6 @@ private struct ProfileEditor: View {
                             Divider()
                             HStack {
                                 Text("DAgger corrections").font(.subheadline.bold()).foregroundStyle(ATColor.coral)
-                                DoubleField("Lead-up seconds", value: daggerBinding(\.preRollSeconds), help: "Minimum context retained before the explicit correction. The runtime automatically extends this to cover the model's full temporal lookback.")
                                 DoubleField("Correction weight", value: daggerBinding(\.correctionWeight), help: "Loss emphasis for short expert corrections so ordinary demonstration volume does not drown them out.")
                                 Spacer()
                             }
@@ -1608,7 +1661,7 @@ struct RunView: View {
                                 LabeledContent("Inference latency", value: model.runtimeMetrics.latencyMilliseconds.formatted(.number.precision(.fractionLength(1))) + " ms")
                                 LabeledContent("Dropped frames", value: "\(model.runtimeMetrics.droppedFrames)")
                                 if let progress = profile.trainingProgress { LabeledContent("Training", value: "\(progress.globalStep) steps • epoch \(progress.epoch)") }
-                                Text("The bottom-right HUD displays AI-generated inputs only and is excluded from the AI's capture filter.").font(.caption).foregroundStyle(ATColor.violet)
+                                Text("The capture-excluded bottom-right HUD shows AI inputs during Run and clearly switches to your expert input during DAgger Recording.").font(.caption).foregroundStyle(ATColor.violet)
                             }
                         }.frame(width: 330)
                     }
@@ -1638,13 +1691,13 @@ struct RunView: View {
                                         color: model.isDAggerRecording ? ATColor.coral : ATColor.violet
                                     )
                                 }
-                                Text("While Run is active, the normal Record keybind starts or stops DAgger instead of an ordinary recording. Starting it preserves the configured lead-up, pauses AI output, and records your correction. The saved correction is automatically added to this AI for warm-start fine-tuning.")
+                                Text("While Run is active, the normal Record keybind starts or stops DAgger instead of an ordinary recording. Starting it suspends Run, switches the UI/HUD to DAgger Recording, and uses the Record tab's universal lead-up, FPS, cursor, resolution, Color Bit, and compression. Stopping resumes Run naturally while the correction publishes.")
                                     .font(.caption).foregroundStyle(.secondary)
                                 Text("Ordinary physical takeover still follows “Stop immediately on my input” and never starts recording by itself.")
                                     .font(.caption.bold()).foregroundStyle(ATColor.amber)
                             }
                             Spacer()
-                            if model.isRunning {
+                            if model.isRunning || model.isDAggerRecording {
                                 Button(model.isDAggerRecording ? "Stop & Save Correction" : "Record DAgger Correction") {
                                     Task { await model.toggleDAggerRecording() }
                                 }

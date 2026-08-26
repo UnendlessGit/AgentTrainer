@@ -57,6 +57,52 @@ struct CaptureSpec: Codable, Hashable, Sendable {
     var region: CodableRect?
     var requestedFPS: Double = 60
     var showsCursor = false
+    /// Present on recordings created by 2.2 and later. Older manifests omit
+    /// this value and continue to describe their native encoded dimensions.
+    var recordingVisuals: RecordingVisualSettings?
+
+    var effectiveRecordingVisuals: RecordingVisualSettings {
+        recordingVisuals ?? RecordingVisualSettings()
+    }
+}
+
+/// Human-facing video controls shared by ordinary Record and DAgger capture.
+/// The encoder deliberately keeps bitrate and codec details behind one simple
+/// compression amount while preserving the exact chosen visual contract in the
+/// recording manifest and in user presets.
+struct RecordingVisualSettings: Codable, Hashable, Sendable {
+    static let defaultCompression = 0.35
+
+    var width = 1280
+    var height = 720
+    var locksAspectRatio = true
+    var colorBits = 8
+    /// Zero favors visual quality; one favors smaller files.
+    var compression = defaultCompression
+
+    var outputSize: CGSize { CGSize(width: width, height: height) }
+
+    func validated() throws -> Self {
+        guard width >= 2, height >= 2, width <= 16_384, height <= 16_384,
+              width.isMultiple(of: 2), height.isMultiple(of: 2) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "Recording resolution must use even dimensions between 2 and 16,384 pixels per side."
+            )
+        }
+        let pixels = width.multipliedReportingOverflow(by: height)
+        guard !pixels.overflow, pixels.partialValue <= 67_108_864 else {
+            throw AgentTrainerError.invalidConfiguration(
+                "Recording resolution may contain at most 67 million pixels."
+            )
+        }
+        guard (1...8).contains(colorBits) else {
+            throw AgentTrainerError.invalidConfiguration("Recording color detail must be 1 through 8 bits.")
+        }
+        guard compression.isFinite, (0...1).contains(compression) else {
+            throw AgentTrainerError.invalidConfiguration("Recording compression must be between higher quality and smaller files.")
+        }
+        return self
+    }
 }
 
 /// A user-owned snapshot of the complete Record-page configuration. Source and
@@ -76,6 +122,19 @@ struct RecordingPreset: Codable, Hashable, Identifiable, Sendable {
     var trimStart: Double
     var trimEnd: Double
     var excludedKeyCodes: Set<UInt16>
+    /// Optional for transparent decoding of presets saved before 2.2.
+    var recordingVisuals: RecordingVisualSettings? = nil
+    /// DAgger lead-up is a universal Record setting, never part of an AI.
+    var leadUpSeconds: Double? = nil
+
+    var effectiveRecordingVisuals: RecordingVisualSettings {
+        recordingVisuals ?? RecordingVisualSettings()
+    }
+
+    var effectiveLeadUpSeconds: Double {
+        let value = leadUpSeconds ?? 3
+        return value.isFinite ? value : 3
+    }
 
     func validated() throws -> Self {
         var value = self
@@ -97,6 +156,10 @@ struct RecordingPreset: Codable, Hashable, Identifiable, Sendable {
         if captureKind == .screenRegion || captureKind == .windowRegion,
            (rect.width <= 0 || rect.height <= 0) {
             throw AgentTrainerError.invalidConfiguration("Region recording presets require a positive width and height.")
+        }
+        _ = try effectiveRecordingVisuals.validated()
+        guard (0.25...15).contains(effectiveLeadUpSeconds) else {
+            throw AgentTrainerError.invalidConfiguration("Recording lead-up must be from 0.25 through 15 seconds.")
         }
         return value
     }
@@ -264,7 +327,10 @@ enum TrainingDataContract {
     /// Version 11 lets a correction recording retain pre-mistake observations
     /// and executed controls as causal context while beginning supervised action
     /// targets only when the expert explicitly starts correcting.
-    static let schemaVersion = 11
+    /// Version 12 changes stochastic batching from one augmentation per batch
+    /// to one per supervised row. Older checkpoints may warm-start their
+    /// weights, but must not restore optimizer/random state as an exact resume.
+    static let schemaVersion = 12
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -479,9 +545,9 @@ struct CNNVisualizationSettings: Codable, Hashable, Sendable {
 
 /// Training-only photometric variation. Spatial transforms are deliberately
 /// excluded because moving pixels without transforming cursor/action labels can
-/// change the meaning of a demonstration. One sampled transform is shared by
-/// the complete batch, so current, causal-past, and future-target frames remain
-/// temporally coherent and the visual encoder can retain its deduplicated path.
+/// change the meaning of a demonstration. Every supervised sample receives an
+/// independent transform, shared only by that sample's current, causal-past,
+/// and future-target frames so its motion and state changes remain coherent.
 struct VisualAugmentationConfiguration: Codable, Hashable, Sendable {
     var enabled = true
     var probability = 0.8
@@ -567,19 +633,16 @@ struct FutureStatePredictionConfiguration: Codable, Hashable, Sendable {
     }
 }
 
-/// Explicit correction capture settings. The effective pre-roll is always at
-/// least the model's temporal lookback so the first expert label can see the
-/// complete sequence that led to the intervention.
+/// AI-specific correction emphasis. Capture appearance and lead-up belong to
+/// the universal Record workflow so ordinary and DAgger recordings never drift.
 struct DAggerConfiguration: Codable, Hashable, Sendable {
     static let maximumBufferedContextBytes = 512 * 1_024 * 1_024
-    var preRollSeconds = 3.0
     var correctionWeight = 4.0
 
     func validated() throws -> Self {
-        guard preRollSeconds.isFinite, (0.25...15).contains(preRollSeconds),
-              correctionWeight.isFinite, (1...20).contains(correctionWeight) else {
+        guard correctionWeight.isFinite, (1...20).contains(correctionWeight) else {
             throw AgentTrainerError.invalidConfiguration(
-                "DAgger pre-roll must be 0.25–15 seconds and correction weight must be 1–20."
+                "DAgger correction weight must be from 1 through 20."
             )
         }
         return self
@@ -587,34 +650,20 @@ struct DAggerConfiguration: Codable, Hashable, Sendable {
 }
 
 enum DAggerContextSizing {
-    static func recentFrameCapacity(
+    static func recordingFrameCapacity(
         preprocessing: PreprocessingSpec,
-        temporal: TemporalVisionConfiguration,
-        perceptionFPS: Double,
-        configuration: DAggerConfiguration
-    ) -> (requested: Int, maximum: Int, temporalBytes: Int) {
-        guard perceptionFPS.isFinite, perceptionFPS > 0 else { return (0, 0, 0) }
+        framesPerSecond: Double,
+        leadUpSeconds: Double
+    ) -> (requested: Int, maximum: Int) {
+        guard framesPerSecond.isFinite, framesPerSecond > 0,
+              leadUpSeconds.isFinite, leadUpSeconds > 0 else { return (0, 0) }
         let overhead = ActionLayout.count * MemoryLayout<Float>.size + 64
-        let requested = max(2, Int(ceil(configuration.preRollSeconds * perceptionFPS)) + 2)
-        let pastSpec = temporal.pastFrameSpec(from: preprocessing)
-        let spaced = temporal.pastFrameCount.multipliedReportingOverflow(by: temporal.frameSpacing)
-        let retained = spaced.partialValue.addingReportingOverflow(temporal.pastFrameCount > 0 ? 1 : 0)
-        let pastStride = pastSpec.sampleByteCount.addingReportingOverflow(overhead)
-        let temporalBytes = retained.partialValue.multipliedReportingOverflow(by: pastStride.partialValue)
-        guard !spaced.overflow, !retained.overflow, !pastStride.overflow, !temporalBytes.overflow else {
-            return (requested, 0, Int.max)
-        }
-        let available = max(0, DAggerConfiguration.maximumBufferedContextBytes - temporalBytes.partialValue)
-        let currentStride = preprocessing.sampleByteCount.addingReportingOverflow(overhead)
-        guard !currentStride.overflow, currentStride.partialValue > 0 else {
-            return (requested, 0, temporalBytes.partialValue)
-        }
-        return (
-            requested,
-            available / currentStride.partialValue,
-            temporalBytes.partialValue
-        )
+        let requested = max(2, Int(ceil(leadUpSeconds * framesPerSecond)) + 2)
+        let stride = preprocessing.sampleByteCount.addingReportingOverflow(overhead)
+        guard !stride.overflow, stride.partialValue > 0 else { return (requested, 0) }
+        return (requested, DAggerConfiguration.maximumBufferedContextBytes / stride.partialValue)
     }
+
 }
 
 enum DAggerCaptureQuality {
@@ -804,12 +853,16 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
         let safeFileNames = [videoFile, eventFile] + (thumbnailFile.map { [$0] } ?? [])
         let supervision = effectiveSupervisionStart
         let weight = trainingWeight ?? 1
+        let recordingVisualsAreValid = capture.recordingVisuals.map {
+            (try? $0.validated()) != nil
+        } ?? true
         let daggerMetadataIsValid = effectivePurpose != .daggerCorrection
             || (sourceProfileID != nil && sourceVersionID != nil && supervisionStart != nil)
         return (1...3).contains(schemaVersion)
             && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && duration.isFinite && duration >= 0
             && capture.requestedFPS.isFinite && capture.requestedFPS > 0 && capture.requestedFPS <= 1_000
+            && recordingVisualsAreValid
             && rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite
             && pixelWidth > 0 && pixelHeight > 0 && pixelWidth <= 32_768 && pixelHeight <= 32_768
             && deliveredFPS.isFinite && deliveredFPS >= 0 && deliveredFPS <= 1_000

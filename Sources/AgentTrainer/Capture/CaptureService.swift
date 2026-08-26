@@ -96,10 +96,16 @@ final class CaptureService: NSObject, @unchecked Sendable {
         let roundedWidth = max(1, Int(outputWidth.rounded()))
         let roundedHeight = max(1, Int(outputHeight.rounded()))
         // Hardware HEVC encoders require an even luma grid on some Apple-silicon
-        // generations. Normalize only saved video; exact model capture remains at
-        // its immutable requested dimensions.
-        config.width = recordingURL == nil ? roundedWidth : max(2, roundedWidth - roundedWidth % 2)
-        config.height = recordingURL == nil ? roundedHeight : max(2, roundedHeight - roundedHeight % 2)
+        // generations. Record settings are validated before this point; never
+        // silently change the user's persisted resolution.
+        if recordingURL != nil,
+           (!roundedWidth.isMultiple(of: 2) || !roundedHeight.isMultiple(of: 2)) {
+            throw AgentTrainerError.invalidConfiguration(
+                "Saved recording dimensions must both be even."
+            )
+        }
+        config.width = roundedWidth
+        config.height = roundedHeight
         config.minimumFrameInterval = CMTime(seconds: 1 / spec.requestedFPS, preferredTimescale: 1_000_000_000)
         // ScreenCaptureKit documents eight surfaces as the practical upper
         // bound. Keeping the queue bounded avoids runaway IOSurface retention.
@@ -117,7 +123,16 @@ final class CaptureService: NSObject, @unchecked Sendable {
         config.preservesAspectRatio = exactOutputSize == nil
         if let sourceRect = selection.sourceRect { config.sourceRect = sourceRect }
 
-        let writer = try recordingURL.map { try HEVCWriter(url: $0, width: config.width, height: config.height, fps: spec.requestedFPS) }
+        let writer = try recordingURL.map {
+            try HEVCWriter(
+                url: $0,
+                width: config.width,
+                height: config.height,
+                fps: spec.requestedFPS,
+                colorBits: spec.effectiveRecordingVisuals.colorBits,
+                compression: spec.effectiveRecordingVisuals.compression
+            )
+        }
         let output = StreamOutput(writer: writer, onFirstFrame: onFirstFrame, onFrame: onFrame, onIdle: onIdle, onUnexpectedStop: onUnexpectedStop)
         let stream = SCStream(filter: selection.filter, configuration: config, delegate: output)
         try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: outputQueue)

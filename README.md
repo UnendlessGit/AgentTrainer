@@ -1,4 +1,4 @@
-# AgentTrainer 2.1.0
+# AgentTrainer 2.2.0
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -17,12 +17,12 @@ The package pins MLX Swift exactly in `Package.resolved`.
 ## Workflow
 
 1. Open AgentTrainer and grant the permissions needed for the operation you want.
-2. Create a recording folder, choose a display, window, or region, optionally save those settings as a reusable preset, then record a demonstration.
+2. Create a recording folder, choose a display, window, or region, set FPS, cursor, output resolution, ratio lock, Color Bit, compression, and lead-up, optionally save the complete setup as a reusable preset, then record a demonstration.
    Existing native `.atrrecord` packages or a portable recording export can also be imported from the Library without transcoding.
 3. Create an AI profile, select recording folders, and configure its vision, controls, and network.
 4. Train the profile. Pause publishes a runnable brain and retains an exact checkpoint.
 5. In Run, choose cursor mode and output permissions, then start the AI.
-6. When the AI makes a mistake, press the normal Record shortcut while Run is active. AI output pauses, the causal lead-up is retained, and your physical correction is saved as DAgger experience for that AI. Press Record again to finish and resume Run.
+6. When the AI makes a mistake, press the normal Record shortcut while Run is active. Run suspends, the UI and capture-excluded HUD switch to DAgger Recording, the causal lead-up is retained at normal Record quality, and your physical correction is saved as DAgger experience for that AI. Press Record again to resume Run immediately while the correction finishes publishing.
 7. Resume training. Existing compatible weights are warm-started; correction-aware best-brain selection requires improved correction fit without a meaningful ordinary-behavior regression.
 8. Use the configured panic shortcut at any time to stop hooks and release held controls.
 
@@ -34,20 +34,20 @@ The capture-source picker refreshes while Record or Run is visible, and reacts i
 
 DAgger is explicit. The Record shortcut creates an ordinary demonstration when no AI is running and toggles correction capture during Run. Ordinary physical takeover still follows the Run safety setting and never starts a recording by itself.
 
-At the trigger, AgentTrainer stops new AI output before preparing the recorder, drains any action already in flight, releases held synthetic controls, and buffers the first expert inputs and frames. A correction package contains:
+At the trigger, AgentTrainer stops inference and new AI output before preparing the recorder, drains work already in flight, releases held synthetic controls, and switches the visible lifecycle from Run to DAgger Recording. A correction package contains:
 
-- recent full-resolution processed vision plus the exact spaced temporal frames the policy used, including lookbacks longer than the recent-window setting
+- a continuous causal lead-up and correction video using the Record page's source, FPS, cursor, resolution, Color Bit, and compression rather than the AI's model-vision resolution
 - the AI or human controls actually associated with those causal frames
 - expert action targets beginning only at the explicit trigger, so the mistake is context rather than a label to imitate
 - a bounded correction weight so short interventions are not drowned by ordinary recording volume
 
-DAgger packages are ordinary native recordings in the Library, are automatically attached to the running AI, and remain exportable. Training always keeps corrections and at least one ordinary demonstration in the training split. A fixed correction probe and an ordinary validation/rehearsal guard select the runnable brain together; the exact key capabilities and runtime semantics belonging to the chosen weights are published with them.
+Lead-up is universal and lives on the Record page; correction weight remains AI-specific. Stopping DAgger clears stale predictions and temporal state before Run resumes, so no pre-correction action can leak into the restarted policy. DAgger packages are ordinary native recordings in the Library, are automatically attached to the running AI, and remain exportable. Training always keeps corrections and at least one ordinary demonstration in the training split. A fixed correction probe and an ordinary validation/rehearsal guard select the runnable brain together; the exact key capabilities and runtime semantics belonging to the chosen weights are published with them.
 
 Correction buffers and video admission are bounded. A package with more than 5% visual-frame loss is discarded instead of learning expert events against stale held video; smaller drop counts are recorded and shown. Quit, storage moves, folder deletion, and profile deletion wait for pending correction publication.
 
 ## Recording efficiency
 
-New recordings use the Apple-silicon hardware HEVC encoder with a direct 8-bit 4:2:0 capture surface, a high-quality resolution/FPS-aware bitrate, and efficient temporal compression. This is intentionally visually transparent lossy storage rather than near-lossless capture: dimensions, timing, and input synchronization are preserved while typical files are several times smaller than the former high-bitrate preset. Existing and imported recordings are never silently transcoded or rewritten.
+New recordings use the Apple-silicon hardware HEVC encoder with a 4:2:0 capture surface, an exact configurable even output resolution, selectable 1–8 bit color detail, and a simple continuous compression control. The default 8-bit path remains zero-copy; lower Color Bit values use pooled accelerated legal-range quantization that preserves neutral chroma before hardware encoding. Dimensions, timing, and input synchronization remain exact, and every setting—including ratio lock and universal DAgger lead-up—round-trips through recording presets. Existing and imported recordings are never silently transcoded or rewritten.
 
 The Library shows exact encoded-frame and logical package-size totals for new recordings. Legacy recordings retain an FPS/duration frame estimate. Each folder shows its complete recording count, frame count, size, and recorded seconds, independent of the current search filter.
 
@@ -68,7 +68,7 @@ The default context is four past frames, two perception intervals apart, at half
 
 The AI editor independently configures three training-only features. None delays or averages the immediate runtime action:
 
-- **Visual Augmentation** varies luminance, contrast, saturation, hue, and gamma within conservative bounds. Spatial transforms are intentionally excluded because they would change cursor/action meaning. One transform is shared across every current, past, and future frame in a training batch, preserving temporal consistency.
+- **Visual Augmentation** varies luminance, contrast, saturation, hue, and gamma within conservative bounds. Spatial transforms are intentionally excluded because they would change cursor/action meaning. Every supervised sample receives an independent transform; only that sample's current, past, and future frames share it, preserving temporal consistency without correlating the batch.
 - **Future Action Prediction** predicts up to four configurable action horizons. Near horizons receive more weight, teaching intent and smoother continuation while the immediate head remains the sole runtime output.
 - **Future State Prediction** predicts an action-conditioned change in the learned visual state. It uses stopped-gradient latent targets and never generates future images; repeated future observations are deduplicated before encoding.
 
@@ -101,7 +101,13 @@ Run the opt-in release benchmark for a compact fixture, the default vision/model
 ./benchmark.sh
 ```
 
-The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. It also executes the complete Policy-v6 objective—including augmentation and both predictive heads—and reports its overhead, memory, and thermal state. Default and temporal-stress runs report sustained windows for both the optimized core path and the full Policy-v6 objective. Low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
+The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. It also executes the complete Policy-v6 objective—including independent per-sample augmentation and both predictive heads—and reports its overhead, memory, and thermal state. Default and temporal-stress runs report sustained windows for both the optimized core path and the full Policy-v6 objective. Low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
+
+Run the opt-in 1280×720 DAgger video-throughput gate with:
+
+```sh
+AGENTTRAINER_RUN_DAGGER_PERFORMANCE_TESTS=1 swift test -c release --filter TrainingPerformanceTests.testRecordQualityDAggerVideoPipelineSustainsDefaultWorkload
+```
 
 Build, sign, package, and install:
 
@@ -124,7 +130,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.1.0.dmg`
+- `AgentTrainer-2.2.0.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

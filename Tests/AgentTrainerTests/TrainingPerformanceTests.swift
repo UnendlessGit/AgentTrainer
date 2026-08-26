@@ -7,6 +7,79 @@ import XCTest
 /// Opt-in hardware benchmark. Normal CI remains deterministic and quick; use
 /// `./benchmark.sh` to exercise the complete packed temporal-vision data path.
 final class TrainingPerformanceTests: XCTestCase {
+    func testRecordQualityDAggerVideoPipelineSustainsDefaultWorkload() async throws {
+        guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_DAGGER_PERFORMANCE_TESTS"] == "1" else {
+            throw XCTSkip("Set AGENTTRAINER_RUN_DAGGER_PERFORMANCE_TESTS=1 to run the Record-quality DAgger benchmark.")
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dagger-performance-\(UUID().uuidString).atrrecord", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let spec = PreprocessingSpec(
+            width: 1280,
+            height: 720,
+            colorMode: .color,
+            bitDepth: 8,
+            chroma: .yuv420,
+            resizePolicy: .stretch
+        )
+        var capture = CaptureSpec(requestedFPS: 60)
+        capture.recordingVisuals = RecordingVisualSettings(
+            width: 1280,
+            height: 720,
+            locksAspectRatio: true,
+            colorBits: 8,
+            compression: RecordingVisualSettings.defaultCompression
+        )
+        let request = DAggerCaptureRequest(
+            recordingID: UUID(),
+            directory: directory,
+            profileID: UUID(),
+            versionID: UUID(),
+            profileName: "Performance",
+            destinationFolderID: UUID(),
+            excludedKeyCodes: [],
+            preprocessing: spec,
+            capture: capture,
+            captureRect: CGRect(x: 0, y: 0, width: 1280, height: 720),
+            perceptionFPS: 60,
+            actionFPS: 60,
+            leadUpSeconds: 0.5,
+            correctionWeight: 4
+        )
+        let packed = Data(repeating: 128, count: spec.sampleByteCount)
+        let controls = [Float](repeating: 0, count: ActionLayout.count)
+        let startNanos: UInt64 = 1_000_000_000
+        let stepNanos: UInt64 = 1_000_000_000 / 60
+        let frames = (0..<60).map { offset in
+            DAggerFrame(
+                timestampNanos: startNanos + UInt64(offset) * stepNanos,
+                packedVision: packed,
+                preprocessing: spec,
+                executedControls: controls
+            )
+        }
+        let began = ContinuousClock.now
+        let recorder = try DAggerRecorder(
+            request: request,
+            correctionStartHostNanos: frames[30].timestampNanos,
+            preRoll: Array(frames.prefix(30))
+        )
+        for frame in frames.dropFirst(30) { recorder.append(frame) }
+        let result = try await recorder.finish(
+            endHostNanos: frames.last!.timestampNanos + stepNanos
+        )
+        let seconds = began.duration(to: .now).benchmarkSeconds
+        let throughput = Double(result.frameCount) / max(0.000_001, seconds)
+        print(
+            "DAGGER_VIDEO_BENCHMARK resolution=1280x720 frames=\(result.frameCount) "
+                + "seconds=\(seconds) frames_per_second=\(throughput) drops=\(result.droppedFrameCount)"
+        )
+        XCTAssertEqual(result.frameCount, 60)
+        XCTAssertEqual(result.droppedFrameCount, 0)
+        XCTAssertGreaterThanOrEqual(throughput, 30)
+    }
+
     func testCompiledMetalDataPathPreservesOrderedUpdatesAndMeasuresThroughput() throws {
         guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_PERFORMANCE_TESTS"] == "1" else {
             throw XCTSkip("Set AGENTTRAINER_RUN_PERFORMANCE_TESTS=1 to run the local Metal benchmark.")
@@ -668,7 +741,7 @@ final class TrainingPerformanceTests: XCTestCase {
             // Exercise the complete Policy-v6 production objective as a
             // separate hardware gate. The core benchmark above isolates the
             // deduplicated encoder optimization; this path adds shared visual
-            // augmentation, multi-horizon actions, future latent dynamics, and
+            // per-sample augmentation, multi-horizon actions, future latent dynamics, and
             // their optimizer state so release numbers cannot hide auxiliary
             // throughput or memory costs.
             Memory.clearCache()
@@ -701,9 +774,9 @@ final class TrainingPerformanceTests: XCTestCase {
 
             func auxiliaryInputs() -> [MLXArray] {
                 try! bufferPool.makeArrays([
-                    .init([uniqueSequenceCount, currentBytesPerSample], dtype: .uint8),
-                    .init([uniquePastFrameCount, pastBytesPerFrame], dtype: .uint8),
-                    .init([uniqueSequenceCount, frameCount, ActionLayout.count], dtype: .float32),
+                    .init([batchSize, currentBytesPerSample], dtype: .uint8),
+                    .init([batchSize, frameCount, pastBytesPerFrame], dtype: .uint8),
+                    .init([batchSize, frameCount, ActionLayout.count], dtype: .float32),
                     .init([uniqueSequenceCount, frameCount], dtype: .int32),
                     .init([batchSize], dtype: .int32),
                     .init([batchSize, 2, ActionLayout.count], dtype: .float32),
@@ -714,9 +787,9 @@ final class TrainingPerformanceTests: XCTestCase {
                     .init([batchSize], dtype: .int32),
                     .init([batchSize], dtype: .float32)
                 ]) { destinations in
-                    uniqueCurrentData.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
-                    deduplicatedPastData.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
-                    uniqueControlData.withUnsafeBytes { destinations[2].copyMemory(from: $0) }
+                    fullCurrentData.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
+                    fullPastData.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
+                    fullControlData.withUnsafeBytes { destinations[2].copyMemory(from: $0) }
                     visionToPastData.withUnsafeBytes { destinations[3].copyMemory(from: $0) }
                     mappingData.withUnsafeBytes { destinations[4].copyMemory(from: $0) }
                     actionData.withUnsafeBytes { destinations[5].copyMemory(from: $0) }
@@ -728,17 +801,95 @@ final class TrainingPerformanceTests: XCTestCase {
                     futureStateMaskData.withUnsafeBytes { destinations[11].copyMemory(from: $0) }
                 }
             }
+            let augmentedImmediateModel = AgentPolicy(profile: profile)
+            try augmentedImmediateModel.loadWeights(from: initialWeights)
+            augmentedImmediateModel.train(true)
+            let augmentedImmediateOptimizer = ResumableAdamW(
+                learningRate: 0.0003,
+                weightDecay: 0.01
+            )
+            augmentedImmediateOptimizer.initialize(model: augmentedImmediateModel)
+            let augmentedImmediateRandomState = MLXRandom.RandomState(seed: 91_337)
+            let augmentedImmediateStep = compile(
+                inputs: [
+                    augmentedImmediateModel,
+                    augmentedImmediateOptimizer,
+                    augmentedImmediateRandomState
+                ],
+                outputs: [
+                    augmentedImmediateModel,
+                    augmentedImmediateOptimizer,
+                    augmentedImmediateRandomState
+                ]
+            ) { arrays in
+                let augmentation = augmentedImmediateModel.sampleVisualAugmentation(
+                    batchSize: batchSize
+                )
+                let current = augmentedImmediateModel.augmentedVision(
+                    VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
+                    parameters: augmentation
+                )
+                let past = augmentedImmediateModel.augmentedPastVision(
+                    VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec),
+                    parameters: augmentation
+                )
+                let actions = arrays[5]
+                let result = valueAndGrad(model: augmentedImmediateModel) { candidate, values in
+                    let temporalFeatures = candidate.temporalFeatures(
+                        currentImages: values[0],
+                        pastImages: values[1],
+                        pastControls: values[2]
+                    )
+                    return [candidate.loss(
+                        logits: candidate.logits(temporalFeatures: temporalFeatures),
+                        targets: actions[0..., 0, 0...],
+                        positiveWeights: positiveWeights,
+                        previousTargets: actions[0..., 1, 0...],
+                        sampleWeights: arrays[6]
+                    )]
+                }(augmentedImmediateModel, [current, past, arrays[2]])
+                augmentedImmediateOptimizer.update(
+                    model: augmentedImmediateModel,
+                    gradients: result.1,
+                    targetType: augmentedImmediateModel.dtype,
+                    gradientNorm: ResumableAdamW.globalGradientNorm(result.1),
+                    maxGradientNorm: 1
+                )
+                return result.0
+            }
+            func runAugmentedImmediate() -> (seconds: Double, loss: Float) {
+                let start = ContinuousClock.now
+                let loss = withRandomState(augmentedImmediateRandomState) {
+                    augmentedImmediateStep(auxiliaryInputs())[0]
+                }
+                MLX.eval(
+                    loss,
+                    augmentedImmediateModel.parameters(),
+                    augmentedImmediateOptimizer.stateArrays(),
+                    augmentedImmediateRandomState.innerState()
+                )
+                return (start.duration(to: .now).benchmarkSeconds, loss.item(Float.self))
+            }
+            for _ in 0..<2 { _ = runAugmentedImmediate() }
+            let augmentedIterations = usesDefaultProfile || usesStressProfile ? 6 : 12
+            var augmentedSeconds = 0.0
+            var augmentedLoss = Float.zero
+            for _ in 0..<augmentedIterations {
+                let result = runAugmentedImmediate()
+                augmentedSeconds += result.seconds
+                augmentedLoss = result.loss
+            }
             let auxiliaryStep = compile(
                 inputs: [auxiliaryModel, auxiliaryOptimizer, auxiliaryRandomState],
                 outputs: [auxiliaryModel, auxiliaryOptimizer, auxiliaryRandomState]
             ) { arrays in
-                let augmentation = auxiliaryModel.sampleVisualAugmentation()
+                let augmentation = auxiliaryModel.sampleVisualAugmentation(batchSize: batchSize)
                 let current = auxiliaryModel.augmentedVision(
                     VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
                     parameters: augmentation
                 )
-                let past = auxiliaryModel.augmentedVision(
-                    VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec),
+                let past = auxiliaryModel.augmentedPastVision(
+                    VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec),
                     parameters: augmentation
                 )
                 let futureImages = auxiliaryModel.augmentedVision(
@@ -750,8 +901,8 @@ final class TrainingPerformanceTests: XCTestCase {
                 let result = valueAndGrad(model: auxiliaryModel) { candidate, values in
                     let temporalFeatures = candidate.temporalFeatures(
                         currentImages: values[0], pastImages: values[1],
-                        pastControls: values[2], visionToPast: arrays[3],
-                        sampleToVision: arrays[4]
+                        pastControls: values[2], visionToPast: nil,
+                        sampleToVision: nil
                     )
                     let fused = candidate.fusedFeatures(temporalFeatures: temporalFeatures)
                     let immediate = candidate.loss(
@@ -810,17 +961,28 @@ final class TrainingPerformanceTests: XCTestCase {
             }
             let auxiliaryMemory = Memory.snapshot()
             let coreSecondsPerStep = reusedSeconds / Double(max(1, iterations))
+            let augmentedSecondsPerStep = augmentedSeconds / Double(max(1, augmentedIterations))
             let auxiliarySecondsPerStep = auxiliarySeconds / Double(max(1, auxiliaryIterations))
+            XCTAssertTrue(augmentedLoss.isFinite)
             XCTAssertTrue(auxiliaryLoss.isFinite)
-            XCTAssertLessThanOrEqual(auxiliarySecondsPerStep, coreSecondsPerStep * 2.5 + 0.002)
+            // Independent visual domains require expanding duplicate action
+            // rows before the CNN. Gate that semantic cost separately from the
+            // predictive heads so neither can hide a regression in the other.
+            XCTAssertLessThanOrEqual(augmentedSecondsPerStep, coreSecondsPerStep * 3 + 0.002)
+            XCTAssertLessThanOrEqual(auxiliarySecondsPerStep, augmentedSecondsPerStep * 2 + 0.002)
             XCTAssertLessThanOrEqual(
                 auxiliaryMemory.cacheMemory,
                 Memory.cacheLimit + 128 * 1_024 * 1_024
             )
             print(
-                "AUXILIARY_TRAINING_BENCHMARK profile=\(profileName) seconds=\(auxiliarySeconds) "
+                "PER_SAMPLE_AUGMENTATION_BENCHMARK profile=\(profileName) seconds=\(augmentedSeconds) "
+                    + "samples_per_second=\(Double(augmentedIterations * batchSize) / max(0.000_001, augmentedSeconds)) "
+                    + "overhead_ratio=\(augmentedSecondsPerStep / max(0.000_001, coreSecondsPerStep)) "
+                    + "loss=\(augmentedLoss)\n"
+                    + "AUXILIARY_TRAINING_BENCHMARK profile=\(profileName) seconds=\(auxiliarySeconds) "
                     + "samples_per_second=\(Double(auxiliaryIterations * batchSize) / max(0.000_001, auxiliarySeconds)) "
-                    + "overhead_ratio=\(auxiliarySecondsPerStep / max(0.000_001, coreSecondsPerStep)) "
+                    + "augmentation_relative_overhead=\(auxiliarySecondsPerStep / max(0.000_001, augmentedSecondsPerStep)) "
+                    + "total_overhead_ratio=\(auxiliarySecondsPerStep / max(0.000_001, coreSecondsPerStep)) "
                     + "loss=\(auxiliaryLoss) active_memory=\(auxiliaryMemory.activeMemory) "
                     + "cache_memory=\(auxiliaryMemory.cacheMemory) thermal=\(TrainingThermalState.current.rawValue)"
             )

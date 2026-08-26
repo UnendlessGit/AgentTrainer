@@ -1,5 +1,7 @@
+import Accelerate
 import AVFoundation
 import CoreMedia
+import CoreVideo
 import Foundation
 import VideoToolbox
 
@@ -9,13 +11,117 @@ enum HEVCEncodingConfiguration {
     /// contain repeated regions and the encoder can spend bits where motion
     /// actually occurs. The bounds keep tiny captures useful and extreme
     /// displays from returning to near-lossless-sized files.
-    static func targetBitRate(width: Int, height: Int, fps: Double) -> Int {
+    static func targetBitRate(
+        width: Int,
+        height: Int,
+        fps: Double,
+        compression: Double = RecordingVisualSettings.defaultCompression
+    ) -> Int {
         guard width > 0, height > 0, fps.isFinite, fps > 0 else { return 1_500_000 }
         let pixels = Double(width) * Double(height)
         let boundedFPS = min(240, max(1, fps))
         let effectiveFPS = min(30, boundedFPS) + max(0, boundedFPS - 30) * 0.5
         let visuallyTransparentTarget = pixels * effectiveFPS * 0.055
-        return Int(min(45_000_000, max(1_500_000, visuallyTransparentTarget.rounded())))
+        let defaultTarget = min(45_000_000, max(1_500_000, visuallyTransparentTarget))
+        let boundedCompression = min(1, max(0, compression.isFinite ? compression : RecordingVisualSettings.defaultCompression))
+        // Exponential scaling gives the whole slider useful range while the
+        // default remains bit-for-bit equivalent to the 2.1 bitrate target.
+        let compressionMultiplier = pow(
+            0.12,
+            boundedCompression - RecordingVisualSettings.defaultCompression
+        )
+        return Int(min(100_000_000, max(250_000, (defaultTarget * compressionMultiplier).rounded())))
+    }
+}
+
+/// One quantization contract for both native video-range capture surfaces and
+/// the full-range packed frames used by DAgger. Luma uses the requested number
+/// of levels. Chroma is quantized symmetrically around its exact neutral code,
+/// preventing low-bit grayscale content from acquiring a color cast.
+struct RecordingColorQuantizationTables: Sendable {
+    let fullRangeLuma: [UInt8]
+    let fullRangeChroma: [UInt8]
+    let videoRangeLuma: [UInt8]
+    let videoRangeChroma: [UInt8]
+
+    init(bits: Int) {
+        let bits = min(8, max(1, bits))
+        fullRangeLuma = Self.luma(bits: bits, lower: 0, upper: 255)
+        fullRangeChroma = Self.chroma(bits: bits, lower: 0, neutral: 128, upper: 255)
+        videoRangeLuma = Self.luma(bits: bits, lower: 16, upper: 235)
+        videoRangeChroma = Self.chroma(bits: bits, lower: 16, neutral: 128, upper: 240)
+    }
+
+    func quantizePacked(_ packed: inout Data, spec: PreprocessingSpec) throws {
+        let lumaCount = spec.width * spec.height
+        let chromaWidth = spec.chroma == .yuv444 ? spec.width : (spec.width + 1) / 2
+        let chromaHeight = spec.chroma == .yuv420 ? (spec.height + 1) / 2 : spec.height
+        let chromaCount = spec.colorMode == .color ? chromaWidth * chromaHeight : 0
+        guard packed.count == lumaCount + 2 * chromaCount else {
+            throw AgentTrainerError.capture("The Record-quality DAgger frame had an invalid packed size.")
+        }
+        let result: vImage_Error = packed.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return kvImageNullPointerArgument }
+            func apply(_ offset: Int, count: Int, table: [UInt8]) -> vImage_Error {
+                guard count > 0 else { return kvImageNoError }
+                var image = vImage_Buffer(
+                    data: base.advanced(by: offset),
+                    height: 1,
+                    width: vImagePixelCount(count),
+                    rowBytes: count
+                )
+                return table.withUnsafeBufferPointer {
+                    vImageTableLookUp_Planar8(
+                        &image,
+                        &image,
+                        $0.baseAddress!,
+                        vImage_Flags(kvImageNoFlags)
+                    )
+                }
+            }
+            let y = apply(0, count: lumaCount, table: fullRangeLuma)
+            guard y == kvImageNoError, chromaCount > 0 else { return y }
+            let cb = apply(lumaCount, count: chromaCount, table: fullRangeChroma)
+            guard cb == kvImageNoError else { return cb }
+            return apply(
+                lumaCount + chromaCount,
+                count: chromaCount,
+                table: fullRangeChroma
+            )
+        }
+        guard result == kvImageNoError else {
+            throw AgentTrainerError.capture("The Record Color Bit transform failed (vImage \(result)).")
+        }
+    }
+
+    private static func luma(bits: Int, lower: Int, upper: Int) -> [UInt8] {
+        let levels = Double((1 << bits) - 1)
+        let extent = Double(upper - lower)
+        return (0...255).map { raw in
+            let value = min(upper, max(lower, raw))
+            let normalized = Double(value - lower) / extent
+            let quantized = (normalized * levels).rounded() / levels
+            return UInt8(clamping: lower + Int((quantized * extent).rounded()))
+        }
+    }
+
+    private static func chroma(
+        bits: Int,
+        lower: Int,
+        neutral: Int,
+        upper: Int
+    ) -> [UInt8] {
+        let sideLevels = Double(1 << max(0, bits - 1))
+        return (0...255).map { raw in
+            let value = min(upper, max(lower, raw))
+            let delta = value - neutral
+            guard delta != 0 else { return UInt8(neutral) }
+            let extent = Double(delta < 0 ? neutral - lower : upper - neutral)
+            let normalizedMagnitude = Double(abs(delta)) / extent
+            let quantizedMagnitude = (normalizedMagnitude * sideLevels).rounded() / sideLevels
+            let signed = delta < 0 ? -quantizedMagnitude : quantizedMagnitude
+            return UInt8(clamping: neutral + Int((signed * extent).rounded()))
+        }
     }
 }
 
@@ -32,10 +138,18 @@ final class HEVCWriter: @unchecked Sendable {
     private var lastPTS: CMTime?
     private var sessionEndPTS: CMTime?
     private var generatedFormatDescription: CMVideoFormatDescription?
+    private let quantizer: RecordingColorQuantizer?
     private(set) var frameCount = 0
     private(set) var droppedFrameCount = 0
 
-    init(url: URL, width: Int, height: Int, fps: Double) throws {
+    init(
+        url: URL,
+        width: Int,
+        height: Int,
+        fps: Double,
+        colorBits: Int = 8,
+        compression: Double = RecordingVisualSettings.defaultCompression
+    ) throws {
         self.url = url
         self.width = width
         self.height = height
@@ -43,7 +157,18 @@ final class HEVCWriter: @unchecked Sendable {
         try? FileManager.default.removeItem(at: url)
         writer = try AVAssetWriter(outputURL: url, fileType: .mov)
 
-        let bitrate = HEVCEncodingConfiguration.targetBitRate(width: width, height: height, fps: fps)
+        guard (1...8).contains(colorBits) else {
+            throw AgentTrainerError.invalidConfiguration("Recording color detail must be 1 through 8 bits.")
+        }
+        quantizer = colorBits < 8
+            ? try RecordingColorQuantizer(width: width, height: height, bits: colorBits)
+            : nil
+        let bitrate = HEVCEncodingConfiguration.targetBitRate(
+            width: width,
+            height: height,
+            fps: fps,
+            compression: compression
+        )
         let encoderSpecification: [String: Any] = [
             kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true,
             kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true
@@ -73,15 +198,28 @@ final class HEVCWriter: @unchecked Sendable {
     }
 
     func append(_ sampleBuffer: CMSampleBuffer) {
-        append(sampleBuffer, waitsForCapacity: false)
+        append(sampleBuffer, waitsForCapacity: false, appliesColorQuantization: true)
     }
 
-    private func append(_ sampleBuffer: CMSampleBuffer, waitsForCapacity: Bool) {
+    private func append(
+        _ sampleBuffer: CMSampleBuffer,
+        waitsForCapacity: Bool,
+        appliesColorQuantization: Bool
+    ) {
         guard CMSampleBufferDataIsReady(sampleBuffer) else {
             droppedFrameCount += 1
             return
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if appliesColorQuantization, let quantizer {
+            guard let source = sampleBuffer.imageBuffer,
+                  let quantized = quantizer.makeBuffer(from: source) else {
+                droppedFrameCount += 1
+                return
+            }
+            append(quantized, presentationTimeStamp: pts)
+            return
+        }
         if !started {
             guard writer.startWriting() else { return }
             writer.startSession(atSourceTime: pts)
@@ -109,7 +247,7 @@ final class HEVCWriter: @unchecked Sendable {
         }
     }
 
-    /// DAgger already owns exact model-ready frames. Rewrapping a reconstructed
+    /// DAgger already owns exact Record-ready frames. Rewrapping a reconstructed
     /// bi-planar surface as a timed sample lets it use the same required
     /// hardware HEVC path without starting a second ScreenCaptureKit stream.
     func append(_ pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
@@ -145,7 +283,7 @@ final class HEVCWriter: @unchecked Sendable {
             droppedFrameCount += 1
             return
         }
-        append(sample, waitsForCapacity: true)
+        append(sample, waitsForCapacity: true, appliesColorQuantization: false)
     }
 
     func finish(endPTS requestedEndPTS: CMTime? = nil) async throws -> (duration: Double, deliveredFPS: Double, frames: Int) {
@@ -182,4 +320,84 @@ final class HEVCWriter: @unchecked Sendable {
         return (duration, duration > 0 ? Double(frameCount) / duration : 0, frameCount)
     }
 
+}
+
+/// Fast lookup-table quantization for ScreenCaptureKit's bi-planar recording
+/// surfaces. A CVPixelBufferPool avoids a full-resolution allocation per frame;
+/// the 8-bit setting bypasses this path entirely for zero-copy recording.
+private final class RecordingColorQuantizer: @unchecked Sendable {
+    private let pool: CVPixelBufferPool
+    private let lumaTable: [UInt8]
+    private let chromaTable: [UInt8]
+
+    init(width: Int, height: Int, bits: Int) throws {
+        let poolAttributes: [CFString: Any] = [
+            kCVPixelBufferPoolMinimumBufferCountKey: 3
+        ]
+        let pixelAttributes: [CFString: Any] = [
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ]
+        var optionalPool: CVPixelBufferPool?
+        guard CVPixelBufferPoolCreate(
+            kCFAllocatorDefault,
+            poolAttributes as CFDictionary,
+            pixelAttributes as CFDictionary,
+            &optionalPool
+        ) == kCVReturnSuccess, let optionalPool else {
+            throw AgentTrainerError.capture("The recording color-detail buffer pool could not be created.")
+        }
+        pool = optionalPool
+        let tables = RecordingColorQuantizationTables(bits: bits)
+        lumaTable = tables.videoRangeLuma
+        chromaTable = tables.videoRangeChroma
+    }
+
+    func makeBuffer(from source: CVPixelBuffer) -> CVPixelBuffer? {
+        guard CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else {
+            return nil
+        }
+        var optionalDestination: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(
+            kCFAllocatorDefault,
+            pool,
+            &optionalDestination
+        ) == kCVReturnSuccess, let destination = optionalDestination else { return nil }
+        CVBufferPropagateAttachments(source, destination)
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(destination, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(destination, [])
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+        guard CVPixelBufferGetPlaneCount(source) == 2,
+              CVPixelBufferGetPlaneCount(destination) == 2 else { return nil }
+        for plane in 0..<2 {
+            guard let sourceBase = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                  let destinationBase = CVPixelBufferGetBaseAddressOfPlane(destination, plane) else { return nil }
+            let activeWidth = plane == 0
+                ? CVPixelBufferGetWidthOfPlane(source, plane)
+                : CVPixelBufferGetWidthOfPlane(source, plane) * 2
+            var sourceImage = vImage_Buffer(
+                data: sourceBase,
+                height: vImagePixelCount(CVPixelBufferGetHeightOfPlane(source, plane)),
+                width: vImagePixelCount(activeWidth),
+                rowBytes: CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+            )
+            var destinationImage = vImage_Buffer(
+                data: destinationBase,
+                height: vImagePixelCount(CVPixelBufferGetHeightOfPlane(destination, plane)),
+                width: vImagePixelCount(activeWidth),
+                rowBytes: CVPixelBufferGetBytesPerRowOfPlane(destination, plane)
+            )
+            let table = plane == 0 ? lumaTable : chromaTable
+            let result = table.withUnsafeBufferPointer {
+                vImageTableLookUp_Planar8(&sourceImage, &destinationImage, $0.baseAddress!, vImage_Flags(kvImageNoFlags))
+            }
+            guard result == kvImageNoError else { return nil }
+        }
+        return destination
+    }
 }
