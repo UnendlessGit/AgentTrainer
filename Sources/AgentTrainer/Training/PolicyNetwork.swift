@@ -13,6 +13,7 @@ struct VisualAugmentationParameters {
 
 final class AgentPolicy: Module, @unchecked Sendable {
     let profile: AIProfile
+    let contextSchema: ModelContextSchema
     let dtype: DType
     // Leading underscore deliberately keeps this deterministic tensor out of
     // MLX Module reflection. It is an input buffer, not a learned parameter;
@@ -44,8 +45,9 @@ final class AgentPolicy: Module, @unchecked Sendable {
     @ModuleInfo var futureStateHead: Linear
     @ModuleInfo var dropout: Dropout
 
-    init(profile: AIProfile) {
+    init(profile: AIProfile, contextSchema: ModelContextSchema = .empty) {
         self.profile = profile
+        self.contextSchema = contextSchema
         dtype = switch profile.training.precision {
         case .float16: .float16
         case .bfloat16: .bfloat16
@@ -107,6 +109,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         var fusionLayers: [Linear] = []
         var fusionNormalizations: [LayerNorm] = []
         var fusionInput = architecture.visualEmbedding + architecture.recurrentWidth
+            + contextSchema.inputValueCount
         for width in architecture.fusionWidths {
             fusionLayers.append(Linear(fusionInput, max(1, width)))
             fusionNormalizations.append(LayerNorm(dimensions: max(1, width)))
@@ -638,8 +641,34 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return concatenated([currentVisualEmbedding, recurrent], axis: -1)
     }
 
-    func fusedFeatures(temporalFeatures: MLXArray) -> MLXArray {
+    func fusedFeatures(
+        temporalFeatures: MLXArray,
+        contextValues: MLXArray? = nil,
+        sampleToVision: MLXArray? = nil
+    ) -> MLXArray {
         var fused = temporalFeatures
+        if contextSchema.inputValueCount > 0 {
+            var context = contextValues ?? MLXArray.zeros(
+                [temporalFeatures.dim(0), contextSchema.inputValueCount],
+                dtype: dtype
+            )
+            precondition(
+                context.ndim == 2
+                    && context.dim(1) == contextSchema.inputValueCount,
+                "Context values must match this brain's immutable vocabulary."
+            )
+            if context.dim(0) != temporalFeatures.dim(0) {
+                guard let sampleToVision,
+                      sampleToVision.ndim == 1,
+                      sampleToVision.dim(0) == temporalFeatures.dim(0) else {
+                    preconditionFailure(
+                        "Shared context rows require one visual index per supervised sample."
+                    )
+                }
+                context = context.take(sampleToVision, axis: 0)
+            }
+            fused = concatenated([fused, context.asType(dtype)], axis: -1)
+        }
         for (index, layer) in fusion.enumerated() {
             fused = layer(fused)
             if fusionNormalizations.indices.contains(index) {
@@ -659,6 +688,18 @@ final class AgentPolicy: Module, @unchecked Sendable {
 
     func logits(temporalFeatures: MLXArray) -> MLXArray {
         logits(fusedFeatures: fusedFeatures(temporalFeatures: temporalFeatures))
+    }
+
+    func logits(
+        temporalFeatures: MLXArray,
+        contextValues: MLXArray?,
+        sampleToVision: MLXArray? = nil
+    ) -> MLXArray {
+        logits(fusedFeatures: fusedFeatures(
+            temporalFeatures: temporalFeatures,
+            contextValues: contextValues,
+            sampleToVision: sampleToVision
+        ))
     }
 
     func futureActionLogits(fusedFeatures: MLXArray) -> MLXArray {
@@ -682,25 +723,33 @@ final class AgentPolicy: Module, @unchecked Sendable {
     func logits(
         currentVisualFeatures: MLXArray,
         pastImages: MLXArray,
-        pastControls: MLXArray
+        pastControls: MLXArray,
+        contextValues: MLXArray? = nil
     ) -> MLXArray {
-        logits(temporalFeatures: temporalFeatures(
-            currentVisualFeatures: currentVisualFeatures,
-            pastImages: pastImages,
-            pastControls: pastControls
-        ))
+        logits(
+            temporalFeatures: temporalFeatures(
+                currentVisualFeatures: currentVisualFeatures,
+                pastImages: pastImages,
+                pastControls: pastControls
+            ),
+            contextValues: contextValues
+        )
     }
 
     func callAsFunction(
         currentImages: MLXArray,
         pastImages: MLXArray,
-        pastControls: MLXArray
+        pastControls: MLXArray,
+        contextValues: MLXArray? = nil
     ) -> MLXArray {
-        logits(temporalFeatures: temporalFeatures(
-            currentImages: currentImages,
-            pastImages: pastImages,
-            pastControls: pastControls
-        ))
+        logits(
+            temporalFeatures: temporalFeatures(
+                currentImages: currentImages,
+                pastImages: pastImages,
+                pastControls: pastControls
+            ),
+            contextValues: contextValues
+        )
     }
 
     func activatedPredictions(logits: MLXArray) -> MLXArray {
@@ -717,18 +766,24 @@ final class AgentPolicy: Module, @unchecked Sendable {
     func predictions(
         currentImages: MLXArray,
         pastImages: MLXArray,
-        pastControls: MLXArray
+        pastControls: MLXArray,
+        contextValues: MLXArray? = nil
     ) -> MLXArray {
         activatedPredictions(logits: callAsFunction(
             currentImages: currentImages,
             pastImages: pastImages,
-            pastControls: pastControls
+            pastControls: pastControls,
+            contextValues: contextValues
         ))
     }
 
-    func currentOnlyPredictions(currentImages: MLXArray) -> MLXArray {
+    func currentOnlyPredictions(
+        currentImages: MLXArray,
+        contextValues: MLXArray? = nil
+    ) -> MLXArray {
         activatedPredictions(logits: logits(
-            temporalFeatures: currentOnlyTemporalFeatures(currentImages: currentImages)
+            temporalFeatures: currentOnlyTemporalFeatures(currentImages: currentImages),
+            contextValues: contextValues
         ))
     }
 

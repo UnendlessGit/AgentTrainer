@@ -1,4 +1,4 @@
-# AgentTrainer 2.2.0
+# AgentTrainer 2.3.0
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -17,7 +17,7 @@ The package pins MLX Swift exactly in `Package.resolved`.
 ## Workflow
 
 1. Open AgentTrainer and grant the permissions needed for the operation you want.
-2. Create a recording folder, choose a display, window, or region, set FPS, cursor, output resolution, ratio lock, Color Bit, compression, and lead-up, optionally save the complete setup as a reusable preset, then record a demonstration.
+2. Create a recording folder, choose a display, window, or region, set FPS, cursor, output resolution, ratio lock, Color Bit, compression, lead-up, and any custom Context / Labels, optionally save the complete setup as a reusable preset, then record a demonstration.
    Existing native `.atrrecord` packages or a portable recording export can also be imported from the Library without transcoding.
 3. Create an AI profile, select recording folders, and configure its vision, controls, and network.
 4. Train the profile. Pause publishes a runnable brain and retains an exact checkpoint.
@@ -47,11 +47,24 @@ Correction buffers and video admission are bounded. A package with more than 5% 
 
 ## Recording efficiency
 
-New recordings use the Apple-silicon hardware HEVC encoder with a 4:2:0 capture surface, an exact configurable even output resolution, selectable 1–8 bit color detail, and a simple continuous compression control. The default 8-bit path remains zero-copy; lower Color Bit values use pooled accelerated legal-range quantization that preserves neutral chroma before hardware encoding. Dimensions, timing, and input synchronization remain exact, and every setting—including ratio lock and universal DAgger lead-up—round-trips through recording presets. Existing and imported recordings are never silently transcoded or rewritten.
+New recordings use the Apple-silicon hardware HEVC encoder with a 4:2:0 capture surface, an exact configurable even output resolution, selectable 1–8 bit color detail, and a simple continuous compression control. The default 8-bit path remains zero-copy; lower Color Bit values use pooled accelerated legal-range quantization that preserves neutral chroma before hardware encoding. Dimensions, timing, and input synchronization remain exact, and every setting—including ratio lock, universal DAgger lead-up, and Context / Labels—round-trips through recording presets. Existing and imported recordings are never silently transcoded or rewritten.
 
 The Library shows exact encoded-frame and logical package-size totals for new recordings. Legacy recordings retain an FPS/duration frame estimate. Each folder shows its complete recording count, frame count, size, and recorded seconds, independent of the current search filter.
 
 The first training-data build decodes compressed video directly to native YUV, creates current and past training resolutions together in one Metal submission, overlaps decode/packing/writes through a bounded pipeline, and packs a held static frame once before repeating its exact bytes at every required perception interval. Renaming or moving a recording no longer invalidates that expensive cache. Subsequent compatible training runs reuse it.
+
+## Context / Labels
+
+Context is a generic user-defined categorical system. AgentTrainer does not ship game, task, camera, vehicle, or other domain-specific labels. Create any number of fields and values in Record or Library, then select zero or one value from each field for a recording.
+
+- Record freezes the current selections when capture starts. Recording presets retain them.
+- Library shows labels on recording rows and supports adding, changing, or clearing a field for one recording or a multi-selection. Bulk manifest edits roll back together on failure and never rewrite video or synchronized input.
+- Renaming a field or value updates recording snapshots without rebuilding packed pixels. Changing the selected value invalidates only the relevant rebuildable dataset/checkpoint identity.
+- Training snapshots only fields and values actually observed in the AI's selected recordings. Each value occupies one stable categorical input; a missing field is an all-zero segment rather than an invented hidden category.
+- Run loads the immutable vocabulary from the selected brain. Every trained field appears blank so the current operating context can be chosen, and changes take effect on the next perception after stale temporal/action state is released. A brain trained without context shows no context controls.
+- DAgger corrections retain the Run context active when correction capture begins.
+
+Existing recordings, presets, profiles, and context-free Policy-v6 brains remain compatible. Context-free models keep their exact original parameter layout.
 
 ## Temporal vision
 
@@ -130,7 +143,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.2.0.dmg`
+- `AgentTrainer-2.3.0.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 
@@ -152,12 +165,14 @@ The default support root is:
 
 It contains:
 
-- `Recordings` — size-optimized hardware HEVC video, synchronized binary input, thumbnails, and manifests
+- `Recordings` — size-optimized hardware HEVC video, synchronized binary input, thumbnails, manifests, and portable context snapshots
 - `Caches` — rebuildable packed datasets
 - `Profiles` — profile metadata, immutable runnable versions, and exact checkpoints
 - `Logs` — bounded local diagnostics
 
-The Library can export any selected recording subset as a self-contained `Recordings` folder plus its folder metadata. Import validates every video, manifest, and synchronized input stream before changing the managed library; duplicate recording identifiers are regenerated without rewriting media or event contents.
+The training-data root also contains `context-fields.json`, the reusable custom field/value catalog.
+
+The Library can export any selected recording subset as a self-contained `Recordings` folder plus its folder and context-field metadata. Import validates every video, manifest, synchronized input stream, and context definition before changing the managed library; duplicate recording or context identifiers are remapped without rewriting media or event contents.
 
 Settings can relocate training data and models independently. Moves use copy, verification, switch, and cleanup steps; selecting an existing AgentTrainer library switches to it without merging. Do not manually edit manifests or move only part of a managed library.
 

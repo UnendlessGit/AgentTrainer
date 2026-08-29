@@ -25,6 +25,7 @@ struct DAggerCaptureRequest: Sendable {
     var actionFPS: Double
     var leadUpSeconds: Double
     var correctionWeight: Double
+    var contextAssignments: [ContextAssignment] = []
 }
 
 /// Immutable Record-page snapshot retained for an entire Run. Freezing it at

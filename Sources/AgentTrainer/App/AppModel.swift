@@ -25,6 +25,10 @@ final class AppModel: ObservableObject {
     @Published var regionHeight = 720.0
     @Published var recordings: [RecordingItem] = []
     @Published var recordingFolders: [RecordingFolder] = []
+    @Published private(set) var contextFields: [ContextFieldDefinition] = []
+    @Published var recordingContextValues: [UUID: UUID] = [:] {
+        didSet { persistWorkflowSettings() }
+    }
     @Published var recordingDestinationFolderID: UUID?
     @Published var selectedRecordingID: UUID?
     @Published var selectedRecordingIDs: Set<UUID> = []
@@ -92,7 +96,18 @@ final class AppModel: ObservableObject {
             agent?.updateOutputPermissions(runtimeOutputPermissions)
         }
     }
+    @Published private(set) var runContextSchema = ModelContextSchema.empty
+    @Published private(set) var runContextVersionID: UUID?
+    @Published private(set) var isLoadingRunContext = false
+    @Published var runContextValues: [UUID: UUID] = [:] {
+        didSet {
+            guard runningVersion?.id == runContextVersionID else { return }
+            runningContextValues = runContextValues
+            agent?.updateContextSelection(runContextValues)
+        }
+    }
     @Published private(set) var trainingProfileID: UUID?
+    @Published private(set) var trainingContextSchema = ModelContextSchema.empty
     @Published private(set) var runningProfileID: UUID?
 
     let hudModel = InputHUDModel()
@@ -120,6 +135,7 @@ final class AppModel: ObservableObject {
     private lazy var runHotkey = GlobalHotkeyMonitor(identifier: 3, binding: hotkeys.run) { [weak self] in Task { @MainActor in guard let self else { return }; self.agentIsActiveOrStarting ? await self.stopAgent() : await self.startAgent() } }
     private var agent: AgentRuntime?
     private var runningVersion: ModelVersionManifest?
+    private var runningContextValues: [UUID: UUID] = [:]
     private var activeRuntimeCaptureSpec: CaptureSpec?
     private var activeRuntimeCaptureRect: CGRect?
     private var activeDAggerCaptureConfiguration: DAggerRuntimeCaptureConfiguration?
@@ -134,6 +150,7 @@ final class AppModel: ObservableObject {
     private var activeRecordingRect: CGRect?
     private var activeRecordingFolderID: UUID?
     private var activeRecordingExcludedKeyCodes: Set<UInt16> = []
+    private var activeRecordingContextAssignments: [ContextAssignment] = []
     private var recordingLaunchRevision: UInt64 = 0
     private var humanHUDStateRevision: UInt64 = 0
     private var agentLaunchRevision: UInt64 = 0
@@ -145,6 +162,7 @@ final class AppModel: ObservableObject {
     private var updateCheckStarted = false
     private var autoTrainingProfileID: UUID?
     private var trainingInterruption: TrainingInterruption?
+    private var runContextLoadRevision: UInt64 = 0
 
     private enum TrainingInterruption: Equatable {
         case pause
@@ -186,6 +204,12 @@ final class AppModel: ObservableObject {
             }
             let leadUp = saved.recordingLeadUpSeconds ?? 3
             recordingLeadUpSeconds = leadUp.isFinite && (0.25...15).contains(leadUp) ? leadUp : 3
+            recordingContextValues = Dictionary(
+                (saved.recordingContextAssignments ?? []).map {
+                    ($0.fieldID, $0.valueID)
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
         }
         // Absolute Cursor was the old default, even for locked-camera data.
         // Move existing installs once to the safer recording-aware mode; the
@@ -349,6 +373,29 @@ final class AppModel: ObservableObject {
         let defaultFolderID = try? await WorkspaceStore.shared.normalizeRecordingFolders()
         recordings = await WorkspaceStore.shared.listRecordings()
         recordingFolders = await WorkspaceStore.shared.listRecordingFolders()
+        let catalog = await WorkspaceStore.shared.contextCatalog()
+        contextFields = catalog.fields.sorted {
+            $0.createdAt == $1.createdAt
+                ? $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                : $0.createdAt < $1.createdAt
+        }.map { field in
+            var field = field
+            field.values.sort {
+                $0.createdAt == $1.createdAt
+                    ? $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                    : $0.createdAt < $1.createdAt
+            }
+            return field
+        }
+        let validContextValues = Dictionary(uniqueKeysWithValues: contextFields.map {
+            ($0.id, Set($0.values.map(\.id)))
+        })
+        let sanitizedContextValues = recordingContextValues.filter { fieldID, valueID in
+            validContextValues[fieldID]?.contains(valueID) == true
+        }
+        if sanitizedContextValues != recordingContextValues {
+            recordingContextValues = sanitizedContextValues
+        }
         if recordingDestinationFolderID == nil || !recordingFolders.contains(where: { $0.id == recordingDestinationFolderID }) {
             recordingDestinationFolderID = defaultFolderID ?? recordingFolders.first?.id
         }
@@ -387,6 +434,43 @@ final class AppModel: ObservableObject {
         isLoadingVersions = false
     }
 
+    /// Loads the immutable vocabulary from the selected profile's active brain.
+    /// A newly selected brain always starts blank by design; models trained with
+    /// no context expose no controls at all.
+    func prepareRunContext(reset: Bool = false) async {
+        runContextLoadRevision &+= 1
+        let revision = runContextLoadRevision
+        guard let profile = selectedProfile,
+              let versionID = profile.activeVersionID else {
+            runContextSchema = .empty
+            runContextVersionID = nil
+            runContextValues = [:]
+            isLoadingRunContext = false
+            return
+        }
+        if !reset, runContextVersionID == versionID {
+            isLoadingRunContext = false
+            return
+        }
+        isLoadingRunContext = true
+        let version = await WorkspaceStore.shared.version(
+            profileID: profile.id,
+            versionID: versionID
+        )
+        guard revision == runContextLoadRevision else { return }
+        isLoadingRunContext = false
+        guard let version else {
+            runContextSchema = .empty
+            runContextVersionID = nil
+            runContextValues = [:]
+            return
+        }
+        runContextSchema = version.effectiveContextSchema
+        runContextVersionID = version.id
+        runContextValues = runningVersion?.id == version.id
+            ? runningContextValues : [:]
+    }
+
     func refreshPermissions() {
         screenPermission = CGPreflightScreenCaptureAccess()
         accessibilityPermission = AXIsProcessTrusted()
@@ -406,12 +490,13 @@ final class AppModel: ObservableObject {
         do {
             let spec = captureSpec(source: source), captureRect = effectiveCaptureRect(source)
             let excludedKeys = recordingExcludedKeyCodes
+            let contextAssignments = currentRecordingContextAssignments()
             let recordingShortcut = hotkeys.record
             let id = UUID()
             let directory = try await WorkspaceStore.shared.createRecordingDirectory(id: id)
             guard recordingLaunchRevision == launchToken else { throw CancellationError() }
             let writer = try InputEventWriter(url: directory.appendingPathComponent("events.atrevents"))
-            recordingID = id; recordingDirectory = directory; eventWriter = writer; activeRecordingSpec = spec; activeRecordingRect = captureRect; activeRecordingFolderID = destinationFolderID; activeRecordingExcludedKeyCodes = excludedKeys
+            recordingID = id; recordingDirectory = directory; eventWriter = writer; activeRecordingSpec = spec; activeRecordingRect = captureRect; activeRecordingFolderID = destinationFolderID; activeRecordingExcludedKeyCodes = excludedKeys; activeRecordingContextAssignments = contextAssignments
             let clock = RecordingClock()
             recordingClock = clock; recordingHostStart = 0
             let eventClock = RecordingClock(); lastEventClock = eventClock
@@ -477,7 +562,7 @@ final class AppModel: ObservableObject {
             _ = try? await capture.stop()
             input.stop(); input.onSample = nil; input.onState = nil; input.excludedKeyCodes = []; hudModel.hide(); _ = try? eventWriter?.finish(); eventWriter = nil
             if let recordingDirectory { try? FileManager.default.removeItem(at: recordingDirectory) }
-            self.recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []
+            self.recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []; activeRecordingContextAssignments = []
             if error is CancellationError { activityStatus = "Recording start cancelled" }
             else { present(error) }
         }
@@ -509,7 +594,7 @@ final class AppModel: ObservableObject {
             var trimStart = min(duration, max(0, recordingTrimStart))
             var trimEnd = max(trimStart, duration - max(0, recordingTrimEnd))
             if trimEnd <= trimStart { trimStart = 0; trimEnd = duration }
-            let manifest = RecordingManifest(id: id, name: "Recording \(Date().formatted(date: .abbreviated, time: .shortened))", createdAt: Date(), hostStartNanos: hostStart, duration: duration, capture: captureSpec, globalRect: CodableRect(captureRect), pixelWidth: result.width, pixelHeight: result.height, deliveredFPS: result.deliveredFPS, frameCount: result.frameCount, droppedFrameCount: result.droppedFrameCount, eventCount: eventCount, trimStart: trimStart, trimEnd: trimEnd, folderID: destinationFolderID, thumbnailFile: "thumbnail.jpg", excludedKeyCodes: activeRecordingExcludedKeyCodes)
+            let manifest = RecordingManifest(id: id, name: "Recording \(Date().formatted(date: .abbreviated, time: .shortened))", createdAt: Date(), hostStartNanos: hostStart, duration: duration, capture: captureSpec, globalRect: CodableRect(captureRect), pixelWidth: result.width, pixelHeight: result.height, deliveredFPS: result.deliveredFPS, frameCount: result.frameCount, droppedFrameCount: result.droppedFrameCount, eventCount: eventCount, trimStart: trimStart, trimEnd: trimEnd, folderID: destinationFolderID, thumbnailFile: "thumbnail.jpg", excludedKeyCodes: activeRecordingExcludedKeyCodes, contextAssignments: activeRecordingContextAssignments)
             try await WorkspaceStore.shared.writeRecording(manifest, to: directory)
             await createThumbnail(for: directory.appendingPathComponent("capture.mov"), at: max(0, min(duration * 0.25, 2)), destination: directory.appendingPathComponent("thumbnail.jpg"))
             activityStatus = "Recording saved"
@@ -520,7 +605,7 @@ final class AppModel: ObservableObject {
                 AppLog.write(.warning, category: "Recording", "Skipped unusable or backpressured capture frames", details: "\(result.droppedFrameCount) frames; input timing and the remaining HEVC timeline were preserved")
             }
         } catch { try? FileManager.default.removeItem(at: directory); present(error) }
-        isRecording = false; recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []; recordingClock = RecordingClock(); lastEventClock = RecordingClock(); await refreshLibrary()
+        isRecording = false; recordingDirectory = nil; recordingID = nil; activeRecordingSpec = nil; activeRecordingRect = nil; activeRecordingFolderID = nil; activeRecordingExcludedKeyCodes = []; activeRecordingContextAssignments = []; recordingClock = RecordingClock(); lastEventClock = RecordingClock(); await refreshLibrary()
     }
 
     func deleteRecording(_ item: RecordingItem) async {
@@ -568,6 +653,153 @@ final class AppModel: ObservableObject {
             try await WorkspaceStore.shared.deleteRecordingFolder(folder, includingRecordings: includingRecordings)
             if recordingDestinationFolderID == folder.id { recordingDestinationFolderID = nil }
             await refreshLibrary()
+        } catch { present(error) }
+    }
+
+    @discardableResult
+    func createContextField(name: String) async -> Bool {
+        guard !recordingIsActiveOrStarting, !daggerLifecycleIsActive else {
+            present(AgentTrainerError.storage(
+                "Finish the active recording or DAgger publication before changing context definitions."
+            ))
+            return false
+        }
+        do {
+            let field = ContextFieldDefinition(
+                id: UUID(),
+                name: name,
+                values: [],
+                createdAt: Date()
+            )
+            _ = try await WorkspaceStore.shared.saveContextField(field)
+            await refreshLibrary()
+            activityStatus = "Context field created"
+            return true
+        } catch {
+            present(error)
+            return false
+        }
+    }
+
+    func renameContextField(_ field: ContextFieldDefinition, name: String) async {
+        guard !recordingIsActiveOrStarting, !daggerLifecycleIsActive else {
+            present(AgentTrainerError.storage(
+                "Finish the active recording or DAgger publication before changing context definitions."
+            ))
+            return
+        }
+        do {
+            var changed = field
+            changed.name = name
+            _ = try await WorkspaceStore.shared.saveContextField(changed)
+            await refreshLibrary()
+            activityStatus = "Context field renamed"
+        } catch { present(error) }
+    }
+
+    func deleteContextField(_ field: ContextFieldDefinition) async {
+        guard !recordingIsActiveOrStarting, !daggerLifecycleIsActive else {
+            present(AgentTrainerError.storage(
+                "Finish the active recording or DAgger publication before changing context definitions."
+            ))
+            return
+        }
+        do {
+            try await WorkspaceStore.shared.deleteContextField(id: field.id)
+            recordingContextValues.removeValue(forKey: field.id)
+            await refreshLibrary()
+            activityStatus = "Context field removed from recordings"
+        } catch { present(error) }
+    }
+
+    @discardableResult
+    func createContextValue(fieldID: UUID, name: String) async -> Bool {
+        guard !recordingIsActiveOrStarting, !daggerLifecycleIsActive else {
+            present(AgentTrainerError.storage(
+                "Finish the active recording or DAgger publication before changing context definitions."
+            ))
+            return false
+        }
+        guard var field = contextFields.first(where: { $0.id == fieldID }) else {
+            return false
+        }
+        field.values.append(ContextValueDefinition(
+            id: UUID(),
+            name: name,
+            createdAt: Date()
+        ))
+        do {
+            _ = try await WorkspaceStore.shared.saveContextField(field)
+            await refreshLibrary()
+            activityStatus = "Context value created"
+            return true
+        } catch {
+            present(error)
+            return false
+        }
+    }
+
+    func renameContextValue(
+        _ value: ContextValueDefinition,
+        in field: ContextFieldDefinition,
+        name: String
+    ) async {
+        guard !recordingIsActiveOrStarting, !daggerLifecycleIsActive else {
+            present(AgentTrainerError.storage(
+                "Finish the active recording or DAgger publication before changing context definitions."
+            ))
+            return
+        }
+        guard let valueIndex = field.values.firstIndex(where: { $0.id == value.id }) else { return }
+        var changed = field
+        changed.values[valueIndex].name = name
+        do {
+            _ = try await WorkspaceStore.shared.saveContextField(changed)
+            await refreshLibrary()
+            activityStatus = "Context value renamed"
+        } catch { present(error) }
+    }
+
+    func deleteContextValue(
+        _ value: ContextValueDefinition,
+        in field: ContextFieldDefinition
+    ) async {
+        guard !recordingIsActiveOrStarting, !daggerLifecycleIsActive else {
+            present(AgentTrainerError.storage(
+                "Finish the active recording or DAgger publication before changing context definitions."
+            ))
+            return
+        }
+        do {
+            try await WorkspaceStore.shared.deleteContextValue(
+                fieldID: field.id,
+                valueID: value.id
+            )
+            if recordingContextValues[field.id] == value.id {
+                recordingContextValues.removeValue(forKey: field.id)
+            }
+            await refreshLibrary()
+            activityStatus = "Context value removed from recordings"
+        } catch { present(error) }
+    }
+
+    func setContextValue(
+        _ valueID: UUID?,
+        fieldID: UUID,
+        recordings items: [RecordingItem]
+    ) async {
+        guard !items.isEmpty else { return }
+        do {
+            try await WorkspaceStore.shared.setContextValue(
+                valueID,
+                for: fieldID,
+                recordings: items
+            )
+            await refreshLibrary()
+            selectedRecordingIDs.formUnion(items.map(\.id))
+            activityStatus = valueID == nil
+                ? "Context removed from \(items.count) recording\(items.count == 1 ? "" : "s")"
+                : "Context updated for \(items.count) recording\(items.count == 1 ? "" : "s")"
         } catch { present(error) }
     }
 
@@ -698,6 +930,7 @@ final class AppModel: ObservableObject {
             let activation = try await WorkspaceStore.shared.activateVersion(profile: profile, versionID: version.id)
             await refreshLibrary()
             selectedProfileID = activation.profile.id
+            await prepareRunContext(reset: true)
             activityStatus = activation.checkpointIsResumable
                 ? "Brain reverted to \(activation.version.name); training will resume there"
                 : "Activated \(activation.version.name) for running"
@@ -745,6 +978,9 @@ final class AppModel: ObservableObject {
     }
 
     private func launchTraining(profile: AIProfile, recordings selected: [RecordingItem]) {
+        trainingContextSchema = (try? ModelContextSchema.trained(from: selected.map {
+            $0.manifest.effectiveContextAssignments
+        })) ?? .empty
         isTraining = true; trainingProfileID = profile.id; trainingStatus = "Preparing packed dataset cache for \(profile.name)"; activityStatus = trainingStatus
         AppLog.write(category: "Training", isAutoTraining ? "Auto training started" : "Training started", details: "\(profile.name), \(selected.count) recordings, batch \(profile.training.batchSize), \(profile.preprocessing.width)×\(profile.preprocessing.height)")
         training.start(profile: profile, recordings: selected, runSettings: trainingRunSettings) { [weak self] value, status in
@@ -791,6 +1027,7 @@ final class AppModel: ObservableObject {
         let interruption = trainingInterruption
         isTraining = false
         trainingProfileID = nil
+        trainingContextSchema = .empty
         isAutoTraining = false
         autoTrainingProfileID = nil
         trainingInterruption = nil
@@ -806,6 +1043,7 @@ final class AppModel: ObservableObject {
         let interruption = trainingInterruption
         isTraining = false
         trainingProfileID = nil
+        trainingContextSchema = .empty
         isAutoTraining = false
         autoTrainingProfileID = nil
         trainingInterruption = nil
@@ -852,6 +1090,12 @@ final class AppModel: ObservableObject {
             guard let version = await WorkspaceStore.shared.version(profileID: profile.id, versionID: versionID) else {
                 throw AgentTrainerError.model("The active runnable brain is missing. Load Saved Brains in AI Models and choose another version.")
             }
+            if runContextVersionID != version.id {
+                runContextSchema = version.effectiveContextSchema
+                runContextVersionID = version.id
+                runContextValues = [:]
+            }
+            let runtimeContextSelection = runContextValues
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
 
             let resolvedMouseMode: MouseControlMode
@@ -943,7 +1187,7 @@ final class AppModel: ObservableObject {
                     "This Record resolution, FPS, and lead-up would use more than 512 MB for DAgger context. Reduce one of those Record settings before Run."
                 )
             }
-            agent = runtime; runningVersion = version
+            agent = runtime; runningVersion = version; runningContextValues = runtimeContextSelection
             activeRuntimeCaptureSpec = runtimeCaptureSpec; activeRuntimeCaptureRect = runtimeCaptureRect
             activeDAggerCaptureConfiguration = daggerCaptureConfiguration
             isRunning = true; runningProfileID = profile.id; hudModel.show(source: .agent, vision: showVisionPreview, cnnVisualization: cnnVisualizationSettings)
@@ -953,7 +1197,8 @@ final class AppModel: ObservableObject {
             runtimeSafety.panicKeyCode = UInt16(clamping: hotkeys.panic.keyCode)
             runtimeSafety.panicModifiers = hotkeys.panic.cgEventModifiers
             let previewRate = visionPreviewMatchesPerception ? version.training.perceptionFPS : visionPreviewFPS
-            try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: runtimeCaptureSpec, captureRect: runtimeCaptureRect, mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, safety: runtimeSafety, daggerCaptureConfiguration: daggerCaptureConfiguration, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run])
+            try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: runtimeCaptureSpec, captureRect: runtimeCaptureRect, mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, contextSelection: runtimeContextSelection, safety: runtimeSafety, daggerCaptureConfiguration: daggerCaptureConfiguration, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run])
+            runtime.updateContextSelection(runContextValues)
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
             if isRunning, agent === runtime { runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue)"; activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus; AppLog.write(category: "Runtime", "Agent started", details: "\(profile.name), \(resolvedMouseMode.rawValue), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")") }
         } catch is CancellationError {
@@ -963,7 +1208,7 @@ final class AppModel: ObservableObject {
             // or explicit Stop) than replacing it with generic cancellation.
             if !installedRuntime || agent === attemptedRuntime {
                 if agent === attemptedRuntime { agent = nil }
-                isRunning = false; runningProfileID = nil; runningVersion = nil; activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; activeDAggerCaptureConfiguration = nil; isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide()
+                isRunning = false; runningProfileID = nil; runningVersion = nil; runningContextValues = [:]; activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; activeDAggerCaptureConfiguration = nil; isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide()
                 runtimeStatus = "Agent start cancelled; all hooks disabled and held inputs released"
                 activityStatus = isTraining ? trainingStatus : runtimeStatus
             }
@@ -973,7 +1218,7 @@ final class AppModel: ObservableObject {
             await attemptedRuntime?.stop(reason: nil)
             guard attemptedRuntime == nil || agent === attemptedRuntime || agent == nil else { return }
             if agent === attemptedRuntime { agent = nil }
-            isRunning = false; runningProfileID = nil; runningVersion = nil; activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; activeDAggerCaptureConfiguration = nil; isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide(); runtimeStatus = error.localizedDescription
+            isRunning = false; runningProfileID = nil; runningVersion = nil; runningContextValues = [:]; activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; activeDAggerCaptureConfiguration = nil; isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide(); runtimeStatus = error.localizedDescription
             if attemptedRuntime != nil { MLXMemoryLifecycle.reclaimCaches(after: "failed agent start") }
             present(error)
         }
@@ -1045,7 +1290,10 @@ final class AppModel: ObservableObject {
                 perceptionFPS: daggerCapture.capture.requestedFPS,
                 actionFPS: version.training.actionFPS,
                 leadUpSeconds: daggerCapture.leadUpSeconds,
-                correctionWeight: configuration.correctionWeight
+                correctionWeight: configuration.correctionWeight,
+                contextAssignments: version.effectiveContextSchema.assignments(
+                    selection: runningContextValues
+                )
             )
             runtimeStatus = "Starting DAgger • preserving the lead-up and pausing AI output…"
             activityStatus = runtimeStatus
@@ -1153,7 +1401,8 @@ final class AppModel: ObservableObject {
                     purpose: .daggerCorrection,
                     sourceProfileID: capture.request.profileID,
                     sourceVersionID: capture.request.versionID,
-                    trainingWeight: capture.request.correctionWeight
+                    trainingWeight: capture.request.correctionWeight,
+                    contextAssignments: capture.request.contextAssignments
                 )
                 guard manifest.isStructurallyValid else {
                     throw AgentTrainerError.storage("The completed DAgger correction has an invalid timeline and was not published.")
@@ -1199,7 +1448,7 @@ final class AppModel: ObservableObject {
 
     private func finishAgentRuntime(_ runtime: AgentRuntime, status: String) {
         guard agent === runtime else { return }
-        agent = nil; isRunning = false; runningProfileID = nil; runningVersion = nil
+        agent = nil; isRunning = false; runningProfileID = nil; runningVersion = nil; runningContextValues = [:]
         activeRuntimeCaptureSpec = nil; activeRuntimeCaptureRect = nil; activeDAggerCaptureConfiguration = nil
         isDAggerRecording = false; runtimeMetrics = RuntimeMetrics(); hudModel.hide()
         runtimeStatus = status; activityStatus = isTraining ? trainingStatus : runtimeStatus
@@ -1227,7 +1476,7 @@ final class AppModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.title = "Choose \(kind.rawValue) Location"
         panel.message = kind == .trainingData
-            ? "Choose the folder that will contain Recordings, Caches, and the recording-folder index. Existing data is safely copied and verified before the app switches."
+            ? "Choose the folder that will contain Recordings, Caches, and the recording-folder/context-field indexes. Existing data is safely copied and verified before the app switches."
             : "Choose the folder that will contain Profiles, checkpoints, and saved runnable brains. Existing models are safely copied and verified before the app switches."
         panel.prompt = "Choose Location"
         panel.canChooseFiles = false
@@ -1378,6 +1627,17 @@ final class AppModel: ObservableObject {
             recordingColorBits = visuals.colorBits
             recordingCompression = visuals.compression
             recordingLeadUpSeconds = preset.effectiveLeadUpSeconds
+            let availableValues = Dictionary(uniqueKeysWithValues: contextFields.map {
+                ($0.id, Set($0.values.map(\.id)))
+            })
+            let presetContext = preset.contextAssignments ?? []
+            recordingContextValues = Dictionary(
+                presetContext.compactMap { assignment in
+                    availableValues[assignment.fieldID]?.contains(assignment.valueID) == true
+                        ? (assignment.fieldID, assignment.valueID) : nil
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
             regionX = preset.region.x; regionY = preset.region.y
             regionWidth = preset.region.width; regionHeight = preset.region.height
             recordingTrimStart = preset.trimStart; recordingTrimEnd = preset.trimEnd
@@ -1389,6 +1649,9 @@ final class AppModel: ObservableObject {
             }
             selectedSourceID = sourceAvailable?.id
             var unavailable: [String] = []
+            if recordingContextValues.count != presetContext.count {
+                unavailable.append("context labels")
+            }
             if sourceAvailable == nil, preset.selectedSourceID != nil { unavailable.append("capture source") }
             if let folderID = preset.destinationFolderID,
                recordingFolders.contains(where: { $0.id == folderID }) {
@@ -1504,8 +1767,22 @@ final class AppModel: ObservableObject {
             trimEnd: recordingTrimEnd,
             excludedKeyCodes: recordingExcludedKeyCodes,
             recordingVisuals: currentRecordingVisualSettings(),
-            leadUpSeconds: recordingLeadUpSeconds
+            leadUpSeconds: recordingLeadUpSeconds,
+            contextAssignments: currentRecordingContextAssignments()
         )
+    }
+
+    private func currentRecordingContextAssignments() -> [ContextAssignment] {
+        contextFields.compactMap { field in
+            guard let valueID = recordingContextValues[field.id],
+                  let value = field.values.first(where: { $0.id == valueID }) else { return nil }
+            return ContextAssignment(
+                fieldID: field.id,
+                fieldName: field.name,
+                valueID: value.id,
+                valueName: value.name
+            )
+        }
     }
 
     private func currentRecordingVisualSettings() -> RecordingVisualSettings {
@@ -1703,7 +1980,8 @@ final class AppModel: ObservableObject {
             runtimeOutputPermissions: runtimeOutputPermissions,
             cnnVisualizationSettings: cnnVisualizationSettings,
             recordingVisuals: currentRecordingVisualSettings(),
-            recordingLeadUpSeconds: recordingLeadUpSeconds
+            recordingLeadUpSeconds: recordingLeadUpSeconds,
+            recordingContextAssignments: currentRecordingContextAssignments()
         )
         if let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: "AgentTrainer.WorkflowSettings") }
     }
@@ -1720,6 +1998,7 @@ private struct PersistentWorkflowSettings: Codable {
     var cnnVisualizationSettings: CNNVisualizationSettings?
     var recordingVisuals: RecordingVisualSettings?
     var recordingLeadUpSeconds: Double?
+    var recordingContextAssignments: [ContextAssignment]?
 }
 
 

@@ -126,6 +126,10 @@ struct RecordingPreset: Codable, Hashable, Identifiable, Sendable {
     var recordingVisuals: RecordingVisualSettings? = nil
     /// DAgger lead-up is a universal Record setting, never part of an AI.
     var leadUpSeconds: Double? = nil
+    /// Optional for presets saved before generic recording context existed.
+    /// Definitions are snapshotted so a preset remains understandable even if
+    /// the workspace catalog is later imported, renamed, or relocated.
+    var contextAssignments: [ContextAssignment]? = nil
 
     var effectiveRecordingVisuals: RecordingVisualSettings {
         recordingVisuals ?? RecordingVisualSettings()
@@ -161,7 +165,243 @@ struct RecordingPreset: Codable, Hashable, Identifiable, Sendable {
         guard (0.25...15).contains(effectiveLeadUpSeconds) else {
             throw AgentTrainerError.invalidConfiguration("Recording lead-up must be from 0.25 through 15 seconds.")
         }
+        _ = try ContextAssignment.validatedList(contextAssignments ?? [])
         return value
+    }
+}
+
+// MARK: - Generic recording and model context
+
+/// One user-defined categorical value. IDs, rather than display names, carry
+/// semantic identity so labels can be renamed without silently changing what a
+/// recording means to an already-trained brain.
+struct ContextValueDefinition: Codable, Hashable, Identifiable, Sendable {
+    var id: UUID
+    var name: String
+    var createdAt: Date = Date()
+
+    func validated() throws -> Self {
+        var value = self
+        value.name = try ContextNaming.validated(name, kind: "Context value")
+        return value
+    }
+}
+
+/// A completely generic categorical field. AgentTrainer never assigns domain
+/// meaning to the name or any of its values.
+struct ContextFieldDefinition: Codable, Hashable, Identifiable, Sendable {
+    var id: UUID
+    var name: String
+    var values: [ContextValueDefinition]
+    var createdAt: Date = Date()
+
+    func validated() throws -> Self {
+        var field = self
+        field.name = try ContextNaming.validated(name, kind: "Context field")
+        field.values = try values.map { try $0.validated() }
+        guard Set(field.values.map(\.id)).count == field.values.count else {
+            throw AgentTrainerError.invalidConfiguration("Context values must have unique identifiers.")
+        }
+        guard ContextNaming.hasUniqueNames(field.values.map(\.name)) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "Values inside a context field must have unique names."
+            )
+        }
+        return field
+    }
+}
+
+/// Workspace-owned reusable definitions. Recording manifests still snapshot
+/// selected names, keeping each `.atrrecord` package self-describing.
+struct ContextCatalog: Codable, Hashable, Sendable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion = Self.currentSchemaVersion
+    var fields: [ContextFieldDefinition] = []
+
+    func validated() throws -> Self {
+        guard schemaVersion == Self.currentSchemaVersion else {
+            throw AgentTrainerError.storage("This context catalog uses an unsupported schema.")
+        }
+        var catalog = self
+        catalog.fields = try fields.map { try $0.validated() }
+        guard Set(catalog.fields.map(\.id)).count == catalog.fields.count else {
+            throw AgentTrainerError.invalidConfiguration("Context fields must have unique identifiers.")
+        }
+        guard ContextNaming.hasUniqueNames(catalog.fields.map(\.name)) else {
+            throw AgentTrainerError.invalidConfiguration("Context fields must have unique names.")
+        }
+        return catalog
+    }
+}
+
+/// A recording owns at most one selected value for each field. Names are a
+/// portable snapshot; IDs are the stable cache and model identity.
+struct ContextAssignment: Codable, Hashable, Sendable {
+    var fieldID: UUID
+    var fieldName: String
+    var valueID: UUID
+    var valueName: String
+
+    func validated() throws -> Self {
+        var assignment = self
+        assignment.fieldName = try ContextNaming.validated(fieldName, kind: "Context field")
+        assignment.valueName = try ContextNaming.validated(valueName, kind: "Context value")
+        return assignment
+    }
+
+    static func validatedList(_ assignments: [Self]) throws -> [Self] {
+        let values = try assignments.map { try $0.validated() }
+        guard Set(values.map(\.fieldID)).count == values.count else {
+            throw AgentTrainerError.invalidConfiguration(
+                "A recording can select only one value for each context field."
+            )
+        }
+        return values.sorted { lhs, rhs in
+            lhs.fieldID.uuidString == rhs.fieldID.uuidString
+                ? lhs.valueID.uuidString < rhs.valueID.uuidString
+                : lhs.fieldID.uuidString < rhs.fieldID.uuidString
+        }
+    }
+}
+
+/// Immutable vocabulary carried by a runnable brain. Only fields and values
+/// present in its selected training recordings are included. Each value owns
+/// one input dimension; a blank field produces zeros for its whole segment.
+struct ModelContextSchema: Codable, Hashable, Sendable {
+    static let maximumInputValues = 65_536
+    static let empty = ModelContextSchema(fields: [])
+
+    var fields: [ContextFieldDefinition]
+
+    var inputValueCount: Int {
+        fields.reduce(into: 0) { count, field in
+            let addition = count.addingReportingOverflow(field.values.count)
+            count = addition.overflow ? Int.max : addition.partialValue
+        }
+    }
+
+    var isEmpty: Bool { fields.isEmpty }
+
+    func validated() throws -> Self {
+        let catalog = try ContextCatalog(fields: fields).validated()
+        guard catalog.fields.allSatisfy({ !$0.values.isEmpty }),
+              inputValueCount <= Self.maximumInputValues else {
+            throw AgentTrainerError.invalidConfiguration(
+                "A trained context schema requires at least one observed value per field and at most \(Self.maximumInputValues.formatted()) total values."
+            )
+        }
+        return Self(fields: catalog.fields)
+    }
+
+    /// UUID order, not mutable display order, fixes every tensor position.
+    static func trained(from assignmentSets: [[ContextAssignment]]) throws -> Self {
+        var fieldNames: [UUID: String] = [:]
+        var valuesByField: [UUID: [UUID: String]] = [:]
+        for assignments in assignmentSets {
+            for assignment in try ContextAssignment.validatedList(assignments) {
+                fieldNames[assignment.fieldID] = fieldNames[assignment.fieldID]
+                    ?? assignment.fieldName
+                var values = valuesByField[assignment.fieldID] ?? [:]
+                values[assignment.valueID] = values[assignment.valueID] ?? assignment.valueName
+                valuesByField[assignment.fieldID] = values
+            }
+        }
+        let fields = valuesByField.keys.sorted { $0.uuidString < $1.uuidString }.map { fieldID in
+            ContextFieldDefinition(
+                id: fieldID,
+                name: fieldNames[fieldID] ?? "Context",
+                values: (valuesByField[fieldID] ?? [:]).keys
+                    .sorted { $0.uuidString < $1.uuidString }
+                    .map { valueID in
+                        ContextValueDefinition(
+                            id: valueID,
+                            name: valuesByField[fieldID]?[valueID] ?? "Value",
+                            createdAt: .distantPast
+                        )
+                    },
+                createdAt: .distantPast
+            )
+        }
+        guard !fields.isEmpty else { return .empty }
+        return try Self(fields: fields).validated()
+    }
+
+    func vector(selection: [UUID: UUID]) -> [Float] {
+        var result = [Float](repeating: 0, count: inputValueCount)
+        var offset = 0
+        for field in fields {
+            if let selected = selection[field.id],
+               let index = field.values.firstIndex(where: { $0.id == selected }) {
+                result[offset + index] = 1
+            }
+            offset += field.values.count
+        }
+        return result
+    }
+
+    func vector(assignments: [ContextAssignment]) -> [Float] {
+        vector(selection: Dictionary(
+            assignments.map { ($0.fieldID, $0.valueID) },
+            uniquingKeysWith: { first, _ in first }
+        ))
+    }
+
+    func assignments(selection: [UUID: UUID]) -> [ContextAssignment] {
+        fields.compactMap { field in
+            guard let valueID = selection[field.id],
+                  let value = field.values.first(where: { $0.id == valueID }) else { return nil }
+            return ContextAssignment(
+                fieldID: field.id,
+                fieldName: field.name,
+                valueID: value.id,
+                valueName: value.name
+            )
+        }
+    }
+
+    /// Names are presentation snapshots; learned compatibility depends on the
+    /// ordered field/value identities alone.
+    func hasSameLayout(as other: Self) -> Bool {
+        guard fields.count == other.fields.count else { return false }
+        for (lhs, rhs) in zip(fields, other.fields) {
+            guard lhs.id == rhs.id,
+                  lhs.values.map(\.id) == rhs.values.map(\.id) else { return false }
+        }
+        return true
+    }
+}
+
+enum ContextNaming {
+    static let maximumLength = 128
+    private static let identityLocale = Locale(identifier: "en_US_POSIX")
+
+    static func validated(_ raw: String, kind: String) throws -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.count <= maximumLength,
+              !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "\(kind) names must contain 1–\(maximumLength) visible characters."
+            )
+        }
+        return value
+    }
+
+    static func hasUniqueNames(_ names: [String]) -> Bool {
+        Set(names.map {
+            identityKey($0)
+        }).count == names.count
+    }
+
+    static func matches(_ lhs: String, _ rhs: String) -> Bool {
+        identityKey(lhs) == identityKey(rhs)
+    }
+
+    private static func identityKey(_ value: String) -> String {
+        value.folding(
+            options: [.caseInsensitive],
+            locale: identityLocale
+        )
     }
 }
 
@@ -330,7 +570,10 @@ enum TrainingDataContract {
     /// Version 12 changes stochastic batching from one augmentation per batch
     /// to one per supervised row. Older checkpoints may warm-start their
     /// weights, but must not restore optimizer/random state as an exact resume.
-    static let schemaVersion = 12
+    /// Version 13 adds one recording-level generic context vector to every
+    /// supervised row. Context-free datasets retain a zero-width vector and the
+    /// exact established Policy-v6 tensor layout.
+    static let schemaVersion = 13
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -806,7 +1049,7 @@ enum RecordingPurpose: String, Codable, Sendable {
 }
 
 struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
-    var schemaVersion = 3
+    var schemaVersion = 4
     var id: UUID
     var name: String
     var createdAt: Date
@@ -839,12 +1082,18 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
     /// Per-row loss emphasis. Corrections default above one so a short, valuable
     /// intervention is not drowned by hours of ordinary demonstrations.
     var trainingWeight: Double? = nil
+    /// Optional keeps every recording created before 2.3 directly decodable.
+    /// Selected names are snapshotted to keep a standalone package portable.
+    var contextAssignments: [ContextAssignment]? = nil
 
     var effectivePurpose: RecordingPurpose { purpose ?? .demonstration }
     var effectiveSupervisionStart: Double { supervisionStart ?? trimStart }
     var effectiveTrainingWeight: Double {
         let value = trainingWeight ?? 1
         return value.isFinite ? min(20, max(1, value)) : 1
+    }
+    var effectiveContextAssignments: [ContextAssignment] {
+        (try? ContextAssignment.validatedList(contextAssignments ?? [])) ?? []
     }
 
     var isStructurallyValid: Bool {
@@ -858,7 +1107,10 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
         } ?? true
         let daggerMetadataIsValid = effectivePurpose != .daggerCorrection
             || (sourceProfileID != nil && sourceVersionID != nil && supervisionStart != nil)
-        return (1...3).contains(schemaVersion)
+        let contextIsValid = (try? ContextAssignment.validatedList(
+            contextAssignments ?? []
+        )) != nil
+        return (1...4).contains(schemaVersion)
             && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && duration.isFinite && duration >= 0
             && capture.requestedFPS.isFinite && capture.requestedFPS > 0 && capture.requestedFPS <= 1_000
@@ -874,6 +1126,7 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
             && supervision.isFinite && supervision >= trimStart && supervision <= end
             && weight.isFinite && (1...20).contains(weight)
             && daggerMetadataIsValid
+            && contextIsValid
             && safeFileNames.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0") }
     }
 
@@ -1045,6 +1298,16 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Fixed DAgger correction-probe loss used alongside ordinary validation
     /// when publishing a correction-aware best brain.
     var correctionLoss: Double? = nil
+    /// Nil is the exact context-free Policy-v6 contract used before 2.3.
+    /// Context-trained brains snapshot only fields and values observed during
+    /// their own training run, independent of later Library edits.
+    var contextSchema: ModelContextSchema? = nil
+
+    var effectiveContextSchema: ModelContextSchema { contextSchema ?? .empty }
+
+    var contextSchemaIsValid: Bool {
+        (try? effectiveContextSchema.validated()) != nil
+    }
 
     /// Manifest filenames are treated as leaf names, never paths. A damaged or
     /// hand-edited manifest must not escape its immutable version directory.
@@ -1307,7 +1570,10 @@ enum AgentTrainerError: LocalizedError {
 }
 
 enum ModelSizing {
-    static func parameterCount(_ profile: AIProfile) -> Int64 {
+    static func parameterCount(
+        _ profile: AIProfile,
+        contextSchema: ModelContextSchema = .empty
+    ) -> Int64 {
         let architecture = profile.training.architecture
         var total: Int64 = 0
         // Current and past frames share the same convolutional weights. Each
@@ -1356,6 +1622,7 @@ enum ModelSizing {
         // its four-gate bias, which is already included above.
         if architecture.recurrentKind == .gru { total = add(total, Int64(recurrent)) }
         var fusionInput = max(1, architecture.visualEmbedding) + recurrent
+            + max(0, contextSchema.inputValueCount)
         for width in architecture.fusionWidths {
             total = add(total, multiply(add(Int64(fusionInput), 1), Int64(max(1, width))))
             total = add(total, multiply(2, Int64(max(1, width))))
@@ -1379,9 +1646,19 @@ enum ModelSizing {
     /// keeps two Float32 moments in addition to parameters and gradients, while
     /// activations and compiler temporaries multiply the nominal batch input.
     /// This is a safety bound, not a reported MLX memory measurement.
-    static func estimatedTrainingWorkingSet(_ profile: AIProfile) -> Int64 {
-        let parameters = multiply(parameterCount(profile), 24)
-        let batch = multiply(NeuralInputSizing.summary(for: profile).nominalBytesPerTrainingBatch, 8)
+    static func estimatedTrainingWorkingSet(
+        _ profile: AIProfile,
+        contextSchema: ModelContextSchema = .empty
+    ) -> Int64 {
+        let parameters = multiply(
+            parameterCount(profile, contextSchema: contextSchema),
+            24
+        )
+        let batch = multiply(
+            NeuralInputSizing.summary(for: profile, contextSchema: contextSchema)
+                .nominalBytesPerTrainingBatch,
+            8
+        )
         return add(512 * 1_024 * 1_024, add(parameters, batch))
     }
 
@@ -1412,6 +1689,7 @@ struct NeuralInputSummary: Hashable, Sendable {
     var frameSpacing: Int64
     var actionValuesPerPastFrame: Int64
     var pastControlValues: Int64
+    var contextValues: Int64
     var frameSpacingSeconds: Double
     var temporalLookbackSeconds: Double
     var valuesPerDecision: Int64
@@ -1444,9 +1722,18 @@ struct NeuralInputCapacityGuide: Hashable, Sendable {
 }
 
 enum NeuralInputSizing {
-    static func capacityGuide(for profile: AIProfile) -> NeuralInputCapacityGuide {
-        let inputValues = summary(for: profile).valuesPerDecision
-        let parameterCount = max(1, ModelSizing.parameterCount(profile))
+    static func capacityGuide(
+        for profile: AIProfile,
+        contextSchema: ModelContextSchema = .empty
+    ) -> NeuralInputCapacityGuide {
+        let inputValues = summary(
+            for: profile,
+            contextSchema: contextSchema
+        ).valuesPerDecision
+        let parameterCount = max(
+            1,
+            ModelSizing.parameterCount(profile, contextSchema: contextSchema)
+        )
         return capacityGuide(inputValues: inputValues, parameterCount: parameterCount)
     }
 
@@ -1462,7 +1749,10 @@ enum NeuralInputSizing {
         return NeuralInputCapacityGuide(level: level, inputValues: inputValues, parameterCount: parameterCount, inputsPerParameter: ratio)
     }
 
-    static func summary(for profile: AIProfile) -> NeuralInputSummary {
+    static func summary(
+        for profile: AIProfile,
+        contextSchema: ModelContextSchema = .empty
+    ) -> NeuralInputSummary {
         let current = profile.preprocessing
         let temporal = profile.training.effectiveTemporalVision
         let past = temporal.pastFrameSpec(from: current)
@@ -1478,8 +1768,12 @@ enum NeuralInputSizing {
         let pastFrameCount = Int64(max(0, temporal.pastFrameCount))
         let actionValues = Int64(ActionLayout.count)
         let controls = multiply(pastFrameCount, actionValues)
+        let contextValues = Int64(max(0, contextSchema.inputValueCount))
         let pastVision = multiply(pastFrameCount, pastConvolution)
-        let perDecision = add(currentConvolution, add(pastVision, controls))
+        let perDecision = add(
+            currentConvolution,
+            add(pastVision, add(controls, contextValues))
+        )
         let perceptionFPS = profile.training.perceptionFPS.isFinite ? max(0, profile.training.perceptionFPS) : 0
         let runtimeValuesPerSecond = rate(perDecision, fps: perceptionFPS)
         let totalPackedVision = add(currentCounts.packed, multiply(pastFrameCount, pastCounts.packed))
@@ -1512,6 +1806,7 @@ enum NeuralInputSizing {
             frameSpacing: Int64(max(1, temporal.frameSpacing)),
             actionValuesPerPastFrame: actionValues,
             pastControlValues: controls,
+            contextValues: contextValues,
             frameSpacingSeconds: temporal.spacingSeconds(perceptionFPS: perceptionFPS),
             temporalLookbackSeconds: temporal.lookbackSeconds(perceptionFPS: perceptionFPS),
             valuesPerDecision: perDecision,

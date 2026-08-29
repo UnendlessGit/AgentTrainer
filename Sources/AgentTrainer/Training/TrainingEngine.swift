@@ -124,6 +124,23 @@ final class TrainingEngine: @unchecked Sendable {
             metrics(value, "\(status) • \(Int((progress * 100).rounded()))%")
         }
         guard dataset.count > 0 else { throw AgentTrainerError.noData }
+        let contextSchema = try dataset.manifest.effectiveContextSchema.validated()
+        let physicalMemory = Int64(ProcessInfo.processInfo.physicalMemory)
+        let parameterCount = ModelSizing.parameterCount(
+            profile,
+            contextSchema: contextSchema
+        )
+        let estimatedWorkingSet = ModelSizing.estimatedTrainingWorkingSet(
+            profile,
+            contextSchema: contextSchema
+        )
+        guard parameterCount < Int64.max,
+              estimatedWorkingSet < Int64.max,
+              estimatedWorkingSet <= (physicalMemory / 3) * 2 else {
+            throw AgentTrainerError.invalidConfiguration(
+                "This model and its context vocabulary cannot fit safely in this Mac's unified memory. Reduce batch size, vision, network widths, or unused context values."
+            )
+        }
         let inputBufferPool = try MetalArrayBufferPool()
         let split = splitIndices(
             dataset: dataset,
@@ -242,7 +259,7 @@ final class TrainingEngine: @unchecked Sendable {
             )
         }()
 
-        let model = AgentPolicy(profile: profile)
+        let model = AgentPolicy(profile: profile, contextSchema: contextSchema)
         model.train(true)
         let optimizer = ResumableAdamW(
             learningRate: Float(profile.training.learningRate),
@@ -284,6 +301,7 @@ final class TrainingEngine: @unchecked Sendable {
             samplingStrategy: desiredSamplingStrategy,
             validationStrategy: TrainingValidationContract.disjointContext
         )
+        state.contextSchema = contextSchema.isEmpty ? nil : contextSchema
         let restore = try await restoreCheckpointIfPresent(
             profile: profile,
             expectedSignature: signature,
@@ -292,8 +310,10 @@ final class TrainingEngine: @unchecked Sendable {
             model: model,
             optimizer: optimizer,
             randomState: randomState,
+            expectedContextSchema: contextSchema,
             state: &state
         )
+        state.contextSchema = contextSchema.isEmpty ? nil : contextSchema
         let validationStep = compile(inputs: [model]) { (arrays: [MLXArray]) -> [MLXArray] in
             // Keep packed-frame expansion, the shared forward pass, loss, and activation
             // inside one Metal graph. The class weights are immutable for this
@@ -302,6 +322,7 @@ final class TrainingEngine: @unchecked Sendable {
             let batch = Self.expandBatch(
                 arrays,
                 profile: profile,
+                contextSchema: contextSchema,
                 reusesVisionFeatures: reusesValidationVisionFeatures
             )
             let temporalFeatures = model.temporalFeatures(
@@ -310,7 +331,10 @@ final class TrainingEngine: @unchecked Sendable {
                 pastControls: batch.pastControls,
                 visionToPast: batch.visionToPast
             )
-            let uniqueLogits = model.logits(temporalFeatures: temporalFeatures)
+            let uniqueLogits = model.logits(
+                temporalFeatures: temporalFeatures,
+                contextValues: batch.contextValues
+            )
             let logits: MLXArray
             if let sampleToVision = batch.sampleToVision,
                sampleToVision.dim(0) != uniqueLogits.dim(0) {
@@ -465,6 +489,7 @@ final class TrainingEngine: @unchecked Sendable {
             let batch = Self.expandBatch(
                 arrays,
                 profile: profile,
+                contextSchema: contextSchema,
                 reusesVisionFeatures: reusesTrainingVisionFeatures,
                 includeAuxiliaries: true
             )
@@ -485,10 +510,13 @@ final class TrainingEngine: @unchecked Sendable {
                 sampleFutureImages,
                 parameters: augmentation
             )
-            let gradientInputs = [
+            var gradientInputs = [
                 currentImages,
                 pastImages,
-                batch.pastControls,
+                batch.pastControls
+            ]
+            if !contextSchema.isEmpty { gradientInputs.append(batch.contextValues) }
+            gradientInputs.append(contentsOf: [
                 batch.targets,
                 batch.previousTargets,
                 batch.sampleWeights,
@@ -497,7 +525,7 @@ final class TrainingEngine: @unchecked Sendable {
                 batch.futureActionMasks,
                 futureStateImages,
                 batch.futureStateMasks
-            ]
+            ])
             // The row map is integer metadata, not a differentiable input.
             // Capture it in the compiled graph instead of asking valueAndGrad
             // to construct a meaningless gradient for it.
@@ -506,6 +534,7 @@ final class TrainingEngine: @unchecked Sendable {
             let sampleToFutureState = usesPerSampleVisualAugmentation
                 ? MLXArray((0..<sampleCount).map(Int32.init), [sampleCount])
                 : batch.sampleToFutureState
+            let contextOffset = contextSchema.isEmpty ? 0 : 1
             let result = valueAndGrad(model: model) { model, arrays in
                 let temporalFeatures = model.temporalFeatures(
                     currentImages: arrays[0],
@@ -514,31 +543,43 @@ final class TrainingEngine: @unchecked Sendable {
                     visionToPast: visionToPast,
                     sampleToVision: sampleToVision
                 )
-                let fusedFeatures = model.fusedFeatures(temporalFeatures: temporalFeatures)
+                let fusedFeatures = model.fusedFeatures(
+                    temporalFeatures: temporalFeatures,
+                    contextValues: contextOffset == 0 ? nil : arrays[3],
+                    sampleToVision: sampleToVision
+                )
                 let logits = model.logits(fusedFeatures: fusedFeatures)
+                let targetIndex = 3 + contextOffset
+                let previousIndex = targetIndex + 1
+                let sampleWeightIndex = targetIndex + 2
+                let futureTargetIndex = targetIndex + 3
+                let futurePreviousIndex = targetIndex + 4
+                let futureMaskIndex = targetIndex + 5
+                let futureImageIndex = targetIndex + 6
+                let futureStateMaskIndex = targetIndex + 7
                 let immediateLoss = model.loss(
                     logits: logits,
-                    targets: arrays[3],
+                    targets: arrays[targetIndex],
                     positiveWeights: classWeights,
-                    previousTargets: arrays[4],
-                    sampleWeights: arrays[5]
+                    previousTargets: arrays[previousIndex],
+                    sampleWeights: arrays[sampleWeightIndex]
                 )
                 let futureActionLoss = model.futureActionLoss(
                     fusedFeatures: fusedFeatures,
-                    futureTargets: arrays[6],
-                    futurePreviousTargets: arrays[7],
-                    masks: arrays[8],
-                    trainingSampleWeights: arrays[5],
+                    futureTargets: arrays[futureTargetIndex],
+                    futurePreviousTargets: arrays[futurePreviousIndex],
+                    masks: arrays[futureMaskIndex],
+                    trainingSampleWeights: arrays[sampleWeightIndex],
                     positiveWeights: classWeights
                 )
                 let futureStateLoss = model.futureStateLoss(
                     fusedFeatures: fusedFeatures,
                     temporalFeatures: temporalFeatures,
-                    currentActions: arrays[3],
-                    futureImages: arrays[9],
+                    currentActions: arrays[targetIndex],
+                    futureImages: arrays[futureImageIndex],
                     sampleToFuture: sampleToFutureState,
-                    masks: arrays[10],
-                    trainingSampleWeights: arrays[5]
+                    masks: arrays[futureStateMaskIndex],
+                    trainingSampleWeights: arrays[sampleWeightIndex]
                 )
                 let totalLoss = immediateLoss
                     + Float(profile.training.effectiveFutureActionPrediction.lossWeight) * futureActionLoss
@@ -1107,6 +1148,9 @@ final class TrainingEngine: @unchecked Sendable {
         let count = indices.count
         let visionPlan = reusesVisionFeatures ? dataset.visionBatchPlan(at: indices) : nil
         let visionCount = visionPlan?.uniqueSequences.count ?? count
+        let contextWidth = dataset.manifest.effectiveContextSchema.inputValueCount
+        let contextRows = reusesVisionFeatures ? visionCount : count
+        let contextData = dataset.contextBatch(at: indices, visionPlan: visionPlan)
         let futureActionConfiguration = profile.training.effectiveFutureActionPrediction
         let usesFutureActions = includeAuxiliaries
             && futureActionConfiguration.enabled
@@ -1125,6 +1169,23 @@ final class TrainingEngine: @unchecked Sendable {
             sampleStride: futureStateConfiguration.sampleStride
         ) : nil
         let trainingWeights = dataset.trainingWeightBatch(at: indices)
+
+        func appendContextDescriptor(
+            to descriptors: inout [MetalArrayBufferPool.Descriptor]
+        ) -> Int? {
+            guard contextWidth > 0 else { return nil }
+            let index = descriptors.count
+            descriptors.append(.init([contextRows, contextWidth], dtype: .float32))
+            return index
+        }
+
+        func populateContext(
+            _ destinations: [UnsafeMutableRawBufferPointer],
+            at index: Int?
+        ) {
+            guard let index else { return }
+            contextData.withUnsafeBytes { destinations[index].copyMemory(from: $0) }
+        }
 
         func appendAuxiliaryDescriptors(
             to descriptors: inout [MetalArrayBufferPool.Descriptor]
@@ -1190,6 +1251,7 @@ final class TrainingEngine: @unchecked Sendable {
             if reusesVisionFeatures { descriptors.append(.init([count], dtype: .int32)) }
             let actionIndex = descriptors.count
             descriptors.append(.init([count, 2, ActionLayout.count], dtype: .float32))
+            let contextIndex = appendContextDescriptor(to: &descriptors)
             let auxiliaryIndices = appendAuxiliaryDescriptors(to: &descriptors)
             return try inputBufferPool.makeArrays(descriptors) { destinations in
                 let actionDestination = destinations[actionIndex]
@@ -1210,6 +1272,7 @@ final class TrainingEngine: @unchecked Sendable {
                     channels: profile.channels,
                     restrictions: profile.effectiveRestrictions
                 )
+                populateContext(destinations, at: contextIndex)
                 populateAuxiliaries(destinations, indices: auxiliaryIndices)
             }
         }
@@ -1231,6 +1294,7 @@ final class TrainingEngine: @unchecked Sendable {
         descriptors.append(
             .init([count, 2, ActionLayout.count], dtype: .float32)
         )
+        let contextIndex = appendContextDescriptor(to: &descriptors)
         let auxiliaryIndices = appendAuxiliaryDescriptors(to: &descriptors)
         return try inputBufferPool.makeArrays(descriptors) { destinations in
             let actionDestination = destinations[actionIndex]
@@ -1270,6 +1334,7 @@ final class TrainingEngine: @unchecked Sendable {
                 channels: profile.channels,
                 restrictions: profile.effectiveRestrictions
             )
+            populateContext(destinations, at: contextIndex)
             populateAuxiliaries(destinations, indices: auxiliaryIndices)
         }
     }
@@ -1277,6 +1342,7 @@ final class TrainingEngine: @unchecked Sendable {
     private static func expandBatch(
         _ arrays: [MLXArray],
         profile: AIProfile,
+        contextSchema: ModelContextSchema,
         reusesVisionFeatures: Bool,
         includeAuxiliaries: Bool = false
     ) -> ExpandedTrainingBatch {
@@ -1286,6 +1352,13 @@ final class TrainingEngine: @unchecked Sendable {
             : (reusesVisionFeatures ? 5 : 3)
         let actions = arrays[actionIndex]
         var cursor = actionIndex + 1
+        let contextValues: MLXArray
+        if contextSchema.inputValueCount > 0 {
+            contextValues = arrays[cursor]
+            cursor += 1
+        } else {
+            contextValues = MLXArray.zeros([actions.dim(0), 1], dtype: .float32)
+        }
         let sampleWeights = arrays[cursor]
         cursor += 1
 
@@ -1338,6 +1411,7 @@ final class TrainingEngine: @unchecked Sendable {
                 pastControls: MLXArray.zeros([visionCount, 1, ActionLayout.count], dtype: .float32),
                 visionToPast: nil,
                 sampleToVision: reusesVisionFeatures ? arrays[1] : nil,
+                contextValues: contextValues,
                 targets: actions[0..., 0, 0...],
                 previousTargets: actions[0..., 1, 0...],
                 sampleWeights: sampleWeights,
@@ -1358,6 +1432,7 @@ final class TrainingEngine: @unchecked Sendable {
             pastControls: arrays[2],
             visionToPast: reusesVisionFeatures ? arrays[3] : nil,
             sampleToVision: reusesVisionFeatures ? arrays[4] : nil,
+            contextValues: contextValues,
             targets: actions[0..., 0, 0...],
             previousTargets: actions[0..., 1, 0...],
             sampleWeights: sampleWeights,
@@ -1948,7 +2023,8 @@ final class TrainingEngine: @unchecked Sendable {
             trainingShowsCursor: displayedCursorVisibility,
             recommendedMouseMode: displayedMouseMode,
             validationReport: displayedValidationReport,
-            correctionLoss: displayedCorrectionLoss
+            correctionLoss: displayedCorrectionLoss,
+            contextSchema: state.contextSchema
         )
         let destination = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
@@ -1995,6 +2071,7 @@ final class TrainingEngine: @unchecked Sendable {
         model: AgentPolicy,
         optimizer: ResumableAdamW,
         randomState: MLXRandom.RandomState,
+        expectedContextSchema: ModelContextSchema,
         state: inout CheckpointState
     ) async throws -> CheckpointRestore {
         let directory = await WorkspaceStore.shared.checkpointDirectory(profileID: profile.id)
@@ -2041,7 +2118,8 @@ final class TrainingEngine: @unchecked Sendable {
            let version = await WorkspaceStore.shared.version(profileID: profile.id, versionID: versionID),
            version.schemaVersion == ModelContract.schemaVersion,
            version.preprocessing == profile.preprocessing,
-           version.training.architecture.weightLayout == profile.training.architecture.weightLayout {
+           version.training.architecture.weightLayout == profile.training.architecture.weightLayout,
+           version.effectiveContextSchema.hasSameLayout(as: expectedContextSchema) {
             let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: versionID)
             try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
             state.epoch = max(0, version.epoch ?? 0)
@@ -2144,6 +2222,7 @@ private struct ExpandedTrainingBatch {
     let pastControls: MLXArray
     let visionToPast: MLXArray?
     let sampleToVision: MLXArray?
+    let contextValues: MLXArray
     let targets: MLXArray
     let previousTargets: MLXArray
     let sampleWeights: MLXArray
@@ -2317,6 +2396,9 @@ private struct CheckpointState: Codable {
     var bestTraining: TrainingConfiguration? = nil
     var bestTrainingShowsCursor: Bool? = nil
     var bestRecommendedMouseMode: MouseControlMode? = nil
+    /// Optional preserves checkpoints written before generic context. Exact
+    /// resume is still protected by the profile signature and dataset schema.
+    var contextSchema: ModelContextSchema? = nil
     var schedulerBestMetric: Double? = nil
     var schedulerPlateauEpochs: Int? = nil
     var schedulerReductions: Int? = nil

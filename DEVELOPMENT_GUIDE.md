@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.2.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.3.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -29,6 +29,7 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Agent/InputInjector.swift` — final output firewall and synthetic HID events
 - `Replay/InputReenactor.swift` — guarded demonstration replay
 - `Core/GitHubReleaseUpdater.swift` — release discovery, verification, staging, and rollback installer
+- `UI/ContextLabelsView.swift` — reusable context pickers, Library bulk editor, and field/value manager
 - `UI/` — views, themes, HUD, diagnostics, and CNN visualization
 - `Tests/AgentTrainerTests/DomainTests.swift` — contract, corruption, concurrency, storage, MLX, and rendering coverage
 - `Tests/AgentTrainerTests/TrainingPerformanceTests.swift` — opt-in release hardware benchmark and trajectory checks
@@ -66,13 +67,15 @@ Large event streams stay memory-mapped. Do not replace summary or dataset paths 
 
 Recording manifests validate schema, finite timing, dimensions, trims, and leaf-only artifact names. Legacy repair may correct malformed metadata after reading the real video duration, but it must retain the original manifest and never rewrite source video or input.
 
-Recording transfer is producer-neutral. Import accepts a native `.atrrecord` directory, a folder containing packages, or an exported root containing `Recordings` and `recording-folders.json`. Validate every manifest, event file, video track, displayed dimension, and first-frame clock before changing the library. Stage the full batch, preserve video/event bytes, map folder metadata deterministically, regenerate colliding package IDs, and roll back the folder index plus every committed package if publication fails. Export writes the same portable root, includes only referenced folders, copies packages unchanged, verifies the copy, and never overwrites a non-empty destination.
+Recording transfer is producer-neutral. Import accepts a native `.atrrecord` directory, a folder containing packages, or an exported root containing `Recordings`, `recording-folders.json`, and optional `context-fields.json`. Validate every manifest, event file, video track, displayed dimension, first-frame clock, and context definition before changing the library. Stage the full batch, preserve video/event bytes, map folder and context metadata deterministically, regenerate colliding package IDs, remap conflicting context IDs by canonical name, and roll back both indexes plus every committed package if publication fails. Export writes the same portable root, includes only referenced folders and context fields, copies packages unchanged, verifies the copy, and never overwrites a non-empty destination. Recording manifests snapshot context names as well as stable IDs, so one standalone package remains self-describing without either sidecar.
 
 Capture status matters: complete/started frames are usable, idle frames may reuse the last good frame, and blank/suspended/stopped frames are dropped.
 
 New saved video requests a bi-planar video-range 4:2:0 ScreenCaptureKit surface at the selected even Record resolution and passes the default 8-bit path directly to the required hardware HEVC Main encoder. Lower Color Bit settings use pooled accelerated, legal-range-aware luma/chroma quantization; neutral chroma remains exactly neutral even at one bit. The user-facing compression amount maps monotonically to a resolution/FPS-aware bitrate while codec, GOP, and profile details remain internal. Live model capture remains BGRA because it is consumed directly rather than encoded. Existing/imported recording artifacts remain byte-preserving and are never migrated implicitly.
 
-`RecordingVisualSettings` owns output width/height, ratio-lock state, Color Bit, and compression. Universal DAgger lead-up sits beside it in workflow settings. Recording presets must snapshot both along with the pre-existing source, destination, FPS, cursor, region, trim, and input blacklist; presets saved before 2.2 decode to safe defaults.
+`RecordingVisualSettings` owns output width/height, ratio-lock state, Color Bit, and compression. Universal DAgger lead-up sits beside it in workflow settings. Recording presets must snapshot both along with the pre-existing source, destination, FPS, cursor, region, trim, input blacklist, and generic context assignments; presets saved before 2.2/2.3 decode visual/context additions to safe defaults.
+
+Current `RecordingManifest` schema is 4. Schema 4 adds optional generic context assignments. Each assignment has a field ID/name and value ID/name, and a manifest may select at most one value per field. IDs carry training identity; names are portable display snapshots. Context names are trimmed, bounded, free of control characters, and unique without locale-dependent comparison. A context edit changes only `manifest.json`; it never rewrites video or input.
 
 Current recording manifests persist the exact successfully encoded frame count. The field is optional for compatibility; Library presentation estimates a missing legacy count from duration and delivered FPS. Package size is the logical recursive byte total collected once during the workspace scan, never a per-row filesystem walk.
 
@@ -84,7 +87,7 @@ Live HUD state and persisted recording state are intentionally separate. The HUD
 
 Saved HEVC sessions end on the shared host clock even when ScreenCaptureKit reports only idle frames. Dataset construction materializes the last decoded frame at every configured perception interval until a newer frame becomes causal; a static screen must not collapse temporal spacing or observation count.
 
-DAgger uses the normal Record shortcut only while Run is active. Triggering it suspends inference, drains AI output, and records physical expert input while a Record-quality capture pipeline continues. Its native schema-3 recording manifest stores `.daggerCorrection`, source profile/version, supervision start, and bounded training weight. Pre-trigger AI controls are causal context only; action labels begin at `supervisionStart`. The rolling video uses the frozen Record source, FPS, cursor, resolution, Color Bit, compression, and universal lead-up. If the AI's immutable cursor-visibility contract differs from Record, a dedicated capture stream preserves both contracts rather than changing model input.
+DAgger uses the normal Record shortcut only while Run is active. Triggering it suspends inference, drains AI output, and records physical expert input while a Record-quality capture pipeline continues. Its native schema-4 recording manifest stores `.daggerCorrection`, source profile/version, supervision start, bounded training weight, and the Run context active at the trigger. Pre-trigger AI controls are causal context only; action labels begin at `supervisionStart`. The rolling video uses the frozen Record source, FPS, cursor, resolution, Color Bit, compression, and universal lead-up. If the AI's immutable cursor-visibility contract differs from Record, a dedicated capture stream preserves both contracts rather than changing model input.
 
 DAgger packages receive balanced terminal releases, follow recording shortcut/blacklist filtering, are automatically attached to their source profile, and remain normal Library/import/export artifacts. Starting, saving, or stopping a correction is single-flight. A failed start resumes output; panic/Run stop finalizes any admitted correction after releasing synthetic controls.
 
@@ -109,13 +112,15 @@ Temporal vision is either current-only or an explicit three-part input:
 
 The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context. Zero frames disables the temporal branch: runtime and training consume only current vision and do not allocate past-image or past-control input buffers.
 
-`TrainingDataContract.schemaVersion` is 12. Version 12 also versions the per-sample augmentation draw/sampling contract, so a 2.1 checkpoint warm-starts compatible weights but never claims an exact optimizer/random-state resume. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, supervision boundaries, weighting, or target meaning changes. A cache has:
+`TrainingDataContract.schemaVersion` is 13. Version 12 versions the per-sample augmentation draw/sampling contract; version 13 adds recording-level generic context conditioning. Older checkpoints may warm-start compatible context-free weights but never claim an exact optimizer/random-state resume across a data-schema change. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, supervision boundaries, weighting, context IDs/selections, or target meaning changes. Display-only context renames refresh the tiny cache manifest without repacking pixels. A cache has:
 
 - `current-observations.bin` — one full-resolution packed image per perception
 - `past-observations.bin` — one reduced packed image of the same perception
 - `observation-indices.bin` — current plus configured past indices for every action row; unavailable segment-leading frames use `UInt32.max`
 - `frame-actions.bin` — one complete control row per perception interval
 - `actions.bin` — action-rate targets; the immediately preceding target remains separate for transition weighting
+
+The cache manifest snapshots a deterministic `ModelContextSchema`. Fields and values are UUID-sorted for tensor stability and include only values assigned by at least one selected recording. Each `CacheSegment` stores that recording's assignments once; batch gathering expands them to a multi-hot Float row. Each value owns one dimension, at most one value per field is active, and an unassigned field is an all-zero segment. Context-free caches have no context descriptor or Metal allocation.
 
 Each `CacheSegment` owns both an action-row start and an observation start. They are equal for ordinary demonstrations; DAgger observation context may begin earlier. Cache validation derives past indices from the observation start, never the first supervised row. Segment purpose and training weight are persisted. Weight reduction normalizes over included unweighted rows so homogeneous correction batches retain their intended emphasis.
 
@@ -152,8 +157,11 @@ Current Policy v6 combines:
 - attention or legacy flattened visual pooling
 - a GRU/LSTM sequence over each past visual embedding concatenated with that frame's 146 controls
 - fusion of the current visual embedding with the final temporal state
+- optional raw categorical context concatenated immediately before the fusion stack
 - per-head bounded activations
 - a fixed four-horizon future-action head and an action-conditioned latent-state-delta head; both are training-only and add no runtime action latency
+
+`ModelVersionManifest.contextSchema` is the immutable display and tensor vocabulary for a context-trained brain. It is nil for every pre-2.3/context-free brain. Empty context adds no tensor, parameter, input descriptor, or compiled-step argument, preserving the exact existing Policy-v6 weight layout. A warm start is allowed only when ordered field/value IDs match; display-name changes alone are layout-compatible. The first fusion layer is the only learned shape widened by context values.
 
 Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. Past control rows are masked for half of training samples while past images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
 
@@ -202,6 +210,8 @@ Predictions must contain 146 finite values. Held keys/buttons may persist betwee
 
 At runtime, every successfully inferred perception stores its reduced packed image with the sanitized controls predicted for that interval. Exact spaced frames are selected from a fixed-capacity circular buffer; unavailable startup slots duplicate the current reduced image with zero controls. This matches training padding without target leakage and keeps sampling/appending O(1).
 
+Run reads context fields and values only from the active immutable version, never the mutable workspace catalog. Selecting another brain clears every Run selection to blank. A live context change increments a runtime revision, clears temporal/prediction state, drains and releases old-context held controls on the action queue, and discards inference already in flight under the previous revision before admitting a new-context prediction.
+
 All synthetic events carry `agentTrainerSyntheticTag`; input safety monitors ignore that tag. Panic and normal stop both drain action work and release held state.
 
 ## Storage contracts
@@ -212,7 +222,7 @@ Default root:
 ~/Library/Application Support/AgentTrainer
 ```
 
-Training data (`Recordings`, `Caches`, folder index) and model data (`Profiles`, versions, checkpoints, contract markers) can be relocated independently.
+Training data (`Recordings`, `Caches`, folder index, context-field catalog) and model data (`Profiles`, versions, checkpoints, contract markers) can be relocated independently.
 
 Relocation must:
 
@@ -249,6 +259,8 @@ User-facing technical values must be derived from shared contract helpers such a
 Library recording rows and inspectors expose encoded frames plus logical package MB/GB. Folder headers aggregate every recording in that folder—not only search results—and show total recordings, frames, logical bytes, and full recorded seconds. Newly created manifests use exact frame counts; legacy estimates must remain compatible and non-destructive.
 
 Recording presets are user-owned, editable snapshots of Record-page settings. Applying a preset must tolerate an unavailable source or deleted destination without inventing an identifier. Library range selection follows the visible folder/search order; bulk manifest moves roll back as a set, and bulk deletion stages all recording directories before cleanup. Global shortcuts may use keyboard keys or any macOS mouse-button number, including additional side buttons, and must remain excluded from recording and human-input safety hooks.
+
+Context UI uses one shared generic field/value catalog. Record freezes selections at startup. Library single and multi-selection pickers may set or clear any field; mixed bulk values stay unchanged until explicitly replaced. Catalog renames update affected recording snapshots transactionally. Deleting a field/value requires confirmation and transactionally removes matching recording assignments, while immutable model-version schemas remain unchanged. Run renders a context card only when the active brain's schema is non-empty and starts every trained field blank.
 
 ## Validation and release
 

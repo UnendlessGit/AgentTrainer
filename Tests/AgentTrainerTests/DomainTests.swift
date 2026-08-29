@@ -19,8 +19,126 @@ private func XCTAssertThrowsErrorAsync<T>(
 }
 
 final class DomainTests: XCTestCase {
-    func testCurrentTrainingDataSchemaVersionsPerSampleAugmentationResumeContract() {
-        XCTAssertEqual(TrainingDataContract.schemaVersion, 12)
+    func testCurrentTrainingDataSchemaIncludesGenericContextContract() {
+        XCTAssertEqual(TrainingDataContract.schemaVersion, 13)
+    }
+
+    func testGenericContextSchemaUsesStableIDsAndExplicitBlankSegments() throws {
+        let fieldA = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let fieldB = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        let valueA1 = UUID(uuidString: "00000000-0000-0000-0000-000000000011")!
+        let valueA2 = UUID(uuidString: "00000000-0000-0000-0000-000000000012")!
+        let valueB1 = UUID(uuidString: "00000000-0000-0000-0000-000000000021")!
+        let first = [
+            ContextAssignment(fieldID: fieldB, fieldName: "Workflow", valueID: valueB1, valueName: "Review"),
+            ContextAssignment(fieldID: fieldA, fieldName: "Viewpoint", valueID: valueA1, valueName: "Wide")
+        ]
+        let second = [
+            ContextAssignment(fieldID: fieldA, fieldName: "Viewpoint", valueID: valueA2, valueName: "Close")
+        ]
+        let schema = try ModelContextSchema.trained(from: [first, second])
+
+        XCTAssertEqual(schema.fields.map(\.id), [fieldA, fieldB])
+        XCTAssertEqual(schema.fields[0].values.map(\.id), [valueA1, valueA2])
+        XCTAssertEqual(schema.inputValueCount, 3)
+        XCTAssertEqual(
+            schema.vector(selection: [fieldA: valueA2]),
+            [0, 1, 0],
+            "An unselected field must be represented by an all-zero segment."
+        )
+        XCTAssertEqual(schema.vector(selection: [:]), [0, 0, 0])
+        XCTAssertEqual(schema.assignments(selection: [fieldB: valueB1]).map(\.fieldName), ["Workflow"])
+        XCTAssertTrue(ModelContextSchema.empty.isEmpty)
+        XCTAssertEqual(ModelContextSchema.empty.inputValueCount, 0)
+
+        XCTAssertThrowsError(try ModelContextSchema.trained(from: [[first[0], first[0]]]))
+        var renamed = schema
+        renamed.fields[0].name = "Renamed for display"
+        XCTAssertTrue(schema.hasSameLayout(as: renamed))
+    }
+
+    func testPolicyContextConditioningIsOptionalAndChangesFusionInput() throws {
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(
+            width: 8,
+            height: 8,
+            colorMode: .grayscale,
+            bitDepth: 8,
+            chroma: .yuv420,
+            resizePolicy: .stretch
+        )
+        profile.training.precision = .float32
+        profile.training.temporalVision = TemporalVisionConfiguration(
+            pastFrameCount: 0,
+            frameSpacing: 1,
+            downsampleFactor: 1
+        )
+        profile.training.architecture = ArchitectureSpec(
+            convolutionChannels: [4],
+            kernelSizes: [3],
+            strides: [2],
+            visualEmbedding: 8,
+            recurrentKind: .gru,
+            recurrentWidth: 4,
+            fusionWidths: [8],
+            dropout: 0,
+            visualPooling: .attention,
+            attentionHeads: 2
+        )
+        let fieldID = UUID()
+        let schema = try ModelContextSchema(fields: [ContextFieldDefinition(
+            id: fieldID,
+            name: "Mode",
+            values: [
+                ContextValueDefinition(id: UUID(), name: "Alpha"),
+                ContextValueDefinition(id: UUID(), name: "Beta")
+            ]
+        )]).validated()
+        let contextFreeCount = ModelSizing.parameterCount(profile)
+        XCTAssertEqual(
+            ModelSizing.parameterCount(profile, contextSchema: schema) - contextFreeCount,
+            16,
+            "Two context inputs should add only two columns to the first 8-wide fusion layer."
+        )
+        let baseInputs = NeuralInputSizing.summary(for: profile)
+        let conditionedInputs = NeuralInputSizing.summary(
+            for: profile,
+            contextSchema: schema
+        )
+        XCTAssertEqual(conditionedInputs.contextValues, 2)
+        XCTAssertEqual(
+            conditionedInputs.valuesPerDecision - baseInputs.valuesPerDecision,
+            2
+        )
+
+        let policy = AgentPolicy(profile: profile, contextSchema: schema)
+        policy.train(false)
+        let actualParameterCount = policy.parameters().flattened().reduce(Int64(0)) {
+            $0 + Int64($1.1.size)
+        }
+        XCTAssertEqual(
+            actualParameterCount,
+            ModelSizing.parameterCount(profile, contextSchema: schema)
+        )
+        let temporal = MLXArray.zeros([2, 12], dtype: .float32)
+        let contexts = MLXArray([Float(1), 0, 0, 1], [2, 2])
+        let conditioned = policy.fusedFeatures(
+            temporalFeatures: temporal,
+            contextValues: contexts
+        )
+        let blank = policy.fusedFeatures(
+            temporalFeatures: temporal,
+            contextValues: MLXArray.zeros([2, 2])
+        )
+        let implicitBlank = policy.fusedFeatures(temporalFeatures: temporal)
+        MLX.eval(conditioned, blank, implicitBlank)
+        XCTAssertEqual(conditioned.shape, [2, 8])
+        XCTAssertEqual(blank.asArray(Float.self), implicitBlank.asArray(Float.self))
+        let rows = conditioned.asArray(Float.self)
+        XCTAssertGreaterThan(
+            zip(rows.prefix(8), rows.dropFirst(8).prefix(8)).map { abs($0 - $1) }.max() ?? 0,
+            0.000_001
+        )
     }
 
     private final class EventCollector: @unchecked Sendable {
@@ -312,6 +430,32 @@ final class DomainTests: XCTestCase {
         manifest.trainingWeight = 4
         let changedCorrectionWeight = try RecordingTrainingIdentity(recording: RecordingItem(manifest: manifest, directory: directory))
         XCTAssertNotEqual(original, changedCorrectionWeight)
+        manifest.trainingWeight = nil
+        let fieldID = UUID(), valueID = UUID()
+        manifest.contextAssignments = [ContextAssignment(
+            fieldID: fieldID,
+            fieldName: "Display name one",
+            valueID: valueID,
+            valueName: "Value name one"
+        )]
+        let changedContext = try RecordingTrainingIdentity(
+            recording: RecordingItem(manifest: manifest, directory: directory)
+        )
+        XCTAssertNotEqual(original, changedContext)
+        manifest.contextAssignments = [ContextAssignment(
+            fieldID: fieldID,
+            fieldName: "Renamed field",
+            valueID: valueID,
+            valueName: "Renamed value"
+        )]
+        let renamedContext = try RecordingTrainingIdentity(
+            recording: RecordingItem(manifest: manifest, directory: directory)
+        )
+        XCTAssertEqual(
+            changedContext,
+            renamedContext,
+            "Display-only context renames must not rebuild packed pixels or discard exact optimizer state."
+        )
     }
 
     func testInputMonitorSessionsJoinBeforeTheyCanRestart() async throws {
@@ -780,13 +924,20 @@ final class DomainTests: XCTestCase {
                 colorBits: 6,
                 compression: 0.7
             ),
-            leadUpSeconds: 4.5
+            leadUpSeconds: 4.5,
+            contextAssignments: [ContextAssignment(
+                fieldID: UUID(),
+                fieldName: "Scenario",
+                valueID: UUID(),
+                valueName: "Variant"
+            )]
         )
         let validated = try preset.validated()
         XCTAssertEqual(validated.name, "Gameplay")
         XCTAssertEqual(validated.effectiveRecordingVisuals.width, 1600)
         XCTAssertEqual(validated.effectiveRecordingVisuals.colorBits, 6)
         XCTAssertEqual(validated.effectiveLeadUpSeconds, 4.5)
+        XCTAssertEqual(validated.contextAssignments?.first?.fieldName, "Scenario")
         var invalid = preset
         invalid.captureFPS = .nan
         XCTAssertThrowsError(try invalid.validated())
@@ -803,12 +954,14 @@ final class DomainTests: XCTestCase {
         var legacyPreset = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         legacyPreset.removeValue(forKey: "recordingVisuals")
         legacyPreset.removeValue(forKey: "leadUpSeconds")
+        legacyPreset.removeValue(forKey: "contextAssignments")
         let decodedLegacy = try JSONDecoder().decode(
             RecordingPreset.self,
             from: JSONSerialization.data(withJSONObject: legacyPreset)
         )
         XCTAssertEqual(decodedLegacy.effectiveRecordingVisuals, RecordingVisualSettings())
         XCTAssertEqual(decodedLegacy.effectiveLeadUpSeconds, 3)
+        XCTAssertNil(decodedLegacy.contextAssignments)
 
         let oldDAgger = try JSONDecoder().decode(
             DAggerConfiguration.self,
@@ -1036,6 +1189,84 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty)
     }
 
+    func testContextCatalogAndBulkRecordingEditsAreTransactionalMetadata() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "context-catalog-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let firstValue = ContextValueDefinition(id: UUID(), name: "Indoor")
+        let secondValue = ContextValueDefinition(id: UUID(), name: "Outdoor")
+        var field = ContextFieldDefinition(
+            id: UUID(),
+            name: "Scene",
+            values: [firstValue, secondValue]
+        )
+        try await store.saveContextField(field)
+
+        var items: [RecordingItem] = []
+        for index in 0..<2 {
+            let id = UUID()
+            let directory = try await store.createRecordingDirectory(id: id)
+            let manifest = RecordingManifest(
+                id: id,
+                name: "Context \(index)",
+                createdAt: Date(),
+                hostStartNanos: 1,
+                duration: 1,
+                capture: CaptureSpec(),
+                globalRect: CodableRect(CGRect(x: 0, y: 0, width: 10, height: 10)),
+                pixelWidth: 10,
+                pixelHeight: 10,
+                deliveredFPS: 1,
+                eventCount: 0
+            )
+            try await store.writeRecording(manifest, to: directory)
+            items.append(RecordingItem(manifest: manifest, directory: directory))
+        }
+        try await store.setContextValue(firstValue.id, for: field.id, recordings: items)
+        var stored = await store.listRecordings()
+        XCTAssertTrue(stored.allSatisfy {
+            $0.manifest.effectiveContextAssignments.first?.valueID == firstValue.id
+        })
+
+        field.name = "Location"
+        field.values[0].name = "Inside"
+        try await store.saveContextField(field)
+        stored = await store.listRecordings()
+        XCTAssertTrue(stored.allSatisfy {
+            $0.manifest.effectiveContextAssignments.first?.fieldName == "Location"
+                && $0.manifest.effectiveContextAssignments.first?.valueName == "Inside"
+        })
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("context-fields.json").path
+        ))
+
+        try await store.setContextValue(secondValue.id, for: field.id, recordings: [stored[0]])
+        stored = await store.listRecordings()
+        XCTAssertEqual(
+            Set(stored.compactMap { $0.manifest.effectiveContextAssignments.first?.valueID }),
+            [firstValue.id, secondValue.id]
+        )
+        try await store.setContextValue(nil, for: field.id, recordings: stored)
+        let cleared = await store.listRecordings()
+        XCTAssertTrue(cleared.allSatisfy {
+            $0.manifest.effectiveContextAssignments.isEmpty
+        })
+
+        try await store.setContextValue(firstValue.id, for: field.id, recordings: stored)
+        try await store.deleteContextValue(fieldID: field.id, valueID: firstValue.id)
+        let valueDeleted = await store.listRecordings()
+        XCTAssertTrue(valueDeleted.allSatisfy {
+            $0.manifest.effectiveContextAssignments.isEmpty
+        })
+        try await store.deleteContextField(id: field.id)
+        let finalCatalog = await store.contextCatalog()
+        XCTAssertTrue(finalCatalog.fields.isEmpty)
+    }
+
     func testRecordingExportAndImportPreserveNativeArtifactsFoldersAndCollisionSafety() async throws {
         let container = FileManager.default.temporaryDirectory.appendingPathComponent("recording-transfer-\(UUID().uuidString)", isDirectory: true)
         let sourceRoot = container.appendingPathComponent("Source", isDirectory: true)
@@ -1047,6 +1278,14 @@ final class DomainTests: XCTestCase {
         try await source.prepare()
         let folder = RecordingFolder(id: UUID(), name: "Portable Demonstrations", createdAt: Date())
         try await source.saveRecordingFolder(folder)
+        let contextValue = ContextValueDefinition(id: UUID(), name: "Variant A")
+        let unusedContextValue = ContextValueDefinition(id: UUID(), name: "Variant B")
+        let contextField = ContextFieldDefinition(
+            id: UUID(),
+            name: "Experiment",
+            values: [contextValue, unusedContextValue]
+        )
+        try await source.saveContextField(contextField)
         let recordingID = UUID()
         let recordingDirectory = try await source.createRecordingDirectory(id: recordingID)
         let videoURL = recordingDirectory.appendingPathComponent("capture.mov")
@@ -1070,7 +1309,13 @@ final class DomainTests: XCTestCase {
             deliveredFPS: 30,
             eventCount: eventCount,
             folderID: folder.id,
-            excludedKeyCodes: [49]
+            excludedKeyCodes: [49],
+            contextAssignments: [ContextAssignment(
+                fieldID: contextField.id,
+                fieldName: contextField.name,
+                valueID: contextValue.id,
+                valueName: contextValue.name
+            )]
         )
         try await source.writeRecording(manifest, to: recordingDirectory)
         let sourceVideo = try Data(contentsOf: videoURL)
@@ -1080,18 +1325,45 @@ final class DomainTests: XCTestCase {
         let exported = try await source.exportRecordings(sourceItems, to: exportRoot)
         XCTAssertEqual(exported.exportedCount, 1)
         XCTAssertTrue(FileManager.default.fileExists(atPath: exportRoot.appendingPathComponent("recording-folders.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: exportRoot.appendingPathComponent("context-fields.json").path))
 
         let target = WorkspaceStore(root: targetRoot)
         try await target.prepare()
+        let collidingLocalField = ContextFieldDefinition(
+            id: contextField.id,
+            name: "Local Existing Field",
+            values: [ContextValueDefinition(id: contextValue.id, name: "Local Existing Value")]
+        )
+        try await target.saveContextField(collidingLocalField)
         let firstImport = try await target.importRecordings(from: [exportRoot], fallbackFolderID: nil)
         XCTAssertEqual(firstImport, RecordingImportResult(importedCount: 1, createdFolderCount: 1, regeneratedIdentifierCount: 0))
         var imported = await target.listRecordings()
         XCTAssertEqual(imported.map(\.id), [recordingID])
         XCTAssertEqual(imported.first?.manifest.excludedKeyCodes, [49])
+        XCTAssertEqual(
+            imported.first?.manifest.effectiveContextAssignments.first?.valueID,
+            contextValue.id
+        )
+        XCTAssertNotEqual(
+            imported.first?.manifest.effectiveContextAssignments.first?.fieldID,
+            contextField.id,
+            "A conflicting external field identifier must be regenerated without changing its semantic name."
+        )
         XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(imported.first).directory.appendingPathComponent("capture.mov")), sourceVideo)
         XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(imported.first).directory.appendingPathComponent("events.atrevents")), sourceEvents)
         let importedFolders = await target.listRecordingFolders()
         XCTAssertEqual(importedFolders.map(\.name), [folder.name])
+        let importedContext = await target.contextCatalog()
+        XCTAssertEqual(Set(importedContext.fields.map(\.name)), [
+            collidingLocalField.name, contextField.name
+        ])
+        let importedField = try XCTUnwrap(importedContext.fields.first {
+            $0.name == contextField.name
+        })
+        XCTAssertEqual(
+            importedField.values.map(\.name),
+            [contextValue.name, unusedContextValue.name]
+        )
 
         let secondImport = try await target.importRecordings(from: [exportRoot], fallbackFolderID: nil)
         XCTAssertEqual(secondImport.importedCount, 1)
@@ -1104,6 +1376,8 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(imported.allSatisfy {
             (try? Data(contentsOf: $0.directory.appendingPathComponent("capture.mov"))) == sourceVideo
                 && (try? Data(contentsOf: $0.directory.appendingPathComponent("events.atrevents"))) == sourceEvents
+                && $0.manifest.effectiveContextAssignments.first?.valueID == contextValue.id
+                && $0.manifest.effectiveContextAssignments.first?.fieldID == importedField.id
         })
     }
 
@@ -3041,6 +3315,73 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(previous[2 * ActionLayout.count], 1)
     }
 
+    func testCachedContextRowsFollowRecordingSegmentsAndPreserveBlank() throws {
+        let fieldID = UUID()
+        let firstValue = ContextValueDefinition(id: UUID(), name: "One")
+        let secondValue = ContextValueDefinition(id: UUID(), name: "Two")
+        let schema = try ModelContextSchema(fields: [ContextFieldDefinition(
+            id: fieldID,
+            name: "Phase",
+            values: [firstValue, secondValue]
+        )]).validated()
+        let firstAssignment = ContextAssignment(
+            fieldID: fieldID,
+            fieldName: "Phase",
+            valueID: firstValue.id,
+            valueName: firstValue.name
+        )
+        let rows = (0..<4).map { row -> [Float] in
+            var values = [Float](repeating: 0, count: ActionLayout.count)
+            values[0] = Float(row)
+            return values
+        }
+        let fixture = try makeSyntheticDataset(
+            name: "context-segments",
+            pastFrameCount: 0,
+            sequences: [[0], [0], [1], [1]],
+            actionRows: rows,
+            segments: [
+                CacheSegment(
+                    recordingID: UUID(),
+                    start: 0,
+                    count: 2,
+                    observationStart: 0,
+                    contextAssignments: [firstAssignment]
+                ),
+                CacheSegment(
+                    recordingID: UUID(),
+                    start: 2,
+                    count: 2,
+                    observationStart: 1,
+                    contextAssignments: []
+                )
+            ],
+            contextSchema: schema
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let values = MLXArray(
+            fixture.dataset.contextBatch(at: [0, 2, 1, 3]),
+            [4, 2],
+            type: Float.self
+        ).asArray(Float.self)
+        XCTAssertEqual(values, [1, 0, 0, 0, 1, 0, 0, 0])
+        let plan = fixture.dataset.visionBatchPlan(at: [0, 1, 2, 3])
+        XCTAssertEqual(plan.uniqueSequences.count, 2)
+        let sharedValues = MLXArray(
+            fixture.dataset.contextBatch(at: [0, 1, 2, 3], visionPlan: plan),
+            [2, 2],
+            type: Float.self
+        ).asArray(Float.self)
+        XCTAssertEqual(sharedValues, [1, 0, 0, 0])
+        XCTAssertTrue(
+            fixture.dataset.manifest.effectiveContextSchema.hasSameLayout(as: schema)
+        )
+        XCTAssertEqual(
+            fixture.dataset.manifest.effectiveContextSchema.fields.map(\.name),
+            ["Phase"]
+        )
+    }
+
     func testFusedTrainingBatchMatchesCanonicalCacheReadsAcrossSegments() throws {
         func verify(pastFrameCount: Int) throws {
             let sequences: [[UInt32]] = pastFrameCount == 2 ? [
@@ -3283,10 +3624,18 @@ final class DomainTests: XCTestCase {
         writer.append(InputSample(timestampNanos: base + 8_000_000, kind: .key, keyCode: 13, isDown: false))
         let eventCount = try writer.finish()
         let duration = 0.2
+        let contextFieldID = UUID(), contextValueID = UUID()
+        let contextAssignment = ContextAssignment(
+            fieldID: contextFieldID,
+            fieldName: "Condition",
+            valueID: contextValueID,
+            valueName: "A"
+        )
         let manifest = RecordingManifest(
             id: recordingID, name: "Integration", createdAt: Date(), hostStartNanos: base, duration: duration,
             capture: CaptureSpec(requestedFPS: 30), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
-            pixelWidth: 16, pixelHeight: 16, deliveredFPS: 30, eventCount: eventCount
+            pixelWidth: 16, pixelHeight: 16, deliveredFPS: 30, eventCount: eventCount,
+            contextAssignments: [contextAssignment]
         )
         try await store.writeRecording(manifest, to: directory)
 
@@ -3306,6 +3655,15 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(dataset.demonstratedKeyCodes().contains(13))
         XCTAssertEqual(dataset.manifest.preprocessing.width, 8)
         XCTAssertEqual(dataset.manifest.pastPreprocessing.width, 4)
+        XCTAssertEqual(dataset.manifest.effectiveContextSchema.inputValueCount, 1)
+        XCTAssertEqual(
+            MLXArray(
+                dataset.contextBatch(at: Array(0..<dataset.count)),
+                [dataset.count, 1],
+                type: Float.self
+            ).asArray(Float.self),
+            [Float](repeating: 1, count: dataset.count)
+        )
         XCTAssertEqual(dataset.pastPackedObservations(at: [0]).count, 2 * dataset.manifest.pastObservationBytesPerSample)
         XCTAssertTrue(
             MLXArray(
@@ -5111,7 +5469,8 @@ final class DomainTests: XCTestCase {
         sequences: [[UInt32]],
         actionRows: [[Float]],
         frameActionRows suppliedFrameActionRows: [[Float]]? = nil,
-        segments: [CacheSegment]? = nil
+        segments: [CacheSegment]? = nil,
+        contextSchema: ModelContextSchema = .empty
     ) throws -> (dataset: CachedDataset, directory: URL) {
         precondition(sequences.count == actionRows.count)
         precondition(actionRows.allSatisfy { $0.count == ActionLayout.count })
@@ -5143,7 +5502,8 @@ final class DomainTests: XCTestCase {
                 currentObservationBytesPerSample: 1,
                 pastObservationBytesPerSample: pastFrameCount > 0 ? 1 : 0,
                 actionValuesPerSample: ActionLayout.count,
-                segments: segments
+                segments: segments,
+                contextSchema: contextSchema.isEmpty ? nil : contextSchema
             )
             let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))

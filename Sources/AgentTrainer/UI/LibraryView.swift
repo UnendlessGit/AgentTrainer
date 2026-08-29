@@ -28,10 +28,16 @@ struct LibraryView: View {
     @State private var expandedFolderIDs: Set<UUID> = []
     @State private var showsTimeline = false
     @State private var selectionAnchorID: UUID?
+    @State private var showsContextCatalog = false
 
     private var visibleRecordings: [RecordingItem] {
         var result = model.recordings.filter { item in
-            (search.isEmpty || item.manifest.name.localizedCaseInsensitiveContains(search))
+            search.isEmpty
+                || item.manifest.name.localizedCaseInsensitiveContains(search)
+                || item.manifest.effectiveContextAssignments.contains {
+                    $0.fieldName.localizedCaseInsensitiveContains(search)
+                        || $0.valueName.localizedCaseInsensitiveContains(search)
+                }
         }
         switch sortOrder {
         case .newest: result.sort { $0.manifest.createdAt > $1.manifest.createdAt }
@@ -83,26 +89,50 @@ struct LibraryView: View {
                 folderToRename = nil
             }
         }
+        .sheet(isPresented: $showsContextCatalog) {
+            ContextCatalogEditor(model: model)
+        }
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 12) {
-            SectionTitle("Library", "Expand folders to browse recordings, inspect captured controls, and replay locally.")
-            TextField("Search recordings", text: $search).textFieldStyle(.roundedBorder).frame(width: 240)
-            Picker("Sort", selection: $sortOrder) { ForEach(SortOrder.allCases) { Text($0.rawValue).tag($0) } }.frame(width: 130)
-            if model.selectedRecordingIDs.count > 1 {
-                StatusPill(text: "\(model.selectedRecordingIDs.count) selected", color: ATColor.cyan)
-                Button("Clear") { clearSelection() }.buttonStyle(.plain).foregroundStyle(ATColor.cyan).font(.caption.bold())
-            } else {
-                Text("Shift-click to select a range").font(.caption).foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                SectionTitle("Library", "Expand folders to browse recordings, inspect captured controls, and replay locally.")
+                Spacer(minLength: 12)
+                Button { Task { await model.refreshLibrary(); ensureSelection() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .primaryButton()
+                .help("Refresh Library")
             }
-            Button("Import Recordings…") { Task { await model.importRecordings() } }
-                .primaryButton(color: ATColor.cyan)
-                .disabled(model.recordingIsActiveOrStarting || model.isReplaying)
-            Button("Export Selected…") { Task { await model.exportRecordings(model.selectedRecordings) } }
-                .primaryButton(color: ATColor.violet)
-                .disabled(model.selectedRecordings.isEmpty)
-            Button { Task { await model.refreshLibrary(); ensureSelection() } } label: { Image(systemName: "arrow.clockwise") }.primaryButton()
+            HStack(alignment: .center, spacing: 10) {
+                TextField("Search names or context", text: $search)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 190, idealWidth: 260, maxWidth: 320)
+                Picker("Sort", selection: $sortOrder) {
+                    ForEach(SortOrder.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .frame(width: 130)
+                if model.selectedRecordingIDs.count > 1 {
+                    StatusPill(text: "\(model.selectedRecordingIDs.count) selected", color: ATColor.cyan)
+                    Button("Clear") { clearSelection() }
+                        .buttonStyle(.plain).foregroundStyle(ATColor.cyan).font(.caption.bold())
+                } else {
+                    Text("Shift-click for a range")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 8)
+                Button("Import…") { Task { await model.importRecordings() } }
+                    .primaryButton(color: ATColor.cyan)
+                    .disabled(model.recordingIsActiveOrStarting || model.isReplaying)
+                    .help("Import native recording packages")
+                Button("Export Selected…") { Task { await model.exportRecordings(model.selectedRecordings) } }
+                    .primaryButton(color: ATColor.violet)
+                    .disabled(model.selectedRecordings.isEmpty)
+                Button("Context Fields…") { showsContextCatalog = true }
+                    .primaryButton(color: ATColor.amber)
+                    .disabled(model.recordingIsActiveOrStarting || model.daggerLifecycleIsActive)
+            }
         }
     }
 
@@ -214,6 +244,18 @@ struct LibraryView: View {
                                 .font(.caption).foregroundStyle(ATColor.coral)
                         }
                         Divider()
+                        HStack {
+                            Label("Context / Labels", systemImage: "tag.fill")
+                                .font(.subheadline.bold()).foregroundStyle(ATColor.amber)
+                            Spacer()
+                            Button("Manage…") { showsContextCatalog = true }
+                                .buttonStyle(.plain).foregroundStyle(ATColor.cyan)
+                                .font(.caption.bold())
+                        }
+                        RecordingContextEditor(model: model, recordings: [item])
+                        Text("Changes update only metadata and invalidate the relevant rebuildable dataset cache; video and input bytes stay untouched.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Divider()
                         HStack { Text("Recorded keyboard").font(.subheadline.bold()); Spacer(); if loadingDetails { ProgressView().controlSize(.small) } else { Text("\(summary.usedKeyCodes.count) keys").font(.caption).foregroundStyle(.secondary) } }
                         Text(summary.usedKeyCodes.sorted().map(KeyNames.name).joined(separator: "  "))
                             .font(.caption.bold()).foregroundStyle(ATColor.cyan)
@@ -281,48 +323,71 @@ struct LibraryView: View {
         let totalDuration = items.reduce(0) { $0 + effectiveDuration($1) }
         let metrics = RecordingCollectionMetrics.total(for: items)
         return OLEDCard(padding: 13) {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    Image(systemName: "checkmark.circle.fill").font(.title2).foregroundStyle(ATColor.cyan)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("\(items.count) recordings selected").font(.title3.bold())
-                        Text("\(durationString(totalDuration)) usable • \(metrics.frameCount.formatted()) frames • \(storageString(metrics.storageBytes)) • \(items.reduce(0) { $0 + $1.manifest.eventCount }.formatted()) input events")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                Text("Shift-click another recording to change the contiguous range. Command-click toggles an individual recording.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Divider()
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Selected recordings").font(.subheadline.bold())
-                    ForEach(items.prefix(8)) { item in
-                        HStack {
-                            Image(systemName: "video.fill").foregroundStyle(ATColor.violet)
-                            Text(item.manifest.name).lineLimit(1)
-                            Spacer()
-                            Text(durationString(effectiveDuration(item))).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.title2).foregroundStyle(ATColor.cyan)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(items.count) recordings selected").font(.title3.bold())
+                            Text("\(durationString(totalDuration)) usable • \(metrics.frameCount.formatted()) frames • \(storageString(metrics.storageBytes)) • \(items.reduce(0) { $0 + $1.manifest.eventCount }.formatted()) input events")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
-                        .font(.caption)
                     }
-                    if items.count > 8 { Text("and \(items.count - 8) more…").font(.caption).foregroundStyle(.tertiary) }
-                }
-                .padding(10)
-                .raisedGlassSurface(cornerRadius: 9)
-                Divider()
-                Picker("Move all to folder", selection: Binding<UUID?>(
-                    get: { commonFolderID },
-                    set: { folderID in
-                        guard let folderID else { return }
-                        Task { await model.moveRecordings(items, to: folderID) }
+                    Text("Shift-click another recording to change the contiguous range. Command-click toggles an individual recording.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Divider()
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Selected recordings").font(.subheadline.bold())
+                        ForEach(items.prefix(8)) { item in
+                            HStack {
+                                Image(systemName: "video.fill").foregroundStyle(ATColor.violet)
+                                Text(item.manifest.name).lineLimit(1)
+                                Spacer()
+                                Text(durationString(effectiveDuration(item)))
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            }
+                            .font(.caption)
+                        }
+                        if items.count > 8 {
+                            Text("and \(items.count - 8) more…")
+                                .font(.caption).foregroundStyle(.tertiary)
+                        }
                     }
-                )) {
-                    if commonFolderID == nil { Text("Mixed folders").tag(UUID?.none) }
-                    ForEach(model.recordingFolders) { Text($0.name).tag(Optional($0.id)) }
-                }
-                HStack {
-                    Button("Keep Only Current") { clearSelection() }.primaryButton(color: ATColor.cyan)
-                    Spacer()
-                    Button("Delete Selected", role: .destructive) { recordingsToDelete = items }.primaryButton(color: ATColor.coral)
+                    .padding(10)
+                    .raisedGlassSurface(cornerRadius: 9)
+                    Divider()
+                    HStack {
+                        Label("Context / Labels", systemImage: "tag.fill")
+                            .font(.subheadline.bold()).foregroundStyle(ATColor.amber)
+                        Spacer()
+                        Button("Manage…") { showsContextCatalog = true }
+                            .buttonStyle(.plain).foregroundStyle(ATColor.cyan)
+                            .font(.caption.bold())
+                    }
+                    RecordingContextEditor(model: model, recordings: items)
+                    Text("Choosing a value applies it to every selected recording. Mixed leaves the field unchanged; Blank removes it from all selected recordings.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    Divider()
+                    Picker("Move all to folder", selection: Binding<UUID?>(
+                        get: { commonFolderID },
+                        set: { folderID in
+                            guard let folderID else { return }
+                            Task { await model.moveRecordings(items, to: folderID) }
+                        }
+                    )) {
+                        if commonFolderID == nil { Text("Mixed folders").tag(UUID?.none) }
+                        ForEach(model.recordingFolders) { Text($0.name).tag(Optional($0.id)) }
+                    }
+                    HStack {
+                        Button("Keep Only Current") { clearSelection() }
+                            .primaryButton(color: ATColor.cyan)
+                        Spacer()
+                        Button("Delete Selected", role: .destructive) {
+                            recordingsToDelete = items
+                        }
+                        .primaryButton(color: ATColor.coral)
+                    }
                 }
             }
         }
@@ -438,6 +503,16 @@ private struct LibraryRecordingRow: View {
                     Label(RecordingMetricFormatter.storage(item.storageBytes), systemImage: "internaldrive")
                     Label("\(item.manifest.eventCount)", systemImage: "cursorarrow.click.2")
                 }.font(.caption2).foregroundStyle(.secondary)
+                let context = item.manifest.effectiveContextAssignments.sorted {
+                    $0.fieldName.localizedStandardCompare($1.fieldName) == .orderedAscending
+                }
+                if !context.isEmpty {
+                    Text(context.prefix(2).map { "\($0.fieldName): \($0.valueName)" }.joined(separator: " • ")
+                        + (context.count > 2 ? " • +\(context.count - 2)" : ""))
+                        .font(.caption2.bold())
+                        .foregroundStyle(ATColor.amber)
+                        .lineLimit(1)
+                }
             }
             Spacer()
             Text(item.manifest.createdAt.formatted(date: .abbreviated, time: .omitted)).font(.caption2).foregroundStyle(.tertiary)

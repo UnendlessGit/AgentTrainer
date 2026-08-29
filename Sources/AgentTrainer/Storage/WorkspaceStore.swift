@@ -7,7 +7,9 @@ enum WorkspaceDataKind: String, Sendable {
 
     fileprivate var managedNames: [String] {
         switch self {
-        case .trainingData: ["Recordings", "Caches", "recording-folders.json"]
+        case .trainingData: [
+            "Recordings", "Caches", "recording-folders.json", "context-fields.json"
+        ]
         case .models: ["Profiles", "model-contract.json", "model-artifact-audit-1.8.2.json"]
         }
     }
@@ -75,6 +77,7 @@ actor WorkspaceStore {
     private var profilesRoot: URL { modelsRoot.appendingPathComponent("Profiles", isDirectory: true) }
     private var cachesRoot: URL { trainingDataRoot.appendingPathComponent("Caches", isDirectory: true) }
     private var foldersURL: URL { trainingDataRoot.appendingPathComponent("recording-folders.json") }
+    private var contextCatalogURL: URL { trainingDataRoot.appendingPathComponent("context-fields.json") }
 
     private static let trainingDataRootKey = "AgentTrainer.TrainingDataRoot.v1"
     private static let modelsRootKey = "AgentTrainer.ModelsRoot.v1"
@@ -240,6 +243,7 @@ actor WorkspaceStore {
                    manifest.schemaVersion == currentSchema,
                    manifest.id.uuidString.caseInsensitiveCompare(item.lastPathComponent) == .orderedSame,
                    manifest.artifactFileNamesAreSafe,
+                   manifest.contextSchemaIsValid,
                    FileManager.default.fileExists(atPath: item.appendingPathComponent(manifest.weightsFile).path) {
                     compatibleVersionIDs.insert(manifest.id)
                 } else {
@@ -370,6 +374,23 @@ actor WorkspaceStore {
             validated.append(try await validateRecordingImport(source))
         }
 
+        var mergedContextCatalog = try loadContextCatalog()
+        for index in validated.indices {
+            let mapped = try mergeImportedContext(
+                sourceFields: validated[index].sourceContextFields,
+                assignments: validated[index].manifest.effectiveContextAssignments,
+                into: &mergedContextCatalog
+            )
+            validated[index].manifest.contextAssignments = mapped
+            if !mapped.isEmpty {
+                validated[index].manifest.schemaVersion = max(
+                    4,
+                    validated[index].manifest.schemaVersion
+                )
+            }
+        }
+        mergedContextCatalog = try mergedContextCatalog.validated()
+
         let originalFolders = listRecordingFolders()
         var folders = originalFolders
         let needsFallbackFolder = validated.contains { item in
@@ -463,9 +484,14 @@ actor WorkspaceStore {
         }
 
         let originalFolderData = try? Data(contentsOf: foldersURL)
+        let originalContextData = try? Data(contentsOf: contextCatalogURL)
         var committed: [URL] = []
         do {
             try atomicWrite(try encoder.encode(folders), to: foldersURL)
+            try atomicWrite(
+                try encoder.encode(mergedContextCatalog),
+                to: contextCatalogURL
+            )
             for item in staged {
                 try FileManager.default.moveItem(at: item.temporary, to: item.destination)
                 committed.append(item.destination)
@@ -475,6 +501,11 @@ actor WorkspaceStore {
             for directory in committed { try? FileManager.default.removeItem(at: directory) }
             if let originalFolderData { try? atomicWrite(originalFolderData, to: foldersURL) }
             else { try? FileManager.default.removeItem(at: foldersURL) }
+            if let originalContextData {
+                try? atomicWrite(originalContextData, to: contextCatalogURL)
+            } else {
+                try? FileManager.default.removeItem(at: contextCatalogURL)
+            }
             try? FileManager.default.removeItem(at: stagingRoot)
             throw AgentTrainerError.storage("The recordings could not all be imported, so the library was restored: \(error.localizedDescription)")
         }
@@ -534,6 +565,11 @@ actor WorkspaceStore {
             let folderIDs = Set(items.compactMap { $0.manifest.folderID })
             let folders = listRecordingFolders().filter { folderIDs.contains($0.id) }
             try atomicWrite(try encoder.encode(folders), to: staging.appendingPathComponent("recording-folders.json"))
+            let context = try portableContextCatalog(for: items)
+            try atomicWrite(
+                try encoder.encode(context),
+                to: staging.appendingPathComponent("context-fields.json")
+            )
 
             if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
             try FileManager.default.moveItem(at: staging, to: destination)
@@ -560,7 +596,7 @@ actor WorkspaceStore {
             guard let originalData = try? Data(contentsOf: manifestURL),
                   var manifest = try? decoder.decode(RecordingManifest.self, from: originalData),
                   !manifest.isStructurallyValid,
-                  (1...3).contains(manifest.schemaVersion),
+                  (1...4).contains(manifest.schemaVersion),
                   Self.isSafeLeafName(manifest.videoFile), Self.isSafeLeafName(manifest.eventFile),
                   manifest.thumbnailFile.map(Self.isSafeLeafName) ?? true else { continue }
 
@@ -733,6 +769,146 @@ actor WorkspaceStore {
         }
     }
 
+    // MARK: Generic context catalog and recording assignments
+
+    func contextCatalog() -> ContextCatalog {
+        (try? loadContextCatalog()) ?? ContextCatalog()
+    }
+
+    /// Adds or updates one generic field. Renames and removed values are
+    /// reflected in every affected recording snapshot as one rollback-safe
+    /// transaction; video and input artifacts are never touched.
+    @discardableResult
+    func saveContextField(_ requestedField: ContextFieldDefinition) throws -> ContextFieldDefinition {
+        let field = try requestedField.validated()
+        var catalog = try loadContextCatalog()
+        if let index = catalog.fields.firstIndex(where: { $0.id == field.id }) {
+            catalog.fields[index] = field
+        } else {
+            catalog.fields.append(field)
+        }
+        catalog = try catalog.validated()
+
+        let values = Dictionary(uniqueKeysWithValues: field.values.map { ($0.id, $0) })
+        let updates: [(RecordingItem, RecordingManifest)] = listRecordings().compactMap { item in
+            guard item.manifest.effectiveContextAssignments.contains(where: {
+                $0.fieldID == field.id
+            }) else { return nil }
+            var manifest = item.manifest
+            manifest.contextAssignments = manifest.effectiveContextAssignments.compactMap { assignment in
+                guard assignment.fieldID == field.id else { return assignment }
+                guard let value = values[assignment.valueID] else { return nil }
+                return ContextAssignment(
+                    fieldID: field.id,
+                    fieldName: field.name,
+                    valueID: value.id,
+                    valueName: value.name
+                )
+            }
+            return (item, manifest)
+        }
+        try commitContextMutation(catalog: catalog, recordingUpdates: updates)
+        return field
+    }
+
+    func deleteContextField(id fieldID: UUID) throws {
+        var catalog = try loadContextCatalog()
+        guard catalog.fields.contains(where: { $0.id == fieldID }) else { return }
+        catalog.fields.removeAll { $0.id == fieldID }
+        let updates = listRecordings().compactMap { item -> (RecordingItem, RecordingManifest)? in
+            guard item.manifest.effectiveContextAssignments.contains(where: {
+                $0.fieldID == fieldID
+            }) else { return nil }
+            var manifest = item.manifest
+            manifest.contextAssignments = manifest.effectiveContextAssignments.filter {
+                $0.fieldID != fieldID
+            }
+            return (item, manifest)
+        }
+        try commitContextMutation(catalog: try catalog.validated(), recordingUpdates: updates)
+    }
+
+    func deleteContextValue(fieldID: UUID, valueID: UUID) throws {
+        var catalog = try loadContextCatalog()
+        guard let fieldIndex = catalog.fields.firstIndex(where: { $0.id == fieldID }),
+              catalog.fields[fieldIndex].values.contains(where: { $0.id == valueID }) else { return }
+        catalog.fields[fieldIndex].values.removeAll { $0.id == valueID }
+        let updates = listRecordings().compactMap { item -> (RecordingItem, RecordingManifest)? in
+            guard item.manifest.effectiveContextAssignments.contains(where: {
+                $0.fieldID == fieldID && $0.valueID == valueID
+            }) else { return nil }
+            var manifest = item.manifest
+            manifest.contextAssignments = manifest.effectiveContextAssignments.filter {
+                !($0.fieldID == fieldID && $0.valueID == valueID)
+            }
+            return (item, manifest)
+        }
+        try commitContextMutation(catalog: try catalog.validated(), recordingUpdates: updates)
+    }
+
+    /// Sets or clears one field for one or many recordings. Every manifest is
+    /// staged in memory first and restored if any write fails, matching folder
+    /// bulk-edit semantics.
+    func setContextValue(
+        _ valueID: UUID?,
+        for fieldID: UUID,
+        recordings requestedItems: [RecordingItem]
+    ) throws {
+        let catalog = try loadContextCatalog()
+        guard let field = catalog.fields.first(where: { $0.id == fieldID }) else {
+            throw AgentTrainerError.storage("The selected context field no longer exists.")
+        }
+        let value = try valueID.map { valueID -> ContextValueDefinition in
+            guard let value = field.values.first(where: { $0.id == valueID }) else {
+                throw AgentTrainerError.storage("The selected context value no longer exists.")
+            }
+            return value
+        }
+        let items = Array(Dictionary(
+            requestedItems.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        ).values)
+        let currentItems = Dictionary(
+            uniqueKeysWithValues: listRecordings().map { ($0.id, $0) }
+        )
+        let managedRoot = normalized(recordingsRoot)
+        let updates = try items.map { requested -> (RecordingItem, RecordingManifest) in
+            guard let item = currentItems[requested.id] else {
+                throw AgentTrainerError.storage(
+                    "A selected recording is no longer in the managed library."
+                )
+            }
+            let directory = normalized(item.directory)
+            guard directory.deletingLastPathComponent() == managedRoot,
+                  directory.pathExtension == "atrrecord",
+                  FileManager.default.fileExists(atPath: directory.path) else {
+                throw AgentTrainerError.storage(
+                    "A selected recording is no longer in the managed library."
+                )
+            }
+            var manifest = item.manifest
+            var assignments = manifest.effectiveContextAssignments.filter {
+                $0.fieldID != fieldID
+            }
+            if let value {
+                assignments.append(ContextAssignment(
+                    fieldID: field.id,
+                    fieldName: field.name,
+                    valueID: value.id,
+                    valueName: value.name
+                ))
+            }
+            manifest.contextAssignments = try ContextAssignment.validatedList(assignments)
+            guard manifest.isStructurallyValid else {
+                throw AgentTrainerError.storage(
+                    "The updated recording context would create an invalid manifest."
+                )
+            }
+            return (item, manifest)
+        }
+        try commitContextMutation(catalog: catalog, recordingUpdates: updates)
+    }
+
     func deleteRecordingFolder(_ folder: RecordingFolder, includingRecordings: Bool) throws {
         var remaining = listRecordingFolders().filter { $0.id != folder.id }
         if includingRecordings {
@@ -754,12 +930,14 @@ actor WorkspaceStore {
     private struct RecordingImportSource {
         var directory: URL
         var sourceFolders: [UUID: RecordingFolder]
+        var sourceContextFields: [ContextFieldDefinition]
     }
 
     private struct ValidatedRecordingImport {
         var directory: URL
         var manifest: RecordingManifest
         var sourceFolders: [UUID: RecordingFolder]
+        var sourceContextFields: [ContextFieldDefinition]
     }
 
     private func recordingImportSources(from selectedURLs: [URL]) throws -> [RecordingImportSource] {
@@ -777,7 +955,26 @@ actor WorkspaceStore {
             }
         }
 
-        func appendPackage(_ package: URL, folders: [UUID: RecordingFolder]) throws {
+        func decodedContextFields(at root: URL) throws -> [ContextFieldDefinition] {
+            let index = root.appendingPathComponent("context-fields.json")
+            guard FileManager.default.fileExists(atPath: index.path) else { return [] }
+            do {
+                return try decoder.decode(
+                    ContextCatalog.self,
+                    from: Data(contentsOf: index)
+                ).validated().fields
+            } catch {
+                throw AgentTrainerError.storage(
+                    "The selected context field catalog is unreadable: \(error.localizedDescription)"
+                )
+            }
+        }
+
+        func appendPackage(
+            _ package: URL,
+            folders: [UUID: RecordingFolder],
+            contextFields: [ContextFieldDefinition]
+        ) throws {
             let unresolvedValues = try package.standardizedFileURL.resourceValues(forKeys: [.isSymbolicLinkKey])
             guard unresolvedValues.isSymbolicLink != true else {
                 throw AgentTrainerError.storage("Recording packages cannot be symbolic links.")
@@ -787,7 +984,11 @@ actor WorkspaceStore {
             guard values.isDirectory == true, values.isSymbolicLink != true,
                   normalizedPackage.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame else { return }
             guard seen.insert(normalizedPackage.path).inserted else { return }
-            result.append(RecordingImportSource(directory: normalizedPackage, sourceFolders: folders))
+            result.append(RecordingImportSource(
+                directory: normalizedPackage,
+                sourceFolders: folders,
+                sourceContextFields: contextFields
+            ))
         }
 
         for selected in selectedURLs {
@@ -803,7 +1004,11 @@ actor WorkspaceStore {
             if selected.pathExtension.localizedCaseInsensitiveCompare("atrrecord") == .orderedSame {
                 let parent = selected.deletingLastPathComponent()
                 let indexRoot = parent.lastPathComponent == "Recordings" ? parent.deletingLastPathComponent() : parent
-                try appendPackage(selected, folders: decodedFolders(at: indexRoot))
+                try appendPackage(
+                    selected,
+                    folders: decodedFolders(at: indexRoot),
+                    contextFields: decodedContextFields(at: indexRoot)
+                )
                 continue
             }
 
@@ -819,12 +1024,19 @@ actor WorkspaceStore {
                 indexRoot = selected
             }
             let folders = try decodedFolders(at: indexRoot)
+            let contextFields = try decodedContextFields(at: indexRoot)
             let children = try FileManager.default.contentsOfDirectory(
                 at: packageRoot,
                 includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             )
-            for child in children { try appendPackage(child, folders: folders) }
+            for child in children {
+                try appendPackage(
+                    child,
+                    folders: folders,
+                    contextFields: contextFields
+                )
+            }
         }
         return result
     }
@@ -893,7 +1105,12 @@ actor WorkspaceStore {
                 throw AgentTrainerError.storage("\(manifest.name) has an unsafe thumbnail artifact.")
             }
         }
-        return ValidatedRecordingImport(directory: source.directory, manifest: manifest, sourceFolders: source.sourceFolders)
+        return ValidatedRecordingImport(
+            directory: source.directory,
+            manifest: manifest,
+            sourceFolders: source.sourceFolders,
+            sourceContextFields: source.sourceContextFields
+        )
     }
 
     private func regularImportFile(_ url: URL) throws -> Bool {
@@ -1057,7 +1274,8 @@ actor WorkspaceStore {
     func saveVersionManifest(_ manifest: ModelVersionManifest, profileID: UUID) throws {
         var manifest = manifest
         manifest.name = manifest.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !manifest.name.isEmpty, manifest.artifactFileNamesAreSafe else {
+        guard !manifest.name.isEmpty, manifest.artifactFileNamesAreSafe,
+              manifest.contextSchemaIsValid else {
             throw AgentTrainerError.storage("The model version manifest contains an invalid name or artifact filename.")
         }
         let directory = versionDirectory(profileID: profileID, versionID: manifest.id)
@@ -1073,6 +1291,7 @@ actor WorkspaceStore {
                   let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
                   manifest.schemaVersion == ModelContract.schemaVersion,
                   manifest.artifactFileNamesAreSafe,
+                  manifest.contextSchemaIsValid,
                   manifest.id.uuidString.caseInsensitiveCompare(url.lastPathComponent) == .orderedSame else { return nil }
             return manifest
         }.sorted { $0.createdAt > $1.createdAt }
@@ -1084,7 +1303,8 @@ actor WorkspaceStore {
               let manifest = try? decoder.decode(ModelVersionManifest.self, from: data),
               manifest.id == versionID,
               manifest.schemaVersion == ModelContract.schemaVersion,
-              manifest.artifactFileNamesAreSafe else { return nil }
+              manifest.artifactFileNamesAreSafe,
+              manifest.contextSchemaIsValid else { return nil }
         return manifest
     }
 
@@ -1461,6 +1681,231 @@ actor WorkspaceStore {
             result.bytes += Int64(values.fileSize ?? 0)
         }
         return result
+    }
+
+    private func loadContextCatalog() throws -> ContextCatalog {
+        guard FileManager.default.fileExists(atPath: contextCatalogURL.path) else {
+            return ContextCatalog()
+        }
+        do {
+            return try decoder.decode(
+                ContextCatalog.self,
+                from: Data(contentsOf: contextCatalogURL)
+            ).validated()
+        } catch let error as AgentTrainerError {
+            throw error
+        } catch {
+            throw AgentTrainerError.storage(
+                "The context field catalog is unreadable: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func mergeImportedContext(
+        sourceFields rawSourceFields: [ContextFieldDefinition],
+        assignments rawAssignments: [ContextAssignment],
+        into catalog: inout ContextCatalog
+    ) throws -> [ContextAssignment] {
+        let assignments = try ContextAssignment.validatedList(rawAssignments)
+        guard !assignments.isEmpty else { return [] }
+        let referencedFieldIDs = Set(assignments.map(\.fieldID))
+        let referencedFieldNames = assignments.map(\.fieldName)
+        var sourceFields = try rawSourceFields.filter { field in
+            referencedFieldIDs.contains(field.id)
+                || referencedFieldNames.contains(where: {
+                    ContextNaming.matches($0, field.name)
+                })
+        }.map { try $0.validated() }
+
+        // A standalone `.atrrecord` package has no catalog sidecar, so its
+        // assignment snapshots also act as the minimal portable definitions.
+        for assignment in assignments {
+            let fieldIndex: Int
+            if let existing = sourceFields.firstIndex(where: {
+                $0.id == assignment.fieldID
+            }) {
+                fieldIndex = existing
+            } else if let existing = sourceFields.firstIndex(where: {
+                ContextNaming.matches($0.name, assignment.fieldName)
+            }) {
+                fieldIndex = existing
+            } else {
+                sourceFields.append(ContextFieldDefinition(
+                    id: assignment.fieldID,
+                    name: assignment.fieldName,
+                    values: [],
+                    createdAt: .distantPast
+                ))
+                fieldIndex = sourceFields.count - 1
+            }
+            if !sourceFields[fieldIndex].values.contains(where: {
+                $0.id == assignment.valueID
+                    || ContextNaming.matches($0.name, assignment.valueName)
+            }) {
+                sourceFields[fieldIndex].values.append(ContextValueDefinition(
+                    id: assignment.valueID,
+                    name: assignment.valueName,
+                    createdAt: .distantPast
+                ))
+            }
+        }
+        sourceFields = try ContextCatalog(fields: sourceFields).validated().fields
+        let normalizedAssignments = try ContextAssignment.validatedList(
+            assignments.compactMap { assignment in
+                guard let sourceField = sourceFields.first(where: {
+                    $0.id == assignment.fieldID
+                }) ?? sourceFields.first(where: {
+                    ContextNaming.matches($0.name, assignment.fieldName)
+                }),
+                let sourceValue = sourceField.values.first(where: {
+                    $0.id == assignment.valueID
+                }) ?? sourceField.values.first(where: {
+                    ContextNaming.matches($0.name, assignment.valueName)
+                }) else { return nil }
+                return ContextAssignment(
+                    fieldID: sourceField.id,
+                    fieldName: sourceField.name,
+                    valueID: sourceValue.id,
+                    valueName: sourceValue.name
+                )
+            }
+        )
+        guard normalizedAssignments.count == assignments.count else {
+            throw AgentTrainerError.storage(
+                "A recording context assignment does not exist in its portable field catalog."
+            )
+        }
+
+        var fieldMap: [UUID: UUID] = [:]
+        var valueMaps: [UUID: [UUID: UUID]] = [:]
+        for sourceField in sourceFields {
+            let targetFieldIndex: Int
+            if let sameID = catalog.fields.firstIndex(where: {
+                $0.id == sourceField.id
+                    && ContextNaming.matches($0.name, sourceField.name)
+            }) {
+                targetFieldIndex = sameID
+            } else if let sameName = catalog.fields.firstIndex(where: {
+                ContextNaming.matches($0.name, sourceField.name)
+            }) {
+                targetFieldIndex = sameName
+            } else {
+                let targetID = catalog.fields.contains(where: { $0.id == sourceField.id })
+                    ? UUID() : sourceField.id
+                catalog.fields.append(ContextFieldDefinition(
+                    id: targetID,
+                    name: sourceField.name,
+                    values: [],
+                    createdAt: sourceField.createdAt
+                ))
+                targetFieldIndex = catalog.fields.count - 1
+            }
+            let targetFieldID = catalog.fields[targetFieldIndex].id
+            fieldMap[sourceField.id] = targetFieldID
+            var valueMap: [UUID: UUID] = [:]
+            for sourceValue in sourceField.values {
+                let targetValueIndex: Int
+                if let sameID = catalog.fields[targetFieldIndex].values.firstIndex(where: {
+                    $0.id == sourceValue.id
+                        && ContextNaming.matches($0.name, sourceValue.name)
+                }) {
+                    targetValueIndex = sameID
+                } else if let sameName = catalog.fields[targetFieldIndex].values.firstIndex(where: {
+                    ContextNaming.matches($0.name, sourceValue.name)
+                }) {
+                    targetValueIndex = sameName
+                } else {
+                    let targetID = catalog.fields[targetFieldIndex].values.contains(where: {
+                        $0.id == sourceValue.id
+                    }) ? UUID() : sourceValue.id
+                    catalog.fields[targetFieldIndex].values.append(ContextValueDefinition(
+                        id: targetID,
+                        name: sourceValue.name,
+                        createdAt: sourceValue.createdAt
+                    ))
+                    targetValueIndex = catalog.fields[targetFieldIndex].values.count - 1
+                }
+                valueMap[sourceValue.id] = catalog.fields[targetFieldIndex]
+                    .values[targetValueIndex].id
+            }
+            valueMaps[sourceField.id] = valueMap
+        }
+        catalog = try catalog.validated()
+
+        return try ContextAssignment.validatedList(normalizedAssignments.compactMap { assignment in
+            guard let targetFieldID = fieldMap[assignment.fieldID],
+                  let targetField = catalog.fields.first(where: { $0.id == targetFieldID }),
+                  let targetValueID = valueMaps[assignment.fieldID]?[assignment.valueID],
+                  let targetValue = targetField.values.first(where: {
+                      $0.id == targetValueID
+                  }) else { return nil }
+            return ContextAssignment(
+                fieldID: targetField.id,
+                fieldName: targetField.name,
+                valueID: targetValue.id,
+                valueName: targetValue.name
+            )
+        })
+    }
+
+    private func portableContextCatalog(
+        for items: [RecordingItem]
+    ) throws -> ContextCatalog {
+        let referencedFields = Set(items.flatMap {
+            $0.manifest.effectiveContextAssignments.map(\.fieldID)
+        })
+        guard !referencedFields.isEmpty else { return ContextCatalog() }
+        let sourceFields = try loadContextCatalog().fields.filter {
+            referencedFields.contains($0.id)
+        }
+        var portable = ContextCatalog()
+        for item in items {
+            _ = try mergeImportedContext(
+                sourceFields: sourceFields,
+                assignments: item.manifest.effectiveContextAssignments,
+                into: &portable
+            )
+        }
+        return try portable.validated()
+    }
+
+    private func commitContextMutation(
+        catalog requestedCatalog: ContextCatalog,
+        recordingUpdates requestedUpdates: [(RecordingItem, RecordingManifest)]
+    ) throws {
+        let catalog = try requestedCatalog.validated()
+        let updates = Dictionary(
+            requestedUpdates.map { ($0.0.id, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        ).values
+        for (_, manifest) in updates where !manifest.isStructurallyValid {
+            throw AgentTrainerError.storage(
+                "A context edit produced an invalid recording manifest."
+            )
+        }
+        let originalCatalog = try? Data(contentsOf: contextCatalogURL)
+        let originals = try updates.map { item, _ in
+            let url = item.directory.appendingPathComponent("manifest.json")
+            return (url, try Data(contentsOf: url))
+        }
+        do {
+            try atomicWrite(try encoder.encode(catalog), to: contextCatalogURL)
+            for (item, manifest) in updates {
+                try writeRecording(manifest, to: item.directory)
+            }
+        } catch {
+            if let originalCatalog {
+                try? atomicWrite(originalCatalog, to: contextCatalogURL)
+            } else {
+                try? FileManager.default.removeItem(at: contextCatalogURL)
+            }
+            for original in originals {
+                try? atomicWrite(original.1, to: original.0)
+            }
+            throw AgentTrainerError.storage(
+                "The context change could not be completed, so the previous catalog and recording labels were restored: \(error.localizedDescription)"
+            )
+        }
     }
 
     private func atomicWrite(_ data: Data, to destination: URL) throws {

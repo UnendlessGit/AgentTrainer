@@ -8,6 +8,11 @@ import Foundation
 /// Renaming or moving a recording in the Library therefore keeps expensive
 /// packed caches and exact optimizer state reusable.
 struct RecordingTrainingIdentity: Codable, Hashable, Sendable {
+    struct ContextIdentity: Codable, Hashable, Sendable {
+        let fieldID: UUID
+        let valueID: UUID
+    }
+
     struct ArtifactFingerprint: Codable, Hashable, Sendable {
         let size: Int64
         let modifiedAt: Date?
@@ -27,6 +32,7 @@ struct RecordingTrainingIdentity: Codable, Hashable, Sendable {
     let sourceProfileID: UUID?
     let sourceVersionID: UUID?
     let trainingWeight: Double
+    let context: [ContextIdentity]
     let videoFile: String
     let eventFile: String
     let video: ArtifactFingerprint
@@ -55,6 +61,13 @@ struct RecordingTrainingIdentity: Codable, Hashable, Sendable {
         sourceProfileID = manifest.sourceProfileID
         sourceVersionID = manifest.sourceVersionID
         trainingWeight = manifest.effectiveTrainingWeight
+        context = manifest.effectiveContextAssignments.map {
+            ContextIdentity(fieldID: $0.fieldID, valueID: $0.valueID)
+        }.sorted {
+            $0.fieldID.uuidString == $1.fieldID.uuidString
+                ? $0.valueID.uuidString < $1.valueID.uuidString
+                : $0.fieldID.uuidString < $1.fieldID.uuidString
+        }
         videoFile = manifest.videoFile
         eventFile = manifest.eventFile
         video = try fingerprint(recording.directory.appendingPathComponent(manifest.videoFile))
@@ -166,6 +179,10 @@ struct CacheSegment: Codable, Hashable, Sendable {
     var observationStart: Int? = nil
     var purpose: RecordingPurpose? = nil
     var trainingWeight: Double? = nil
+    /// One immutable recording-level selection, expanded to rows only when a
+    /// batch is gathered. Optional keeps caches from earlier schemas decodable
+    /// long enough to reject them by schema version.
+    var contextAssignments: [ContextAssignment]? = nil
 
     var effectivePurpose: RecordingPurpose { purpose ?? .demonstration }
     var effectiveTrainingWeight: Float {
@@ -189,8 +206,10 @@ struct DatasetCacheManifest: Codable, Hashable, Sendable {
     var pastObservationBytesPerSample: Int
     var actionValuesPerSample: Int
     var segments: [CacheSegment]
+    var contextSchema: ModelContextSchema? = nil
 
     var observationIndexValuesPerSample: Int { 1 + temporalVision.pastFrameCount }
+    var effectiveContextSchema: ModelContextSchema { contextSchema ?? .empty }
 }
 
 /// Compact host batch copied from the memory-mapped cache. Current and past
@@ -264,6 +283,7 @@ final class CachedDataset: @unchecked Sendable {
     private let observationIndices: Data
     private let frameActions: Data
     private let actions: Data
+    private let segmentContextVectors: [[Float]]
 
     init(directory: URL) throws {
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
@@ -274,6 +294,7 @@ final class CachedDataset: @unchecked Sendable {
         _ = try decoded.preprocessing.validated()
         _ = try decoded.temporalVision.validated(current: decoded.preprocessing)
         _ = try decoded.pastPreprocessing.validated()
+        let contextSchema = try decoded.effectiveContextSchema.validated()
         let expectedPastSpec = decoded.temporalVision.pastFrameSpec(from: decoded.preprocessing)
         let expectedPastBytes = decoded.temporalVision.pastFrameCount > 0
             ? decoded.pastPreprocessing.sampleByteCount
@@ -317,7 +338,11 @@ final class CachedDataset: @unchecked Sendable {
             let weight = segment.trainingWeight ?? 1
             guard segment.start == segmentEnd, segment.count >= 0, !end.overflow,
                   observationStart >= 0, observationStart < max(1, decoded.observationCount),
-                  weight.isFinite, (1...20).contains(weight) else {
+                  weight.isFinite, (1...20).contains(weight),
+                  Self.contextAssignments(
+                      segment.contextAssignments ?? [],
+                      belongTo: contextSchema
+                  ) else {
                 throw AgentTrainerError.storage("The dataset cache segment index is invalid.")
             }
             segmentEnd = end.partialValue
@@ -388,6 +413,9 @@ final class CachedDataset: @unchecked Sendable {
         observationIndices = loadedObservationIndices
         frameActions = loadedFrameActions
         actions = loadedActions
+        segmentContextVectors = decoded.segments.map {
+            contextSchema.vector(assignments: $0.contextAssignments ?? [])
+        }
     }
 
     var count: Int { manifest.sampleCount }
@@ -405,6 +433,17 @@ final class CachedDataset: @unchecked Sendable {
                 bytes.count,
                 MADV_NORMAL
             )
+        }
+    }
+
+    private static func contextAssignments(
+        _ assignments: [ContextAssignment],
+        belongTo schema: ModelContextSchema
+    ) -> Bool {
+        guard (try? ContextAssignment.validatedList(assignments)) != nil else { return false }
+        return assignments.allSatisfy { assignment in
+            schema.fields.first(where: { $0.id == assignment.fieldID })?
+                .values.contains(where: { $0.id == assignment.valueID }) == true
         }
     }
 
@@ -1109,6 +1148,47 @@ final class CachedDataset: @unchecked Sendable {
         return values.withUnsafeBytes { Data($0) }
     }
 
+    /// Expands one recording-level categorical vector per requested row. When
+    /// CNN work is shared, one vector per unique visual sequence is sufficient;
+    /// a sequence cannot cross a recording boundary, and the assertion below
+    /// protects that invariant from future cache-layout changes.
+    func contextBatch(
+        at indices: [Int],
+        visionPlan: CachedVisionBatchPlan? = nil
+    ) -> Data {
+        let width = manifest.effectiveContextSchema.inputValueCount
+        guard width > 0, !indices.isEmpty else { return Data() }
+        let vectors: [[Float]]
+        if let visionPlan {
+            precondition(visionPlan.sampleToVision.count == indices.count)
+            var representatives = [Int?](
+                repeating: nil,
+                count: visionPlan.uniqueSequences.count
+            )
+            for (row, sample) in indices.enumerated() {
+                let vision = Int(visionPlan.sampleToVision[row])
+                precondition(representatives.indices.contains(vision))
+                if let prior = representatives[vision] {
+                    precondition(
+                        contextVector(at: prior) == contextVector(at: sample),
+                        "A shared visual sequence cannot span recording contexts."
+                    )
+                } else {
+                    representatives[vision] = sample
+                }
+            }
+            precondition(
+                representatives.allSatisfy { $0 != nil },
+                "Every shared visual sequence must represent at least one row."
+            )
+            vectors = representatives.map { contextVector(at: $0!) }
+        } else {
+            vectors = indices.map(contextVector(at:))
+        }
+        let flattened = vectors.flatMap { $0 }
+        return flattened.withUnsafeBytes { Data($0) }
+    }
+
     /// Gathers future action labels without crossing a recording boundary. Each
     /// target retains its own immediately preceding row for transition weighting.
     func futureActionBatch(at indices: [Int], offsets: [Int]) -> CachedFutureActionBatch {
@@ -1224,6 +1304,17 @@ final class CachedDataset: @unchecked Sendable {
         return manifest.segments.indices.contains(index) ? manifest.segments[index].start : 0
     }
 
+    private func contextVector(at sample: Int) -> [Float] {
+        let segment = segmentIndex(for: sample)
+        guard segmentContextVectors.indices.contains(segment) else {
+            return [Float](
+                repeating: 0,
+                count: manifest.effectiveContextSchema.inputValueCount
+            )
+        }
+        return segmentContextVectors[segment]
+    }
+
     private func segmentIndex(for index: Int) -> Int {
         var low = 0, high = manifest.segments.count
         while low < high {
@@ -1262,12 +1353,33 @@ actor DatasetCacheBuilder {
 
     func cache(for profile: AIProfile, recordings: [RecordingItem], progress: @escaping @Sendable (Double, String) -> Void) async throws -> CachedDataset {
         guard !recordings.isEmpty else { throw AgentTrainerError.noData }
+        let contextSchema = try ModelContextSchema.trained(
+            from: recordings.map { $0.manifest.effectiveContextAssignments }
+        )
         if preprocessor == nil { preprocessor = try VisionPreprocessor() }
         try await workspace.prepare()
         let root = await workspace.cacheDirectory()
         let key = try cacheKey(profile: profile, recordings: recordings)
         let directory = root.appendingPathComponent("\(key).atrcache", isDirectory: true)
-        if FileManager.default.fileExists(atPath: directory.appendingPathComponent("manifest.json").path), let cached = try? CachedDataset(directory: directory) {
+        if FileManager.default.fileExists(atPath: directory.appendingPathComponent("manifest.json").path),
+           let cached = try? CachedDataset(directory: directory),
+           cached.manifest.effectiveContextSchema.hasSameLayout(as: contextSchema) {
+            if cached.manifest.effectiveContextSchema != contextSchema {
+                // Label renames do not change pixels, row pairing, or tensor
+                // positions. Refresh only the tiny display snapshot instead of
+                // rebuilding gigabytes of packed vision.
+                var refreshed = cached.manifest
+                refreshed.contextSchema = contextSchema.isEmpty ? nil : contextSchema
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                encoder.dateEncodingStrategy = .iso8601
+                try encoder.encode(refreshed).write(
+                    to: directory.appendingPathComponent("manifest.json"),
+                    options: .atomic
+                )
+                progress(1, "Reusing packed dataset cache")
+                return try CachedDataset(directory: directory)
+            }
             progress(1, "Reusing packed dataset cache")
             return cached
         }
@@ -1319,7 +1431,8 @@ actor DatasetCacheBuilder {
                         count: appended.samples,
                         observationStart: observationCount - appended.observations,
                         purpose: recording.manifest.effectivePurpose,
-                        trainingWeight: recording.manifest.effectiveTrainingWeight
+                        trainingWeight: recording.manifest.effectiveTrainingWeight,
+                        contextAssignments: recording.manifest.effectiveContextAssignments
                     ))
                 }
             }
@@ -1340,7 +1453,8 @@ actor DatasetCacheBuilder {
                 currentObservationBytesPerSample: profile.preprocessing.sampleByteCount,
                 pastObservationBytesPerSample: temporal.pastFrameCount > 0 ? pastSpec.sampleByteCount : 0,
                 actionValuesPerSample: ActionLayout.count,
-                segments: segments
+                segments: segments,
+                contextSchema: contextSchema.isEmpty ? nil : contextSchema
             )
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(manifest).write(to: temporary.appendingPathComponent("manifest.json"), options: .atomic)

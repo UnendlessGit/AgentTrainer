@@ -58,6 +58,7 @@ struct RecordView: View {
     @ObservedObject var model: AppModel
     @State private var presetName = ""
     @State private var presetToDelete: RecordingPreset?
+    @State private var showsContextCatalog = false
     private var sources: [CaptureSourceOption] {
         model.captureSources.filter { source in
             switch model.captureKind { case .display, .screenRegion: source.kind == .display; case .window, .windowRegion: source.kind == .window }
@@ -68,6 +69,34 @@ struct RecordView: View {
             VStack(alignment: .leading, spacing: 22) {
                 SectionTitle("Record", "Hardware HEVC video with frame-accurate input synchronization and configurable cleanup at both ends.")
                 recordingPresets
+                OLEDCard {
+                    VStack(alignment: .leading, spacing: 11) {
+                        HStack {
+                            Label("Context / Labels", systemImage: "tag.fill")
+                                .font(.headline).foregroundStyle(ATColor.amber)
+                            InfoTip("These generic categorical values are frozen when recording starts. They can be changed later in Library and can condition any AI trained from the recording.")
+                            Spacer()
+                            Button("Manage Fields & Values…") {
+                                showsContextCatalog = true
+                            }
+                            .primaryButton(color: ATColor.violet)
+                        }
+                        ContextSelectionEditor(
+                            fields: model.contextFields,
+                            selection: $model.recordingContextValues,
+                            blankLabel: "Not set",
+                            accent: ATColor.amber
+                        )
+                        if model.contextFields.isEmpty {
+                            Text("Create any fields you need. Nothing is predefined or game-specific.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text("Blank fields are simply omitted from this recording. Recording presets also retain these selections.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .disabled(model.recordingIsActiveOrStarting || model.agentIsActiveOrStarting)
                 HStack(alignment: .top, spacing: 16) {
                     OLEDCard {
                         VStack(alignment: .leading, spacing: 16) {
@@ -180,6 +209,9 @@ struct RecordView: View {
             }
         } message: {
             Text("This deletes only the preset “\(presetToDelete?.name ?? "")”. Existing recordings are unchanged.")
+        }
+        .sheet(isPresented: $showsContextCatalog) {
+            ContextCatalogEditor(model: model)
         }
     }
 
@@ -432,10 +464,13 @@ private struct ProfileEditor: View {
                         }
                         HStack { InfoTip("The shared encoder sees the current frame and each real reduced-resolution past frame with screen coordinates. The temporal encoder then reads every past visual embedding together with the controls tied to that frame."); Spacer() }
                         HStack { IntArrayField("Conv channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
-                        HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs. Changing it keeps existing brain weights and starts a fresh optimizer sequence when training resumes."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
+                        HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs. Changing it keeps existing brain weights and starts a fresh optimizer sequence when training resumes."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft, contextSchema: selectedContextSchema).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
                     }
                 }
-                NeuralNetworkInputOverview(profile: draft)
+                NeuralNetworkInputOverview(
+                    profile: draft,
+                    contextSchema: selectedContextSchema
+                )
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Training recordings").font(.headline).foregroundStyle(ATColor.amber)
@@ -578,6 +613,17 @@ private struct ProfileEditor: View {
         return "Past frames use the same \(colorDetail), \(draft.preprocessing.bitDepth)-bit detail, and resize policy as the current frame."
     }
 
+    private var selectedContextSchema: ModelContextSchema {
+        let folderIDs = Set(draft.effectiveFolderIDs)
+        let selected = model.recordings.filter {
+            draft.recordingIDs.contains($0.id)
+                || $0.manifest.folderID.map(folderIDs.contains) == true
+        }
+        return (try? ModelContextSchema.trained(from: selected.map {
+            $0.manifest.effectiveContextAssignments
+        })) ?? .empty
+    }
+
     private func handleDraftChange(_ value: AIProfile) {
         if suppressDraftObserver {
             suppressDraftObserver = false
@@ -607,11 +653,18 @@ private struct ProfileEditor: View {
 
 private struct NeuralNetworkInputOverview: View {
     let profile: AIProfile
+    let contextSchema: ModelContextSchema
     @State private var showsTechnicalDetails = false
 
     var body: some View {
-        let input = NeuralInputSizing.summary(for: profile)
-        let capacity = NeuralInputSizing.capacityGuide(for: profile)
+        let input = NeuralInputSizing.summary(
+            for: profile,
+            contextSchema: contextSchema
+        )
+        let capacity = NeuralInputSizing.capacityGuide(
+            for: profile,
+            contextSchema: contextSchema
+        )
         let color = statusColor(capacity.level)
         OLEDCard {
             VStack(alignment: .leading, spacing: 13) {
@@ -660,7 +713,7 @@ private struct NeuralNetworkInputOverview: View {
                         Label(showsTechnicalDetails ? "Hide technical details" : "Show technical details", systemImage: "slider.horizontal.3")
                             .font(.caption.bold()).foregroundStyle(ATColor.cyan)
                         Spacer()
-                        Text("current vision, past frames, controls, memory, and rates").font(.caption2).foregroundStyle(.secondary)
+                        Text("vision, temporal controls, context, memory, and rates").font(.caption2).foregroundStyle(.secondary)
                     }
                 }
                 .tint(ATColor.cyan)
@@ -723,6 +776,14 @@ private struct NeuralNetworkInputOverview: View {
                     detail: "\(input.pastFrameCount.formatted()) frames × \(input.actionValuesPerPastFrame.formatted()) complete outputs • \(input.temporalLookbackSeconds.formatted(.number.precision(.fractionLength(3))))s lookback",
                     color: ATColor.green
                 )
+                if input.contextValues > 0 {
+                    NeuralInputBreakdown(
+                        title: "Context conditioning",
+                        value: "\(input.contextValues.formatted()) categorical values",
+                        detail: "\(contextSchema.fields.count.formatted()) custom field\(contextSchema.fields.count == 1 ? "" : "s"); one trained value per field can be active",
+                        color: ATColor.amber
+                    )
+                }
             }
 
             HStack(spacing: 8) {
@@ -1210,6 +1271,21 @@ struct TrainingView: View {
         return profile.trainingProgress?.globalStep ?? 0
     }
 
+    private var displayedContextSchema: ModelContextSchema {
+        guard let profile = displayedProfile else { return .empty }
+        if model.isTraining, model.trainingProfileID == profile.id {
+            return model.trainingContextSchema
+        }
+        let folderIDs = Set(profile.effectiveFolderIDs)
+        let selected = model.recordings.filter {
+            profile.recordingIDs.contains($0.id)
+                || $0.manifest.folderID.map(folderIDs.contains) == true
+        }
+        return (try? ModelContextSchema.trained(from: selected.map {
+            $0.manifest.effectiveContextAssignments
+        })) ?? .empty
+    }
+
     private var graphValues: [Double] {
         switch graphKind {
         case .current: model.trainingMetrics.lossHistory
@@ -1263,6 +1339,12 @@ struct TrainingView: View {
                         .frame(width: 360)
                         InfoTip("Choose the AI whose recordings, vision settings, and network configuration should be trained. You can switch here without visiting AI Models.")
                         if let profile = displayedProfile { StatusPill(text: profile.activeVersionID == nil ? "Untrained" : "Runnable brain ready", color: ATColor.violet) }
+                    }
+                    if !displayedContextSchema.isEmpty {
+                        StatusPill(
+                            text: "\(displayedContextSchema.fields.count) context field\(displayedContextSchema.fields.count == 1 ? "" : "s") • \(displayedContextSchema.inputValueCount) values",
+                            color: ATColor.amber
+                        )
                     }
                     Spacer()
                     if model.isTraining { Button("Pause → Runnable Brain") { model.pauseTraining() }.primaryButton(color: ATColor.amber); Button("Stop") { model.stopTraining() }.primaryButton(color: ATColor.coral) }
@@ -1333,7 +1415,7 @@ struct TrainingView: View {
                 }
                 if let profile = displayedProfile {
                     HStack(spacing: 12) {
-                        MetricCard(title: "Parameters", value: ModelSizing.parameterCount(profile).formatted(), symbol: "circle.grid.cross", color: ATColor.cyan)
+                        MetricCard(title: "Parameters", value: ModelSizing.parameterCount(profile, contextSchema: displayedContextSchema).formatted(), symbol: "circle.grid.cross", color: ATColor.cyan)
                         MetricCard(title: "Packed sample", value: ByteCountFormatter.string(fromByteCount: Int64(profile.preprocessing.sampleByteCount), countStyle: .memory), symbol: "shippingbox.fill", color: ATColor.violet)
                         MetricCard(title: "Workspace storage", value: ByteCountFormatter.string(fromByteCount: model.storageBytes, countStyle: .file), symbol: "internaldrive", color: ATColor.green)
                     }
@@ -1554,6 +1636,10 @@ private struct LossChart: View {
 struct RunView: View {
     @ObservedObject var model: AppModel
     private var sources: [CaptureSourceOption] { model.captureSources.filter { source in switch model.captureKind { case .display, .screenRegion: source.kind == .display; case .window, .windowRegion: source.kind == .window } } }
+    private var contextLoadID: String {
+        (model.selectedProfileID?.uuidString ?? "none") + ":"
+            + (model.selectedProfile?.activeVersionID?.uuidString ?? "none")
+    }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -1579,6 +1665,39 @@ struct RunView: View {
                     OLEDCard {
                         HStack { VStack(alignment: .leading, spacing: 7) { Text(profile.name).font(.title2.bold()); Text("Model vision \(profile.preprocessing.width) × \(profile.preprocessing.height) — live capture will be exactly the same").foregroundStyle(ATColor.cyan); Text("\(profile.preprocessing.colorMode.rawValue), \(profile.preprocessing.bitDepth)-bit, \(profile.preprocessing.chroma.rawValue)").foregroundStyle(.secondary) }; Spacer(); StatusPill(text: model.isStartingAgent ? "Starting / stopping" : model.isRunning ? "AI running" : profile.activeVersionID == nil ? "Training required" : "Ready", color: model.agentIsActiveOrStarting ? ATColor.green : ATColor.violet) }
                     }
+                    if model.isLoadingRunContext {
+                        OLEDCard {
+                            HStack {
+                                ProgressView().controlSize(.small)
+                                Text("Loading this brain's trained context vocabulary…")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    } else if !model.runContextSchema.isEmpty {
+                        OLEDCard {
+                            VStack(alignment: .leading, spacing: 11) {
+                                HStack {
+                                    Label("Operating Context", systemImage: "tag.fill")
+                                        .font(.headline).foregroundStyle(ATColor.amber)
+                                    InfoTip("These are exactly the generic fields and values observed by this immutable brain during training. They start blank whenever you select a different brain.")
+                                    Spacer()
+                                    StatusPill(
+                                        text: "\(model.runContextValues.count)/\(model.runContextSchema.fields.count) set",
+                                        color: model.runContextValues.count == model.runContextSchema.fields.count
+                                            ? ATColor.green : ATColor.amber
+                                    )
+                                }
+                                ContextSelectionEditor(
+                                    fields: model.runContextSchema.fields,
+                                    selection: $model.runContextValues,
+                                    blankLabel: "Choose…",
+                                    accent: ATColor.amber
+                                )
+                                Text("Blank is allowed and represented explicitly. Changes made during Run condition the very next perception; DAgger corrections save the values active when correction begins.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                     OLEDCard {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("What the AI watches").font(.headline).foregroundStyle(ATColor.cyan)
@@ -1601,7 +1720,7 @@ struct RunView: View {
                                         HStack { Text(model.runMouseMode == .automatic ? "Game Camera settings (when Auto detects it)" : "Game Camera").font(.subheadline.bold()).foregroundStyle(ATColor.violet); Spacer(); Text("\(model.gameCamera.sensitivity.formatted(.number.precision(.fractionLength(2))))× sensitivity").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                                         Slider(value: $model.gameCamera.sensitivity, in: 0.1...3, step: 0.05).tint(ATColor.violet)
                                         Toggle("Recenter before and after every raw delta", isOn: $model.gameCamera.recenterCursor).tint(ATColor.cyan)
-                                        Text(model.gameCamera.recenterCursor ? "Recommended for Roblox and locked-camera games. A HID-system event is posted at the capture center and the cursor is restored immediately, preventing screen-edge damping." : "Raw deltas are posted without warping. Use this only for software that rejects cursor recentering.")
+                                        Text(model.gameCamera.recenterCursor ? "Recommended for locked-camera software. A HID-system event is posted at the capture center and the cursor is restored immediately, preventing screen-edge damping." : "Raw deltas are posted without warping. Use this only for software that rejects cursor recentering.")
                                             .font(.caption).foregroundStyle(.secondary)
                                     }
                                     .padding(10)
@@ -1709,6 +1828,9 @@ struct RunView: View {
                     HStack { StatusPill(text: model.isTraining ? "Background training remains active" : "Custom panic shortcut armed", color: model.isTraining ? ATColor.cyan : ATColor.coral); Spacer(); if model.agentIsActiveOrStarting { Button(model.isStartingAgent ? "Cancel AI Start & Release Inputs" : "Stop AI & Disable All Hooks") { Task { await model.stopAgent() } }.primaryButton(color: ATColor.coral) } else { Button("Run AI") { Task { await model.startAgent() } }.primaryButton(color: ATColor.green).disabled(profile.activeVersionID == nil || model.trainingProfileID == profile.id || model.recordingIsActiveOrStarting || model.isReplaying) } }
                 } else { ContentUnavailableView("No AI profile selected", systemImage: "cpu") }
             }.padding(28)
+        }
+        .task(id: contextLoadID) {
+            await model.prepareRunContext()
         }
     }
 

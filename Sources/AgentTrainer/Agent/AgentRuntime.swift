@@ -96,6 +96,10 @@ final class AgentRuntime: @unchecked Sendable {
     private var saliencyVisualizationFunction: (@Sendable ([MLXArray]) -> [MLXArray])?
     private var saliencyGradientFunction: (([MLXArray]) -> MLXArray)?
     private var profile: AIProfile?
+    private var contextSchema = ModelContextSchema.empty
+    private var contextVector: [Float] = []
+    private var contextRevision: UInt64 = 0
+    private var contextTransitionPending = false
     private var safety = AgentSafetyPolicy()
     private var captureRect = CGRect.zero
     private var mode: FrameMode = .newest
@@ -229,7 +233,7 @@ final class AgentRuntime: @unchecked Sendable {
         injector.onState = { [weak self] state in self?.onState?(state) }
     }
 
-    func start(profile: AIProfile, version: ModelVersionManifest, allowedKeyCodes: Set<UInt16>, captureSpec: CaptureSpec, captureRect: CGRect, mode: FrameMode, mouseMode: MouseControlMode, gameCamera: GameCameraSettings = GameCameraSettings(), outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions(), safety: AgentSafetyPolicy, daggerCaptureConfiguration: DAggerRuntimeCaptureConfiguration, previewFPS: Double = 0, visualizationSettings: CNNVisualizationSettings = CNNVisualizationSettings(), ignoredHotkeys: [HotkeyBinding] = []) async throws {
+    func start(profile: AIProfile, version: ModelVersionManifest, allowedKeyCodes: Set<UInt16>, captureSpec: CaptureSpec, captureRect: CGRect, mode: FrameMode, mouseMode: MouseControlMode, gameCamera: GameCameraSettings = GameCameraSettings(), outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions(), contextSelection: [UUID: UUID] = [:], safety: AgentSafetyPolicy, daggerCaptureConfiguration: DAggerRuntimeCaptureConfiguration, previewFPS: Double = 0, visualizationSettings: CNNVisualizationSettings = CNNVisualizationSettings(), ignoredHotkeys: [HotkeyBinding] = []) async throws {
         guard AXIsProcessTrusted() else {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(options)
@@ -269,24 +273,33 @@ final class AgentRuntime: @unchecked Sendable {
         _ = try runtimeProfile.training.effectiveTemporalVision.validated(
             current: runtimeProfile.preprocessing
         )
+        let contextSchema = try version.effectiveContextSchema.validated()
+        let initialContextVector = contextSchema.vector(selection: contextSelection)
         let startRevisions = lock.withLock { (outputPermissionsRevision, visualizationSettingsRevision) }
-        let model = AgentPolicy(profile: runtimeProfile)
+        let model = AgentPolicy(profile: runtimeProfile, contextSchema: contextSchema)
         let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
         model.train(false)
         let temporal = runtimeProfile.training.effectiveTemporalVision
         let hasTemporalMemory = temporal.pastFrameCount > 0
+        let hasContext = !contextSchema.isEmpty
+        let contextInputIndex = hasTemporalMemory ? 3 : 1
         let pastSpec = temporal.pastFrameSpec(from: runtimeProfile.preprocessing)
         let predictionFunction: VisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
             let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
+            let contextValues = hasContext ? inputs[contextInputIndex] : nil
             if hasTemporalMemory {
                 return [model.predictions(
                     currentImages: currentImages,
                     pastImages: VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec),
-                    pastControls: inputs[2]
+                    pastControls: inputs[2],
+                    contextValues: contextValues
                 )]
             }
-            return [model.currentOnlyPredictions(currentImages: currentImages)]
+            return [model.currentOnlyPredictions(
+                currentImages: currentImages,
+                contextValues: contextValues
+            )]
         }
         // Diagnostic graphs are lazy: creating these closures does not execute
         // or materialize an extra tensor. The selected graph first compiles only
@@ -295,6 +308,7 @@ final class AgentRuntime: @unchecked Sendable {
             compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
                 let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
                 let layers = model.visualActivations(images: currentImages)
+                let contextValues = hasContext ? inputs[contextInputIndex] : nil
                 let temporalFeatures = hasTemporalMemory
                     ? model.temporalFeatures(
                         currentVisualFeatures: layers.last!,
@@ -302,7 +316,10 @@ final class AgentRuntime: @unchecked Sendable {
                         pastControls: inputs[2]
                     )
                     : model.currentOnlyTemporalFeatures(currentVisualFeatures: layers.last!)
-                let logits = model.logits(temporalFeatures: temporalFeatures)
+                let logits = model.logits(
+                    temporalFeatures: temporalFeatures,
+                    contextValues: contextValues
+                )
                 let map = model.sampledForVisualization(layers[selectedLayer]).mean(axis: -1, keepDims: true)
                 return [model.activatedPredictions(logits: logits), map]
             }
@@ -310,6 +327,7 @@ final class AgentRuntime: @unchecked Sendable {
         let channelVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
             let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
             let layers = model.visualActivations(images: currentImages)
+            let contextValues = hasContext ? inputs[contextInputIndex] : nil
             let temporalFeatures = hasTemporalMemory
                 ? model.temporalFeatures(
                     currentVisualFeatures: layers.last!,
@@ -317,12 +335,16 @@ final class AgentRuntime: @unchecked Sendable {
                     pastControls: inputs[2]
                 )
                 : model.currentOnlyTemporalFeatures(currentVisualFeatures: layers.last!)
-            let logits = model.logits(temporalFeatures: temporalFeatures)
+            let logits = model.logits(
+                temporalFeatures: temporalFeatures,
+                contextValues: contextValues
+            )
             return [model.activatedPredictions(logits: logits), model.strongestChannelsForVisualization(layers.last!)]
         }
         let saliencyVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
             let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
             let layers = model.visualActivations(images: currentImages)
+            let contextValues = hasContext ? inputs[contextInputIndex] : nil
             let temporalFeatures = hasTemporalMemory
                 ? model.temporalFeatures(
                     currentVisualFeatures: layers.last!,
@@ -330,7 +352,10 @@ final class AgentRuntime: @unchecked Sendable {
                     pastControls: inputs[2]
                 )
                 : model.currentOnlyTemporalFeatures(currentVisualFeatures: layers.last!)
-            let logits = model.logits(temporalFeatures: temporalFeatures)
+            let logits = model.logits(
+                temporalFeatures: temporalFeatures,
+                contextValues: contextValues
+            )
             // Keep the exact final tensor on GPU for the post-CNN gradient.
             // This graph intentionally omits the channel ranking used by the
             // separate feature-grid view.
@@ -339,17 +364,23 @@ final class AgentRuntime: @unchecked Sendable {
         let saliencyGradient = grad({ (inputs: [MLXArray]) -> MLXArray in
             if hasTemporalMemory {
                 let pastImages = VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec)
+                let contextValues = hasContext ? inputs[3] : nil
+                let selector = inputs[hasContext ? 4 : 3]
                 let logits = model.logits(
                     currentVisualFeatures: inputs[0],
                     pastImages: pastImages,
-                    pastControls: inputs[2]
+                    pastControls: inputs[2],
+                    contextValues: contextValues
                 )
-                return (logits * inputs[3].asType(model.dtype)).sum()
+                return (logits * selector.asType(model.dtype)).sum()
             }
+            let contextValues = hasContext ? inputs[1] : nil
+            let selector = inputs[hasContext ? 2 : 1]
             let logits = model.logits(
-                temporalFeatures: model.currentOnlyTemporalFeatures(currentVisualFeatures: inputs[0])
+                temporalFeatures: model.currentOnlyTemporalFeatures(currentVisualFeatures: inputs[0]),
+                contextValues: contextValues
             )
-            return (logits * inputs[1].asType(model.dtype)).sum()
+            return (logits * selector.asType(model.dtype)).sum()
         }, argumentNumbers: [0])
         let accepted = lock.withLock { () -> Bool in
             guard launchRevision == launchToken, starting, stopped else { return false }
@@ -360,6 +391,10 @@ final class AgentRuntime: @unchecked Sendable {
             self.saliencyVisualizationFunction = saliencyVisualizationFunction
             self.saliencyGradientFunction = saliencyGradient
             self.profile = runtimeProfile
+            self.contextSchema = contextSchema
+            self.contextVector = initialContextVector
+            self.contextRevision &+= 1
+            self.contextTransitionPending = false
             self.sourceVersionID = version.id
             self.daggerRuntimeConfiguration = daggerCaptureConfiguration
             self.daggerColorQuantization = RecordingColorQuantizationTables(
@@ -498,6 +533,39 @@ final class AgentRuntime: @unchecked Sendable {
             outputPermissionsRevision &+= 1
             outputPermissions = permissions
             injector.updateOutputPermissions(permissions)
+        }
+    }
+
+    /// Context is an ordinary live model input, not mutable model metadata.
+    /// Updating a picker therefore takes effect on the next admitted perception
+    /// without recompiling the graph; old-context held controls are released.
+    func updateContextSelection(_ selection: [UUID: UUID]) {
+        let transitionRevision = lock.withLock { () -> UInt64? in
+            let updated = contextSchema.vector(selection: selection)
+            guard updated != contextVector else { return nil }
+            contextVector = updated
+            contextRevision &+= 1
+            temporalFrames.reset()
+            predictionLatch.reset()
+            latestContextControls = [Float](repeating: 0, count: ActionLayout.count)
+            guard !stopped else { return nil }
+            contextTransitionPending = true
+            return contextRevision
+        }
+        guard let transitionRevision else { return }
+        actionQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.withLock {
+                guard !self.stopped else { return }
+                // A context switch is a semantic session boundary. Release any
+                // state held by the previous prediction before admitting the
+                // first action conditioned on the new values.
+                self.injector.disableAndReleaseAll()
+                self.injector.enable(outputPermissions: self.outputPermissions)
+                if self.contextRevision == transitionRevision {
+                    self.contextTransitionPending = false
+                }
+            }
         }
     }
 
@@ -720,7 +788,7 @@ final class AgentRuntime: @unchecked Sendable {
             }
         }
         lock.withLock {
-            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; sourceVersionID = nil; daggerRuntimeConfiguration = nil; daggerColorQuantization = nil; recentDAggerDropTimestamps.removeAll(keepingCapacity: false); allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
+            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; contextSchema = .empty; contextVector.removeAll(keepingCapacity: false); contextRevision &+= 1; contextTransitionPending = false; sourceVersionID = nil; daggerRuntimeConfiguration = nil; daggerColorQuantization = nil; recentDAggerDropTimestamps.removeAll(keepingCapacity: false); allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
             latestFrame = nil; latestFrameHostNanos = 0; lastUsableCaptureFrame = nil; temporalFrames.reset(); daggerFrames.reset(); predictionLatch.reset(); processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
@@ -927,6 +995,8 @@ final class AgentRuntime: @unchecked Sendable {
         let saliencyVisualizationFunction = self.saliencyVisualizationFunction
         let saliencyGradientFunction = self.saliencyGradientFunction
         let mouseMode = self.mouseMode
+        let contextVector = self.contextVector
+        let inferenceContextRevision = contextRevision
         lock.unlock()
         let began = CACurrentMediaTime()
         do {
@@ -968,22 +1038,32 @@ final class AgentRuntime: @unchecked Sendable {
                 descriptors.append(.init([1, temporal.pastFrameCount, pastSpec.sampleByteCount], dtype: .uint8))
                 descriptors.append(.init([1, temporal.pastFrameCount, ActionLayout.count], dtype: .float32))
             }
+            let contextInputIndex: Int? = contextVector.isEmpty ? nil : descriptors.count
+            if !contextVector.isEmpty {
+                descriptors.append(.init([1, contextVector.count], dtype: .float32))
+            }
             let inferenceInputs = try inferenceInputBuffers.makeArrays(descriptors) { destinations in
                 packed.withUnsafeBytes { source in
                     destinations[0].copyMemory(from: source)
                 }
-                guard hasTemporalMemory else { return }
-                let controlRowBytes = ActionLayout.count * MemoryLayout<Float>.size
-                for (frame, selected) in selectedFrames.enumerated() {
-                    selected.packed.withUnsafeBytes { source in
-                        UnsafeMutableRawBufferPointer(
-                            rebasing: destinations[1][frame * pastSpec.sampleByteCount..<(frame + 1) * pastSpec.sampleByteCount]
-                        ).copyMemory(from: source)
+                if hasTemporalMemory {
+                    let controlRowBytes = ActionLayout.count * MemoryLayout<Float>.size
+                    for (frame, selected) in selectedFrames.enumerated() {
+                        selected.packed.withUnsafeBytes { source in
+                            UnsafeMutableRawBufferPointer(
+                                rebasing: destinations[1][frame * pastSpec.sampleByteCount..<(frame + 1) * pastSpec.sampleByteCount]
+                            ).copyMemory(from: source)
+                        }
+                        selected.controls.withUnsafeBytes { source in
+                            UnsafeMutableRawBufferPointer(
+                                rebasing: destinations[2][frame * controlRowBytes..<(frame + 1) * controlRowBytes]
+                            ).copyMemory(from: source)
+                        }
                     }
-                    selected.controls.withUnsafeBytes { source in
-                        UnsafeMutableRawBufferPointer(
-                            rebasing: destinations[2][frame * controlRowBytes..<(frame + 1) * controlRowBytes]
-                        ).copyMemory(from: source)
+                }
+                if let contextInputIndex {
+                    contextVector.withUnsafeBytes {
+                        destinations[contextInputIndex].copyMemory(from: $0)
                     }
                 }
             }
@@ -1002,9 +1082,13 @@ final class AgentRuntime: @unchecked Sendable {
                     guard let saliencyVisualizationFunction, let saliencyGradientFunction else { return predictionFunction(inferenceInputs) }
                     let forward = saliencyVisualizationFunction(inferenceInputs)
                     guard forward.count >= 2 else { return predictionFunction(inferenceInputs) }
-                    let gradientInputs = hasTemporalMemory
-                        ? [forward[1], inferenceInputs[1], inferenceInputs[2], selector]
-                        : [forward[1], selector]
+                    var gradientInputs = hasTemporalMemory
+                        ? [forward[1], inferenceInputs[1], inferenceInputs[2]]
+                        : [forward[1]]
+                    if let contextInputIndex {
+                        gradientInputs.append(inferenceInputs[contextInputIndex])
+                    }
+                    gradientInputs.append(selector)
                     let gradients = saliencyGradientFunction(gradientInputs)
                     let weights = gradients.mean(axes: [1, 2], keepDims: true)
                     let saliency = relu((forward[1] * weights).sum(axis: -1, keepDims: true))
@@ -1045,7 +1129,11 @@ final class AgentRuntime: @unchecked Sendable {
             }
             if let preview { onPreview?(preview) }
             lock.lock()
-            guard !stopped, !daggerInferencePaused else { lock.unlock(); return }
+            guard !stopped, !daggerInferencePaused, !contextTransitionPending,
+                  contextRevision == inferenceContextRevision else {
+                lock.unlock()
+                return
+            }
             let frameControls = RuntimeActionSemantics.temporalControlValues(
                 values,
                 channels: profile.channels,
