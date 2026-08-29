@@ -1,4 +1,4 @@
-# AgentTrainer 2.3.0
+# AgentTrainer 2.3.5
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
 
@@ -98,6 +98,8 @@ Runtime output is constrained in several independent layers:
 - Full-Mac control is opt-in; otherwise output stays inside the configured control region.
 - Locked-camera movement is transient and is never replayed from a stale prediction.
 
+Physical input recovery reads macOS's HID-system hardware state rather than the foreground session's mutable accumulated event state. A game or another app therefore cannot turn a physically held key, modifier, or mouse button into a synthetic release in the recording. Reconciliation snapshots are revision-guarded as well, so an in-flight poll cannot overwrite a newer first-frame or DAgger seed; genuine missed releases are still repaired by the next fresh poll and every recording is balanced at shutdown.
+
 These are safeguards, not a security boundary. Supervise new brains in a low-risk environment.
 
 ## Build and test
@@ -143,7 +145,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.3.0.dmg`
+- `AgentTrainer-2.3.5.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

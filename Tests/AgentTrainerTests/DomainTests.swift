@@ -2288,6 +2288,113 @@ final class DomainTests: XCTestCase {
         XCTAssertTrue(seededReleases.contains { $0.kind == .mouseButton && $0.button == 15 && !$0.isDown })
     }
 
+    func testPhysicalPollingUsesHIDStateWhenForegroundSessionStateDisagrees() {
+        let wKeyCode = UInt16(13)
+        let sideButton = UInt8(15)
+        let shift = CGEventFlags.maskShift.rawValue
+        let reader = PhysicalInputStateReader(
+            stateID: PhysicalInputStateReader.hardware.stateID,
+            keyState: { stateID, keyCode in
+                // Reproduce the foreground-app failure: the accumulated login
+                // session reports W up while the raw hardware table reports it down.
+                stateID == .hidSystemState && keyCode == CGKeyCode(wKeyCode)
+            },
+            buttonState: { stateID, button in
+                stateID == .hidSystemState && button.rawValue == UInt32(sideButton)
+            },
+            flagsState: { stateID in stateID == .hidSystemState ? shift : 0 },
+            pointerState: { .zero }
+        )
+        let snapshot = PhysicalInputSnapshot.current(
+            keyCodes: [wKeyCode],
+            buttonNumbers: [sideButton],
+            reader: reader
+        )
+
+        XCTAssertEqual(PhysicalInputStateReader.hardware.stateID, .hidSystemState)
+        XCTAssertEqual(snapshot.keys, [wKeyCode])
+        XCTAssertEqual(snapshot.buttons, [sideButton])
+        XCTAssertEqual(snapshot.modifiers & HotkeyBinding.cgModifierMask, shift)
+
+        var state = PhysicalInputState()
+        state.consume(InputSample(
+            timestampNanos: 9,
+            kind: .flags,
+            keyCode: 56,
+            modifiers: shift,
+            isDown: true
+        ))
+        state.consume(InputSample(
+            timestampNanos: 10,
+            kind: .key,
+            keyCode: wKeyCode,
+            modifiers: shift,
+            isDown: true
+        ))
+        state.consume(InputSample(
+            timestampNanos: 11,
+            kind: .mouseButton,
+            button: sideButton,
+            modifiers: shift,
+            isDown: true
+        ))
+        XCTAssertTrue(state.reconcile(to: snapshot, timestampNanos: 20).isEmpty)
+        XCTAssertTrue(state.keys.contains(wKeyCode), "A session-state mismatch must never release a physically held key")
+        XCTAssertTrue(state.buttons.contains(sideButton))
+        XCTAssertEqual(state.modifiers & HotkeyBinding.cgModifierMask, shift)
+    }
+
+    func testPhysicalReconciliationDiscardsSnapshotMadeStaleByRecordingSeed() {
+        let wKeyCode = UInt16(13)
+        var state = PhysicalInputState()
+        let pollRevision = state.reconciliationRevision
+        let staleSnapshot = PhysicalInputSnapshot(
+            keys: [], buttons: [], modifiers: 0, pointer: .zero
+        )
+
+        state.seed(
+            from: PhysicalInputSnapshot(
+                keys: [wKeyCode], buttons: [], modifiers: 0, pointer: .zero
+            ),
+            timestampNanos: 10
+        )
+        let samples = state.reconcile(
+            to: staleSnapshot,
+            timestampNanos: 20,
+            ifUnchangedSince: pollRevision
+        )
+
+        XCTAssertTrue(samples.isEmpty)
+        XCTAssertTrue(state.keys.contains(wKeyCode), "A poll begun before first-frame seeding must not overwrite the newer physical state")
+
+        let freshRevision = state.reconciliationRevision
+        let releases = state.reconcile(
+            to: staleSnapshot,
+            timestampNanos: 30,
+            ifUnchangedSince: freshRevision
+        )
+        XCTAssertTrue(releases.contains {
+            $0.kind == .key && $0.keyCode == wKeyCode && !$0.isDown
+        }, "A later fresh hardware snapshot must retain missed-release recovery")
+
+        var eventState = PhysicalInputState()
+        eventState.consume(InputSample(
+            timestampNanos: 40, kind: .key, keyCode: wKeyCode, isDown: true
+        ))
+        let beforeNewEvidence = eventState.reconciliationRevision
+        // Even a duplicate down edge is newer physical evidence. It must
+        // invalidate an earlier poll that observed the key as absent.
+        eventState.consume(InputSample(
+            timestampNanos: 41, kind: .key, keyCode: wKeyCode, isDown: true
+        ))
+        XCTAssertTrue(eventState.reconcile(
+            to: staleSnapshot,
+            timestampNanos: 50,
+            ifUnchangedSince: beforeNewEvidence
+        ).isEmpty)
+        XCTAssertTrue(eventState.keys.contains(wKeyCode))
+    }
+
     func testRecordingKeyBlacklistDropsKeysAndSanitizesModifiers() {
         var filter = RecordingKeyFilter(excludedKeyCodes: [0, 56])
         let shift = CGEventFlags.maskShift.rawValue

@@ -300,7 +300,7 @@ final class InputCaptureService: @unchecked Sendable {
                 timestampNanos: timestamp,
                 keyCode: keyCode,
                 modifiers: modifiers,
-                isPhysicallyDown: CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(keyCode))
+                isPhysicallyDown: PhysicalInputStateReader.hardware.keyIsDown(CGKeyCode(keyCode))
             )
             for flagsSample in samples {
                 physicalStateLock.withLock { physicalState.consume(flagsSample) }
@@ -346,13 +346,25 @@ final class InputCaptureService: @unchecked Sendable {
 
     private func reconcilePhysicalState(scanAllControls: Bool = false) {
         guard isRunning else { return }
-        let tracked = physicalStateLock.withLock { (physicalState.keys, physicalState.buttons) }
+        let tracked = physicalStateLock.withLock {
+            (
+                keys: physicalState.keys,
+                buttons: physicalState.buttons,
+                revision: physicalState.reconciliationRevision
+            )
+        }
         let snapshot = PhysicalInputSnapshot.current(
-            keyCodes: scanAllControls ? nil : tracked.0,
-            buttonNumbers: scanAllControls ? nil : tracked.1
+            keyCodes: scanAllControls ? nil : tracked.keys,
+            buttonNumbers: scanAllControls ? nil : tracked.buttons
         )
         let now = DispatchTime.now().uptimeNanoseconds
-        let samples = physicalStateLock.withLock { physicalState.reconcile(to: snapshot, timestampNanos: now) }
+        let samples = physicalStateLock.withLock {
+            physicalState.reconcile(
+                to: snapshot,
+                timestampNanos: now,
+                ifUnchangedSince: tracked.revision
+            )
+        }
         for sample in samples { deliver(sample) }
         clearLiveTransientStateIfNeeded()
     }
@@ -553,11 +565,15 @@ struct PhysicalInputSnapshot {
     var modifiers: UInt64
     var pointer: CGPoint
 
-    static func current(keyCodes: Set<UInt16>? = nil, buttonNumbers: Set<UInt8>? = nil) -> Self {
+    static func current(
+        keyCodes: Set<UInt16>? = nil,
+        buttonNumbers: Set<UInt8>? = nil,
+        reader: PhysicalInputStateReader = .hardware
+    ) -> Self {
         let candidateKeys = keyCodes ?? Set((0..<128).map(UInt16.init))
         let keys = Set(candidateKeys.compactMap { code -> UInt16? in
             guard !modifierKeyCodes.contains(code), !toggleKeyCodes.contains(code),
-                  CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code)) else { return nil }
+                  reader.keyIsDown(CGKeyCode(code)) else { return nil }
             return code
         })
         // NSEvent exposes a 32-bit pressed-button mask and gaming mice commonly
@@ -565,15 +581,54 @@ struct PhysicalInputSnapshot {
         // for startup/tap recovery; normal reconciliation polls tracked buttons.
         let candidateButtons = buttonNumbers ?? Set((0..<32).map(UInt8.init))
         let buttons = Set(candidateButtons.compactMap { raw in
-            CGEventSource.buttonState(.combinedSessionState, button: CGMouseButton(rawValue: UInt32(raw)) ?? .left) ? UInt8(raw) : nil
+            reader.buttonIsDown(CGMouseButton(rawValue: UInt32(raw)) ?? .left) ? UInt8(raw) : nil
         })
         return Self(
             keys: keys,
             buttons: buttons,
-            modifiers: CGEventSource.flagsState(.combinedSessionState).rawValue,
-            pointer: CGEvent(source: nil)?.location ?? .zero
+            modifiers: reader.modifiers,
+            pointer: reader.pointer
         )
     }
+}
+
+/// Reads the hardware state table rather than the foreground login session's
+/// accumulated event-source table. A game or another process can post events
+/// that change the combined-session table while a physical key is still down;
+/// that state must never be allowed to synthesize a human key release.
+struct PhysicalInputStateReader: Sendable {
+    let stateID: CGEventSourceStateID
+    private let keyState: @Sendable (CGEventSourceStateID, CGKeyCode) -> Bool
+    private let buttonState: @Sendable (CGEventSourceStateID, CGMouseButton) -> Bool
+    private let flagsState: @Sendable (CGEventSourceStateID) -> UInt64
+    private let pointerState: @Sendable () -> CGPoint
+
+    static let hardware = Self(
+        stateID: .hidSystemState,
+        keyState: { CGEventSource.keyState($0, key: $1) },
+        buttonState: { CGEventSource.buttonState($0, button: $1) },
+        flagsState: { CGEventSource.flagsState($0).rawValue },
+        pointerState: { CGEvent(source: nil)?.location ?? .zero }
+    )
+
+    init(
+        stateID: CGEventSourceStateID,
+        keyState: @escaping @Sendable (CGEventSourceStateID, CGKeyCode) -> Bool,
+        buttonState: @escaping @Sendable (CGEventSourceStateID, CGMouseButton) -> Bool,
+        flagsState: @escaping @Sendable (CGEventSourceStateID) -> UInt64,
+        pointerState: @escaping @Sendable () -> CGPoint
+    ) {
+        self.stateID = stateID
+        self.keyState = keyState
+        self.buttonState = buttonState
+        self.flagsState = flagsState
+        self.pointerState = pointerState
+    }
+
+    func keyIsDown(_ key: CGKeyCode) -> Bool { keyState(stateID, key) }
+    func buttonIsDown(_ button: CGMouseButton) -> Bool { buttonState(stateID, button) }
+    var modifiers: UInt64 { flagsState(stateID) }
+    var pointer: CGPoint { pointerState() }
 }
 
 /// Tracks the physical HID truth independently of recording filters. Polling
@@ -583,6 +638,7 @@ struct PhysicalInputState: Sendable {
     private(set) var keys: Set<UInt16> = []
     private(set) var buttons: Set<UInt8> = []
     private(set) var modifiers: UInt64 = 0
+    private(set) var reconciliationRevision: UInt64 = 0
     private var lastTimestamp: UInt64 = 0
 
     mutating func consume(_ sample: InputSample) {
@@ -591,11 +647,14 @@ struct PhysicalInputState: Sendable {
         switch sample.kind {
         case .key:
             if sample.isDown { keys.insert(sample.keyCode) } else { keys.remove(sample.keyCode) }
+            reconciliationRevision &+= 1
         case .mouseButton:
             if sample.isDown { buttons.insert(sample.button) } else { buttons.remove(sample.button) }
+            reconciliationRevision &+= 1
         case .flags:
             modifiers = sample.modifiers
             synchronizeModifierKeys()
+            reconciliationRevision &+= 1
         case .mouseMove, .scroll:
             break
         }
@@ -608,9 +667,21 @@ struct PhysicalInputState: Sendable {
         modifiers = snapshot.modifiers
         lastTimestamp = timestampNanos
         synchronizeModifierKeys()
+        // Seeding runs on the capture callback queue while polling runs on the
+        // input-tap thread. Always invalidate a poll that began before this
+        // snapshot, even when the logical sets happen to compare equal.
+        reconciliationRevision &+= 1
     }
 
-    mutating func reconcile(to snapshot: PhysicalInputSnapshot, timestampNanos: UInt64) -> [InputSample] {
+    mutating func reconcile(
+        to snapshot: PhysicalInputSnapshot,
+        timestampNanos: UInt64,
+        ifUnchangedSince expectedRevision: UInt64? = nil
+    ) -> [InputSample] {
+        // The Core Graphics reads intentionally happen outside the lock. If an
+        // event or first-frame/DAgger seed was admitted while those reads were in
+        // flight, the snapshot is stale and cannot safely release anything.
+        guard expectedRevision == nil || expectedRevision == reconciliationRevision else { return [] }
         let nextTimestamp = lastTimestamp == .max ? UInt64.max : lastTimestamp + 1
         let timestamp = max(timestampNanos, nextTimestamp)
         var samples: [InputSample] = []
@@ -633,7 +704,10 @@ struct PhysicalInputState: Sendable {
         buttons = snapshot.buttons
         modifiers = snapshot.modifiers
         synchronizeModifierKeys()
-        if !samples.isEmpty { lastTimestamp = timestamp }
+        if !samples.isEmpty {
+            lastTimestamp = timestamp
+            reconciliationRevision &+= 1
+        }
         return samples
     }
 

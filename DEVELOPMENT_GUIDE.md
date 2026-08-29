@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.3.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.3.5. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -81,7 +81,7 @@ Current recording manifests persist the exact successfully encoded frame count. 
 
 Capture-source discovery is a live list, not a one-shot bootstrap result. Refresh it on app activation, display topology changes, application launch/termination, and through a bounded two-second poll while a source picker is visible. Publish only changed, stably sorted snapshots, discard stale overlapping results, and do not disturb an active capture.
 
-The input event tap is backed by a low-rate physical-state reconciliation pass. If macOS disables the tap or drops a transition, the next pass emits only the missing key, modifier, or mouse-button edges. Recording shutdown appends balanced releases for every logical control still held. The first complete screen frame seeds controls that were already held during asynchronous startup. Shortcut and blacklist filters apply to both ordinary and reconciled input.
+The input event tap is backed by a low-rate physical-state reconciliation pass. Reconciliation reads the HID-system hardware table, never the foreground session's mutable accumulated event state: another app's event sources must not synthesize a release for a physically held key. A poll is also revision-guarded, so a snapshot taken before a concurrent first-frame or DAgger seed is discarded instead of overwriting newer physical truth. If macOS disables the tap or drops a transition, the next valid pass emits only the missing key, modifier, or mouse-button edges. Recording shutdown appends balanced releases for every logical control still held. The first complete screen frame seeds controls that were already held during asynchronous startup. Shortcut and blacklist filters apply to both ordinary and reconciled input.
 
 Live HUD state and persisted recording state are intentionally separate. The HUD reduces blacklist-sanitized physical samples immediately, so a held modifier or mouse button is visible on its down edge; monotonic state revisions prevent cross-thread UI delivery from restoring an older state. The event file may briefly buffer modifier transitions to determine whether they belong to a global shortcut, but it preserves their original timestamps and separately held modifiers. Global shortcut suppression ends with the trigger/modifier release lifecycle; it must never consume an unrelated input merely because it occurs inside an expiry window. Caps Lock is normalized to a tap and Fn/Globe retains physical key edges so both remain in the ordinary keyboard action space.
 
