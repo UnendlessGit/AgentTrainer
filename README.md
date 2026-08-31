@@ -1,8 +1,8 @@
-# AgentTrainer 2.3.5
+# AgentTrainer 2.4.0
 
-AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation policies with MLX, and running those policies with explicit safety controls.
+AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation and reinforcement-learning policies with MLX, and running those policies with explicit safety controls.
 
-Recordings, models, settings, and diagnostics stay on the Mac. The only built-in network operation is a check of the public AgentTrainer GitHub Releases feed; the app does not upload training data or telemetry.
+Recordings, models, settings, and diagnostics stay on the Mac. Network use is limited to the public GitHub Releases check and a reward WebSocket explicitly configured by the user while reinforcement learning is active. AgentTrainer does not upload training data or telemetry.
 
 ## Requirements
 
@@ -20,15 +20,58 @@ The package pins MLX Swift exactly in `Package.resolved`.
 2. Create a recording folder, choose a display, window, or region, set FPS, cursor, output resolution, ratio lock, Color Bit, compression, lead-up, and any custom Context / Labels, optionally save the complete setup as a reusable preset, then record a demonstration.
    Existing native `.atrrecord` packages or a portable recording export can also be imported from the Library without transcoding.
 3. Create an AI profile, select recording folders, and configure its vision, controls, and network.
-4. Train the profile. Pause publishes a runnable brain and retains an exact checkpoint.
+4. Train the profile from recordings. Pause publishes a runnable brain and retains an exact checkpoint.
 5. In Run, choose cursor mode and output permissions, then start the AI.
 6. When the AI makes a mistake, press the normal Record shortcut while Run is active. Run suspends, the UI and capture-excluded HUD switch to DAgger Recording, the causal lead-up is retained at normal Record quality, and your physical correction is saved as DAgger experience for that AI. Press Record again to resume Run immediately while the correction finishes publishing.
 7. Resume training. Existing compatible weights are warm-started; correction-aware best-brain selection requires improved correction fit without a meaningful ordinary-behavior regression.
 8. Use the configured panic shortcut at any time to stop hooks and release held controls.
 
+Reinforcement learning is a separate path over the same Policy-v6 actor. In **AI Models → Training Configuration → Reinforcement Learning**, configure the reward WebSocket, explicit action allowlist, episode limits, PPO settings, reward conditioning, reconnect behavior, and save cadence. Then choose the capture source, context, mouse execution, safety, and output permissions in Run and use the dedicated RL shortcut (default `Control–Option–Command–L`) to start or stop. RL has no start/stop button by design.
+
+An existing demonstration-trained brain can be warm-started with RL. An RL-trained brain can likewise be warm-started by ordinary training or DAgger. Stopping RL publishes an ordinary runnable actor; normal Run loads that actor without opening a WebSocket or requiring rewards.
+
 Training and another already-trained AI may run at the same time when they use different profiles.
 
 The capture-source picker refreshes while Record or Run is visible, and reacts immediately when apps launch or quit, displays change, or AgentTrainer becomes active again. A closed window is removed and the picker falls back to another valid source of the same kind.
+
+## Reinforcement learning
+
+AgentTrainer uses clipped Proximal Policy Optimization with generalized advantage estimation. Keys, modifiers, and mouse buttons use a joint Bernoulli policy; absolute cursor actions use a sigmoid-bounded Gaussian and Game Camera / scroll actions use tanh-bounded Gaussians. A session-owned value critic shares the actor's learned visual features but is stored only in the isolated RL checkpoint and is never needed by normal Run.
+
+The RL action space is an allowlist, not a blacklist. It starts empty and may contain any combination of:
+
+- exact macOS keyboard keys, with quick-add presets for WASD, arrows, and number-row keys
+- exact mouse buttons, including middle and additional side buttons
+- absolute cursor movement
+- relative Game Camera movement
+- scrolling
+
+The final executable action remains the intersection of that allowlist, the immutable capability saved with the RL actor, profile channel switches and blocked outputs, Run's live cursor/keyboard permissions, and the configured control region. A profile must have at least one executable allowed action before RL can start.
+
+The default reward URL is:
+
+```text
+ws://127.0.0.1:47831
+```
+
+AgentTrainer accepts UTF-8 text or binary JSON messages. A reward may arrive independently at 30–60 Hz or faster; values received between policy perceptions are accumulated without an unbounded message queue:
+
+```json
+{"reward": 1.5}
+```
+
+The sender can finish an episode with either of these forms:
+
+```json
+{"reward": -1.0, "done": true}
+{"type": "episode_finished"}
+```
+
+At an ordinary boundary AgentTrainer sends `episode_finished`, `episode_starting`, and `episode_started` messages in order. The finished message includes the episode number, reason, return, step count, next episode, and ISO-8601 timestamp. It also sends `training_update_started` / `training_update_finished` around an in-session PPO update so an environment can pause its simulation while actions are released and Metal updates the policy.
+
+The connection uses a bounded message size and automatic exponential-backoff reconnect. A disconnect always releases synthetic controls and pauses action admission. Optional reward-staleness protection does the same when a connected server stops sending rewards. Episode timers exclude these safe pauses and PPO update time.
+
+RL rollout memory is estimated before startup and is capped by both a fixed 1 GiB ceiling and the Mac's physical memory. Exact RL checkpoints transactionally retain actor, critic, AdamW moments, counters, reward normalization, sampling state, and MLX random state. Periodic runnable versions remain bounded by the existing autosave retention policy.
 
 ## DAgger corrections
 
@@ -94,6 +137,7 @@ Runtime output is constrained in several independent layers:
 - A physical-input monitor can stop the AI as soon as the user intervenes.
 - The panic action stops capture and action queues before releasing every held key and button.
 - A model can emit only keys represented in its training data.
+- An RL model can emit only the keys, mouse buttons, and movement modes in its explicit immutable allowlist.
 - Per-profile restrictions and live cursor/keyboard permissions are applied again at execution.
 - Full-Mac control is opt-in; otherwise output stays inside the configured control region.
 - Locked-camera movement is transient and is never replayed from a stale prediction.
@@ -116,7 +160,7 @@ Run the opt-in release benchmark for a compact fixture, the default vision/model
 ./benchmark.sh
 ```
 
-The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. It also executes the complete Policy-v6 objective—including independent per-sample augmentation and both predictive heads—and reports its overhead, memory, and thermal state. Default and temporal-stress runs report sustained windows for both the optimized core path and the full Policy-v6 objective. Low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
+The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, and learning-quality deltas against the pre-optimization graph. It also executes the complete Policy-v6 objective—including independent per-sample augmentation and both predictive heads—and reports its overhead, memory, and thermal state. A separate default-profile RL gate runs a complete retained rollout through PPO and reports policy/value loss, entropy, optimizer steps, throughput, unified memory, and thermal state. Default and temporal-stress runs report sustained windows for both the optimized core path and the full Policy-v6 objective. Low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
 
 Run the opt-in 1280×720 DAgger video-throughput gate with:
 
@@ -145,7 +189,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.3.5.dmg`
+- `AgentTrainer-2.4.0.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 
@@ -169,7 +213,7 @@ It contains:
 
 - `Recordings` — size-optimized hardware HEVC video, synchronized binary input, thumbnails, manifests, and portable context snapshots
 - `Caches` — rebuildable packed datasets
-- `Profiles` — profile metadata, immutable runnable versions, and exact checkpoints
+- `Profiles` — profile metadata, immutable runnable versions, exact demonstration checkpoints, and isolated exact RL actor-critic checkpoints
 - `Logs` — bounded local diagnostics
 
 The training-data root also contains `context-fields.json`, the reusable custom field/value catalog.

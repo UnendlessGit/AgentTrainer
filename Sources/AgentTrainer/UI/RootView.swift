@@ -115,7 +115,7 @@ struct RootView: View {
                 }
                 .primaryButton(color: ATColor.coral)
                 .help(model.recordingIsActiveOrStarting ? "Stop or cancel recording" : "Start recording")
-                .disabled(model.agentIsActiveOrStarting)
+                .disabled(model.liveControlIsActiveOrStarting)
 
                 Button {
                     Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() }
@@ -124,7 +124,7 @@ struct RootView: View {
                 }
                 .primaryButton(color: ATColor.violet)
                 .help(model.agentIsActiveOrStarting ? "Stop AI and release inputs" : "Run selected AI")
-                .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil)
+                .disabled(model.reinforcementIsActiveOrStarting || (!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil))
 
                 Button(role: .destructive) { model.panic() } label: {
                     Image(systemName: "hand.raised.fill")
@@ -191,6 +191,10 @@ struct RootView: View {
     private var activityTitle: String {
         if model.isStoppingRecording { return "Saving recording" }
         if model.isRecording { return "Recording" }
+        if model.reinforcementIsActiveOrStarting && model.isTraining { return "RL + train" }
+        if model.isStartingReinforcementLearning { return "RL starting" }
+        if model.isStoppingReinforcementLearning { return "RL stopping" }
+        if model.isReinforcementLearning { return "RL training" }
         if model.agentIsActiveOrStarting && model.isTraining { return model.isStartingAgent ? "Start/stop + train" : "Run + train" }
         if model.isStartingAgent { return "AI starting / stopping" }
         if model.isRunning { return "AI running" }
@@ -200,6 +204,7 @@ struct RootView: View {
 
     private var activityColor: Color {
         if model.isRecording { return ATColor.coral }
+        if model.reinforcementIsActiveOrStarting { return ATColor.green }
         if model.agentIsActiveOrStarting { return ATColor.violet }
         if model.isTraining { return ATColor.cyan }
         return ATColor.green

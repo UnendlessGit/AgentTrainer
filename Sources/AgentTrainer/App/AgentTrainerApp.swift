@@ -24,7 +24,9 @@ struct AgentTrainerApp: App {
                         else { await model.startRecording() }
                     }
                 }
+                .disabled(model.reinforcementIsActiveOrStarting)
                 Button(model.agentIsActiveOrStarting ? "Stop Agent" : "Run Agent") { Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() } }
+                    .disabled(model.reinforcementIsActiveOrStarting)
             }
             CommandMenu("Recordings") {
                 Button("Import Recordings…") {
@@ -43,9 +45,9 @@ struct AgentTrainerApp: App {
         MenuBarExtra {
             AgentTrainerMenuBarView(model: model)
         } label: {
-            Image(systemName: model.isRecording || model.isDAggerRecording ? "record.circle.fill" : model.agentIsActiveOrStarting ? "play.circle.fill" : model.isTraining ? "brain.head.profile.fill" : "waveform.path.ecg.rectangle")
+            Image(systemName: model.isRecording || model.isDAggerRecording ? "record.circle.fill" : model.reinforcementIsActiveOrStarting ? "brain.head.profile.fill" : model.agentIsActiveOrStarting ? "play.circle.fill" : model.isTraining ? "brain.head.profile.fill" : "waveform.path.ecg.rectangle")
                 .symbolRenderingMode(.palette)
-                .foregroundStyle(model.isRecording || model.isDAggerRecording ? Color.red : model.agentIsActiveOrStarting ? Color.purple : model.isTraining ? Color.cyan : Color.primary)
+                .foregroundStyle(model.isRecording || model.isDAggerRecording ? Color.red : model.reinforcementIsActiveOrStarting ? Color.green : model.agentIsActiveOrStarting ? Color.purple : model.isTraining ? Color.cyan : Color.primary)
         }
         .menuBarExtraStyle(.window)
     }
@@ -60,7 +62,7 @@ private struct AgentTrainerMenuBarView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Image(nsImage: NSApplication.shared.applicationIconImage).resizable().frame(width: 25, height: 25).clipShape(RoundedRectangle(cornerRadius: ATCorner.scaled(6), style: .continuous))
-                VStack(alignment: .leading, spacing: 1) { Text(appearance.configuration.appName).font(.headline); Text(model.isSavingDAgger ? "Saving DAgger correction" : model.isDAggerRecording ? "Recording DAgger correction" : model.isStoppingRecording ? "Saving recording" : model.isRecording ? "Recording" : appearance.configuration.appSubtitle).font(.caption).foregroundStyle(model.isRecording || model.isDAggerRecording ? Color.red : Color.secondary) }
+                VStack(alignment: .leading, spacing: 1) { Text(appearance.configuration.appName).font(.headline); Text(model.isSavingDAgger ? "Saving DAgger correction" : model.isDAggerRecording ? "Recording DAgger correction" : model.isStoppingRecording ? "Saving recording" : model.isRecording ? "Recording" : model.reinforcementIsActiveOrStarting ? "Reinforcement learning" : appearance.configuration.appSubtitle).font(.caption).foregroundStyle(model.isRecording || model.isDAggerRecording ? Color.red : model.reinforcementIsActiveOrStarting ? ATColor.green : Color.secondary) }
                 Spacer()
                 if model.isRecording || model.isDAggerRecording { Circle().fill(.red).frame(width: 9, height: 9) }
             }
@@ -68,6 +70,7 @@ private struct AgentTrainerMenuBarView: View {
             status("Recording", model.isStoppingRecording ? "Saving" : model.isRecording ? "Active" : model.isStartingRecording ? "Starting" : "Idle", model.recordingIsActiveOrStarting ? .red : .secondary)
             status("DAgger", model.isSavingDAgger ? "Saving" : model.isDAggerRecording ? "Correction active" : "Idle", model.isDAggerRecording || model.isSavingDAgger ? .red : .secondary)
             status("Training", model.isTraining ? model.profiles.first(where: { $0.id == model.trainingProfileID })?.name ?? "Active" : "Idle", model.isTraining ? ATColor.cyan : .secondary)
+            status("RL", model.reinforcementIsActiveOrStarting ? model.profiles.first(where: { $0.id == model.reinforcementProfileID })?.name ?? "Active" : "Idle", model.reinforcementIsActiveOrStarting ? ATColor.green : .secondary)
             status("Agent", model.isStartingAgent ? "Starting / stopping" : model.isRunning ? model.profiles.first(where: { $0.id == model.runningProfileID })?.name ?? "Running" : "Idle", model.agentIsActiveOrStarting ? ATColor.violet : .secondary)
             Divider()
             Button(model.isDAggerRecording ? "Stop & Save DAgger Correction" : model.agentIsActiveOrStarting ? "Record DAgger Correction" : model.recordingIsActiveOrStarting ? (model.isStoppingRecording ? "Saving Recording…" : model.isRecording ? "Stop & Save Recording" : "Cancel Recording Start") : "Start Recording") {
@@ -77,9 +80,9 @@ private struct AgentTrainerMenuBarView: View {
                     else { await model.startRecording() }
                 }
             }
-            .disabled(model.isStartingAgent || model.isStoppingRecording || model.isStartingDAgger || model.isSavingDAgger)
+            .disabled(model.isStartingAgent || model.isStoppingRecording || model.isStartingDAgger || model.isSavingDAgger || model.reinforcementIsActiveOrStarting)
             Button(model.agentIsActiveOrStarting ? "Stop Agent & Release Inputs" : "Start Selected Agent") { Task { model.agentIsActiveOrStarting ? await model.stopAgent() : await model.startAgent() } }
-                .disabled(!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil)
+                .disabled(model.reinforcementIsActiveOrStarting || (!model.agentIsActiveOrStarting && model.selectedProfile?.activeVersionID == nil))
             Button("Panic — Stop Everything", role: .destructive) { model.panic() }
             Divider()
             Button("Show AgentTrainer") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
@@ -100,14 +103,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let model,
               model.isTraining || model.recordingIsActiveOrStarting
                 || model.agentIsActiveOrStarting || model.daggerLifecycleIsActive
+                || model.reinforcementIsActiveOrStarting
                 || model.isReplaying else { return .terminateNow }
         if model.isTraining { model.pauseTraining() }
         Task { @MainActor in
             if model.agentIsActiveOrStarting { await model.stopAgent() }
+            if model.reinforcementIsActiveOrStarting { await model.stopReinforcementLearning() }
             if model.isReplaying { model.stopReenactment() }
             if model.recordingIsActiveOrStarting { await model.stopRecording() }
             while model.recordingIsActiveOrStarting { try? await Task.sleep(for: .milliseconds(50)) }
             while model.agentIsActiveOrStarting { try? await Task.sleep(for: .milliseconds(50)) }
+            while model.reinforcementIsActiveOrStarting { try? await Task.sleep(for: .milliseconds(50)) }
             while model.daggerLifecycleIsActive {
                 try? await Task.sleep(for: .milliseconds(50))
             }

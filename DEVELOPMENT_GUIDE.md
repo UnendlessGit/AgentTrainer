@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.3.5. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.4.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -24,6 +24,10 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Training/DAggerRecorder.swift` — bounded correction video/input publication from Record-quality live frames
 - `Training/PolicyNetwork.swift` — Policy v6, predictive objectives, augmentation, and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
+- `Training/ReinforcementLearningDomain.swift` — RL configuration, explicit action allowlist, bounded sizing, provenance, and live metrics
+- `Training/ReinforcementLearningPolicy.swift` — hybrid action distribution, shared Policy-v6 actor, isolated critic, GAE, and clipped PPO updates
+- `Training/ReinforcementLearningEngine.swift` — live capture/action scheduling, episode lifecycle, reward association, RL checkpoints, and actor publication
+- `Training/RewardWebSocket.swift` — bounded high-rate reward aggregation, protocol messages, connection timeout, and reconnect ownership
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
 - `Agent/AgentRuntime.swift` — capture, inference scheduling, prediction latching, and teardown
 - `Agent/InputInjector.swift` — final output firewall and synthetic HID events
@@ -47,6 +51,9 @@ Capture, runtime, training, and injection use dedicated locks and queues because
 - Post key/button releases while holding the same injector lock used by execution. A stop/restart or permission off/on transition must not overtake a release.
 - Keep callbacks to UI state outside low-level locks.
 - Treat start and stop as re-entrant operations; duplicate requests must coalesce or return.
+- RL startup and teardown follow the same rule. Stop action admission, drain the action queue, release controls, stop capture, drain inference/update work, then publish the final actor. A stop during asynchronous startup must invalidate the launch before a late capture or input monitor can survive it.
+- RL inference and PPO mutation are serialized on one session queue. During an update, connection loss, reward staleness pause, or episode reset, clear the prediction latch and temporal ring and release synthetic controls before admitting another action.
+- The WebSocket receive path may run at 30–60 Hz or faster, but it must reduce messages into one lock-bounded accumulator. Never replace it with an unbounded continuation, task-per-reward, or retained message array.
 - A background task may publish only bounded snapshots to the main actor.
 - An explicit DAgger trigger must synchronously suspend inference and new AI action admission before recorder construction. Buffer early physical samples and Record-quality frames until the recorder is installed; ordinary takeover must never enter correction mode. The main UI and capture-excluded HUD must expose DAgger Recording rather than Run during this interval.
 - Stopping DAgger resumes the resident Run session before publication finishes, but only after clearing its temporal ring and prediction latch. No stale pre-correction action may execute after the transition.
@@ -146,6 +153,14 @@ Every frame-control row includes normalized absolute cursor position, raw relati
 
 `ModelContract.schemaVersion` is 6 and the weight format is `AgentTrainer.Policy.v6`.
 
+Demonstration training and RL intentionally share that exact actor layout. RL must save the actor alone as an ordinary Policy-v6 `weights.safetensors`, so either trainer can warm-start the other and normal Run stays unaware of rewards. The RL critic is a separate session-owned module over fused actor features; it appears only in `RLCheckpoint/rl.weights.safetensors` and must never become a runtime dependency.
+
+RL uses clipped PPO with GAE. Binary controls use Bernoulli logits; absolute mouse samples are sigmoid-bounded Gaussians and relative mouse/scroll samples are tanh-bounded Gaussians. Store the pre-transform continuous latent in the rollout so a later PPO pass recomputes the exact transformed policy density. Actor, visual encoder, recurrent path, fusion stack, and critic must all remain inside the differentiated closure; precomputing actor temporal features outside `valueAndGrad` silently prevents end-to-end RL learning. Supervised dropout remains unchanged, but PPO likelihood updates disable it: a new random dropout mask must never be mistaken for policy divergence from the stored action probability.
+
+`ReinforcementActionSpace` is an explicit allowlist. A category with no selected member is disabled. At collection and normal Run, an RL version's immutable allowlist is intersected with saved/current channels, profile restrictions, live output permissions, allowed keys, and the control region. Demonstration versions leave `reinforcementActionSpace` nil and retain their established runtime semantics.
+
+Changing transport timing, episode limits, or publication cadence does not invalidate learned state. The exact RL checkpoint signature does include actor layout, context layout, action space, mouse mode, critic layout, PPO/reward objective, and seed. Activating another brain makes a mismatched RL checkpoint ineligible; RL then warm-starts the selected actor and initializes a fresh critic/optimizer.
+
 A runnable version is immutable. Runtime current vision, temporal vision, architecture, precision, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
 
 Dropout is stochastic training regularization, not part of the learned tensor layout. It is normalized out of `LearnedBrainContract`: editing only dropout must preserve the active brain and load its weights into the next run. Because the stochastic objective changed, the exact optimizer/checkpoint signature still includes dropout and begins a fresh optimizer sequence rather than claiming an invalid exact resume.
@@ -214,6 +229,12 @@ Run reads context fields and values only from the active immutable version, neve
 
 All synthetic events carry `agentTrainerSyntheticTag`; input safety monitors ignore that tag. Panic and normal stop both drain action work and release held state.
 
+Ordinary `AgentRuntime` never constructs `RewardWebSocketClient`. An RL-published version runs with no connection or reward signal; its optional RL metadata only narrows executable capabilities. RL itself reuses Run's frozen source, region, frame mode, mouse execution, Game Camera, safety, cursor/keyboard permissions, preview, and immutable context vocabulary. Live context and output-permission changes preserve Run's release-and-clear semantics.
+
+The RL shortcut is the sole normal start/stop surface. Panic and application termination may stop RL for safety, but no button or menu item may start it. Panic, Record, Run, and RL shortcuts must remain distinct and capture/safety-excluded.
+
+Reward JSON accepts one finite numeric `reward` and optional `done`, `episode_finished`, `terminated`, or episode-end `type`. Booleans and non-finite/coerced strings are invalid. At a normal boundary, send `episode_finished`, then `episode_starting`, then `episode_started`. A disconnect releases controls, clears stale state, and reconnects with bounded exponential backoff; rewards received between perceptions use the configured sum/mean/latest reduction without retaining individual messages.
+
 ## Storage contracts
 
 Default root:
@@ -223,6 +244,8 @@ Default root:
 ```
 
 Training data (`Recordings`, `Caches`, folder index, context-field catalog) and model data (`Profiles`, versions, checkpoints, contract markers) can be relocated independently.
+
+Each profile may own both `Checkpoint` (demonstration optimizer state) and `RLCheckpoint` (combined actor/critic, optimizer, MLX random state, and RL state). Learning reset moves/removes both transactionally. Duplication copies both. Model-contract audit archives an incompatible RL checkpoint rather than interpreting it under a new actor schema.
 
 Relocation must:
 
@@ -256,6 +279,8 @@ Theme controls are bounded and global. Motion honors Reduce Motion, can be disab
 
 User-facing technical values must be derived from shared contract helpers such as `NeuralInputSizing` and `ModelSizing`, not duplicated formulas.
 
+AI Models exposes Training Configuration as separate Training Data and Reinforcement Learning tabs. The RL tab keeps common episode/rollout settings visible, places PPO, exploration, reward, connection, and persistence controls under one Advanced disclosure, displays estimated retained rollout memory, and uses an inverse blocked-key editor: only selected keys/buttons/movement modes are executable. Run may display live RL status and metrics but must not add a start/stop button.
+
 Library recording rows and inspectors expose encoded frames plus logical package MB/GB. Folder headers aggregate every recording in that folder—not only search results—and show total recordings, frames, logical bytes, and full recorded seconds. Newly created manifests use exact frame counts; legacy estimates must remain compatible and non-destructive.
 
 Recording presets are user-owned, editable snapshots of Record-page settings. Applying a preset must tolerate an unavailable source or deleted destination without inventing an identifier. Library range selection follows the visible folder/search order; bulk manifest moves roll back as a set, and bulk deletion stages all recording directories before cleanup. Global shortcuts may use keyboard keys or any macOS mouse-button number, including additional side buttons, and must remain excluded from recording and human-input safety hooks.
@@ -273,7 +298,8 @@ Before release:
 5. Quit AgentTrainer and run `./build.sh`.
 6. Verify `/Applications/AgentTrainer.app` launches and reports the intended version.
 7. Exercise permission refresh, ordinary recording start/stop, explicit DAgger start/correct/stop, ordinary takeover without recording, correction warm-start, training pause/resume, agent panic, and updater UI.
-8. Verify the DMG and `SHA256SUMS.txt` in `outputs`.
-9. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
+8. Against a loopback WebSocket, exercise high-rate rewards, remote `done`, episode lifecycle messages, disconnect/reconnect release behavior, reward staleness, keybind-only start/stop, an RL update from a demonstration brain, demonstration warm-start from an RL brain, and normal Run of the RL actor with the reward server absent.
+9. Verify the DMG and `SHA256SUMS.txt` in `outputs`.
+10. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
 
 `build.sh` creates a fully signed staging bundle, transactionally installs it into `/Applications/AgentTrainer.app` by default, and then packages the DMG/source/checksums. Override the install path with `APP_PATH`; override signing with `CODE_SIGN_IDENTITY` and optionally `CODE_SIGN_KEYCHAIN`.

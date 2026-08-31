@@ -7,6 +7,99 @@ import XCTest
 /// Opt-in hardware benchmark. Normal CI remains deterministic and quick; use
 /// `./benchmark.sh` to exercise the complete packed temporal-vision data path.
 final class TrainingPerformanceTests: XCTestCase {
+    func testReinforcementPPOUpdateMeasuresDefaultProfileThroughputAndMemory() throws {
+        guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_RL_PERFORMANCE_TESTS"] == "1" else {
+            throw XCTSkip("Set AGENTTRAINER_RUN_RL_PERFORMANCE_TESTS=1 to run the online PPO benchmark.")
+        }
+        try Device.withDefaultDevice(.gpu) {
+            MLXMemoryLifecycle.configure()
+            let profile = AIProfile.fresh(name: "RL Performance")
+            var configuration = ReinforcementLearningConfiguration()
+            configuration.actionSpace = ReinforcementActionSpace(
+                allowedKeyCodes: [13]
+            )
+            let plan = try ReinforcementActionPlan.make(
+                profile: profile,
+                configuration: configuration,
+                mouseMode: .absolute
+            )
+            let optimizer = try ReinforcementPolicyOptimizer(
+                profile: profile,
+                configuration: configuration,
+                contextSchema: .empty,
+                actionPlan: plan,
+                actorWeightsURL: nil
+            )
+            let temporal = profile.training.effectiveTemporalVision
+            let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
+            let observation = ReinforcementObservation(
+                currentPacked: Data(
+                    repeating: 127,
+                    count: profile.preprocessing.sampleByteCount
+                ),
+                pastPacked: Data(
+                    repeating: 127,
+                    count: temporal.pastFrameCount * pastSpec.sampleByteCount
+                ),
+                pastControls: [Float](
+                    repeating: 0,
+                    count: temporal.pastFrameCount * ActionLayout.count
+                ),
+                contextValues: []
+            )
+            let prediction = try optimizer.prediction(for: observation)
+            var random = ReinforcementRandomGenerator(seed: configuration.seed)
+            let sample = try plan.sample(
+                logits: prediction.logits,
+                standardDeviation: Float(
+                    configuration.continuousActionStandardDeviation
+                ),
+                binaryTemperature: Float(configuration.binaryActionTemperature),
+                random: &random
+            )
+            let transitions = (0..<configuration.rolloutSteps).map { index in
+                ReinforcementTransition(
+                    observation: observation,
+                    distributionActions: sample.distributionActions,
+                    executedActions: sample.executedActions,
+                    oldLogProbability: sample.logProbability,
+                    oldValue: prediction.value,
+                    reward: index.isMultiple(of: 7) ? 1 : -0.02,
+                    terminal: index == configuration.rolloutSteps - 1
+                )
+            }
+            let memoryBefore = Memory.snapshot()
+            let began = ContinuousClock.now
+            let metrics = try optimizer.update(
+                transitions: transitions,
+                bootstrapValue: 0,
+                shuffleSeed: configuration.seed
+            )
+            let seconds = began.duration(to: .now).benchmarkSeconds
+            let memoryAfter = Memory.snapshot()
+            let throughput = Double(transitions.count) / max(0.000_001, seconds)
+            print(
+                "RL_PPO_BENCHMARK profile=default rollout=\(transitions.count) "
+                    + "optimizer_steps=\(metrics.optimizerSteps) seconds=\(seconds) "
+                    + "samples_per_second=\(throughput) policy_loss=\(metrics.policyLoss) "
+                    + "value_loss=\(metrics.valueLoss) entropy=\(metrics.entropy) "
+                    + "active_before=\(memoryBefore.activeMemory) active_after=\(memoryAfter.activeMemory) "
+                    + "cache_after=\(memoryAfter.cacheMemory) thermal=\(TrainingThermalState.current.rawValue)"
+            )
+            XCTAssertGreaterThan(metrics.optimizerSteps, 0)
+            XCTAssertLessThanOrEqual(metrics.optimizerSteps, 8)
+            XCTAssertTrue(metrics.policyLoss.isFinite)
+            XCTAssertTrue(metrics.valueLoss.isFinite)
+            XCTAssertTrue(metrics.entropy.isFinite)
+            XCTAssertGreaterThan(throughput, 0.5)
+            XCTAssertLessThan(
+                Int64(memoryAfter.activeMemory),
+                Int64(ProcessInfo.processInfo.physicalMemory) * 3 / 4
+            )
+            XCTAssertNotEqual(TrainingThermalState.current, .critical)
+        }
+    }
+
     func testRecordQualityDAggerVideoPipelineSustainsDefaultWorkload() async throws {
         guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_DAGGER_PERFORMANCE_TESTS"] == "1" else {
             throw XCTSkip("Set AGENTTRAINER_RUN_DAGGER_PERFORMANCE_TESTS=1 to run the Record-quality DAgger benchmark.")

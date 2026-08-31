@@ -1302,11 +1302,36 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Context-trained brains snapshot only fields and values observed during
     /// their own training run, independent of later Library edits.
     var contextSchema: ModelContextSchema? = nil
+    /// Nil means the established demonstration-training path. RL versions use
+    /// the same actor weights and add only provenance/capability metadata.
+    var trainingOrigin: ModelTrainingOrigin? = nil
+    var reinforcementLearningSummary: ReinforcementLearningSummary? = nil
+    /// RL has an explicit allowlist that must remain immutable with its actor.
+    /// Demonstration-trained versions leave this nil and retain existing Run
+    /// semantics exactly.
+    var reinforcementActionSpace: ReinforcementActionSpace? = nil
 
     var effectiveContextSchema: ModelContextSchema { contextSchema ?? .empty }
+    var effectiveTrainingOrigin: ModelTrainingOrigin {
+        trainingOrigin ?? .demonstration
+    }
 
     var contextSchemaIsValid: Bool {
         (try? effectiveContextSchema.validated()) != nil
+    }
+
+    var reinforcementMetadataIsValid: Bool {
+        guard effectiveTrainingOrigin == .reinforcementLearning else {
+            return reinforcementLearningSummary == nil
+                && reinforcementActionSpace == nil
+        }
+        guard let summary = reinforcementLearningSummary,
+              let actionSpace = reinforcementActionSpace,
+              (try? actionSpace.validated()) != nil else { return false }
+        return summary.episode >= 0 && summary.update >= 0
+            && summary.environmentSteps >= 0
+            && summary.lastEpisodeReturn.isFinite
+            && summary.averageEpisodeReturn.isFinite
     }
 
     /// Manifest filenames are treated as leaf names, never paths. A damaged or
@@ -1327,6 +1352,9 @@ struct TrainingProgressSummary: Codable, Hashable, Sendable {
     /// Optional for backward-compatible decoding of existing profile.json files.
     var trainingDurationSeconds: Double? = nil
     var experienceDurationSeconds: Double? = nil
+    var reinforcementEpisodes: Int? = nil
+    var reinforcementUpdates: Int? = nil
+    var reinforcementAverageReturn: Double? = nil
 }
 
 struct AIProfile: Codable, Hashable, Identifiable, Sendable {
@@ -1344,6 +1372,9 @@ struct AIProfile: Codable, Hashable, Identifiable, Sendable {
     /// A cheap list-row summary. It avoids scanning every autosave manifest just
     /// to show how much an AI has trained.
     var trainingProgress: TrainingProgressSummary?
+    /// Optional preserves profile decoding while keeping every RL setting
+    /// profile-local and independent from the demonstration trainer.
+    var reinforcementLearning: ReinforcementLearningConfiguration? = nil
     /// Sticky once Crystal V4 is discovered, so renaming the profile cannot
     /// accidentally remove its user-requested protection.
     var deletionProtected: Bool?
@@ -1355,6 +1386,9 @@ struct AIProfile: Codable, Hashable, Identifiable, Sendable {
 
     var effectiveFolderIDs: [UUID] { recordingFolderIDs ?? [] }
     var effectiveRestrictions: ActionRestrictions { restrictions ?? ActionRestrictions() }
+    var effectiveReinforcementLearning: ReinforcementLearningConfiguration {
+        reinforcementLearning ?? ReinforcementLearningConfiguration()
+    }
     var isDeletionProtected: Bool {
         deletionProtected == true || Self.isProtectedModelName(name)
     }
@@ -1541,6 +1575,10 @@ struct HotkeyBinding: Codable, Hashable, Sendable {
     static let panic = HotkeyBinding(keyCode: 53, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
     static let record = HotkeyBinding(keyCode: 15, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
     static let run = HotkeyBinding(keyCode: 0, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
+    static let reinforcementLearning = HotkeyBinding(
+        keyCode: 37,
+        carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8)
+    )
 
     static func mouse(_ button: UInt8, carbonModifiers: UInt32 = 0) -> Self {
         HotkeyBinding(keyCode: 0, carbonModifiers: carbonModifiers, mouseButton: button)
@@ -1551,6 +1589,61 @@ struct HotkeySettings: Codable, Hashable, Sendable {
     var panic = HotkeyBinding.panic
     var record = HotkeyBinding.record
     var run = HotkeyBinding.run
+    var reinforcementLearning = HotkeyBinding.reinforcementLearning
+
+    init(
+        panic: HotkeyBinding = .panic,
+        record: HotkeyBinding = .record,
+        run: HotkeyBinding = .run,
+        reinforcementLearning: HotkeyBinding = .reinforcementLearning
+    ) {
+        self.panic = panic
+        self.record = record
+        self.run = run
+        self.reinforcementLearning = reinforcementLearning
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case panic, record, run, reinforcementLearning
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        panic = try container.decodeIfPresent(HotkeyBinding.self, forKey: .panic) ?? .panic
+        record = try container.decodeIfPresent(HotkeyBinding.self, forKey: .record) ?? .record
+        run = try container.decodeIfPresent(HotkeyBinding.self, forKey: .run) ?? .run
+        reinforcementLearning = try container.decodeIfPresent(
+            HotkeyBinding.self,
+            forKey: .reinforcementLearning
+        ) ?? .reinforcementLearning
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(panic, forKey: .panic)
+        try container.encode(record, forKey: .record)
+        try container.encode(run, forKey: .run)
+        try container.encode(reinforcementLearning, forKey: .reinforcementLearning)
+    }
+
+    /// Adding the fourth shortcut must not erase three valid user-owned
+    /// shortcuts merely because one of them already used the new default.
+    func resolvingReinforcementConflict() -> Self {
+        let established = [panic, record, run]
+        guard Set(established).count == established.count else {
+            return HotkeySettings()
+        }
+        guard established.contains(reinforcementLearning) else { return self }
+        var result = self
+        let modifiers = HotkeyBinding.reinforcementLearning.carbonModifiers
+        let candidates = [37, 17, 40, 3, 45].map {
+            HotkeyBinding(keyCode: UInt32($0), carbonModifiers: modifiers)
+        }
+        result.reinforcementLearning = candidates.first {
+            !established.contains($0)
+        } ?? HotkeyBinding.reinforcementLearning
+        return result
+    }
 }
 
 enum AgentTrainerError: LocalizedError {

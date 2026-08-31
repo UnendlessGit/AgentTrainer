@@ -91,6 +91,10 @@ enum ActionLayout {
     /// executed; their dedicated modifier outputs are the single source of
     /// truth. Shift intentionally remains part of Keyboard.
     static let commandOptionControlKeyCodes: [UInt16] = [54, 55, 58, 59, 61, 62]
+    static let shiftKeyCodes: Set<UInt16> = [56, 60]
+    static let allModifierKeyCodes: Set<UInt16> = shiftKeyCodes.union(
+        commandOptionControlKeyCodes
+    )
     static let commandOptionControlKeyCodeSet = Set(commandOptionControlKeyCodes)
     static let commandOptionControlKeyboardIndices = commandOptionControlKeyCodes.map { keyboard.lowerBound + Int($0) }
     static let commandOptionControlKeyboardIndexSet = Set(commandOptionControlKeyboardIndices)

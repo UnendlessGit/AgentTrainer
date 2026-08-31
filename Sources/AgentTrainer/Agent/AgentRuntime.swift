@@ -269,6 +269,19 @@ final class AgentRuntime: @unchecked Sendable {
         runtimeProfile.preprocessing = version.preprocessing
         runtimeProfile.channels = RuntimeActionSemantics.effectiveChannels(saved: version.channels, current: profile.channels)
         runtimeProfile.training = version.training
+        var runtimeAllowedKeyCodes = allowedKeyCodes
+        if let reinforcementActionSpace = version.reinforcementActionSpace {
+            runtimeProfile.channels = reinforcementActionSpace.effectiveChannels(
+                base: runtimeProfile.channels,
+                mouseMode: mouseMode
+            )
+            runtimeProfile.restrictions = reinforcementActionSpace.applying(
+                to: profile.effectiveRestrictions
+            )
+            runtimeAllowedKeyCodes.formIntersection(
+                reinforcementActionSpace.allowedKeyCodes
+            )
+        }
         _ = try runtimeProfile.preprocessing.validated()
         _ = try runtimeProfile.training.effectiveTemporalVision.validated(
             current: runtimeProfile.preprocessing
@@ -400,7 +413,7 @@ final class AgentRuntime: @unchecked Sendable {
             self.daggerColorQuantization = RecordingColorQuantizationTables(
                 bits: daggerCaptureConfiguration.preprocessing.bitDepth
             )
-            self.allowedKeyCodes = allowedKeyCodes
+            self.allowedKeyCodes = runtimeAllowedKeyCodes
             self.shiftUsesKeyboardChannel = (version.trainingDataSchema ?? 0) >= 7
             self.safety = safety
             self.captureRect = captureRect

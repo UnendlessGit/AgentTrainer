@@ -44,6 +44,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var isStoppingRecording = false
     @Published var isTraining = false
     @Published private(set) var isAutoTraining = false
+    @Published private(set) var isReinforcementLearning = false
+    @Published private(set) var isStartingReinforcementLearning = false
+    @Published private(set) var isStoppingReinforcementLearning = false
     @Published var isRunning = false
     @Published private(set) var isStartingAgent = false
     @Published private(set) var isDAggerRecording = false
@@ -54,9 +57,11 @@ final class AppModel: ObservableObject {
     /// background, while decorative animation and chart refresh can pause.
     @Published var isAppActive = NSApplication.shared.isActive
     @Published var trainingMetrics = TrainingMetrics()
+    @Published var reinforcementMetrics = ReinforcementLearningMetrics()
     @Published var runtimeMetrics = RuntimeMetrics()
     @Published var activityStatus = "Ready"
     @Published var trainingStatus = "Idle"
+    @Published var reinforcementStatus = "Idle"
     @Published var runtimeStatus = "Idle"
     @Published var errorMessage: String?
     @Published private(set) var appUpdateProgress: AppUpdateProgress?
@@ -94,6 +99,7 @@ final class AppModel: ObservableObject {
         didSet {
             persistWorkflowSettings()
             agent?.updateOutputPermissions(runtimeOutputPermissions)
+            reinforcement?.updateOutputPermissions(runtimeOutputPermissions)
         }
     }
     @Published private(set) var runContextSchema = ModelContextSchema.empty
@@ -101,14 +107,20 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLoadingRunContext = false
     @Published var runContextValues: [UUID: UUID] = [:] {
         didSet {
-            guard runningVersion?.id == runContextVersionID else { return }
-            runningContextValues = runContextValues
-            agent?.updateContextSelection(runContextValues)
+            if runningVersion?.id == runContextVersionID {
+                runningContextValues = runContextValues
+                agent?.updateContextSelection(runContextValues)
+            }
+            if reinforcement != nil,
+               reinforcementContextVersionID == runContextVersionID {
+                reinforcement?.updateContextSelection(runContextValues)
+            }
         }
     }
     @Published private(set) var trainingProfileID: UUID?
     @Published private(set) var trainingContextSchema = ModelContextSchema.empty
     @Published private(set) var runningProfileID: UUID?
+    @Published private(set) var reinforcementProfileID: UUID?
 
     let hudModel = InputHUDModel()
     private let capture = CaptureService()
@@ -121,6 +133,7 @@ final class AppModel: ObservableObject {
         Task { @MainActor in
             guard let self else { return }
             guard !self.isStartingAgent else { return }
+            guard !self.reinforcementIsActiveOrStarting else { return }
             if self.isDAggerRecording {
                 await self.toggleDAggerRecording()
             } else if self.agentIsActiveOrStarting {
@@ -132,8 +145,22 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    private lazy var runHotkey = GlobalHotkeyMonitor(identifier: 3, binding: hotkeys.run) { [weak self] in Task { @MainActor in guard let self else { return }; self.agentIsActiveOrStarting ? await self.stopAgent() : await self.startAgent() } }
+    private lazy var runHotkey = GlobalHotkeyMonitor(identifier: 3, binding: hotkeys.run) { [weak self] in Task { @MainActor in guard let self, !self.reinforcementIsActiveOrStarting else { return }; self.agentIsActiveOrStarting ? await self.stopAgent() : await self.startAgent() } }
+    private lazy var reinforcementHotkey = GlobalHotkeyMonitor(
+        identifier: 4,
+        binding: hotkeys.reinforcementLearning
+    ) { [weak self] in
+        Task { @MainActor in
+            guard let self else { return }
+            if self.reinforcementIsActiveOrStarting {
+                await self.stopReinforcementLearning()
+            } else {
+                await self.startReinforcementLearning()
+            }
+        }
+    }
     private var agent: AgentRuntime?
+    private var reinforcement: ReinforcementLearningEngine?
     private var runningVersion: ModelVersionManifest?
     private var runningContextValues: [UUID: UUID] = [:]
     private var activeRuntimeCaptureSpec: CaptureSpec?
@@ -154,6 +181,7 @@ final class AppModel: ObservableObject {
     private var recordingLaunchRevision: UInt64 = 0
     private var humanHUDStateRevision: UInt64 = 0
     private var agentLaunchRevision: UInt64 = 0
+    private var reinforcementLaunchRevision: UInt64 = 0
     private var lastEventClock = RecordingClock()
     private var profileAutosaveTask: Task<Void, Never>?
     private var captureSourceMonitorTask: Task<Void, Never>?
@@ -162,6 +190,8 @@ final class AppModel: ObservableObject {
     private var updateCheckStarted = false
     private var autoTrainingProfileID: UUID?
     private var trainingInterruption: TrainingInterruption?
+    private var reinforcementStopRequested = false
+    private var reinforcementContextVersionID: UUID?
     private var runContextLoadRevision: UInt64 = 0
 
     private enum TrainingInterruption: Equatable {
@@ -175,12 +205,19 @@ final class AppModel: ObservableObject {
     var selectedProfile: AIProfile? { profiles.first { $0.id == selectedProfileID } }
     var recordingIsActiveOrStarting: Bool { isRecording || isStartingRecording || isStoppingRecording }
     var agentIsActiveOrStarting: Bool { agent != nil || isStartingAgent }
+    var reinforcementIsActiveOrStarting: Bool {
+        reinforcement != nil || isStartingReinforcementLearning
+            || isStoppingReinforcementLearning
+    }
+    var liveControlIsActiveOrStarting: Bool {
+        agentIsActiveOrStarting || reinforcementIsActiveOrStarting
+    }
     var daggerLifecycleIsActive: Bool {
         isStartingDAgger || isDAggerRecording || isSavingDAgger || pendingDAggerDirectory != nil
     }
     var canChangeStorageLocations: Bool {
         !isChangingStorageLocation && !recordingIsActiveOrStarting && !isTraining
-            && !agentIsActiveOrStarting && !daggerLifecycleIsActive && !isReplaying
+            && !liveControlIsActiveOrStarting && !daggerLifecycleIsActive && !isReplaying
     }
 
     init() {
@@ -221,15 +258,19 @@ final class AppModel: ObservableObject {
         isRestoringWorkflowSettings = false
         if migratedMouseMode { persistWorkflowSettings() }
         if let data = UserDefaults.standard.data(forKey: "AgentTrainer.Hotkeys"), let saved = try? JSONDecoder().decode(HotkeySettings.self, from: data) { hotkeys = saved }
-        if Set([hotkeys.panic, hotkeys.record, hotkeys.run]).count != 3 { hotkeys = HotkeySettings() }
+        hotkeys = hotkeys.resolvingReinforcementConflict()
         if let data = UserDefaults.standard.data(forKey: "AgentTrainer.RecordingPresets"),
            let saved = try? JSONDecoder().decode([RecordingPreset].self, from: data) {
             recordingPresets = saved.compactMap { try? $0.validated() }.sorted { $0.createdAt < $1.createdAt }
         }
-        input.ignoredHotkeys = [hotkeys.panic, hotkeys.record, hotkeys.run]
+        input.ignoredHotkeys = [
+            hotkeys.panic, hotkeys.record, hotkeys.run,
+            hotkeys.reinforcementLearning
+        ]
         reenactor.onFinish = { [weak self] reason in Task { @MainActor in self?.isReplaying = false; self?.activityStatus = reason ?? "Reenactment complete" } }
         AppLog.write(category: "Lifecycle", "Application model initialized")
         panicHotkey.start(); recordHotkey.start(); runHotkey.start()
+        reinforcementHotkey.start()
         startCaptureSourceMonitoring()
         Task { await bootstrap() }
     }
@@ -351,7 +392,7 @@ final class AppModel: ObservableObject {
 
     func captureEnvironmentDidChange() {
         guard isAppActive, selection == .record || selection == .run,
-              !recordingIsActiveOrStarting, !agentIsActiveOrStarting else { return }
+              !recordingIsActiveOrStarting, !liveControlIsActiveOrStarting else { return }
         Task { await refreshSources(reportFailure: false) }
     }
 
@@ -363,7 +404,7 @@ final class AppModel: ObservableObject {
                 guard !Task.isCancelled, let self else { return }
                 let sourcePickerIsVisible = self.selection == .record || self.selection == .run
                 guard self.isAppActive, sourcePickerIsVisible,
-                      !self.recordingIsActiveOrStarting, !self.agentIsActiveOrStarting else { continue }
+                      !self.recordingIsActiveOrStarting, !self.liveControlIsActiveOrStarting else { continue }
                 await self.refreshSources(reportFailure: false)
             }
         }
@@ -478,7 +519,7 @@ final class AppModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !recordingIsActiveOrStarting, !agentIsActiveOrStarting, !isReplaying else { return }
+        guard !recordingIsActiveOrStarting, !liveControlIsActiveOrStarting, !isReplaying else { return }
         guard let source = selectedSource else { present(AgentTrainerError.invalidConfiguration("Select a capture source.")); return }
         guard let destinationFolderID = recordingDestinationFolderID else { present(AgentTrainerError.invalidConfiguration("Create or select a recording folder.")); return }
         guard recordingFolders.contains(where: { $0.id == destinationFolderID }) else { present(AgentTrainerError.invalidConfiguration("The selected recording folder no longer exists.")); return }
@@ -915,7 +956,7 @@ final class AppModel: ObservableObject {
     }
     func deleteProfile(_ profile: AIProfile) async {
         guard !isProfileBusy(profile.id) else {
-            present(AgentTrainerError.model("Stop this AI's Run, training, or pending DAgger publication before deleting it."))
+            present(AgentTrainerError.model("Stop this AI's Run, RL, training, or pending DAgger publication before deleting it."))
             return
         }
         profileAutosaveTask?.cancel()
@@ -958,6 +999,7 @@ final class AppModel: ObservableObject {
     private func startTraining(automaticallyRepeating: Bool) {
         guard let profile = selectedProfile, !isTraining else { return }
         guard runningProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently running. Select a different AI to train in the background.")); return }
+        guard reinforcementProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently learning through RL. Select a different AI for demonstration training.")); return }
         guard pendingDAggerProfileID != profile.id else {
             present(AgentTrainerError.model("This AI is still publishing its DAgger correction. Wait for it to appear in Library before training so the correction is included."))
             return
@@ -981,10 +1023,16 @@ final class AppModel: ObservableObject {
         trainingContextSchema = (try? ModelContextSchema.trained(from: selected.map {
             $0.manifest.effectiveContextAssignments
         })) ?? .empty
-        isTraining = true; trainingProfileID = profile.id; trainingStatus = "Preparing packed dataset cache for \(profile.name)"; activityStatus = trainingStatus
+        isTraining = true; trainingProfileID = profile.id; trainingStatus = "Preparing packed dataset cache for \(profile.name)"; activityStatus = reinforcementIsActiveOrStarting ? "RL active • \(trainingStatus)" : trainingStatus
         AppLog.write(category: "Training", isAutoTraining ? "Auto training started" : "Training started", details: "\(profile.name), \(selected.count) recordings, batch \(profile.training.batchSize), \(profile.preprocessing.width)×\(profile.preprocessing.height)")
         training.start(profile: profile, recordings: selected, runSettings: trainingRunSettings) { [weak self] value, status in
-            Task { @MainActor in self?.trainingMetrics = value; self?.trainingStatus = status; self?.activityStatus = self?.isRunning == true ? "AI running • \(status)" : status }
+            Task { @MainActor in
+                self?.trainingMetrics = value
+                self?.trainingStatus = status
+                self?.activityStatus = self?.reinforcementIsActiveOrStarting == true
+                    ? "RL active • \(status)"
+                    : self?.isRunning == true ? "AI running • \(status)" : status
+            }
         } completion: { [weak self] result in
             Task { @MainActor in
                 await self?.handleTrainingCompletion(result, profileID: profile.id)
@@ -1007,7 +1055,8 @@ final class AppModel: ObservableObject {
                 let selected = recordings.filter { profile.recordingIDs.contains($0.id) || $0.manifest.folderID.map(folderIDs.contains) == true }
                 guard !selected.isEmpty else { let error = AgentTrainerError.noData; finishTraining(with: error); present(error); return }
                 trainingStatus = "Training block complete — starting the next \(profile.training.epochs)-epoch block"
-                activityStatus = trainingStatus
+                activityStatus = reinforcementIsActiveOrStarting
+                    ? "RL active • \(trainingStatus)" : trainingStatus
                 launchTraining(profile: profile, recordings: selected)
                 return
             }
@@ -1036,7 +1085,8 @@ final class AppModel: ObservableObject {
         case .stop: trainingStatus = "Training stopped."
         case nil: trainingStatus = completion.completed ? "Training complete — runnable brain saved" : "Paused — current brain is ready to run and resume"
         }
-        activityStatus = trainingStatus
+        activityStatus = reinforcementIsActiveOrStarting
+            ? "RL active • \(trainingStatus)" : trainingStatus
     }
 
     private func finishTraining(with error: Error) {
@@ -1048,7 +1098,8 @@ final class AppModel: ObservableObject {
         autoTrainingProfileID = nil
         trainingInterruption = nil
         trainingStatus = interruption == .stop ? "Training stopped." : error.localizedDescription
-        activityStatus = trainingStatus
+        activityStatus = reinforcementIsActiveOrStarting
+            ? "RL active • \(trainingStatus)" : trainingStatus
     }
 
     func pauseTraining() {
@@ -1058,7 +1109,8 @@ final class AppModel: ObservableObject {
         autoTrainingProfileID = nil
         training.pauseAndSave()
         trainingStatus = training.isRunning ? "Saving exact training state…" : "Pausing automatic training after the completed block…"
-        activityStatus = trainingStatus
+        activityStatus = reinforcementIsActiveOrStarting
+            ? "RL active • \(trainingStatus)" : trainingStatus
     }
 
     func stopTraining() {
@@ -1068,12 +1120,13 @@ final class AppModel: ObservableObject {
         autoTrainingProfileID = nil
         training.stop()
         trainingStatus = training.isRunning ? "Stopping training safely…" : "Stopping automatic training after the completed block…"
-        activityStatus = trainingStatus
+        activityStatus = reinforcementIsActiveOrStarting
+            ? "RL active • \(trainingStatus)" : trainingStatus
     }
 
     func startAgent() async {
         guard let profile = selectedProfile, let versionID = profile.activeVersionID,
-              let source = selectedSource, !recordingIsActiveOrStarting, !agentIsActiveOrStarting, agent == nil, !isReplaying else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop recording, replay, or any current AI first.")); return }
+              let source = selectedSource, !recordingIsActiveOrStarting, !liveControlIsActiveOrStarting, agent == nil, !isReplaying else { present(AgentTrainerError.model("Select a trained AI and a live capture source, and stop recording, replay, RL, or any current AI first.")); return }
         guard trainingProfileID != profile.id else { present(AgentTrainerError.model("This AI is currently training. Select another trained AI to run at the same time.")); return }
         do { try validateCurrentRecordingSettings(source: source) }
         catch { present(error); return }
@@ -1197,7 +1250,7 @@ final class AppModel: ObservableObject {
             runtimeSafety.panicKeyCode = UInt16(clamping: hotkeys.panic.keyCode)
             runtimeSafety.panicModifiers = hotkeys.panic.cgEventModifiers
             let previewRate = visionPreviewMatchesPerception ? version.training.perceptionFPS : visionPreviewFPS
-            try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: runtimeCaptureSpec, captureRect: runtimeCaptureRect, mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, contextSelection: runtimeContextSelection, safety: runtimeSafety, daggerCaptureConfiguration: daggerCaptureConfiguration, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run])
+            try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: runtimeCaptureSpec, captureRect: runtimeCaptureRect, mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, contextSelection: runtimeContextSelection, safety: runtimeSafety, daggerCaptureConfiguration: daggerCaptureConfiguration, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run, hotkeys.reinforcementLearning])
             runtime.updateContextSelection(runContextValues)
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
             if isRunning, agent === runtime { runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue)"; activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus; AppLog.write(category: "Runtime", "Agent started", details: "\(profile.name), \(resolvedMouseMode.rawValue), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")") }
@@ -1244,6 +1297,276 @@ final class AppModel: ObservableObject {
             return
         }
         if let runtime { finishAgentRuntime(runtime, status: finalStatus) }
+    }
+
+    /// RL is intentionally keybind-only. This method is invoked by the global
+    /// RL shortcut and has no corresponding start/stop button in the UI.
+    func startReinforcementLearning() async {
+        guard let profile = selectedProfile, let source = selectedSource,
+              !recordingIsActiveOrStarting, !liveControlIsActiveOrStarting,
+              !isReplaying else {
+            present(AgentTrainerError.model(
+                "Select an AI and live capture source, then stop recording, replay, Run, or any current RL session."
+            ))
+            return
+        }
+        guard trainingProfileID != profile.id else {
+            present(AgentTrainerError.model(
+                "This AI is currently using demonstration training. Pause it before starting RL, or select another AI."
+            ))
+            return
+        }
+        do {
+            try validateProfile(profile)
+            _ = try profile.effectiveReinforcementLearning.validated()
+            try validateCurrentRecordingSettings(source: source)
+        } catch {
+            present(error)
+            return
+        }
+
+        isStartingReinforcementLearning = true
+        reinforcementProfileID = profile.id
+        reinforcementStopRequested = false
+        reinforcementLaunchRevision &+= 1
+        let launchToken = reinforcementLaunchRevision
+        reinforcementStatus = "Preparing isolated PPO actor and reward connection…"
+        activityStatus = reinforcementStatus
+        var attemptedEngine: ReinforcementLearningEngine?
+        do {
+            let version: ModelVersionManifest?
+            if let versionID = profile.activeVersionID {
+                guard let loaded = await WorkspaceStore.shared.version(
+                    profileID: profile.id,
+                    versionID: versionID
+                ) else {
+                    throw AgentTrainerError.model(
+                        "The active brain is missing. Choose another saved brain or reset this AI before RL training."
+                    )
+                }
+                version = loaded
+                if runContextVersionID != loaded.id {
+                    runContextSchema = loaded.effectiveContextSchema
+                    runContextVersionID = loaded.id
+                    runContextValues = [:]
+                }
+            } else {
+                version = nil
+                runContextSchema = .empty
+                runContextVersionID = nil
+                runContextValues = [:]
+            }
+            guard reinforcementLaunchRevision == launchToken else {
+                throw CancellationError()
+            }
+            let configuration = try profile.effectiveReinforcementLearning.validated()
+            let resolvedMouseMode = try await resolvedReinforcementMouseMode(
+                profile: profile,
+                version: version,
+                configuration: configuration
+            )
+            guard reinforcementLaunchRevision == launchToken else {
+                throw CancellationError()
+            }
+            let engine = try ReinforcementLearningEngine()
+            attemptedEngine = engine
+            engine.onState = { [weak self, weak engine] state in
+                Task { @MainActor in
+                    guard let self, let engine, self.reinforcement === engine,
+                          self.isReinforcementLearning
+                            || self.isStartingReinforcementLearning else { return }
+                    self.hudModel.update(state: state, source: .agent)
+                }
+            }
+            engine.onPreview = { [weak self, weak engine] frame in
+                Task { @MainActor in
+                    guard let self, let engine, self.reinforcement === engine else { return }
+                    self.hudModel.updateVision(frame)
+                }
+            }
+            engine.onRuntimeMetrics = { [weak self, weak engine] value in
+                Task { @MainActor in
+                    guard let self, let engine, self.reinforcement === engine else { return }
+                    self.runtimeMetrics = value
+                }
+            }
+            engine.onVersionPublished = { [weak self, weak engine] updated, version in
+                Task { @MainActor in
+                    guard let self, let engine, self.reinforcement === engine else { return }
+                    if let index = self.profiles.firstIndex(where: { $0.id == updated.id }) {
+                        self.profiles[index] = updated
+                    }
+                    if self.selectedProfileID == updated.id {
+                        self.runContextSchema = version.effectiveContextSchema
+                        self.runContextVersionID = version.id
+                        self.reinforcementContextVersionID = version.id
+                    }
+                    if self.versionsLoadedForProfileID == updated.id {
+                        await self.refreshVersions()
+                    }
+                }
+            }
+            reinforcement = engine
+            reinforcementContextVersionID = version?.id
+            isReinforcementLearning = true
+            hudModel.show(
+                source: .agent,
+                vision: showVisionPreview,
+                cnnVisualization: CNNVisualizationSettings()
+            )
+            var runtimeSafety = safety
+            runtimeSafety.panicKeyCode = UInt16(clamping: hotkeys.panic.keyCode)
+            runtimeSafety.panicModifiers = hotkeys.panic.cgEventModifiers
+            let runtimeCaptureSpec = captureSpec(source: source)
+            let runtimeCaptureRect = effectiveCaptureRect(source)
+            let previewRate = showVisionPreview
+                ? (visionPreviewMatchesPerception
+                    ? (version?.training.perceptionFPS ?? profile.training.perceptionFPS)
+                    : visionPreviewFPS)
+                : 0
+            try await engine.start(
+                profile: profile,
+                version: version,
+                captureSpec: runtimeCaptureSpec,
+                captureRect: runtimeCaptureRect,
+                frameMode: frameMode,
+                mouseMode: resolvedMouseMode,
+                gameCamera: gameCamera,
+                outputPermissions: runtimeOutputPermissions,
+                contextSelection: runContextValues,
+                safety: runtimeSafety,
+                previewFPS: previewRate,
+                ignoredHotkeys: [
+                    hotkeys.panic, hotkeys.record, hotkeys.run,
+                    hotkeys.reinforcementLearning
+                ],
+                metrics: { [weak self, weak engine] value, status in
+                    Task { @MainActor in
+                        guard let self, let engine, self.reinforcement === engine else { return }
+                        self.reinforcementMetrics = value
+                        self.reinforcementStatus = status
+                        self.activityStatus = self.isTraining
+                            ? "RL active • \(self.trainingStatus)" : status
+                    }
+                },
+                completion: { [weak self, weak engine] result in
+                    Task { @MainActor in
+                        guard let self, let engine else { return }
+                        await self.handleReinforcementCompletion(
+                            result,
+                            engine: engine
+                        )
+                    }
+                }
+            )
+            guard reinforcementLaunchRevision == launchToken,
+                  reinforcement === engine else {
+                await engine.stop(reason: "RL start cancelled by keybind")
+                throw CancellationError()
+            }
+            isStartingReinforcementLearning = false
+            reinforcementStatus = "RL training active • stop with \(hotkeys.reinforcementLearning.displayName)"
+            activityStatus = reinforcementStatus
+            let rewardEndpoint = configuration.validatedWebSocketURL.map {
+                "\($0.scheme ?? "ws")://\($0.host ?? "configured host")"
+                    + ($0.port.map { ":\($0)" } ?? "")
+            } ?? "configured WebSocket"
+            AppLog.write(
+                category: "Reinforcement Learning",
+                "RL training started",
+                details: "\(profile.name), \(rewardEndpoint), \(resolvedMouseMode.rawValue), \(configuration.actionSpace.allowedKeyCodes.count) allowed keys, \(configuration.actionSpace.allowedMouseButtons.count) allowed mouse buttons"
+            )
+        } catch is CancellationError {
+            if let attemptedEngine, reinforcement === attemptedEngine {
+                reinforcement = nil
+            }
+            reinforcementContextVersionID = nil
+            isStartingReinforcementLearning = false
+            isStoppingReinforcementLearning = false
+            isReinforcementLearning = false
+            reinforcementProfileID = nil
+            hudModel.hide()
+            reinforcementStatus = "RL start cancelled; inputs released"
+            activityStatus = isTraining ? trainingStatus : reinforcementStatus
+        } catch {
+            if let attemptedEngine, attemptedEngine.isRunning {
+                await attemptedEngine.stop(reason: "RL start failed")
+            }
+            if reinforcement === attemptedEngine { reinforcement = nil }
+            reinforcementContextVersionID = nil
+            isStartingReinforcementLearning = false
+            isStoppingReinforcementLearning = false
+            isReinforcementLearning = false
+            reinforcementProfileID = nil
+            hudModel.hide()
+            reinforcementStatus = error.localizedDescription
+            present(error)
+        }
+    }
+
+    func stopReinforcementLearning() async {
+        guard reinforcementIsActiveOrStarting else { return }
+        reinforcementLaunchRevision &+= 1
+        reinforcementStopRequested = true
+        isStoppingReinforcementLearning = true
+        guard let engine = reinforcement else {
+            reinforcementStatus = "Cancelling RL startup…"
+            activityStatus = reinforcementStatus
+            return
+        }
+        reinforcementStatus = "Stopping RL safely, releasing inputs, and publishing the actor…"
+        activityStatus = reinforcementStatus
+        await engine.stop(reason: "RL training stopped by keybind")
+    }
+
+    private func handleReinforcementCompletion(
+        _ result: Result<ReinforcementLearningCompletion, Error>,
+        engine: ReinforcementLearningEngine
+    ) async {
+        guard reinforcement === engine else { return }
+        let requestedStop = reinforcementStopRequested
+        reinforcement = nil
+        reinforcementContextVersionID = nil
+        reinforcementProfileID = nil
+        isStartingReinforcementLearning = false
+        isStoppingReinforcementLearning = false
+        isReinforcementLearning = false
+        reinforcementStopRequested = false
+        runtimeMetrics = RuntimeMetrics()
+        hudModel.hide()
+        switch result {
+        case .success(let completion):
+            await refreshLibrary()
+            selectedProfileID = completion.profile.id
+            if versionsLoadedForProfileID == completion.profile.id {
+                await refreshVersions()
+            }
+            await prepareRunContext(reset: true)
+            reinforcementStatus = completion.version == nil
+                ? "\(completion.reason) • no complete PPO update was available, so the brain was unchanged"
+                : "\(completion.reason) • runnable actor saved • normal Run needs no reward connection"
+            activityStatus = isTraining ? trainingStatus : reinforcementStatus
+            AppLog.write(
+                category: "Reinforcement Learning",
+                completion.version == nil ? "RL session stopped without experience" : "RL actor published",
+                details: completion.version.map {
+                    "episode \($0.reinforcementLearningSummary?.episode ?? 0), update \($0.reinforcementLearningSummary?.update ?? 0), return \($0.reinforcementLearningSummary?.lastEpisodeReturn ?? 0)"
+                }
+            )
+        case .failure(let error):
+            reinforcementStatus = error.localizedDescription
+            activityStatus = isTraining ? trainingStatus : reinforcementStatus
+            if !requestedStop { present(error) }
+            else {
+                AppLog.write(
+                    .error,
+                    category: "Reinforcement Learning",
+                    "RL could not publish its final actor",
+                    details: error.localizedDescription
+                )
+                present(error)
+            }
+        }
     }
 
     func toggleDAggerRecording() async {
@@ -1457,19 +1780,19 @@ final class AppModel: ObservableObject {
     }
     func startReenactment() {
         guard let recording = selectedRecording else { return }
-        guard !agentIsActiveOrStarting, !recordingIsActiveOrStarting, !isReplaying else {
-            present(AgentTrainerError.invalidConfiguration("Stop the current agent or recording before reenacting real input."))
+        guard !liveControlIsActiveOrStarting, !recordingIsActiveOrStarting, !isReplaying else {
+            present(AgentTrainerError.invalidConfiguration("Stop the current agent, RL session, or recording before reenacting real input."))
             return
         }
         do { try reenactor.start(recording: recording); isReplaying = true; activityStatus = "Guarded reenactment running"; AppLog.write(category: "Replay", "Reenactment started", details: recording.manifest.name) } catch { present(error) }
     }
     func stopReenactment() { reenactor.stop(); if isReplaying { AppLog.write(category: "Replay", "Reenactment stopped") }; isReplaying = false; activityStatus = "Reenactment stopped" }
-    func panic() { AppLog.write(.warning, category: "Safety", "Panic stop requested"); Task { stopReenactment(); await stopAgent(); if recordingIsActiveOrStarting { await stopRecording() }; if isTraining { stopTraining() } } }
+    func panic() { AppLog.write(.warning, category: "Safety", "Panic stop requested"); Task { stopReenactment(); await stopAgent(); await stopReinforcementLearning(); if recordingIsActiveOrStarting { await stopRecording() }; if isTraining { stopTraining() } } }
     func clearCaches() async { do { try await WorkspaceStore.shared.clearCaches(); await refreshStorageState(); activityStatus = "Dataset caches cleared"; AppLog.write(category: "Storage", "Dataset caches cleared") } catch { present(error) } }
 
     func chooseStorageLocation(_ kind: WorkspaceDataKind) async {
         guard canChangeStorageLocations else {
-            present(AgentTrainerError.storage("Stop recording, training, running, and replay before changing storage locations."))
+            present(AgentTrainerError.storage("Stop recording, training, RL, running, and replay before changing storage locations."))
             return
         }
         let current = kind == .trainingData ? storageLocations.trainingDataRoot : storageLocations.modelsRoot
@@ -1490,7 +1813,7 @@ final class AppModel: ObservableObject {
 
     func restoreDefaultStorageLocation(_ kind: WorkspaceDataKind) async {
         guard canChangeStorageLocations else {
-            present(AgentTrainerError.storage("Stop recording, training, running, and replay before changing storage locations."))
+            present(AgentTrainerError.storage("Stop recording, training, RL, running, and replay before changing storage locations."))
             return
         }
         await changeStorageLocation(kind, to: storageLocations.supportRoot)
@@ -1565,24 +1888,26 @@ final class AppModel: ObservableObject {
     }
 
     func saveHotkeys(_ value: HotkeySettings) {
-        guard Set([value.panic, value.record, value.run]).count == 3 else { resumeGlobalHotkeys(); present(AgentTrainerError.invalidConfiguration("Panic, recording, and agent shortcuts must be different.")); return }
+        guard Set([
+            value.panic, value.record, value.run, value.reinforcementLearning
+        ]).count == 4 else { resumeGlobalHotkeys(); present(AgentTrainerError.invalidConfiguration("Panic, recording, agent, and RL shortcuts must all be different.")); return }
         let previous = hotkeys
         hotkeys = value
-        panicHotkey.update(value.panic); recordHotkey.update(value.record); runHotkey.update(value.run)
-        let statuses = [panicHotkey.registrationStatus, recordHotkey.registrationStatus, runHotkey.registrationStatus]
+        panicHotkey.update(value.panic); recordHotkey.update(value.record); runHotkey.update(value.run); reinforcementHotkey.update(value.reinforcementLearning)
+        let statuses = [panicHotkey.registrationStatus, recordHotkey.registrationStatus, runHotkey.registrationStatus, reinforcementHotkey.registrationStatus]
         if let failure = statuses.first(where: { $0 != GlobalHotkeyMonitor.successStatus }) {
             hotkeys = previous
-            panicHotkey.update(previous.panic); recordHotkey.update(previous.record); runHotkey.update(previous.run)
+            panicHotkey.update(previous.panic); recordHotkey.update(previous.record); runHotkey.update(previous.run); reinforcementHotkey.update(previous.reinforcementLearning)
             present(AgentTrainerError.invalidConfiguration("macOS could not register that global shortcut (error \(failure)). The previous shortcuts were restored."))
         } else {
             if let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: "AgentTrainer.Hotkeys") }
-            input.ignoredHotkeys = [value.panic, value.record, value.run]
+            input.ignoredHotkeys = [value.panic, value.record, value.run, value.reinforcementLearning]
             activityStatus = "Global shortcuts updated"
         }
     }
 
-    func suspendGlobalHotkeys() { panicHotkey.stop(); recordHotkey.stop(); runHotkey.stop() }
-    func resumeGlobalHotkeys() { panicHotkey.start(); recordHotkey.start(); runHotkey.start() }
+    func suspendGlobalHotkeys() { panicHotkey.stop(); recordHotkey.stop(); runHotkey.stop(); reinforcementHotkey.stop() }
+    func resumeGlobalHotkeys() { panicHotkey.start(); recordHotkey.start(); runHotkey.start(); reinforcementHotkey.start() }
 
     func createRecordingPreset(name: String) {
         do {
@@ -1867,6 +2192,41 @@ final class AppModel: ObservableObject {
         }.value
     }
 
+    private func resolvedReinforcementMouseMode(
+        profile: AIProfile,
+        version: ModelVersionManifest?,
+        configuration: ReinforcementLearningConfiguration
+    ) async throws -> MouseControlMode {
+        let actionSpace = configuration.actionSpace
+        if runMouseMode == .absolute {
+            guard !profile.channels.mouseMovement
+                    || !actionSpace.allowsRelativeMouseMovement
+                    || actionSpace.allowsAbsoluteMouseMovement else {
+                throw AgentTrainerError.invalidConfiguration(
+                    "Run is set to Absolute Cursor, but the RL allowlist permits only Game Camera movement. Change the Run mouse mode or the RL movement allowlist."
+                )
+            }
+            return .absolute
+        }
+        if runMouseMode == .relative {
+            guard !profile.channels.mouseMovement
+                    || !actionSpace.allowsAbsoluteMouseMovement
+                    || actionSpace.allowsRelativeMouseMovement else {
+                throw AgentTrainerError.invalidConfiguration(
+                    "Run is set to Game Camera, but the RL allowlist permits only Absolute Cursor movement. Change the Run mouse mode or the RL movement allowlist."
+                )
+            }
+            return .relative
+        }
+        if actionSpace.allowsRelativeMouseMovement
+            && !actionSpace.allowsAbsoluteMouseMovement { return .relative }
+        if actionSpace.allowsAbsoluteMouseMovement
+            && !actionSpace.allowsRelativeMouseMovement { return .absolute }
+        if let recommended = version?.recommendedMouseMode,
+           recommended != .automatic { return recommended }
+        return await resolvedMouseMode(for: profile)
+    }
+
     private func repairLegacyRecordingClocks() async {
         var changed = false
         for item in recordings where item.manifest.hostStartNanos == 0 || item.manifest.duration > 24 * 60 * 60 {
@@ -1927,6 +2287,9 @@ final class AppModel: ObservableObject {
             throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, cosine cycles 1–10,000 epochs, plateau patience 1–1,000, minimum learning-rate ratio 0.001–0.5, focal gamma 0–4, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
         }
         _ = try training.effectiveDAgger.validated()
+        _ = try profile.effectiveReinforcementLearning.validated(
+            requiresActionSelection: false
+        )
         let futureAction = training.effectiveFutureActionPrediction
         if futureAction.enabled {
             let offsets = futureAction.actionOffsets(actionFPS: training.actionFPS)
@@ -1965,7 +2328,8 @@ final class AppModel: ObservableObject {
     }
 
     func isProfileBusy(_ id: UUID) -> Bool {
-        trainingProfileID == id || runningProfileID == id || pendingDAggerProfileID == id
+        trainingProfileID == id || runningProfileID == id
+            || reinforcementProfileID == id || pendingDAggerProfileID == id
     }
 
     private func persistWorkflowSettings() {
