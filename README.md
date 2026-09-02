@@ -1,8 +1,8 @@
-# AgentTrainer 2.4.0
+# AgentTrainer 2.4.5
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training imitation and reinforcement-learning policies with MLX, and running those policies with explicit safety controls.
 
-Recordings, models, settings, and diagnostics stay on the Mac. Network use is limited to the public GitHub Releases check and a reward WebSocket explicitly configured by the user while reinforcement learning is active. AgentTrainer does not upload training data or telemetry.
+Recordings, models, settings, and diagnostics stay on the Mac. Network use is limited to the public GitHub Releases check and the reward WebSocket server explicitly configured by the user while reinforcement learning is active. That server is local-only by default. AgentTrainer does not upload training data or telemetry.
 
 ## Requirements
 
@@ -26,7 +26,7 @@ The package pins MLX Swift exactly in `Package.resolved`.
 7. Resume training. Existing compatible weights are warm-started; correction-aware best-brain selection requires improved correction fit without a meaningful ordinary-behavior regression.
 8. Use the configured panic shortcut at any time to stop hooks and release held controls.
 
-Reinforcement learning is a separate path over the same Policy-v6 actor. In **AI Models → Training Configuration → Reinforcement Learning**, configure the reward WebSocket, explicit action allowlist, episode limits, PPO settings, reward conditioning, reconnect behavior, and save cadence. Then choose the capture source, context, mouse execution, safety, and output permissions in Run and use the dedicated RL shortcut (default `Control–Option–Command–L`) to start or stop. RL has no start/stop button by design.
+Reinforcement learning is a separate path over the same Policy-v6 actor. In **AI Models → Training Configuration → Reinforcement Learning**, configure the explicit action allowlist, per-action exploration/stabilization, episode limits, PPO settings, reward conditioning, and save cadence. Configure the one app-wide hosted endpoint and protocol names in **Settings → Reward WebSocket**. Then choose the capture source, context, mouse execution, safety, and output permissions in Run and use the dedicated RL shortcut (default `Control–Option–Command–L`) to start or stop. RL has no start/stop button by design.
 
 An existing demonstration-trained brain can be warm-started with RL. An RL-trained brain can likewise be warm-started by ordinary training or DAgger. Stopping RL publishes an ordinary runnable actor; normal Run loads that actor without opening a WebSocket or requiring rewards.
 
@@ -36,25 +36,31 @@ The capture-source picker refreshes while Record or Run is visible, and reacts i
 
 ## Reinforcement learning
 
-AgentTrainer uses clipped Proximal Policy Optimization with generalized advantage estimation. Keys, modifiers, and mouse buttons use a joint Bernoulli policy; absolute cursor actions use a sigmoid-bounded Gaussian and Game Camera / scroll actions use tanh-bounded Gaussians. A session-owned value critic shares the actor's learned visual features but is stored only in the isolated RL checkpoint and is never needed by normal Run.
+AgentTrainer uses clipped Proximal Policy Optimization with generalized advantage estimation. Keys, modifiers, and mouse buttons use a joint Bernoulli policy; absolute cursor actions use a sigmoid-bounded Gaussian and Game Camera / scroll actions use tanh-bounded Gaussians. Exploration has separate conservative standard deviations for cursor, camera, and scroll instead of one oversized value. Absolute cursor motion is initialized from the real pointer, smoothed, and step-limited; Game Camera motion is smoothed, dead-zoned, and magnitude-limited. These executable transforms are identical during collection and Run and are immutable metadata on an RL brain.
+
+A session-owned value critic shares the actor's learned visual features but is stored only in the isolated RL checkpoint and is never needed by normal Run. Normal Run uses Bernoulli sampling with the saved temperature for an RL actor rather than converting every key/button probability through a fixed `0.5` threshold. Continuous Run output uses the actor mean plus the saved stabilization contract, avoiding exploration jitter while preserving the learned direction and scale. Demonstration-trained actors retain their established deterministic runtime semantics.
 
 The RL action space is an allowlist, not a blacklist. It starts empty and may contain any combination of:
 
-- exact macOS keyboard keys, with quick-add presets for WASD, arrows, and number-row keys
+- macOS keyboard keys across the complete usable 0–127 virtual-key range—including Space, Return, Tab, Escape, arrows, function/navigation/keypad keys, Caps Lock, Fn/Globe, and modifier families—with quick-add presets for WASD, arrows, and number-row keys
 - exact mouse buttons, including middle and additional side buttons
 - absolute cursor movement
 - relative Game Camera movement
 - scrolling
 
-The final executable action remains the intersection of that allowlist, the immutable capability saved with the RL actor, profile channel switches and blocked outputs, Run's live cursor/keyboard permissions, and the configured control region. A profile must have at least one executable allowed action before RL can start.
+The final executable action remains the intersection of that allowlist, the immutable capability saved with the RL actor, profile channel switches and blocked outputs, Run's cursor/keyboard permissions, the selected mouse mode, and the configured control region. A profile must have at least one executable allowed action before RL can start. Changing a live output permission in a way that would alter an active on-policy action space releases controls, checkpoints, publishes, and stops instead of training against actions that were not actually executed.
 
-The default reward URL is:
+`Maximum Episodes`, runnable publication cadence, and checkpoint cadence are measured from the current start-to-stop RL run. Lifetime episode/update counters remain cumulative for history and exact resume. Terminal-marked rollouts shorter than the preferred four-transition update size are retained across episode resets; a safe/final stop still performs a finite PPO update for even one to three collected transitions rather than silently discarding them.
+
+AgentTrainer is the WebSocket server and the rewarder is the client. The one universal default server URL is:
 
 ```text
 ws://127.0.0.1:47831
 ```
 
-AgentTrainer accepts UTF-8 text or binary JSON messages. A reward may arrive independently at 30–60 Hz or faster; values received between policy perceptions are accumulated without an unbounded message queue:
+The server listens only while RL is starting or active, accepts one rewarder at a time, limits messages to 64 KiB, and is loopback-only by default. Trusted-LAN access is an explicit warning-bearing toggle. RL waits for the rewarder before starting capture or admitting actions.
+
+AgentTrainer accepts complete UTF-8 text or binary JSON messages. A reward may arrive independently at 30–60 Hz or faster; values received between policy perceptions are accumulated without an unbounded message queue:
 
 ```json
 {"reward": 1.5}
@@ -67,9 +73,30 @@ The sender can finish an episode with either of these forms:
 {"type": "episode_finished"}
 ```
 
-At an ordinary boundary AgentTrainer sends `episode_finished`, `episode_starting`, and `episode_started` messages in order. The finished message includes the episode number, reason, return, step count, next episode, and ISO-8601 timestamp. It also sends `training_update_started` / `training_update_finished` around an in-session PPO update so an environment can pause its simulation while actions are released and Metal updates the policy.
+When rewards are intentionally sparse, the rewarder can keep the safety clock fresh without adding reward:
 
-The connection uses a bounded message size and automatic exponential-backoff reconnect. A disconnect always releases synthetic controls and pauses action admission. Optional reward-staleness protection does the same when a connected server stops sending rewards. Episode timers exclude these safe pauses and PPO update time.
+```json
+{"type": "heartbeat"}
+```
+
+Every field/type value below is editable in Settings. Outgoing metadata keys—`episode`, `timestamp`, `reason`, `return`, `steps`, and `next_episode`—remain stable.
+
+| Direction | Default field or type value | Meaning |
+| --- | --- | --- |
+| Receive | `type` | JSON field containing an event name |
+| Receive | `reward` | Finite numeric reward field |
+| Receive | `done` | Boolean episode-finished field |
+| Receive | `episode_finished` | Episode-finished `type` value |
+| Receive | `heartbeat` | Reward-free liveness `type` value |
+| Send | `episode_finished` | Actions released; includes reason/return/steps/next episode |
+| Send | `episode_starting` | Environment may reset before the configured start delay |
+| Send | `episode_started` | Capture/action admission for the new episode is active |
+| Send | `training_update_started` | Actions released before PPO mutates the policy |
+| Send | `training_update_finished` | PPO finished; action admission may resume |
+
+At an ordinary boundary AgentTrainer sends `episode_finished` before any PPO update lifecycle messages, then sends `episode_starting` and `episode_started` in order. The first message includes the episode number, reason, return, step count, next episode, and ISO-8601 timestamp. Rewards that arrive despite `training_update_started` are ignored rather than attached to the next action and are counted in live diagnostics; a remote done signal received during an update is preserved and ends the episode safely.
+
+Disconnect, reward/heartbeat timeout, invalid-message-flood, capture-stop, stale-inference, focus-loss, human-input, panic, and output-permission safeguards all release synthetic controls and clear stale prediction/temporal state. By default, a rewarder disconnect or reward timeout transactionally checkpoints the exact actor/critic/optimizer/random state, publishes any newly updated runnable actor, and stops. Settings can instead keep RL safely paused for a reconnect/fresh heartbeat, with a configurable disconnect grace period. Application quit waits for the same stop-and-save path. Episode timers exclude startup, environment reset, disconnect/stale pauses, and PPO update time.
 
 RL rollout memory is estimated before startup and is capped by both a fixed 1 GiB ceiling and the Mac's physical memory. Exact RL checkpoints transactionally retain actor, critic, AdamW moments, counters, reward normalization, sampling state, and MLX random state. Periodic runnable versions remain bounded by the existing autosave retention policy.
 
@@ -138,6 +165,8 @@ Runtime output is constrained in several independent layers:
 - The panic action stops capture and action queues before releasing every held key and button.
 - A model can emit only keys represented in its training data.
 - An RL model can emit only the keys, mouse buttons, and movement modes in its explicit immutable allowlist.
+- RL Run samples the immutable Bernoulli policy used during training; it does not reinterpret key/button probabilities as permanent thresholded holds.
+- RL mouse execution uses per-category exploration plus saved smoothing, dead-zone, magnitude, cursor-position, and step-limit safeguards in both training and Run.
 - Per-profile restrictions and live cursor/keyboard permissions are applied again at execution.
 - Full-Mac control is opt-in; otherwise output stays inside the configured control region.
 - Locked-camera movement is transient and is never replayed from a stale prediction.
@@ -189,7 +218,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.4.0.dmg`
+- `AgentTrainer-2.4.5.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

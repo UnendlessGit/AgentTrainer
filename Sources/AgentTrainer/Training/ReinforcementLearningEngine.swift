@@ -75,7 +75,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
     private let injector = InputInjector()
     private let safetyMonitor = InputCaptureService()
     private let rewardAccumulator = ReinforcementRewardAccumulator()
-    private lazy var rewardClient = RewardWebSocketClient(
+    private lazy var rewardServer = RewardWebSocketServer(
         accumulator: rewardAccumulator
     ) { [weak self] state, detail in
         self?.handleConnectionState(state, detail: detail)
@@ -95,6 +95,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
     private var actorProfile: AIProfile?
     private var executionProfile: AIProfile?
     private var configuration = ReinforcementLearningConfiguration()
+    private var webSocketSettings = RewardWebSocketServerSettings()
     private var contextSchema = ModelContextSchema.empty
     private var contextVector: [Float] = []
     private var actionPlan: ReinforcementActionPlan?
@@ -174,8 +175,11 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
     private var rollout: [ReinforcementTransition] = []
     private var pendingTransition: ReinforcementTransition?
     private var samplingRandom = ReinforcementRandomGenerator(seed: 7_431)
+    private var actionFilter = ReinforcementActionFilter()
     private var rewardStatistics = ReinforcementRewardStatistics()
     private var currentEpisode = 0
+    private var sessionStartingCompletedEpisodes = 0
+    private var sessionStartingUpdates = 0
     private var episodeStep = 0
     private var episodeReturn = 0.0
     private var episodeStartedAt = 0.0
@@ -190,6 +194,8 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
     private var lastRewardMessageCount = 0
     private var lastRewardRateTime = 0.0
     private var lastFocusCheckTime = 0.0
+    private var disconnectSafetyRevision: UInt64 = 0
+    private var disconnectSafetyTask: Task<Void, Never>?
 
     var isRunning: Bool {
         lock.withLock { !stopped || starting || teardownInProgress }
@@ -204,6 +210,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
     func start(
         profile requestedProfile: AIProfile,
         version: ModelVersionManifest?,
+        webSocketSettings requestedWebSocketSettings: RewardWebSocketServerSettings,
         captureSpec requestedCaptureSpec: CaptureSpec,
         captureRect: CGRect,
         frameMode: FrameMode,
@@ -240,9 +247,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
 
         do {
             let configuration = try requestedProfile.effectiveReinforcementLearning.validated()
-            guard let rewardURL = configuration.validatedWebSocketURL else {
-                throw AgentTrainerError.invalidConfiguration("The RL reward WebSocket URL is invalid.")
-            }
+            let webSocketSettings = try requestedWebSocketSettings.validated()
             var actorProfile = requestedProfile
             let contextSchema: ModelContextSchema
             if let version {
@@ -269,7 +274,8 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             let actionPlan = try ReinforcementActionPlan.make(
                 profile: actorProfile,
                 configuration: configuration,
-                mouseMode: mouseMode
+                mouseMode: mouseMode,
+                outputPermissions: outputPermissions
             )
             let rolloutBytes = configuration.estimatedRolloutBytes(
                 profile: actorProfile,
@@ -307,11 +313,18 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 self.actorProfile = actorProfile
                 self.executionProfile = executionProfile
                 self.configuration = configuration
+                self.webSocketSettings = webSocketSettings
                 self.contextSchema = contextSchema
                 self.contextVector = contextSchema.vector(
                     selection: contextSelection
                 )
                 self.actionPlan = actionPlan
+                self.captureRect = captureRect
+                self.frameMode = frameMode
+                self.mouseMode = mouseMode
+                self.gameCamera = gameCamera
+                self.outputPermissions = outputPermissions
+                self.safety = safety
             }
 
             let profileRoot = await WorkspaceStore.shared.profileDirectory(requestedProfile.id)
@@ -366,16 +379,17 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 seed: configuration.seed
             )
 
-            try await rewardClient.start(
-                url: rewardURL,
-                connectionTimeout: configuration.connectionTimeoutSeconds,
-                reconnectInitialDelay: configuration.reconnectInitialDelaySeconds,
-                reconnectMaximumDelay: configuration.reconnectMaximumDelaySeconds
+            guard lock.withLock({ !stopped }) else { throw CancellationError() }
+            try await rewardServer.start(settings: webSocketSettings)
+            try await rewardServer.waitForRewarder(
+                timeout: webSocketSettings.connectionWaitTimeoutSeconds
             )
             guard lock.withLock({ !stopped }) else { throw CancellationError() }
 
             let now = CACurrentMediaTime()
-            lock.withLock {
+            let initialCursor = Self.normalizedCursor(in: captureRect)
+            let installed = lock.withLock { () -> Bool in
+                guard !stopped else { return false }
                 self.profile = requestedProfile
                 self.actorProfile = actorProfile
                 self.executionProfile = executionProfile
@@ -399,6 +413,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 samplingRandom = ReinforcementRandomGenerator(
                     seed: state.samplingRandomState
                 )
+                actionFilter.reset(absoluteMousePosition: initialCursor)
                 rewardStatistics = state.rewardStatistics
                 rollout.removeAll(keepingCapacity: false)
                 rollout.reserveCapacity(configuration.rolloutSteps)
@@ -410,7 +425,6 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 lastUsableFrame = nil
                 processing = false
                 nextPerceptionTime = 0
-                connectionState = .connected
                 rewardIsStale = false
                 rewardStaleStartedAt = nil
                 connectionPauseStartedAt = nil
@@ -419,6 +433,8 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 episodeBoundaryInProgress = false
                 episodeIsOpen = true
                 currentEpisode = state.completedEpisodes + 1
+                sessionStartingCompletedEpisodes = state.completedEpisodes
+                sessionStartingUpdates = state.updates
                 episodeStep = 0
                 episodeReturn = 0
                 episodeStartedAt = now
@@ -428,8 +444,9 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 lastPreviewTime = 0
                 runtimeMetrics = RuntimeMetrics()
                 reinforcementMetrics = ReinforcementLearningMetrics(
-                    connectionState: .connected,
+                    connectionState: connectionState,
                     episode: currentEpisode,
+                    sessionEpisode: 1,
                     update: state.updates,
                     environmentSteps: state.environmentSteps,
                     averageEpisodeReturn: Self.average(
@@ -443,8 +460,27 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 lastRewardMessageCount = rewardStats.received
                 lastRewardRateTime = now
                 lastFocusCheckTime = 0
-                injector.enable(outputPermissions: outputPermissions)
+                if connectionState == .connected {
+                    injector.enable(outputPermissions: outputPermissions)
+                }
+                return true
             }
+            guard installed else { throw CancellationError() }
+
+            guard lock.withLock({ !stopped && connectionState == .connected }) else {
+                throw RewardWebSocketError.notConnected
+            }
+
+            await sendEpisodeMessage(
+                event: .episodeStarting,
+                episode: currentEpisode
+            )
+            if configuration.interEpisodeStartDelaySeconds > 0 {
+                try await Task.sleep(
+                    for: .seconds(configuration.interEpisodeStartDelaySeconds)
+                )
+            }
+            guard lock.withLock({ !stopped }) else { throw CancellationError() }
 
             safetyMonitor.ignoredHotkeys = ignoredHotkeys
             safetyMonitor.onSample = { [weak self] _ in
@@ -482,10 +518,16 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 }
             )
             guard lock.withLock({ !stopped }) else { throw CancellationError() }
+            let activeStart = CACurrentMediaTime()
+            lock.withLock {
+                episodeStartedAt = activeStart
+                sessionStartedAt = activeStart
+                rewardFreshnessBaseline = activeStart
+            }
             startActionTimer(fps: actorProfile.training.actionFPS)
             lock.withLock { starting = false }
             rewardAccumulator.resetEpisode(clearLastMessageTime: true)
-            await sendEpisodeMessage(type: "episode_started", episode: currentEpisode)
+            await sendEpisodeMessage(event: .episodeStarted, episode: currentEpisode)
             let initialStatus = checkpointFilesAreComplete
                 ? "RL connected • exact PPO checkpoint restored • episode \(currentEpisode)"
                 : version == nil
@@ -503,12 +545,15 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
 
     func stop(reason: String = "RL training stopped by keybind") async {
         let transition = lock.withLock { () -> (Bool, DispatchSourceTimer?) in
-            guard !teardownInProgress, !stopped || starting else {
+            guard !teardownInProgress, (!stopped || starting) else {
                 return (false, nil)
             }
             stopped = true
             starting = false
             teardownInProgress = true
+            disconnectSafetyRevision &+= 1
+            disconnectSafetyTask?.cancel()
+            disconnectSafetyTask = nil
             let timer = actionTimer
             actionTimer = nil
             latestFrame = nil
@@ -537,12 +582,25 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 }
                 do {
                     try self.finalizePendingTransition(terminal: true)
-                    if self.rollout.count >= 4 {
-                        try self.performPolicyUpdate(bootstrapValue: 0)
+                    if ReinforcementRolloutPolicy.canUpdateFinalBatch(
+                        transitionCount: self.rollout.count
+                    ) {
+                        _ = try self.performPolicyUpdate(bootstrapValue: 0)
                     }
-                    let prepared = (self.checkpointState?.updates ?? 0)
-                            > self.lock.withLock { self.lastPublishedUpdate }
-                        ? try self.prepareSnapshot(isAutosave: false) : nil
+                    let hasUnpublishedUpdate = (self.checkpointState?.updates ?? 0)
+                        > self.lock.withLock { self.lastPublishedUpdate }
+                    let prepared: PreparedReinforcementSnapshot?
+                    if hasUnpublishedUpdate {
+                        // Snapshot preparation saves the exact checkpoint and
+                        // the standalone runtime actor in one ordered operation.
+                        prepared = try self.prepareSnapshot(isAutosave: false)
+                    } else {
+                        // A stop caused by quit, panic, capture loss, reward
+                        // timeout, or disconnect still refreshes the recoverable
+                        // actor-critic checkpoint between normal save cadences.
+                        try self.saveCheckpoint()
+                        prepared = nil
+                    }
                     finalization.set(.success(prepared))
                 } catch {
                     finalization.set(.failure(error))
@@ -556,9 +614,9 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             return currentEpisode
         }) {
             await sendEpisodeMessage(
-                type: "episode_finished",
+                event: .episodeFinished,
                 episode: episode,
-                reason: "training_stopped",
+                reason: Self.protocolStopReason(reason),
                 episodeReturn: episodeReturn,
                 steps: episodeStep
             )
@@ -605,16 +663,38 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         case nil:
             completionResult = .failure(CancellationError())
         }
-        await rewardClient.stop()
+        await rewardServer.stop()
         finishTeardown()
         completionHandler?(completionResult)
     }
 
     func updateOutputPermissions(_ permissions: RuntimeOutputPermissions) {
-        lock.withLock { outputPermissions = permissions }
+        let invalidatesActionSpace = lock.withLock { () -> Bool in
+            let movementIsConfigured = actorProfile?.channels.mouseMovement == true
+                && (mouseMode == .absolute
+                    ? configuration.actionSpace.allowsAbsoluteMouseMovement
+                    : configuration.actionSpace.allowsRelativeMouseMovement)
+            let keyboardIsConfigured = !configuration.actionSpace
+                .allowedKeyCodes.isEmpty
+                && (actorProfile?.channels.keyboard == true
+                    || actorProfile?.channels.modifiers == true)
+            let changesMovement = outputPermissions.cursorMovement
+                != permissions.cursorMovement && movementIsConfigured
+            let changesKeyboard = outputPermissions.keyboard
+                != permissions.keyboard && keyboardIsConfigured
+            outputPermissions = permissions
+            return !stopped && (changesMovement || changesKeyboard)
+        }
         actionQueue.async { [weak self] in
             guard let self else { return }
             self.injector.updateOutputPermissions(permissions)
+        }
+        if invalidatesActionSpace {
+            Task {
+                await stop(
+                    reason: "RL saved and stopped because live output permissions changed its active action space"
+                )
+            }
         }
     }
 
@@ -651,7 +731,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         await drain(queue: actionQueue)
         injector.disableAndReleaseAll()
         await drain(queue: inferenceQueue)
-        await rewardClient.stop()
+        await rewardServer.stop()
         finishTeardown()
     }
 
@@ -662,6 +742,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             actorProfile = nil
             executionProfile = nil
             actionPlan = nil
+            actionFilter.reset()
             checkpointState = nil
             checkpointDirectory = nil
             profileRoot = nil
@@ -681,6 +762,9 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             updateInProgress = false
             episodeBoundaryInProgress = false
             episodeIsOpen = false
+            disconnectSafetyRevision &+= 1
+            disconnectSafetyTask?.cancel()
+            disconnectSafetyTask = nil
             teardownInProgress = false
         }
         MLXMemoryLifecycle.reclaimCaches(after: "reinforcement learning")
@@ -850,12 +934,22 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 rewardDrain.lastMessageTime ?? 0,
                 max(episodeStart, freshnessBaseline)
             )
-            let stale = configuration.rewardTimeoutSeconds > 0
-                && now - rewardClock > configuration.rewardTimeoutSeconds
-            if stale, configuration.pauseActionsWhenRewardStale {
+            let stale = webSocketSettings.rewardTimeoutSeconds > 0
+                && now - rewardClock > webSocketSettings.rewardTimeoutSeconds
+            if stale {
                 try finalizePendingTransition(terminal: true, rewardDrain: rewardDrain)
                 pauseForStaleReward()
-                publishMetrics(status: "RL paused safely • waiting for fresh reward messages")
+                if webSocketSettings.stopAndSaveOnRewardTimeout {
+                    Task {
+                        await stop(
+                            reason: "RL saved and stopped because the reward stream became stale"
+                        )
+                    }
+                } else {
+                    publishMetrics(
+                        status: "RL paused safely • waiting for a reward or heartbeat message"
+                    )
+                }
                 return
             }
             if rewardIsStale {
@@ -881,20 +975,30 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 return
             }
             if rollout.count >= configuration.rolloutSteps {
-                try performPolicyUpdate(bootstrapValue: prediction.value)
+                let remoteDone = try performPolicyUpdate(
+                    bootstrapValue: prediction.value
+                )
+                if remoteDone {
+                    beginEpisodeBoundary(reason: "remote_done_during_update")
+                }
                 return
             }
 
             var random = samplingRandom
+            let behavior = configuration.effectiveActionBehavior
             let sample = try session.2.sample(
                 logits: prediction.logits,
-                standardDeviation: Float(configuration.continuousActionStandardDeviation),
-                binaryTemperature: Float(configuration.binaryActionTemperature),
+                behavior: behavior,
                 random: &random
             )
             samplingRandom = random
+            let stabilizedActions = actionFilter.apply(
+                to: sample.executedActions,
+                plan: session.2,
+                behavior: behavior
+            )
             let frameControls = RuntimeActionSemantics.temporalControlValues(
-                sample.executedActions,
+                stabilizedActions,
                 channels: executionProfile?.channels,
                 restrictions: executionProfile?.effectiveRestrictions
                     ?? ActionRestrictions(),
@@ -940,6 +1044,16 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 spec: session.1.preprocessing,
                 now: now
             )
+            if webSocketSettings.stopAndSaveOnInvalidMessageFlood,
+               rewardAccumulator.statistics().invalid
+                    >= webSocketSettings.maximumInvalidMessages {
+                Task {
+                    await stop(
+                        reason: "RL saved and stopped after too many invalid reward messages"
+                    )
+                }
+                return
+            }
             publishMetrics(status: "RL training • episode \(currentEpisode) • rollout \(rollout.count)/\(configuration.rolloutSteps)")
         } catch {
             Task { await stop(reason: error.localizedDescription) }
@@ -985,17 +1099,18 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         reinforcementMetrics.episodeReturn = episodeReturn
     }
 
-    private func performPolicyUpdate(bootstrapValue: Float) throws {
-        guard let policyOptimizer, !rollout.isEmpty else { return }
+    private func performPolicyUpdate(bootstrapValue: Float) throws -> Bool {
+        guard let policyOptimizer, !rollout.isEmpty else { return false }
         lock.withLock {
             updateInProgress = true
             predictionLatch.reset()
             temporalFrames.reset()
         }
+        resetActionFilterToCurrentCursor()
         actionQueue.sync { injector.disableAndReleaseAll() }
         let updateEpisode = currentEpisode
         sendEpisodeMessageSynchronously(
-            type: "training_update_started",
+            event: .trainingUpdateStarted,
             episode: updateEpisode
         )
         let began = CACurrentMediaTime()
@@ -1009,7 +1124,11 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             )
         }
         rollout.removeAll(keepingCapacity: true)
-        _ = rewardAccumulator.drain(aggregation: configuration.rewardAggregation)
+        let pausedSignal = rewardAccumulator.drain(
+            aggregation: configuration.rewardAggregation
+        )
+        reinforcementMetrics.rewardMessagesIgnoredDuringUpdates +=
+            pausedSignal.messageCount
         let updateDuration = CACurrentMediaTime() - began
         lock.withLock { episodeStartedAt += updateDuration }
         if var state = checkpointState {
@@ -1024,7 +1143,9 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             state.lastClipFraction = update.clipFraction
             state.lastExplainedVariance = update.explainedVariance
             checkpointState = state
-            if state.updates.isMultiple(of: configuration.checkpointEveryUpdates) {
+            let updatesThisSession = max(0, state.updates - sessionStartingUpdates)
+            if updatesThisSession > 0,
+               updatesThisSession.isMultiple(of: configuration.checkpointEveryUpdates) {
                 try saveCheckpoint()
             }
         }
@@ -1039,18 +1160,20 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         reinforcementMetrics.mlxActiveMemory = memory.activeMemory
         reinforcementMetrics.mlxCacheMemory = memory.cacheMemory
         reinforcementMetrics.mlxPeakMemory = memory.peakMemory
+        sendEpisodeMessageSynchronously(
+            event: .trainingUpdateFinished,
+            episode: updateEpisode
+        )
         lock.withLock {
             updateInProgress = false
             nextPerceptionTime = 0
             rewardFreshnessBaseline = CACurrentMediaTime()
-            if !stopped, connectionState == .connected, !rewardIsStale {
+            if !stopped, connectionState == .connected, !rewardIsStale,
+               !pausedSignal.episodeFinished {
                 injector.enable(outputPermissions: outputPermissions)
             }
         }
-        sendEpisodeMessageSynchronously(
-            type: "training_update_finished",
-            episode: updateEpisode
-        )
+        return pausedSignal.episodeFinished
     }
 
     private func beginEpisodeBoundary(reason: String, bootstrapValue: Float = 0) {
@@ -1063,12 +1186,40 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             return true
         }
         guard accepted else { return }
+        resetActionFilterToCurrentCursor()
         let finishedEpisode = currentEpisode
         let finishedReturn = episodeReturn
         let finishedSteps = episodeStep
-        actionQueue.async { [weak self] in self?.injector.disableAndReleaseAll() }
-        if rollout.count >= 4 {
-            do { try performPolicyUpdate(bootstrapValue: bootstrapValue) }
+        let anticipatedLifetimeCompleted = (checkpointState?.completedEpisodes ?? 0) + 1
+        let anticipatedMaximum = ReinforcementSessionLimits.reachedMaximumEpisodes(
+            maximumEpisodes: configuration.maximumEpisodes,
+            lifetimeCompleted: anticipatedLifetimeCompleted,
+            lifetimeAtSessionStart: sessionStartingCompletedEpisodes
+        )
+        actionQueue.sync { injector.disableAndReleaseAll() }
+        sendEpisodeMessageSynchronously(
+            event: .episodeFinished,
+            episode: finishedEpisode,
+            reason: reason,
+            episodeReturn: finishedReturn,
+            steps: finishedSteps,
+            nextEpisode: anticipatedMaximum ? nil : finishedEpisode + 1
+        )
+        let canUpdateAtBoundary = ReinforcementRolloutPolicy.canUpdate(
+            transitionCount: rollout.count
+        ) || (anticipatedMaximum
+            && ReinforcementRolloutPolicy.canUpdateFinalBatch(
+                transitionCount: rollout.count
+            ))
+        if !canUpdateAtBoundary, !rollout.isEmpty {
+            // A retained short rollout must not propagate GAE through an
+            // environment reset. Immediate larger updates can bootstrap time
+            // limits from the current critic; deferred tiny segments use a
+            // terminal separator instead of joining unrelated episodes.
+            rollout[rollout.count - 1].terminal = true
+        }
+        if canUpdateAtBoundary {
+            do { _ = try performPolicyUpdate(bootstrapValue: bootstrapValue) }
             catch {
                 failEpisodeBoundary(
                     error,
@@ -1095,10 +1246,19 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             cumulativeReturn: checkpointState?.cumulativeEpisodeReturn ?? 0,
             episodeCount: checkpointState?.completedEpisodes ?? 0
         )
-        let reachedMaximum = configuration.maximumEpisodes > 0
-            && (checkpointState?.completedEpisodes ?? 0) >= configuration.maximumEpisodes
-        let shouldPublish = (checkpointState?.completedEpisodes ?? 0)
-            .isMultiple(of: configuration.publishEveryEpisodes)
+        let completedThisSession = ReinforcementSessionLimits.completedEpisodes(
+            lifetimeCompleted: checkpointState?.completedEpisodes ?? 0,
+            lifetimeAtSessionStart: sessionStartingCompletedEpisodes
+        )
+        let reachedMaximum = ReinforcementSessionLimits.reachedMaximumEpisodes(
+            maximumEpisodes: configuration.maximumEpisodes,
+            lifetimeCompleted: checkpointState?.completedEpisodes ?? 0,
+            lifetimeAtSessionStart: sessionStartingCompletedEpisodes
+        )
+        let shouldPublish = completedThisSession > 0
+            && completedThisSession.isMultiple(
+                of: configuration.publishEveryEpisodes
+            )
         var prepared: PreparedReinforcementSnapshot?
         if (shouldPublish || reachedMaximum),
            (checkpointState?.updates ?? 0) > lock.withLock({ lastPublishedUpdate }) {
@@ -1115,14 +1275,6 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         }
         Task { [weak self] in
             guard let self else { return }
-            await self.sendEpisodeMessage(
-                type: "episode_finished",
-                episode: finishedEpisode,
-                reason: reason,
-                episodeReturn: finishedReturn,
-                steps: finishedSteps,
-                nextEpisode: reachedMaximum ? nil : finishedEpisode + 1
-            )
             if let prepared {
                 do {
                     let updated = try await WorkspaceStore.shared.commitReinforcementVersion(
@@ -1148,7 +1300,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 return
             }
             await self.sendEpisodeMessage(
-                type: "episode_starting",
+                event: .episodeStarting,
                 episode: finishedEpisode + 1
             )
             let delay = self.configuration.interEpisodeDelaySeconds
@@ -1162,19 +1314,12 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
 
     private func failEpisodeBoundary(
         _ error: Error,
-        episode: Int,
-        episodeReturn: Double,
-        steps: Int
+        episode _: Int,
+        episodeReturn _: Double,
+        steps _: Int
     ) {
         Task { [weak self] in
             guard let self else { return }
-            await self.sendEpisodeMessage(
-                type: "episode_finished",
-                episode: episode,
-                reason: "training_error",
-                episodeReturn: episodeReturn,
-                steps: steps
-            )
             await self.stop(reason: error.localizedDescription)
         }
     }
@@ -1186,7 +1331,10 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         episodeReturn = 0
         rewardAccumulator.resetEpisode(clearLastMessageTime: true)
         pendingTransition = nil
-        rollout.removeAll(keepingCapacity: true)
+        // Keep a terminal-marked short rollout across episode boundaries. GAE
+        // already stops at each terminal, and discarding fewer than four steps
+        // here made short externally-ended episodes incapable of learning.
+        resetActionFilterToCurrentCursor()
         lock.withLock {
             episodeBoundaryInProgress = false
             episodeIsOpen = true
@@ -1203,10 +1351,14 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             }
         }
         reinforcementMetrics.episode = nextEpisode
+        reinforcementMetrics.sessionEpisode = max(
+            1,
+            nextEpisode - sessionStartingCompletedEpisodes
+        )
         reinforcementMetrics.episodeStep = 0
         reinforcementMetrics.episodeReturn = 0
         Task {
-            await sendEpisodeMessage(type: "episode_started", episode: nextEpisode)
+            await sendEpisodeMessage(event: .episodeStarted, episode: nextEpisode)
         }
         publishMetrics(status: "RL episode \(nextEpisode) started")
     }
@@ -1223,11 +1375,13 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             return true
         }
         guard paused else { return }
+        resetActionFilterToCurrentCursor()
         actionQueue.async { [weak self] in self?.injector.disableAndReleaseAll() }
     }
 
     private func resumeAfterFreshReward() {
         rewardAccumulator.resetEpisode(clearLastMessageTime: false)
+        resetActionFilterToCurrentCursor()
         lock.withLock {
             if let rewardStaleStartedAt {
                 episodeStartedAt += max(0, CACurrentMediaTime() - rewardStaleStartedAt)
@@ -1252,15 +1406,25 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         _ state: ReinforcementConnectionState,
         detail: String?
     ) {
-        let beganPause = lock.withLock { () -> Bool in
+        let transition = lock.withLock { () -> (
+            beganPause: Bool,
+            scheduleSafetyStop: Bool,
+            revision: UInt64,
+            grace: Double
+        ) in
             connectionState = state
+            disconnectSafetyRevision &+= 1
+            let revision = disconnectSafetyRevision
+            disconnectSafetyTask?.cancel()
+            disconnectSafetyTask = nil
+            var beganPause = false
             if state != .connected {
                 predictionLatch.reset()
                 temporalFrames.reset()
                 if profile != nil, connectionPauseStartedAt == nil,
                    !rewardIsStale {
                     connectionPauseStartedAt = CACurrentMediaTime()
-                    return true
+                    beganPause = true
                 }
             } else if let connectionPauseStartedAt {
                 episodeStartedAt += max(
@@ -1272,13 +1436,19 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                 temporalFrames.reset()
                 predictionLatch.reset()
             }
-            return false
+            return (
+                beganPause,
+                beganPause && webSocketSettings.stopAndSaveOnDisconnect,
+                revision,
+                webSocketSettings.disconnectGracePeriodSeconds
+            )
         }
         if state != .connected {
             actionQueue.async { [weak self] in self?.injector.disableAndReleaseAll() }
-            if beganPause {
+            if transition.beganPause {
                 inferenceQueue.async { [weak self] in
                     guard let self, !self.lock.withLock({ self.stopped }) else { return }
+                    self.resetActionFilterToCurrentCursor()
                     do { try self.finalizePendingTransition(terminal: true) }
                     catch {
                         Task { await self.stop(reason: error.localizedDescription) }
@@ -1287,8 +1457,35 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
                     self.rewardAccumulator.resetEpisode(clearLastMessageTime: true)
                 }
             }
+            if transition.scheduleSafetyStop {
+                let task = Task { [weak self] in
+                    if transition.grace > 0 {
+                        try? await Task.sleep(for: .seconds(transition.grace))
+                    }
+                    guard !Task.isCancelled, let self,
+                          self.lock.withLock({
+                              !self.stopped
+                                  && self.connectionState != .connected
+                                  && self.disconnectSafetyRevision
+                                      == transition.revision
+                          }) else { return }
+                    await self.stop(
+                        reason: "RL saved and stopped because the rewarder disconnected"
+                    )
+                }
+                lock.withLock {
+                    if disconnectSafetyRevision == transition.revision {
+                        disconnectSafetyTask = task
+                    } else {
+                        task.cancel()
+                    }
+                }
+            }
         } else {
             rewardAccumulator.resetEpisode(clearLastMessageTime: true)
+            inferenceQueue.async { [weak self] in
+                self?.resetActionFilterToCurrentCursor()
+            }
             actionQueue.async { [weak self] in
                 guard let self else { return }
                 self.lock.withLock {
@@ -1302,7 +1499,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         let suffix = detail.map { " • \($0)" } ?? ""
         inferenceQueue.async { [weak self] in
             self?.publishMetrics(
-                status: "Reward WebSocket: \(state.rawValue)\(suffix)"
+                status: "Reward server: \(state.rawValue)\(suffix)"
             )
         }
     }
@@ -1407,6 +1604,10 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         reinforcementMetrics.connectionState = lock.withLock { connectionState }
         reinforcementMetrics.invalidRewardMessages = rewardCounts.invalid
         reinforcementMetrics.episode = currentEpisode
+        reinforcementMetrics.sessionEpisode = max(
+            1,
+            currentEpisode - sessionStartingCompletedEpisodes
+        )
         reinforcementMetrics.environmentSteps = checkpointState?.environmentSteps ?? 0
         reinforcementMetrics.episodeStep = episodeStep
         reinforcementMetrics.rolloutCount = rollout.count + (pendingTransition == nil ? 0 : 1)
@@ -1486,7 +1687,8 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             contextSchema: contextSchema.isEmpty ? nil : contextSchema,
             trainingOrigin: .reinforcementLearning,
             reinforcementLearningSummary: summary,
-            reinforcementActionSpace: configuration.actionSpace
+            reinforcementActionSpace: configuration.actionSpace,
+            reinforcementActionBehavior: configuration.effectiveActionBehavior
         )
         var progress = TrainingProgressSummary(
             globalStep: state.globalStep,
@@ -1561,7 +1763,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
     }
 
     private func sendEpisodeMessage(
-        type: String,
+        event: RewardWebSocketProtocol.OutgoingEvent,
         episode: Int,
         reason: String? = nil,
         episodeReturn: Double? = nil,
@@ -1569,27 +1771,37 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         nextEpisode: Int? = nil
     ) async {
         guard let data = try? RewardWebSocketProtocol.episodeMessage(
-            type: type,
+            event: event,
+            names: webSocketSettings.messageNames,
             episode: episode,
             reason: reason,
             episodeReturn: episodeReturn,
             steps: steps,
             nextEpisode: nextEpisode
         ) else { return }
-        await rewardClient.send(data)
+        await rewardServer.send(data)
     }
 
     private func sendEpisodeMessageSynchronously(
-        type: String,
-        episode: Int
+        event: RewardWebSocketProtocol.OutgoingEvent,
+        episode: Int,
+        reason: String? = nil,
+        episodeReturn: Double? = nil,
+        steps: Int? = nil,
+        nextEpisode: Int? = nil
     ) {
         guard let data = try? RewardWebSocketProtocol.episodeMessage(
-            type: type,
-            episode: episode
+            event: event,
+            names: webSocketSettings.messageNames,
+            episode: episode,
+            reason: reason,
+            episodeReturn: episodeReturn,
+            steps: steps,
+            nextEpisode: nextEpisode
         ) else { return }
         let delivered = DispatchSemaphore(value: 0)
-        Task { [rewardClient] in
-            await rewardClient.send(data)
+        Task { [rewardServer] in
+            await rewardServer.send(data)
             delivered.signal()
         }
         _ = delivered.wait(timeout: .now() + 1)
@@ -1614,6 +1826,9 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
               state.actorVersionID == expectedActorVersionID,
               state.completedEpisodes >= 0, state.updates >= 0,
               state.environmentSteps >= 0, state.globalStep >= 0,
+              state.completedEpisodes <= 1_000_000_000,
+              state.updates <= 1_000_000_000,
+              state.environmentSteps <= 1_000_000_000_000,
               state.elapsed.isFinite, state.elapsed >= 0,
               state.episodeReturns.allSatisfy(\.isFinite),
               state.cumulativeEpisodeReturn.isFinite else { return nil }
@@ -1630,11 +1845,20 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         return ReinforcementCheckpointState(
             signature: signature,
             actorVersionID: profile.activeVersionID,
-            completedEpisodes: summary?.episode
-                ?? profile.trainingProgress?.reinforcementEpisodes ?? 0,
-            updates: summary?.update
-                ?? profile.trainingProgress?.reinforcementUpdates ?? 0,
-            environmentSteps: summary?.environmentSteps ?? 0,
+            completedEpisodes: min(1_000_000_000, max(
+                0,
+                summary?.episode
+                    ?? profile.trainingProgress?.reinforcementEpisodes ?? 0
+            )),
+            updates: min(1_000_000_000, max(
+                0,
+                summary?.update
+                    ?? profile.trainingProgress?.reinforcementUpdates ?? 0
+            )),
+            environmentSteps: min(1_000_000_000_000, max(
+                0,
+                summary?.environmentSteps ?? 0
+            )),
             globalStep: max(0, version?.globalStep
                 ?? profile.trainingProgress?.globalStep ?? 0),
             displayedEpoch: max(0, version?.epoch
@@ -1691,8 +1915,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             var bootstrapTimeLimits: Bool
             var criticHiddenWidth: Int
             var criticLayerCount: Int
-            var continuousStandardDeviation: Double
-            var binaryTemperature: Double
+            var actionBehavior: ReinforcementActionBehavior
             var rewardAggregation: ReinforcementRewardAggregation
             var rewardScale: Double
             var rewardClipMagnitude: Double
@@ -1729,8 +1952,7 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
             bootstrapTimeLimits: configuration.bootstrapTimeLimits,
             criticHiddenWidth: configuration.criticHiddenWidth,
             criticLayerCount: configuration.criticLayerCount,
-            continuousStandardDeviation: configuration.continuousActionStandardDeviation,
-            binaryTemperature: configuration.binaryActionTemperature,
+            actionBehavior: configuration.effectiveActionBehavior,
             rewardAggregation: configuration.rewardAggregation,
             rewardScale: configuration.rewardScale,
             rewardClipMagnitude: configuration.rewardClipMagnitude,
@@ -1780,12 +2002,48 @@ final class ReinforcementLearningEngine: @unchecked Sendable {
         return UInt64(scaled.value)
     }
 
+    private static func normalizedCursor(
+        in rect: CGRect
+    ) -> (x: Float, y: Float)? {
+        guard rect.width.isFinite, rect.height.isFinite,
+              rect.width > 0, rect.height > 0,
+              let point = CGEvent(source: nil)?.location else { return nil }
+        return (
+            Float(min(1, max(0, (point.x - rect.minX) / rect.width))),
+            Float(min(1, max(0, (point.y - rect.minY) / rect.height)))
+        )
+    }
+
+    private func resetActionFilterToCurrentCursor() {
+        actionFilter.reset(
+            absoluteMousePosition: Self.normalizedCursor(in: captureRect)
+        )
+    }
+
     private static func average(
         cumulativeReturn: Double,
         episodeCount: Int
     ) -> Double {
         guard episodeCount > 0 else { return 0 }
         return cumulativeReturn / Double(episodeCount)
+    }
+
+    private static func protocolStopReason(_ reason: String) -> String {
+        let value = reason.lowercased()
+        if value.contains("rewarder") && value.contains("disconnect") {
+            return "rewarder_disconnected"
+        }
+        if value.contains("reward") && value.contains("stale") {
+            return "reward_timeout"
+        }
+        if value.contains("focus") { return "focus_lost" }
+        if value.contains("human input") { return "human_input" }
+        if value.contains("capture") { return "capture_stopped" }
+        if value.contains("invalid reward") { return "invalid_reward_messages" }
+        if value.contains("inference") { return "inference_stale" }
+        if value.contains("episode limit") { return "episode_limit" }
+        if value.contains("panic") { return "panic" }
+        return "training_stopped"
     }
 
     deinit {

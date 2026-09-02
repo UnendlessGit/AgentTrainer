@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import QuartzCore
 
 struct ReinforcementRewardDrain: Equatable, Sendable {
@@ -21,9 +22,13 @@ final class ReinforcementRewardAccumulator: @unchecked Sendable {
     private var receivedTotal = 0
     private var invalidTotal = 0
 
-    func ingest(_ data: Data, receivedAt: Double = CACurrentMediaTime()) -> Bool {
-        guard data.count <= RewardWebSocketProtocol.maximumMessageBytes,
-              let signal = RewardWebSocketProtocol.decode(data) else {
+    func ingest(
+        _ data: Data,
+        names: RewardWebSocketMessageNames = RewardWebSocketMessageNames(),
+        receivedAt: Double = CACurrentMediaTime()
+    ) -> Bool {
+        guard data.count <= RewardWebSocketServerSettings.maximumMessageBytes,
+              let signal = RewardWebSocketProtocol.decode(data, names: names) else {
             lock.withLock { invalidTotal += 1 }
             return false
         }
@@ -91,38 +96,65 @@ final class ReinforcementRewardAccumulator: @unchecked Sendable {
 }
 
 enum RewardWebSocketProtocol {
-    static let maximumMessageBytes = 64 * 1_024
+    enum OutgoingEvent: Equatable, Sendable {
+        case episodeFinished
+        case episodeStarting
+        case episodeStarted
+        case trainingUpdateStarted
+        case trainingUpdateFinished
+    }
 
     struct Signal: Equatable, Sendable {
         var reward: Double?
         var episodeFinished: Bool
+        var heartbeat = false
     }
 
-    static func decode(_ data: Data) -> Signal? {
+    static func decode(
+        _ data: Data,
+        names: RewardWebSocketMessageNames = RewardWebSocketMessageNames()
+    ) -> Signal? {
         guard let object = try? JSONSerialization.jsonObject(with: data),
               let dictionary = object as? [String: Any] else { return nil }
         let reward: Double?
-        if let number = dictionary["reward"] as? NSNumber {
+        if let number = dictionary[names.rewardField] as? NSNumber {
             guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
             let value = number.doubleValue
             guard value.isFinite else { return nil }
             reward = value
-        } else if dictionary["reward"] != nil {
+        } else if dictionary[names.rewardField] != nil {
             return nil
         } else {
             reward = nil
         }
-        let type = (dictionary["type"] as? String)?.lowercased()
-        let done = (dictionary["done"] as? Bool) == true
-            || (dictionary["episode_finished"] as? Bool) == true
-            || (dictionary["terminated"] as? Bool) == true
-            || type == "episode_finished" || type == "episode_end"
-        guard reward != nil || done else { return nil }
-        return Signal(reward: reward, episodeFinished: done)
+        if dictionary[names.typeField] != nil,
+           dictionary[names.typeField] as? String == nil { return nil }
+        if dictionary[names.doneField] != nil,
+           dictionary[names.doneField] as? Bool == nil { return nil }
+        let type = dictionary[names.typeField] as? String
+        var done = (dictionary[names.doneField] as? Bool) == true
+            || type == names.incomingEpisodeFinished
+        // Preserve the permissive 2.4.0 protocol only while every relevant name
+        // is still at its default. Custom naming switches to exact matching.
+        if names == RewardWebSocketMessageNames() {
+            done = done
+                || (dictionary["episode_finished"] as? Bool) == true
+                || (dictionary["terminated"] as? Bool) == true
+                || type?.lowercased() == "episode_finished"
+                || type?.lowercased() == "episode_end"
+        }
+        let heartbeat = type == names.incomingHeartbeat
+        guard reward != nil || done || heartbeat else { return nil }
+        return Signal(
+            reward: reward,
+            episodeFinished: done,
+            heartbeat: heartbeat
+        )
     }
 
     static func episodeMessage(
-        type: String,
+        event: OutgoingEvent,
+        names: RewardWebSocketMessageNames = RewardWebSocketMessageNames(),
         episode: Int,
         reason: String? = nil,
         episodeReturn: Double? = nil,
@@ -130,8 +162,15 @@ enum RewardWebSocketProtocol {
         nextEpisode: Int? = nil,
         timestamp: Date = Date()
     ) throws -> Data {
+        let type = switch event {
+        case .episodeFinished: names.outgoingEpisodeFinished
+        case .episodeStarting: names.outgoingEpisodeStarting
+        case .episodeStarted: names.outgoingEpisodeStarted
+        case .trainingUpdateStarted: names.outgoingTrainingUpdateStarted
+        case .trainingUpdateFinished: names.outgoingTrainingUpdateFinished
+        }
         var object: [String: Any] = [
-            "type": type,
+            names.typeField: type,
             "episode": max(0, episode),
             "timestamp": ISO8601DateFormatter().string(from: timestamp)
         ]
@@ -141,41 +180,79 @@ enum RewardWebSocketProtocol {
         if let nextEpisode { object["next_episode"] = max(0, nextEpisode) }
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
+
+    /// Source compatibility for helpers written against the 2.4.0 protocol.
+    static func episodeMessage(
+        type: String,
+        episode: Int,
+        reason: String? = nil,
+        episodeReturn: Double? = nil,
+        steps: Int? = nil,
+        nextEpisode: Int? = nil,
+        timestamp: Date = Date()
+    ) throws -> Data {
+        let event: OutgoingEvent = switch type {
+        case "episode_starting": .episodeStarting
+        case "episode_started": .episodeStarted
+        case "training_update_started": .trainingUpdateStarted
+        case "training_update_finished": .trainingUpdateFinished
+        default: .episodeFinished
+        }
+        return try episodeMessage(
+            event: event,
+            episode: episode,
+            reason: reason,
+            episodeReturn: episodeReturn,
+            steps: steps,
+            nextEpisode: nextEpisode,
+            timestamp: timestamp
+        )
+    }
 }
 
 enum RewardWebSocketError: LocalizedError {
-    case connectionTimedOut
+    case listenerTimedOut
+    case rewarderConnectionTimedOut
+    case listenerFailed(String)
     case notConnected
     case unsupportedMessage
 
     var errorDescription: String? {
         switch self {
-        case .connectionTimedOut: "The RL reward WebSocket did not complete its handshake before the connection timeout."
-        case .notConnected: "The RL reward WebSocket is not connected."
-        case .unsupportedMessage: "The RL reward WebSocket sent a message that was not UTF-8 text or binary data."
+        case .listenerTimedOut:
+            "AgentTrainer could not start the reward WebSocket server before the timeout. Check that its port is available."
+        case .rewarderConnectionTimedOut:
+            "AgentTrainer is hosting the reward WebSocket, but no rewarder connected before the startup timeout. Start the rewarder and try the RL shortcut again."
+        case .listenerFailed(let detail):
+            "The reward WebSocket server could not listen at the configured URL: \(detail)"
+        case .notConnected: "No rewarder is connected to AgentTrainer's WebSocket server."
+        case .unsupportedMessage:
+            "The rewarder sent an unsupported WebSocket frame. Use complete UTF-8 text or binary JSON messages."
         }
     }
 }
 
-/// One connection owner with bounded outbound lifecycle buffering and automatic
-/// reconnect after an established session drops. Normal Run never constructs
-/// this type and therefore has no network dependency.
-actor RewardWebSocketClient {
+/// Single-client WebSocket listener owned by one RL session. AgentTrainer hosts
+/// the endpoint and keeps listening after a rewarder disconnects so a client may
+/// reconnect during the configured safety grace period. Normal Run never
+/// constructs this type and therefore has no network dependency.
+actor RewardWebSocketServer {
     typealias StateHandler = @Sendable (ReinforcementConnectionState, String?) -> Void
 
     private let accumulator: ReinforcementRewardAccumulator
     private let onState: StateHandler
-    private var session: URLSession?
-    private var socket: URLSessionWebSocketTask?
-    private var receiveTask: Task<Void, Never>?
-    private var reconnectTask: Task<Void, Never>?
+    private let queue = DispatchQueue(
+        label: "AgentTrainer.RewardWebSocketServer",
+        qos: .userInitiated
+    )
+    private var listener: NWListener?
+    private var connection: NWConnection?
     private var running = false
     private var generation: UInt64 = 0
-    private var url: URL?
-    private var connectionTimeout = 5.0
-    private var reconnectInitialDelay = 0.25
-    private var reconnectMaximumDelay = 5.0
-    private var reconnectDelay = 0.25
+    private var listenerReady = false
+    private var clientConnected = false
+    private var listenerFailure: String?
+    private var settings = RewardWebSocketServerSettings()
     private var pendingOutbound: [Data] = []
     private var state = ReinforcementConnectionState.disconnected
 
@@ -187,153 +264,311 @@ actor RewardWebSocketClient {
         self.onState = onState
     }
 
-    func start(
-        url: URL,
-        connectionTimeout: Double,
-        reconnectInitialDelay: Double,
-        reconnectMaximumDelay: Double
-    ) async throws {
-        await stop()
+    func start(settings requestedSettings: RewardWebSocketServerSettings) async throws {
+        stop()
+        let settings = try requestedSettings.validated()
+        guard let portValue = settings.validatedURL?.port,
+              let port = NWEndpoint.Port(rawValue: UInt16(portValue)) else {
+            throw AgentTrainerError.invalidConfiguration(
+                "The reward WebSocket server URL has no usable port."
+            )
+        }
         running = true
         generation &+= 1
-        self.url = url
-        self.connectionTimeout = connectionTimeout
-        self.reconnectInitialDelay = reconnectInitialDelay
-        self.reconnectMaximumDelay = reconnectMaximumDelay
-        reconnectDelay = reconnectInitialDelay
+        let launchGeneration = generation
+        self.settings = settings
+        listenerReady = false
+        clientConnected = false
+        listenerFailure = nil
+
+        let webSocket = NWProtocolWebSocket.Options()
+        webSocket.autoReplyPing = true
+        webSocket.maximumMessageSize = Self.maximumMessageBytes
+        webSocket.setClientRequestHandler(queue) { _, _ in
+            NWProtocolWebSocket.Response(status: .accept, subprotocol: nil)
+        }
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        parameters.acceptLocalOnly = !settings.allowRemoteConnections
+        parameters.includePeerToPeer = settings.allowRemoteConnections
+        parameters.defaultProtocolStack.applicationProtocols.insert(
+            webSocket,
+            at: 0
+        )
         do {
-            try await connect(generation: generation, reconnecting: false)
+            let listener = try NWListener(using: parameters, on: port)
+            listener.stateUpdateHandler = { [weak self] state in
+                Task { await self?.handleListenerState(
+                    state,
+                    generation: launchGeneration
+                ) }
+            }
+            listener.newConnectionHandler = { [weak self] connection in
+                Task { await self?.accept(
+                    connection,
+                    generation: launchGeneration
+                ) }
+            }
+            self.listener = listener
+            listener.start(queue: queue)
+            try await waitForListener(
+                timeout: min(10, settings.connectionWaitTimeoutSeconds)
+            )
         } catch {
-            running = false
-            transition(to: .disconnected, detail: error.localizedDescription)
+            stop()
             throw error
         }
     }
 
+    func waitForRewarder(timeout: Double) async throws {
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        while running, !clientConnected {
+            if let listenerFailure {
+                throw RewardWebSocketError.listenerFailed(listenerFailure)
+            }
+            guard ContinuousClock.now < deadline else {
+                throw RewardWebSocketError.rewarderConnectionTimedOut
+            }
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        guard running, clientConnected else { throw CancellationError() }
+    }
+
     func send(_ data: Data) async {
-        guard data.count <= RewardWebSocketProtocol.maximumMessageBytes else { return }
-        guard state == .connected, let socket else {
+        guard data.count <= Self.maximumMessageBytes else { return }
+        guard state == .connected, let connection else {
             enqueue(data)
             return
         }
-        do {
-            try await socket.send(webSocketMessage(for: data))
-        } catch {
-            enqueue(data)
-            connectionFailed(error, generation: generation)
+        let expectedGeneration = generation
+        let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
+        let context = NWConnection.ContentContext(
+            identifier: "AgentTrainer.RewardMessage.Awaited",
+            metadata: [metadata]
+        )
+        let error: NWError? = await withCheckedContinuation { continuation in
+            connection.send(
+                content: data,
+                contentContext: context,
+                isComplete: true,
+                completion: .contentProcessed { continuation.resume(returning: $0) }
+            )
         }
+        guard let error, running, generation == expectedGeneration,
+              self.connection === connection else { return }
+        enqueue(data)
+        disconnect(connection, detail: error.localizedDescription)
     }
 
-    func stop() async {
+    func stop() {
         running = false
         generation &+= 1
-        receiveTask?.cancel()
-        reconnectTask?.cancel()
-        receiveTask = nil
-        reconnectTask = nil
-        socket?.cancel(with: .goingAway, reason: nil)
-        session?.invalidateAndCancel()
-        socket = nil
-        session = nil
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+        listener?.stateUpdateHandler = nil
+        listener?.newConnectionHandler = nil
+        listener?.cancel()
+        connection = nil
+        listener = nil
+        listenerReady = false
+        clientConnected = false
+        listenerFailure = nil
         pendingOutbound.removeAll(keepingCapacity: false)
         transition(to: .disconnected, detail: nil)
     }
 
-    private func connect(generation expectedGeneration: UInt64, reconnecting: Bool) async throws {
-        guard running, generation == expectedGeneration, let url else {
-            throw CancellationError()
+    private func waitForListener(timeout: Double) async throws {
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        while running, !listenerReady {
+            if let listenerFailure {
+                throw RewardWebSocketError.listenerFailed(listenerFailure)
+            }
+            guard ContinuousClock.now < deadline else {
+                throw RewardWebSocketError.listenerTimedOut
+            }
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(20))
         }
-        transition(to: reconnecting ? .reconnecting : .connecting, detail: nil)
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.waitsForConnectivity = false
-        configuration.timeoutIntervalForRequest = connectionTimeout
-        let session = URLSession(configuration: configuration)
-        let socket = session.webSocketTask(with: url)
-        socket.maximumMessageSize = RewardWebSocketProtocol.maximumMessageBytes
-        self.session = session
-        self.socket = socket
-        socket.resume()
-        // URLSession completes WebSocket control frames while a receive is in
-        // flight. Start the bounded receive loop before the handshake ping so
-        // a quiet reward server cannot deadlock startup waiting for a pong.
-        receiveTask = Task { [weak self, weak socket] in
-            guard let self, let socket else { return }
-            await self.receiveLoop(
-                socket: socket,
+        guard running, listenerReady else { throw CancellationError() }
+    }
+
+    private func handleListenerState(
+        _ newState: NWListener.State,
+        generation expectedGeneration: UInt64
+    ) {
+        guard running, generation == expectedGeneration else { return }
+        switch newState {
+        case .ready:
+            listenerReady = true
+            listenerFailure = nil
+            transition(to: .listening, detail: "Waiting for the rewarder to connect")
+        case .waiting(let error):
+            transition(to: .listening, detail: error.localizedDescription)
+        case .failed(let error):
+            listenerFailure = error.localizedDescription
+            transition(to: .disconnected, detail: error.localizedDescription)
+        case .cancelled:
+            if running {
+                listenerFailure = "The listener was cancelled unexpectedly."
+                transition(to: .disconnected, detail: listenerFailure)
+            }
+        case .setup:
+            break
+        @unknown default:
+            listenerFailure = "The listener entered an unknown state."
+        }
+    }
+
+    private func accept(
+        _ candidate: NWConnection,
+        generation expectedGeneration: UInt64
+    ) {
+        guard running, generation == expectedGeneration,
+              connection == nil else {
+            candidate.cancel()
+            return
+        }
+        connection = candidate
+        candidate.stateUpdateHandler = { [weak self, weak candidate] state in
+            guard let candidate else { return }
+            Task { await self?.handleConnectionState(
+                state,
+                connection: candidate,
                 generation: expectedGeneration
-            )
+            ) }
         }
-        try await ping(socket, timeout: connectionTimeout)
-        guard running, generation == expectedGeneration, self.socket === socket else {
-            socket.cancel(with: .goingAway, reason: nil)
-            session.invalidateAndCancel()
-            throw CancellationError()
+        candidate.start(queue: queue)
+    }
+
+    private func handleConnectionState(
+        _ newState: NWConnection.State,
+        connection candidate: NWConnection,
+        generation expectedGeneration: UInt64
+    ) {
+        guard running, generation == expectedGeneration,
+              connection === candidate else { return }
+        switch newState {
+        case .ready:
+            clientConnected = true
+            transition(to: .connected, detail: nil)
+            receiveNext(over: candidate, generation: expectedGeneration)
+            let queued = pendingOutbound
+            pendingOutbound.removeAll(keepingCapacity: true)
+            for data in queued {
+                send(data, over: candidate, generation: expectedGeneration)
+            }
+        case .failed(let error):
+            disconnect(candidate, detail: error.localizedDescription)
+        case .cancelled:
+            disconnect(candidate, detail: "The rewarder disconnected")
+        case .waiting(let error):
+            if clientConnected {
+                disconnect(candidate, detail: error.localizedDescription)
+            }
+        case .setup, .preparing:
+            break
+        @unknown default:
+            disconnect(candidate, detail: "The rewarder connection entered an unknown state")
         }
-        reconnectDelay = reconnectInitialDelay
-        transition(to: .connected, detail: nil)
-        let queued = pendingOutbound
-        pendingOutbound.removeAll(keepingCapacity: true)
-        for data in queued {
-            do { try await socket.send(webSocketMessage(for: data)) }
-            catch {
-                enqueue(data)
-                connectionFailed(error, generation: expectedGeneration)
+    }
+
+    private func receiveNext(
+        over candidate: NWConnection,
+        generation expectedGeneration: UInt64
+    ) {
+        candidate.receiveMessage { [weak self, weak candidate] data, context, _, error in
+            guard let self, let candidate else { return }
+            Task { await self.receive(
+                data,
+                context: context,
+                error: error,
+                over: candidate,
+                generation: expectedGeneration
+            ) }
+        }
+    }
+
+    private func receive(
+        _ data: Data?,
+        context: NWConnection.ContentContext?,
+        error: NWError?,
+        over candidate: NWConnection,
+        generation expectedGeneration: UInt64
+    ) {
+        guard running, generation == expectedGeneration,
+              connection === candidate else { return }
+        if let error {
+            disconnect(candidate, detail: error.localizedDescription)
+            return
+        }
+        let metadata = context?.protocolMetadata(
+            definition: NWProtocolWebSocket.definition
+        ) as? NWProtocolWebSocket.Metadata
+        switch metadata?.opcode {
+        case .text, .binary:
+            guard let data, data.count <= Self.maximumMessageBytes else {
+                disconnect(candidate, detail: "A reward message exceeded the 64 KiB limit")
                 return
             }
+            _ = accumulator.ingest(data, names: settings.messageNames)
+        case .close:
+            disconnect(candidate, detail: "The rewarder closed the WebSocket")
+            return
+        case .ping, .pong:
+            break
+        default:
+            disconnect(candidate, detail: RewardWebSocketError.unsupportedMessage.localizedDescription)
+            return
         }
+        receiveNext(over: candidate, generation: expectedGeneration)
     }
 
-    private func receiveLoop(
-        socket expectedSocket: URLSessionWebSocketTask,
+    private func send(
+        _ data: Data,
+        over candidate: NWConnection,
         generation expectedGeneration: UInt64
-    ) async {
-        do {
-            while running, generation == expectedGeneration,
-                  socket === expectedSocket, !Task.isCancelled {
-                let message = try await expectedSocket.receive()
-                let data: Data = switch message {
-                case .data(let data): data
-                case .string(let text): Data(text.utf8)
-                @unknown default: throw RewardWebSocketError.unsupportedMessage
-                }
-                _ = accumulator.ingest(data)
+    ) {
+        let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
+        let context = NWConnection.ContentContext(
+            identifier: "AgentTrainer.RewardMessage",
+            metadata: [metadata]
+        )
+        candidate.send(
+            content: data,
+            contentContext: context,
+            isComplete: true,
+            completion: .contentProcessed { [weak self, weak candidate] error in
+                guard let self, let candidate, let error else { return }
+                Task { await self.sendFailed(
+                    data,
+                    error: error,
+                    over: candidate,
+                    generation: expectedGeneration
+                ) }
             }
-        } catch is CancellationError {
-            return
-        } catch {
-            connectionFailed(error, generation: expectedGeneration)
-        }
+        )
     }
 
-    private func connectionFailed(_ error: Error, generation expectedGeneration: UInt64) {
-        guard running, generation == expectedGeneration else { return }
-        socket?.cancel(with: .abnormalClosure, reason: nil)
-        session?.invalidateAndCancel()
-        socket = nil
-        session = nil
-        receiveTask?.cancel()
-        receiveTask = nil
-        transition(to: .reconnecting, detail: error.localizedDescription)
-        guard reconnectTask == nil else { return }
-        let delay = reconnectDelay
-        reconnectDelay = min(reconnectMaximumDelay, max(reconnectInitialDelay, delay * 2))
-        reconnectTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
-            guard !Task.isCancelled, let self else { return }
-            await self.retryConnection(generation: expectedGeneration)
-        }
+    private func sendFailed(
+        _ data: Data,
+        error: NWError,
+        over candidate: NWConnection,
+        generation expectedGeneration: UInt64
+    ) {
+        guard running, generation == expectedGeneration,
+              connection === candidate else { return }
+        enqueue(data)
+        disconnect(candidate, detail: error.localizedDescription)
     }
 
-    private func retryConnection(generation expectedGeneration: UInt64) async {
-        reconnectTask = nil
-        guard running, generation == expectedGeneration else { return }
-        do {
-            try await connect(generation: expectedGeneration, reconnecting: true)
-        } catch is CancellationError {
-            return
-        } catch {
-            connectionFailed(error, generation: expectedGeneration)
-        }
+    private func disconnect(_ candidate: NWConnection, detail: String) {
+        guard connection === candidate else { return }
+        candidate.stateUpdateHandler = nil
+        candidate.cancel()
+        connection = nil
+        clientConnected = false
+        transition(to: .listening, detail: detail)
     }
 
     private func enqueue(_ data: Data) {
@@ -341,14 +576,6 @@ actor RewardWebSocketClient {
         if pendingOutbound.count > 32 {
             pendingOutbound.removeFirst(pendingOutbound.count - 32)
         }
-    }
-
-    private func webSocketMessage(
-        for data: Data
-    ) -> URLSessionWebSocketTask.Message {
-        String(data: data, encoding: .utf8).map {
-            .string($0)
-        } ?? .data(data)
     }
 
     private func transition(
@@ -360,30 +587,11 @@ actor RewardWebSocketClient {
         onState(newState, detail)
     }
 
-    private func ping(
-        _ socket: URLSessionWebSocketTask,
-        timeout: Double
-    ) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { continuation in
-                    socket.sendPing { error in
-                        if let error { continuation.resume(throwing: error) }
-                        else { continuation.resume() }
-                    }
-                }
-            }
-            group.addTask {
-                try await Task.sleep(for: .seconds(timeout))
-                socket.cancel(with: .goingAway, reason: nil)
-                throw RewardWebSocketError.connectionTimedOut
-            }
-            guard let result = try await group.next() else {
-                throw RewardWebSocketError.connectionTimedOut
-            }
-            group.cancelAll()
-            return result
-        }
+    private static let maximumMessageBytes = RewardWebSocketServerSettings.maximumMessageBytes
+
+    deinit {
+        connection?.cancel()
+        listener?.cancel()
     }
 }
 

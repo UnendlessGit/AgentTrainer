@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.4.0. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.4.5. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -27,7 +27,7 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Training/ReinforcementLearningDomain.swift` — RL configuration, explicit action allowlist, bounded sizing, provenance, and live metrics
 - `Training/ReinforcementLearningPolicy.swift` — hybrid action distribution, shared Policy-v6 actor, isolated critic, GAE, and clipped PPO updates
 - `Training/ReinforcementLearningEngine.swift` — live capture/action scheduling, episode lifecycle, reward association, RL checkpoints, and actor publication
-- `Training/RewardWebSocket.swift` — bounded high-rate reward aggregation, protocol messages, connection timeout, and reconnect ownership
+- `Training/RewardWebSocket.swift` — single-client hosted WebSocket, bounded high-rate reward aggregation, customizable protocol messages, and reconnect admission
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
 - `Agent/AgentRuntime.swift` — capture, inference scheduling, prediction latching, and teardown
 - `Agent/InputInjector.swift` — final output firewall and synthetic HID events
@@ -36,6 +36,7 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `UI/ContextLabelsView.swift` — reusable context pickers, Library bulk editor, and field/value manager
 - `UI/` — views, themes, HUD, diagnostics, and CNN visualization
 - `Tests/AgentTrainerTests/DomainTests.swift` — contract, corruption, concurrency, storage, MLX, and rendering coverage
+- `Tests/AgentTrainerTests/ReinforcementLearningTests.swift` — policy, hosted protocol, migration, safety, rollout, checkpoint, and runtime-semantics coverage
 - `Tests/AgentTrainerTests/TrainingPerformanceTests.swift` — opt-in release hardware benchmark and trajectory checks
 
 ## Concurrency ownership
@@ -54,6 +55,8 @@ Capture, runtime, training, and injection use dedicated locks and queues because
 - RL startup and teardown follow the same rule. Stop action admission, drain the action queue, release controls, stop capture, drain inference/update work, then publish the final actor. A stop during asynchronous startup must invalidate the launch before a late capture or input monitor can survive it.
 - RL inference and PPO mutation are serialized on one session queue. During an update, connection loss, reward staleness pause, or episode reset, clear the prediction latch and temporal ring and release synthetic controls before admitting another action.
 - The WebSocket receive path may run at 30–60 Hz or faster, but it must reduce messages into one lock-bounded accumulator. Never replace it with an unbounded continuation, task-per-reward, or retained message array.
+- `RewardWebSocketServer` is an actor over one `NWListener` and at most one admitted `NWConnection`. Callback generations must reject late listener/connection state after stop or restart. A disconnected client may reconnect to the still-listening server during the safety grace period; a second concurrent client is rejected.
+- An RL stop during asynchronous model/listener/rewarder startup must atomically fail the final state-install guard. No late optimizer, listener, capture, input monitor, or injector enable may repopulate a stopped session.
 - A background task may publish only bounded snapshots to the main actor.
 - An explicit DAgger trigger must synchronously suspend inference and new AI action admission before recorder construction. Buffer early physical samples and Record-quality frames until the recorder is installed; ordinary takeover must never enter correction mode. The main UI and capture-excluded HUD must expose DAgger Recording rather than Run during this interval.
 - Stopping DAgger resumes the resident Run session before publication finishes, but only after clearing its temporal ring and prediction latch. No stale pre-correction action may execute after the transition.
@@ -155,11 +158,19 @@ Every frame-control row includes normalized absolute cursor position, raw relati
 
 Demonstration training and RL intentionally share that exact actor layout. RL must save the actor alone as an ordinary Policy-v6 `weights.safetensors`, so either trainer can warm-start the other and normal Run stays unaware of rewards. The RL critic is a separate session-owned module over fused actor features; it appears only in `RLCheckpoint/rl.weights.safetensors` and must never become a runtime dependency.
 
-RL uses clipped PPO with GAE. Binary controls use Bernoulli logits; absolute mouse samples are sigmoid-bounded Gaussians and relative mouse/scroll samples are tanh-bounded Gaussians. Store the pre-transform continuous latent in the rollout so a later PPO pass recomputes the exact transformed policy density. Actor, visual encoder, recurrent path, fusion stack, and critic must all remain inside the differentiated closure; precomputing actor temporal features outside `valueAndGrad` silently prevents end-to-end RL learning. Supervised dropout remains unchanged, but PPO likelihood updates disable it: a new random dropout mask must never be mistaken for policy divergence from the stored action probability.
+RL uses clipped PPO with GAE. Binary controls use Bernoulli logits; absolute mouse samples are sigmoid-bounded Gaussians and relative mouse/scroll samples are tanh-bounded Gaussians. Cursor, Game Camera, and scroll have independent fixed exploration deviations; one shared continuous deviation is a legacy decode-only setting. Store the pre-transform continuous latent in the rollout so a later PPO pass recomputes the exact category-specific transformed policy density. Actor, visual encoder, recurrent path, fusion stack, and critic must all remain inside the differentiated closure; precomputing actor temporal features outside `valueAndGrad` silently prevents end-to-end RL learning. Supervised dropout remains unchanged, but PPO likelihood updates disable it: a new random dropout mask must never be mistaken for policy divergence from the stored action probability.
 
-`ReinforcementActionSpace` is an explicit allowlist. A category with no selected member is disabled. At collection and normal Run, an RL version's immutable allowlist is intersected with saved/current channels, profile restrictions, live output permissions, allowed keys, and the control region. Demonstration versions leave `reinforcementActionSpace` nil and retain their established runtime semantics.
+`ReinforcementActionBehavior` is an immutable RL runtime contract. After sampling, absolute cursor output starts from the real cursor, applies configured smoothing, and obeys a maximum normalized step. Relative Game Camera output applies smoothing, a dead zone, and a maximum magnitude before `GameCameraContract.deltaScale` and Run sensitivity. Scroll has its own smoothing. The distribution sample—not the transformed executable output—remains the PPO likelihood action; the executable transform is deterministic actuator behavior and is also supplied as temporal control context.
 
-Changing transport timing, episode limits, or publication cadence does not invalidate learned state. The exact RL checkpoint signature does include actor layout, context layout, action space, mouse mode, critic layout, PPO/reward objective, and seed. Activating another brain makes a mismatched RL checkpoint ineligible; RL then warm-starts the selected actor and initializes a fresh critic/optimizer.
+Normal Run must inspect RL provenance and compile raw actor logits. It samples every allowed binary with the saved Bernoulli temperature on each fresh perception, applies the saved action behavior, and publishes the sanitized executable row. It uses the deterministic continuous mean rather than exploration noise. Sending activated probabilities through the demonstration runtime's `0.5` threshold is forbidden because it turns a stochastic learned policy into permanently held modal controls. Demonstration versions still compile their established activated deterministic output.
+
+`ReinforcementActionSpace` is an explicit allowlist. A category with no selected member is disabled. It supports the complete usable macOS virtual-key range 0–127, with modifier `flagsChanged` capture, and mouse buttons 0–7. At collection and normal Run, an RL version's immutable allowlist is intersected with saved/current channels, profile restrictions, selected mouse mode, live output permissions, allowed keys, and the control region. Collection must have at least one executable action after this full intersection. Changing a live permission that changes an active RL distribution stops and saves rather than silently collecting an action the injector cannot execute. Demonstration versions leave `reinforcementActionSpace` nil and retain their established runtime semantics.
+
+Changing hosted transport timing, protocol names, episode limits, or publication cadence does not invalidate learned state. The exact RL checkpoint signature does include actor layout, context layout, action space, action behavior, mouse mode, critic layout, PPO/reward objective, and seed. Activating another brain makes a mismatched RL checkpoint ineligible; RL then warm-starts the selected actor and initializes a fresh critic/optimizer. A pre-2.4.5 RL checkpoint is intentionally not claimed as an exact resume under the new distribution/action contract; its active Policy-v6 actor remains a valid warm start.
+
+`maximumEpisodes`, runnable publication cadence, and checkpoint cadence are relative to the current start-to-stop session. Lifetime episode/update/environment counters remain cumulative. An episode boundary marks the final transition before environment reset. Preferred PPO updates use at least four transitions; shorter terminal segments remain in the bounded rollout across episodes, and GAE stops at their terminal separator. A maximum-episode or safe/final stop updates a valid one-to-three-transition final batch rather than discarding collected experience.
+
+Episode timers begin only after initial capture is live and exclude reset/start delays, connection/staleness pauses, and PPO time. Boundary protocol order is `episode_finished`, optional `training_update_started` / `training_update_finished`, `episode_starting`, delay/reset, then `episode_started`. Rewards received during a declared PPO update are ignored and counted; a done signal received during the update is retained and triggers the boundary without briefly re-enabling output.
 
 A runnable version is immutable. Runtime current vision, temporal vision, architecture, precision, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
 
@@ -218,6 +229,7 @@ The final executable action is the intersection of:
 4. demonstrated key codes
 5. live cursor and keyboard permissions
 6. the allowed control region unless full-Mac control is enabled
+7. for RL versions, the immutable action behavior that samples binaries and bounds/stabilizes continuous output
 
 Every mutable profile channel is a disable-only runtime firewall over the immutable saved channels—including mouse movement, buttons, scroll, keyboard, and modifiers. A current editor switch may never enable a head the saved brain did not learn or continue executing a head the user disabled.
 
@@ -229,11 +241,17 @@ Run reads context fields and values only from the active immutable version, neve
 
 All synthetic events carry `agentTrainerSyntheticTag`; input safety monitors ignore that tag. Panic and normal stop both drain action work and release held state.
 
-Ordinary `AgentRuntime` never constructs `RewardWebSocketClient`. An RL-published version runs with no connection or reward signal; its optional RL metadata only narrows executable capabilities. RL itself reuses Run's frozen source, region, frame mode, mouse execution, Game Camera, safety, cursor/keyboard permissions, preview, and immutable context vocabulary. Live context and output-permission changes preserve Run's release-and-clear semantics.
+Ordinary `AgentRuntime` never constructs `RewardWebSocketServer`. An RL-published version runs with no connection or reward signal; its immutable RL metadata narrows capabilities and defines policy sampling/stabilization. RL itself reuses Run's frozen source, region, frame mode, mouse execution, Game Camera, safety, cursor/keyboard permissions, preview, and immutable context vocabulary. A live context change creates an episode boundary. A live output-permission change that alters the on-policy action space stops and saves.
 
 The RL shortcut is the sole normal start/stop surface. Panic and application termination may stop RL for safety, but no button or menu item may start it. Panic, Record, Run, and RL shortcuts must remain distinct and capture/safety-excluded.
 
-Reward JSON accepts one finite numeric `reward` and optional `done`, `episode_finished`, `terminated`, or episode-end `type`. Booleans and non-finite/coerced strings are invalid. At a normal boundary, send `episode_finished`, then `episode_starting`, then `episode_started`. A disconnect releases controls, clears stale state, and reconnects with bounded exponential backoff; rewards received between perceptions use the configured sum/mean/latest reduction without retaining individual messages.
+The reward transport is one app-wide `RewardWebSocketServerSettings` value persisted with workflow settings, never active per-profile transport. AgentTrainer hosts `ws://`; the rewarder connects as a client. The default is `ws://127.0.0.1:47831`, `acceptLocalOnly`, one client, explicit port 1024–65535, no credentials/query/fragment, and a 64 KiB maximum message. Trusted-LAN listening is explicit and warning-bearing. `wss://` is not accepted because the app does not invent or persist a TLS server identity.
+
+`RewardWebSocketMessageNames` owns the editable incoming `type`, `reward`, and `done` fields; incoming episode-finished and heartbeat type values; and outgoing episode-finished, episode-starting, episode-started, update-started, and update-finished values. Names are trimmed, bounded, control-free, collision-checked, and frozen at session start. Outgoing metadata keys `episode`, `timestamp`, `reason`, `return`, `steps`, and `next_episode` remain stable. Default 2.4.0 aliases remain receive-compatible only while default naming is active.
+
+Reward JSON accepts one finite numeric configured reward field, an optional configured boolean done field, the configured episode-finished type, or the configured heartbeat type. Booleans masquerading as numbers, non-finite/coerced strings, wrong field types, oversized messages, and semantically empty objects are invalid. Rewards received between perceptions use sum/mean/latest reduction without retaining individual messages.
+
+Any server/client disconnect immediately releases controls and clears stale prediction/temporal/filter state. Default safety checkpoints, publishes any updated actor, and stops after the configured reconnect grace. A toggle may instead remain safely paused while the listener admits a reconnect. Reward/heartbeat staleness and cumulative invalid-message floods have separate stop-and-save toggles. Capture loss, stale inference, target focus loss, physical input, panic, relevant output-permission changes, and application termination use the same ordered release/checkpoint/publication path. Every final stop refreshes the exact RL checkpoint; even a partial final rollout is updated when nonempty.
 
 ## Storage contracts
 
@@ -279,7 +297,7 @@ Theme controls are bounded and global. Motion honors Reduce Motion, can be disab
 
 User-facing technical values must be derived from shared contract helpers such as `NeuralInputSizing` and `ModelSizing`, not duplicated formulas.
 
-AI Models exposes Training Configuration as separate Training Data and Reinforcement Learning tabs. The RL tab keeps common episode/rollout settings visible, places PPO, exploration, reward, connection, and persistence controls under one Advanced disclosure, displays estimated retained rollout memory, and uses an inverse blocked-key editor: only selected keys/buttons/movement modes are executable. Run may display live RL status and metrics but must not add a start/stop button.
+AI Models exposes Training Configuration as separate Training Data and Reinforcement Learning tabs. The RL tab keeps common episode/rollout settings visible, places PPO, per-category exploration/stabilization, reward, environment lifecycle, and persistence controls under one Advanced disclosure, displays estimated retained rollout memory, and uses an inverse blocked-key editor: only selected keys/buttons/movement modes are executable. The one universal hosted endpoint, access controls, stop-and-save toggles, and every protocol name live in Settings → Reward WebSocket. Run may display live RL status and metrics but must not add a start/stop button.
 
 Library recording rows and inspectors expose encoded frames plus logical package MB/GB. Folder headers aggregate every recording in that folder—not only search results—and show total recordings, frames, logical bytes, and full recorded seconds. Newly created manifests use exact frame counts; legacy estimates must remain compatible and non-destructive.
 
@@ -298,7 +316,7 @@ Before release:
 5. Quit AgentTrainer and run `./build.sh`.
 6. Verify `/Applications/AgentTrainer.app` launches and reports the intended version.
 7. Exercise permission refresh, ordinary recording start/stop, explicit DAgger start/correct/stop, ordinary takeover without recording, correction warm-start, training pause/resume, agent panic, and updater UI.
-8. Against a loopback WebSocket, exercise high-rate rewards, remote `done`, episode lifecycle messages, disconnect/reconnect release behavior, reward staleness, keybind-only start/stop, an RL update from a demonstration brain, demonstration warm-start from an RL brain, and normal Run of the RL actor with the reward server absent.
+8. Against AgentTrainer's loopback-hosted WebSocket, exercise high-rate rewards, custom names end to end, heartbeat, remote `done`, strict lifecycle ordering, single-client admission, disconnect/reconnect release behavior, reward staleness, stop-and-save, keybind-only start/stop, an RL update from a demonstration brain, demonstration warm-start from an RL brain, and normal stochastic Run of the RL actor with no rewarder.
 9. Verify the DMG and `SHA256SUMS.txt` in `outputs`.
 10. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
 

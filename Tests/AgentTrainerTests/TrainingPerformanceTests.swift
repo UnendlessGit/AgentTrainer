@@ -51,10 +51,7 @@ final class TrainingPerformanceTests: XCTestCase {
             var random = ReinforcementRandomGenerator(seed: configuration.seed)
             let sample = try plan.sample(
                 logits: prediction.logits,
-                standardDeviation: Float(
-                    configuration.continuousActionStandardDeviation
-                ),
-                binaryTemperature: Float(configuration.binaryActionTemperature),
+                behavior: configuration.effectiveActionBehavior,
                 random: &random
             )
             let transitions = (0..<configuration.rolloutSteps).map { index in

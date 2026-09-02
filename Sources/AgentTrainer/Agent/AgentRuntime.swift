@@ -110,6 +110,10 @@ final class AgentRuntime: @unchecked Sendable {
     private var allowedKeyCodes: Set<UInt16> = []
     private var sourceVersionID: UUID?
     private var shiftUsesKeyboardChannel = false
+    private var reinforcementActionPlan: ReinforcementActionPlan?
+    private var reinforcementActionBehavior: ReinforcementActionBehavior?
+    private var reinforcementRandom = ReinforcementRandomGenerator(seed: 7_431)
+    private var reinforcementActionFilter = ReinforcementActionFilter()
     private var latestFrame: CVPixelBuffer?
     private var latestFrameHostNanos: UInt64 = 0
     private var lastUsableCaptureFrame: CVPixelBuffer?
@@ -270,6 +274,8 @@ final class AgentRuntime: @unchecked Sendable {
         runtimeProfile.channels = RuntimeActionSemantics.effectiveChannels(saved: version.channels, current: profile.channels)
         runtimeProfile.training = version.training
         var runtimeAllowedKeyCodes = allowedKeyCodes
+        var reinforcementPlan: ReinforcementActionPlan?
+        var reinforcementBehavior: ReinforcementActionBehavior?
         if let reinforcementActionSpace = version.reinforcementActionSpace {
             runtimeProfile.channels = reinforcementActionSpace.effectiveChannels(
                 base: runtimeProfile.channels,
@@ -281,6 +287,19 @@ final class AgentRuntime: @unchecked Sendable {
             runtimeAllowedKeyCodes.formIntersection(
                 reinforcementActionSpace.allowedKeyCodes
             )
+            var runtimeConfiguration = ReinforcementLearningConfiguration()
+            runtimeConfiguration.actionSpace = reinforcementActionSpace
+            let behavior = try (
+                version.reinforcementActionBehavior
+                    ?? ReinforcementActionBehavior()
+            ).validated()
+            runtimeConfiguration.actionBehavior = behavior
+            reinforcementPlan = try ReinforcementActionPlan.make(
+                profile: runtimeProfile,
+                configuration: runtimeConfiguration,
+                mouseMode: mouseMode
+            )
+            reinforcementBehavior = behavior
         }
         _ = try runtimeProfile.preprocessing.validated()
         _ = try runtimeProfile.training.effectiveTemporalVision.validated(
@@ -296,23 +315,30 @@ final class AgentRuntime: @unchecked Sendable {
         let temporal = runtimeProfile.training.effectiveTemporalVision
         let hasTemporalMemory = temporal.pastFrameCount > 0
         let hasContext = !contextSchema.isEmpty
+        let usesReinforcementSemantics = reinforcementPlan != nil
         let contextInputIndex = hasTemporalMemory ? 3 : 1
         let pastSpec = temporal.pastFrameSpec(from: runtimeProfile.preprocessing)
         let predictionFunction: VisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
             let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
             let contextValues = hasContext ? inputs[contextInputIndex] : nil
             if hasTemporalMemory {
-                return [model.predictions(
+                let logits = model(
                     currentImages: currentImages,
                     pastImages: VisionPreprocessor.mlxPastFrameTensor(inputs[1], spec: pastSpec),
                     pastControls: inputs[2],
                     contextValues: contextValues
-                )]
+                )
+                return [usesReinforcementSemantics
+                    ? logits : model.activatedPredictions(logits: logits)]
             }
-            return [model.currentOnlyPredictions(
-                currentImages: currentImages,
+            let logits = model.logits(
+                temporalFeatures: model.currentOnlyTemporalFeatures(
+                    currentImages: currentImages
+                ),
                 contextValues: contextValues
-            )]
+            )
+            return [usesReinforcementSemantics
+                ? logits : model.activatedPredictions(logits: logits)]
         }
         // Diagnostic graphs are lazy: creating these closures does not execute
         // or materialize an extra tensor. The selected graph first compiles only
@@ -334,7 +360,8 @@ final class AgentRuntime: @unchecked Sendable {
                     contextValues: contextValues
                 )
                 let map = model.sampledForVisualization(layers[selectedLayer]).mean(axis: -1, keepDims: true)
-                return [model.activatedPredictions(logits: logits), map]
+                return [usesReinforcementSemantics
+                    ? logits : model.activatedPredictions(logits: logits), map]
             }
         }
         let channelVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
@@ -352,7 +379,8 @@ final class AgentRuntime: @unchecked Sendable {
                 temporalFeatures: temporalFeatures,
                 contextValues: contextValues
             )
-            return [model.activatedPredictions(logits: logits), model.strongestChannelsForVisualization(layers.last!)]
+            return [usesReinforcementSemantics
+                ? logits : model.activatedPredictions(logits: logits), model.strongestChannelsForVisualization(layers.last!)]
         }
         let saliencyVisualizationFunction = compile(inputs: [model]) { (inputs: [MLXArray]) -> [MLXArray] in
             let currentImages = VisionPreprocessor.mlxTensor(inputs[0], spec: runtimeProfile.preprocessing)
@@ -372,7 +400,8 @@ final class AgentRuntime: @unchecked Sendable {
             // Keep the exact final tensor on GPU for the post-CNN gradient.
             // This graph intentionally omits the channel ranking used by the
             // separate feature-grid view.
-            return [model.activatedPredictions(logits: logits), layers.last!]
+            return [usesReinforcementSemantics
+                ? logits : model.activatedPredictions(logits: logits), layers.last!]
         }
         let saliencyGradient = grad({ (inputs: [MLXArray]) -> MLXArray in
             if hasTemporalMemory {
@@ -395,6 +424,7 @@ final class AgentRuntime: @unchecked Sendable {
             )
             return (logits * selector.asType(model.dtype)).sum()
         }, argumentNumbers: [0])
+        let initialReinforcementCursor = Self.normalizedCursor(in: captureRect)
         let accepted = lock.withLock { () -> Bool in
             guard launchRevision == launchToken, starting, stopped else { return false }
             self.model = model
@@ -415,6 +445,15 @@ final class AgentRuntime: @unchecked Sendable {
             )
             self.allowedKeyCodes = runtimeAllowedKeyCodes
             self.shiftUsesKeyboardChannel = (version.trainingDataSchema ?? 0) >= 7
+            self.reinforcementActionPlan = reinforcementPlan
+            self.reinforcementActionBehavior = reinforcementBehavior
+            self.reinforcementRandom = ReinforcementRandomGenerator(
+                seed: Self.reinforcementRuntimeSeed(version.id)
+                    ^ DispatchTime.now().uptimeNanoseconds
+            )
+            self.reinforcementActionFilter.reset(
+                absoluteMousePosition: initialReinforcementCursor
+            )
             self.safety = safety
             self.captureRect = captureRect
             self.mode = mode
@@ -560,6 +599,9 @@ final class AgentRuntime: @unchecked Sendable {
             contextRevision &+= 1
             temporalFrames.reset()
             predictionLatch.reset()
+            reinforcementActionFilter.reset(
+                absoluteMousePosition: Self.normalizedCursor(in: captureRect)
+            )
             latestContextControls = [Float](repeating: 0, count: ActionLayout.count)
             guard !stopped else { return nil }
             contextTransitionPending = true
@@ -704,6 +746,9 @@ final class AgentRuntime: @unchecked Sendable {
                 daggerInferencePaused = false
                 temporalFrames.reset()
                 predictionLatch.reset()
+                reinforcementActionFilter.reset(
+                    absoluteMousePosition: Self.normalizedCursor(in: captureRect)
+                )
                 injector.enable(outputPermissions: outputPermissions)
             }
             safetyMonitor.excludedKeyCodes = []
@@ -728,6 +773,9 @@ final class AgentRuntime: @unchecked Sendable {
             daggerFrameCapturePaused = false
             temporalFrames.reset()
             predictionLatch.reset()
+            reinforcementActionFilter.reset(
+                absoluteMousePosition: Self.normalizedCursor(in: captureRect)
+            )
             daggerFrames.reset()
             recentDAggerDropTimestamps.removeAll(keepingCapacity: true)
             nextDAggerFrameHostNanos = 0
@@ -758,7 +806,7 @@ final class AgentRuntime: @unchecked Sendable {
             daggerRecorder = nil; daggerOutputPaused = false; daggerInferencePaused = false; daggerFrameCapturePaused = true
             daggerStarting = false; daggerStartupBuffer.reset()
             latestFrame = nil; latestFrameHostNanos = 0; lastUsableCaptureFrame = nil
-            temporalFrames.reset(); predictionLatch.reset(); targetPID = nil
+            temporalFrames.reset(); predictionLatch.reset(); reinforcementActionFilter.reset(); targetPID = nil
             return (.perform(timer), recorder)
         }
         let action = transition.0
@@ -801,8 +849,8 @@ final class AgentRuntime: @unchecked Sendable {
             }
         }
         lock.withLock {
-            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; contextSchema = .empty; contextVector.removeAll(keepingCapacity: false); contextRevision &+= 1; contextTransitionPending = false; sourceVersionID = nil; daggerRuntimeConfiguration = nil; daggerColorQuantization = nil; recentDAggerDropTimestamps.removeAll(keepingCapacity: false); allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
-            latestFrame = nil; latestFrameHostNanos = 0; lastUsableCaptureFrame = nil; temporalFrames.reset(); daggerFrames.reset(); predictionLatch.reset(); processing = false
+            predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; contextSchema = .empty; contextVector.removeAll(keepingCapacity: false); contextRevision &+= 1; contextTransitionPending = false; sourceVersionID = nil; daggerRuntimeConfiguration = nil; daggerColorQuantization = nil; recentDAggerDropTimestamps.removeAll(keepingCapacity: false); allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false; reinforcementActionPlan = nil; reinforcementActionBehavior = nil
+            latestFrame = nil; latestFrameHostNanos = 0; lastUsableCaptureFrame = nil; temporalFrames.reset(); daggerFrames.reset(); predictionLatch.reset(); reinforcementActionFilter.reset(); processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
         MLXMemoryLifecycle.reclaimCaches(after: "agent runtime")
@@ -1119,6 +1167,19 @@ final class AgentRuntime: @unchecked Sendable {
             guard values.count >= ActionLayout.count, values.prefix(ActionLayout.count).allSatisfy(\.isFinite) else {
                 throw AgentTrainerError.model("The brain produced an invalid prediction, so all outputs were stopped safely.")
             }
+            let sampledValues: [Float]
+            if let reinforcementActionPlan, let reinforcementActionBehavior {
+                var random = reinforcementRandom
+                sampledValues = try reinforcementActionPlan.sample(
+                    logits: values,
+                    behavior: reinforcementActionBehavior,
+                    includesContinuousExploration: false,
+                    random: &random
+                ).executedActions
+                reinforcementRandom = random
+            } else {
+                sampledValues = values
+            }
             if let visualization {
                 let frame = CNNVisualizationFrame(
                     packed: packed,
@@ -1147,8 +1208,18 @@ final class AgentRuntime: @unchecked Sendable {
                 lock.unlock()
                 return
             }
+            let executablePrediction: [Float]
+            if let reinforcementActionPlan, let reinforcementActionBehavior {
+                executablePrediction = reinforcementActionFilter.apply(
+                    to: sampledValues,
+                    plan: reinforcementActionPlan,
+                    behavior: reinforcementActionBehavior
+                )
+            } else {
+                executablePrediction = sampledValues
+            }
             let frameControls = RuntimeActionSemantics.temporalControlValues(
-                values,
+                executablePrediction,
                 channels: profile.channels,
                 restrictions: profile.effectiveRestrictions,
                 allowedKeyCodes: allowedKeyCodes,
@@ -1168,7 +1239,10 @@ final class AgentRuntime: @unchecked Sendable {
                     capacity: retainedFrameCount
                 )
             }
-            predictionLatch.publish(values)
+            predictionLatch.publish(
+                reinforcementActionPlan == nil
+                    ? executablePrediction : frameControls
+            )
             metrics.frameCount += 1
             let elapsed = max(0.001, CACurrentMediaTime() - startedAt)
             metrics.perceptionFPS = Double(metrics.frameCount) / elapsed
@@ -1294,6 +1368,24 @@ final class AgentRuntime: @unchecked Sendable {
             return DispatchTime.now().uptimeNanoseconds
         }
         return UInt64(scaled.value)
+    }
+
+    private static func reinforcementRuntimeSeed(_ versionID: UUID) -> UInt64 {
+        versionID.uuidString.utf8.reduce(0xcbf2_9ce4_8422_2325) {
+            ($0 ^ UInt64($1)) &* 0x0000_0100_0000_01b3
+        }
+    }
+
+    private static func normalizedCursor(
+        in rect: CGRect
+    ) -> (x: Float, y: Float)? {
+        guard rect.width.isFinite, rect.height.isFinite,
+              rect.width > 0, rect.height > 0,
+              let point = CGEvent(source: nil)?.location else { return nil }
+        return (
+            Float(min(1, max(0, (point.x - rect.minX) / rect.width))),
+            Float(min(1, max(0, (point.y - rect.minY) / rect.height)))
+        )
     }
 
     private func drain(queue: DispatchQueue) async {

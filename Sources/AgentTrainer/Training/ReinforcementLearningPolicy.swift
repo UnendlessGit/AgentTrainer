@@ -50,7 +50,8 @@ struct ReinforcementActionPlan: Hashable, Sendable {
     static func make(
         profile: AIProfile,
         configuration: ReinforcementLearningConfiguration,
-        mouseMode: MouseControlMode
+        mouseMode: MouseControlMode,
+        outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions()
     ) throws -> Self {
         let actionSpace = try configuration.actionSpace.validated()
         let restrictions = profile.effectiveRestrictions
@@ -61,7 +62,7 @@ struct ReinforcementActionPlan: Hashable, Sendable {
         }
 
         let keys = actionSpace.executableKeyCodes(restrictions: restrictions)
-        if profile.channels.keyboard {
+        if profile.channels.keyboard, outputPermissions.keyboard {
             binary += keys.sorted().compactMap { code in
                 guard code <= ReinforcementActionSpace.maximumKeyCode,
                       !ActionLayout.allModifierKeyCodes.contains(code),
@@ -76,7 +77,7 @@ struct ReinforcementActionPlan: Hashable, Sendable {
         let modifierEquivalents: [Set<UInt16>] = [
             ActionLayout.shiftKeyCodes, [59, 62], [58, 61], [55, 54]
         ]
-        if profile.channels.modifiers {
+        if profile.channels.modifiers, outputPermissions.keyboard {
             for modifier in 1..<4 where restrictions.allowsModifier(modifier)
                 && !keys.isDisjoint(with: modifierEquivalents[modifier]) {
                 binary.append(ActionLayout.modifiers.lowerBound + modifier)
@@ -85,7 +86,7 @@ struct ReinforcementActionPlan: Hashable, Sendable {
 
         var continuous: [Int] = []
         var absolute: Set<Int> = []
-        if profile.channels.mouseMovement {
+        if profile.channels.mouseMovement, outputPermissions.cursorMovement {
             switch mouseMode {
             case .absolute where actionSpace.allowsAbsoluteMouseMovement:
                 continuous += ActionLayout.absoluteMouse
@@ -103,7 +104,7 @@ struct ReinforcementActionPlan: Hashable, Sendable {
         continuous = Array(Set(continuous)).sorted()
         guard !binary.isEmpty || !continuous.isEmpty else {
             throw AgentTrainerError.invalidConfiguration(
-                "The RL allowlist has no actions left after the AI's channel switches and blocked-output restrictions are applied."
+                "The RL allowlist has no executable actions after the AI's channel switches, blocked-output restrictions, selected mouse mode, and Run output permissions are applied."
             )
         }
         return Self(
@@ -117,16 +118,15 @@ struct ReinforcementActionPlan: Hashable, Sendable {
 
     func sample(
         logits: [Float],
-        standardDeviation: Float,
-        binaryTemperature: Float,
+        behavior: ReinforcementActionBehavior,
+        includesContinuousExploration: Bool = true,
         random: inout ReinforcementRandomGenerator
     ) throws -> ReinforcementPolicySample {
         guard logits.count >= ActionLayout.count,
               logits.prefix(ActionLayout.count).allSatisfy(\.isFinite) else {
             throw AgentTrainerError.model("The RL actor produced an invalid action distribution.")
         }
-        let std = max(0.001, standardDeviation)
-        let temperature = max(0.1, binaryTemperature)
+        let temperature = max(0.1, Float(behavior.binaryActionTemperature))
         var distribution = [Float](repeating: 0, count: ActionLayout.count)
         var executed = [Float](repeating: 0, count: ActionLayout.count)
         var logProbability = 0.0
@@ -139,13 +139,15 @@ struct ReinforcementActionPlan: Hashable, Sendable {
             logProbability += action > 0.5
                 ? Self.logSigmoid(scaled) : Self.logSigmoid(-scaled)
         }
-        let logNormalizer = Foundation.log(Double(std))
-            + 0.5 * Foundation.log(2 * Double.pi)
         for index in continuousIndices {
+            let std = max(0.001, behavior.standardDeviation(for: index))
             let mean = Double(logits[index])
-            let latent = mean + Double(std) * random.standardNormal()
+            let latent = includesContinuousExploration
+                ? mean + Double(std) * random.standardNormal() : mean
             let standardized = (latent - mean) / Double(std)
-            logProbability += -0.5 * standardized * standardized - logNormalizer
+            logProbability += -0.5 * standardized * standardized
+                - Foundation.log(Double(std))
+                - 0.5 * Foundation.log(2 * Double.pi)
             distribution[index] = Float(latent)
             if absoluteContinuousIndices.contains(index) {
                 let bounded = Self.sigmoid(latent)
@@ -167,6 +169,26 @@ struct ReinforcementActionPlan: Hashable, Sendable {
         )
     }
 
+    /// Compatibility overload for focused tests and third-party source builds
+    /// written against 2.4.0's one-size-fits-all exploration setting.
+    func sample(
+        logits: [Float],
+        standardDeviation: Float,
+        binaryTemperature: Float,
+        random: inout ReinforcementRandomGenerator
+    ) throws -> ReinforcementPolicySample {
+        try sample(
+            logits: logits,
+            behavior: ReinforcementActionBehavior(
+                binaryActionTemperature: Double(binaryTemperature),
+                absoluteMouseStandardDeviation: Double(standardDeviation),
+                relativeMouseStandardDeviation: Double(standardDeviation),
+                scrollStandardDeviation: Double(standardDeviation)
+            ),
+            random: &random
+        )
+    }
+
     var binaryMask: [Float] {
         mask(indices: binaryIndices)
     }
@@ -177,6 +199,16 @@ struct ReinforcementActionPlan: Hashable, Sendable {
 
     var absoluteContinuousMask: [Float] {
         mask(indices: Array(absoluteContinuousIndices))
+    }
+
+    func continuousStandardDeviations(
+        behavior: ReinforcementActionBehavior
+    ) -> [Float] {
+        var result = [Float](repeating: 1, count: ActionLayout.count)
+        for index in continuousIndices where result.indices.contains(index) {
+            result[index] = behavior.standardDeviation(for: index)
+        }
+        return result
     }
 
     private func mask(indices: [Int]) -> [Float] {
@@ -195,6 +227,102 @@ struct ReinforcementActionPlan: Hashable, Sendable {
         value >= 0
             ? -Foundation.log1p(Foundation.exp(-value))
             : value - Foundation.log1p(Foundation.exp(value))
+    }
+}
+
+/// Stateful, deterministic action transform used after policy sampling. PPO
+/// retains the original distribution sample for its likelihood ratio while the
+/// environment and temporal controls receive this stabilized executable action.
+/// Normal Run applies the same transform to the saved actor.
+struct ReinforcementActionFilter: Sendable {
+    private var absoluteMouse: (x: Float, y: Float)?
+    private var relativeMouse = (x: Float(0), y: Float(0))
+    private var scroll = (x: Float(0), y: Float(0))
+
+    mutating func reset(
+        absoluteMousePosition: (x: Float, y: Float)? = nil
+    ) {
+        absoluteMouse = absoluteMousePosition
+        relativeMouse = (0, 0)
+        scroll = (0, 0)
+    }
+
+    mutating func apply(
+        to rawActions: [Float],
+        plan: ReinforcementActionPlan,
+        behavior: ReinforcementActionBehavior
+    ) -> [Float] {
+        guard rawActions.count >= ActionLayout.count else { return rawActions }
+        var actions = rawActions
+        if plan.absoluteContinuousIndices.contains(ActionLayout.absoluteMouse.lowerBound),
+           plan.absoluteContinuousIndices.contains(ActionLayout.absoluteMouse.lowerBound + 1) {
+            let target = (
+                x: min(1, max(0, actions[ActionLayout.absoluteMouse.lowerBound])),
+                y: min(1, max(0, actions[ActionLayout.absoluteMouse.lowerBound + 1]))
+            )
+            let previous = absoluteMouse ?? target
+            let retained = Float(behavior.absoluteMouseSmoothing)
+            var next = (
+                x: previous.x * retained + target.x * (1 - retained),
+                y: previous.y * retained + target.y * (1 - retained)
+            )
+            let dx = next.x - previous.x
+            let dy = next.y - previous.y
+            let distance = Foundation.sqrt(dx * dx + dy * dy)
+            let maximumStep = Float(behavior.maximumAbsoluteMouseStep)
+            if distance > maximumStep, distance > 0 {
+                let scale = maximumStep / distance
+                next = (previous.x + dx * scale, previous.y + dy * scale)
+            }
+            absoluteMouse = next
+            actions[ActionLayout.absoluteMouse.lowerBound] = next.x
+            actions[ActionLayout.absoluteMouse.lowerBound + 1] = next.y
+        }
+        if plan.continuousIndices.contains(ActionLayout.relativeMouse.lowerBound),
+           plan.continuousIndices.contains(ActionLayout.relativeMouse.lowerBound + 1) {
+            var target = (
+                x: min(1, max(-1, actions[ActionLayout.relativeMouse.lowerBound])),
+                y: min(1, max(-1, actions[ActionLayout.relativeMouse.lowerBound + 1]))
+            )
+            let magnitude = Foundation.sqrt(target.x * target.x + target.y * target.y)
+            if magnitude < Float(behavior.relativeMouseDeadZone) { target = (0, 0) }
+            let retained = Float(behavior.relativeMouseSmoothing)
+            relativeMouse = (
+                relativeMouse.x * retained + target.x * (1 - retained),
+                relativeMouse.y * retained + target.y * (1 - retained)
+            )
+            let filteredMagnitude = Foundation.sqrt(
+                relativeMouse.x * relativeMouse.x
+                    + relativeMouse.y * relativeMouse.y
+            )
+            let maximumMagnitude = Float(
+                behavior.maximumRelativeMouseMagnitude
+            )
+            if filteredMagnitude > maximumMagnitude, filteredMagnitude > 0 {
+                let scale = maximumMagnitude / filteredMagnitude
+                relativeMouse = (
+                    relativeMouse.x * scale,
+                    relativeMouse.y * scale
+                )
+            }
+            actions[ActionLayout.relativeMouse.lowerBound] = relativeMouse.x
+            actions[ActionLayout.relativeMouse.lowerBound + 1] = relativeMouse.y
+        }
+        if plan.continuousIndices.contains(ActionLayout.scroll.lowerBound),
+           plan.continuousIndices.contains(ActionLayout.scroll.lowerBound + 1) {
+            let retained = Float(behavior.scrollSmoothing)
+            scroll = (
+                scroll.x * retained
+                    + min(1, max(-1, actions[ActionLayout.scroll.lowerBound]))
+                        * (1 - retained),
+                scroll.y * retained
+                    + min(1, max(-1, actions[ActionLayout.scroll.lowerBound + 1]))
+                        * (1 - retained)
+            )
+            actions[ActionLayout.scroll.lowerBound] = scroll.x
+            actions[ActionLayout.scroll.lowerBound + 1] = scroll.y
+        }
+        return actions
     }
 }
 
@@ -433,6 +561,11 @@ final class ReinforcementPolicyOptimizer: @unchecked Sendable {
             [1, ActionLayout.count]
         )
         let signedContinuousMask = continuousMask - absoluteContinuousMask
+        let actionBehavior = configuration.effectiveActionBehavior
+        let continuousStandardDeviations = MLXArray(
+            actionPlan.continuousStandardDeviations(behavior: actionBehavior),
+            [1, ActionLayout.count]
+        )
         let activeActionCount = Float(max(1, actionPlan.actionCount))
         trainingFunction = compile(
             inputs: [actorCritic, ppoOptimizer, randomState],
@@ -476,16 +609,15 @@ final class ReinforcementPolicyOptimizer: @unchecked Sendable {
                 let logits = model.actor.logits(fusedFeatures: fused).asType(.float32)
                 let values = model.value(fusedFeatures: fused)
                 let actions = differentiableInputs[actionIndex].asType(.float32)
-                let scaledBinaryLogits = logits / Float(configuration.binaryActionTemperature)
+                let scaledBinaryLogits = logits / Float(actionBehavior.binaryActionTemperature)
                 let binaryLogProbability = -binaryCrossEntropy(
                     logits: scaledBinaryLogits,
                     targets: actions * binaryMask,
                     reduction: .none
                 )
-                let standardDeviation = Float(configuration.continuousActionStandardDeviation)
-                let normalized = (actions - logits) / standardDeviation
+                let normalized = (actions - logits) / continuousStandardDeviations
                 let normalLogProbability = -0.5 * square(normalized)
-                    - Foundation.log(Double(standardDeviation))
+                    - log(continuousStandardDeviations)
                     - 0.5 * Foundation.log(2 * Double.pi)
                 let absoluteActions = sigmoid(actions)
                 let signedActions = tanh(actions)
@@ -539,11 +671,8 @@ final class ReinforcementPolicyOptimizer: @unchecked Sendable {
                 )
                 let normalEntropy = MLXArray.full(
                     logits.shape,
-                    values: MLXArray(
-                        Float(0.5 * Foundation.log(2 * Double.pi * Double(standardDeviation * standardDeviation)) + 0.5),
-                        dtype: .float32
-                    )
-                )
+                    values: MLXArray(0.5 * Foundation.log(2 * Double.pi) + 0.5)
+                ) + log(continuousStandardDeviations)
                 let entropy = ((binaryEntropy * binaryMask + normalEntropy * continuousMask)
                     .sum(axis: -1) / activeActionCount).mean()
                 let total = policyLoss
@@ -584,7 +713,9 @@ final class ReinforcementPolicyOptimizer: @unchecked Sendable {
         bootstrapValue: Float,
         shuffleSeed: UInt64
     ) throws -> ReinforcementUpdateMetrics {
-        guard transitions.count >= 4 else { return ReinforcementUpdateMetrics() }
+        guard ReinforcementRolloutPolicy.canUpdateFinalBatch(
+            transitionCount: transitions.count
+        ) else { return ReinforcementUpdateMetrics() }
         let rewards = transitions.map(\.reward)
         let oldValues = transitions.map(\.oldValue)
         let (advantages, returns) = ReinforcementAdvantageMath.advantagesAndReturns(

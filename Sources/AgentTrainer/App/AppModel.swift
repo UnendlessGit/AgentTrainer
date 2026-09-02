@@ -76,11 +76,14 @@ final class AppModel: ObservableObject {
     @Published var screenPermission = false
     @Published var accessibilityPermission = false
     @Published var inputPermission = false
-    @Published var frameMode: FrameMode = .newest
-    @Published var safety = AgentSafetyPolicy()
-    @Published var showVisionPreview = true
-    @Published var visionPreviewFPS = 10.0
-    @Published var visionPreviewMatchesPerception = false
+    @Published var frameMode: FrameMode = .newest { didSet { persistWorkflowSettings() } }
+    @Published var safety = AgentSafetyPolicy() { didSet { persistWorkflowSettings() } }
+    @Published var showVisionPreview = true { didSet { persistWorkflowSettings() } }
+    @Published var visionPreviewFPS = 10.0 { didSet { persistWorkflowSettings() } }
+    @Published var visionPreviewMatchesPerception = false { didSet { persistWorkflowSettings() } }
+    @Published var rewardWebSocketSettings = RewardWebSocketServerSettings() {
+        didSet { persistWorkflowSettings() }
+    }
     @Published var cnnVisualizationSettings = CNNVisualizationSettings() {
         didSet {
             persistWorkflowSettings()
@@ -193,6 +196,7 @@ final class AppModel: ObservableObject {
     private var reinforcementStopRequested = false
     private var reinforcementContextVersionID: UUID?
     private var runContextLoadRevision: UInt64 = 0
+    private var shouldMigrateLegacyRewardServerSettings = true
 
     private enum TrainingInterruption: Equatable {
         case pause
@@ -232,6 +236,16 @@ final class AppModel: ObservableObject {
             gameCamera = saved.gameCamera ?? GameCameraSettings()
             runtimeOutputPermissions = saved.runtimeOutputPermissions ?? RuntimeOutputPermissions()
             cnnVisualizationSettings = (saved.cnnVisualizationSettings ?? CNNVisualizationSettings()).sanitized()
+            frameMode = saved.frameMode ?? .newest
+            safety = saved.safety ?? AgentSafetyPolicy()
+            showVisionPreview = saved.showVisionPreview ?? true
+            let savedPreviewFPS = saved.visionPreviewFPS ?? 10
+            visionPreviewFPS = savedPreviewFPS.isFinite
+                && (0.1...60).contains(savedPreviewFPS) ? savedPreviewFPS : 10
+            visionPreviewMatchesPerception = saved.visionPreviewMatchesPerception ?? false
+            rewardWebSocketSettings = saved.rewardWebSocketSettings
+                ?? RewardWebSocketServerSettings()
+            shouldMigrateLegacyRewardServerSettings = saved.rewardWebSocketSettings == nil
             if let visuals = try? (saved.recordingVisuals ?? RecordingVisualSettings()).validated() {
                 recordingWidth = visuals.width
                 recordingHeight = visuals.height
@@ -441,6 +455,7 @@ final class AppModel: ObservableObject {
             recordingDestinationFolderID = defaultFolderID ?? recordingFolders.first?.id
         }
         profiles = await WorkspaceStore.shared.listProfiles()
+        await migrateLegacyRewardServerSettingsIfNeeded()
         await refreshStorageState()
         let validRecordingIDs = Set(recordings.map(\.id))
         selectedRecordingIDs.formIntersection(validRecordingIDs)
@@ -456,6 +471,62 @@ final class AppModel: ObservableObject {
             if loaded == selectedProfileID { await refreshVersions() }
             else { unloadVersions() }
         }
+    }
+
+    private func migrateLegacyRewardServerSettingsIfNeeded() async {
+        guard shouldMigrateLegacyRewardServerSettings else { return }
+        shouldMigrateLegacyRewardServerSettings = false
+        if let legacy = profiles.compactMap({ $0.reinforcementLearning }).first(where: {
+            $0.webSocketURL != nil
+        }) {
+            var migrated = RewardWebSocketServerSettings()
+            if let url = legacy.webSocketURL { migrated.url = url }
+            if let timeout = legacy.connectionTimeoutSeconds,
+               timeout.isFinite {
+                migrated.connectionWaitTimeoutSeconds = min(300, max(0.5, timeout))
+            }
+            if let timeout = legacy.rewardTimeoutSeconds,
+               timeout.isFinite {
+                migrated.rewardTimeoutSeconds = min(600, max(0, timeout))
+            }
+            if (try? migrated.validated()) != nil {
+                rewardWebSocketSettings = migrated
+                AppLog.write(
+                    category: "Migration",
+                    "Moved the legacy per-AI reward URL into universal WebSocket settings",
+                    details: migrated.url
+                )
+            } else {
+                AppLog.write(
+                    .warning,
+                    category: "Migration",
+                    "The legacy per-AI reward URL could not become a hosted server URL",
+                    details: "Kept the safe universal default; review Settings → Reward WebSocket"
+                )
+            }
+        }
+        var cleaned: [AIProfile] = []
+        cleaned.reserveCapacity(profiles.count)
+        for var profile in profiles {
+            if var configuration = profile.reinforcementLearning,
+               configuration.webSocketURL != nil
+                    || configuration.connectionTimeoutSeconds != nil
+                    || configuration.rewardTimeoutSeconds != nil
+                    || configuration.pauseActionsWhenRewardStale != nil
+                    || configuration.reconnectInitialDelaySeconds != nil
+                    || configuration.reconnectMaximumDelaySeconds != nil {
+                configuration.webSocketURL = nil
+                configuration.connectionTimeoutSeconds = nil
+                configuration.rewardTimeoutSeconds = nil
+                configuration.pauseActionsWhenRewardStale = nil
+                configuration.reconnectInitialDelaySeconds = nil
+                configuration.reconnectMaximumDelaySeconds = nil
+                profile.reinforcementLearning = configuration
+                try? await WorkspaceStore.shared.saveProfile(profile)
+            }
+            cleaned.append(profile)
+        }
+        profiles = cleaned
     }
 
     func refreshVersions() async {
@@ -1152,7 +1223,15 @@ final class AppModel: ObservableObject {
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
 
             let resolvedMouseMode: MouseControlMode
-            if runMouseMode != .automatic {
+            if let actionSpace = version.reinforcementActionSpace {
+                var runtimeConfiguration = profile.effectiveReinforcementLearning
+                runtimeConfiguration.actionSpace = actionSpace
+                resolvedMouseMode = try await resolvedReinforcementMouseMode(
+                    profile: profile,
+                    version: version,
+                    configuration: runtimeConfiguration
+                )
+            } else if runMouseMode != .automatic {
                 resolvedMouseMode = runMouseMode
             } else if let recommended = version.recommendedMouseMode {
                 resolvedMouseMode = recommended
@@ -1253,7 +1332,18 @@ final class AppModel: ObservableObject {
             try await runtime.start(profile: profile, version: version, allowedKeyCodes: allowedKeyCodes, captureSpec: runtimeCaptureSpec, captureRect: runtimeCaptureRect, mode: frameMode, mouseMode: resolvedMouseMode, gameCamera: gameCamera, outputPermissions: runtimeOutputPermissions, contextSelection: runtimeContextSelection, safety: runtimeSafety, daggerCaptureConfiguration: daggerCaptureConfiguration, previewFPS: showVisionPreview ? previewRate : 0, visualizationSettings: cnnVisualizationSettings, ignoredHotkeys: [hotkeys.panic, hotkeys.record, hotkeys.run, hotkeys.reinforcementLearning])
             runtime.updateContextSelection(runContextValues)
             guard agentLaunchRevision == launchToken else { throw CancellationError() }
-            if isRunning, agent === runtime { runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue)"; activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus; AppLog.write(category: "Runtime", "Agent started", details: "\(profile.name), \(resolvedMouseMode.rawValue), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")") }
+            if isRunning, agent === runtime {
+                let policyMode = version.effectiveTrainingOrigin == .reinforcementLearning
+                    ? "RL probability sampling + stabilized continuous control"
+                    : "deterministic demonstration policy"
+                runtimeStatus = "Agent running locally • \(resolvedMouseMode.rawValue) • \(policyMode)"
+                activityStatus = isTraining ? "AI running • \(trainingStatus)" : runtimeStatus
+                AppLog.write(
+                    category: "Runtime",
+                    "Agent started",
+                    details: "\(profile.name), \(resolvedMouseMode.rawValue), \(policyMode), \(allowedKeyCodes.count) allowed keys, cursor \(runtimeOutputPermissions.cursorMovement ? "enabled" : "disabled"), keyboard \(runtimeOutputPermissions.keyboard ? "enabled" : "disabled"), CNN diagnostics \(cnnVisualizationSettings.enabled ? cnnVisualizationSettings.mode.rawValue : "disabled")"
+                )
+            }
         } catch is CancellationError {
             await attemptedRuntime?.stop(reason: nil)
             // If an installed runtime already cleared itself, its onStop reason
@@ -1319,6 +1409,7 @@ final class AppModel: ObservableObject {
         do {
             try validateProfile(profile)
             _ = try profile.effectiveReinforcementLearning.validated()
+            _ = try rewardWebSocketSettings.validated()
             try validateCurrentRecordingSettings(source: source)
         } catch {
             present(error)
@@ -1330,7 +1421,7 @@ final class AppModel: ObservableObject {
         reinforcementStopRequested = false
         reinforcementLaunchRevision &+= 1
         let launchToken = reinforcementLaunchRevision
-        reinforcementStatus = "Preparing isolated PPO actor and reward connection…"
+        reinforcementStatus = "Preparing PPO, starting the reward server, and waiting for its rewarder…"
         activityStatus = reinforcementStatus
         var attemptedEngine: ReinforcementLearningEngine?
         do {
@@ -1427,6 +1518,7 @@ final class AppModel: ObservableObject {
             try await engine.start(
                 profile: profile,
                 version: version,
+                webSocketSettings: rewardWebSocketSettings,
                 captureSpec: runtimeCaptureSpec,
                 captureRect: runtimeCaptureRect,
                 frameMode: frameMode,
@@ -1467,10 +1559,8 @@ final class AppModel: ObservableObject {
             isStartingReinforcementLearning = false
             reinforcementStatus = "RL training active • stop with \(hotkeys.reinforcementLearning.displayName)"
             activityStatus = reinforcementStatus
-            let rewardEndpoint = configuration.validatedWebSocketURL.map {
-                "\($0.scheme ?? "ws")://\($0.host ?? "configured host")"
-                    + ($0.port.map { ":\($0)" } ?? "")
-            } ?? "configured WebSocket"
+            let rewardEndpoint = rewardWebSocketSettings.validatedURL?.absoluteString
+                ?? "configured WebSocket"
             AppLog.write(
                 category: "Reinforcement Learning",
                 "RL training started",
@@ -2345,7 +2435,13 @@ final class AppModel: ObservableObject {
             cnnVisualizationSettings: cnnVisualizationSettings,
             recordingVisuals: currentRecordingVisualSettings(),
             recordingLeadUpSeconds: recordingLeadUpSeconds,
-            recordingContextAssignments: currentRecordingContextAssignments()
+            recordingContextAssignments: currentRecordingContextAssignments(),
+            frameMode: frameMode,
+            safety: safety,
+            showVisionPreview: showVisionPreview,
+            visionPreviewFPS: visionPreviewFPS,
+            visionPreviewMatchesPerception: visionPreviewMatchesPerception,
+            rewardWebSocketSettings: rewardWebSocketSettings
         )
         if let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: "AgentTrainer.WorkflowSettings") }
     }
@@ -2363,6 +2459,12 @@ private struct PersistentWorkflowSettings: Codable {
     var recordingVisuals: RecordingVisualSettings?
     var recordingLeadUpSeconds: Double?
     var recordingContextAssignments: [ContextAssignment]?
+    var frameMode: FrameMode?
+    var safety: AgentSafetyPolicy?
+    var showVisionPreview: Bool?
+    var visionPreviewFPS: Double?
+    var visionPreviewMatchesPerception: Bool?
+    var rewardWebSocketSettings: RewardWebSocketServerSettings?
 }
 
 

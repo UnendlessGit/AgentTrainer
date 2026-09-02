@@ -1310,6 +1310,10 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Demonstration-trained versions leave this nil and retain existing Run
     /// semantics exactly.
     var reinforcementActionSpace: ReinforcementActionSpace? = nil
+    /// Immutable sampling/filter semantics used to collect this RL actor and to
+    /// execute it later in normal Run. Nil migrates 2.4.0 RL brains to the safe
+    /// current defaults without affecting demonstration-trained versions.
+    var reinforcementActionBehavior: ReinforcementActionBehavior? = nil
 
     var effectiveContextSchema: ModelContextSchema { contextSchema ?? .empty }
     var effectiveTrainingOrigin: ModelTrainingOrigin {
@@ -1324,12 +1328,19 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
         guard effectiveTrainingOrigin == .reinforcementLearning else {
             return reinforcementLearningSummary == nil
                 && reinforcementActionSpace == nil
+                && reinforcementActionBehavior == nil
         }
         guard let summary = reinforcementLearningSummary,
               let actionSpace = reinforcementActionSpace,
-              (try? actionSpace.validated()) != nil else { return false }
+              (try? actionSpace.validated()) != nil,
+              reinforcementActionBehavior.map({
+                  (try? $0.validated()) != nil
+              }) ?? true else { return false }
         return summary.episode >= 0 && summary.update >= 0
             && summary.environmentSteps >= 0
+            && summary.episode <= 1_000_000_000
+            && summary.update <= 1_000_000_000
+            && summary.environmentSteps <= 1_000_000_000_000
             && summary.lastEpisodeReturn.isFinite
             && summary.averageEpisodeReturn.isFinite
     }
