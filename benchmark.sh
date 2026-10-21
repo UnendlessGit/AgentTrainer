@@ -28,7 +28,7 @@ if [[ -z "$METALLIB" || ! -f "$METALLIB" ]]; then
     exit 1
 fi
 
-swift test -c release list >/dev/null
+swift test --build-system native -c release list >/dev/null
 TEST_BUNDLE="$(find "$ROOT/.build" -type d -path '*/release/AgentTrainerPackageTests.xctest' ! -path '*/xcode/*' | head -1)"
 if [[ -z "$TEST_BUNDLE" || ! -d "$TEST_BUNDLE/Contents/MacOS" ]]; then
     print -u2 "SwiftPM did not produce the AgentTrainer release test bundle."
@@ -40,17 +40,15 @@ benchmark_filter="TrainingPerformanceTests.testCompiledMetalDataPathPreservesOrd
 AGENTTRAINER_RUN_PERFORMANCE_TESTS=1 \
     AGENTTRAINER_BENCHMARK_SUSTAINED_STEPS=0 \
     AGENTTRAINER_BENCHMARK_SUSTAINED_BASELINE_STEPS=0 \
-    swift test -c release --skip-build --filter "$benchmark_filter"
+    swift test --build-system native -c release --skip-build --filter "$benchmark_filter"
 
-AGENTTRAINER_RUN_RL_PERFORMANCE_TESTS=1 \
-    swift test -c release --skip-build --filter "TrainingPerformanceTests.testReinforcementPPOUpdateMeasuresDefaultProfileThroughputAndMemory"
 AGENTTRAINER_RUN_PERFORMANCE_TESTS=1 \
     AGENTTRAINER_BENCHMARK_DEFAULT_PROFILE=1 \
     AGENTTRAINER_BENCHMARK_SUSTAINED_STEPS="${AGENTTRAINER_BENCHMARK_SUSTAINED_STEPS:-256}" \
     AGENTTRAINER_BENCHMARK_SUSTAINED_BASELINE_STEPS=0 \
-    swift test -c release --skip-build --filter "$benchmark_filter"
+    swift test --build-system native -c release --skip-build --filter "$benchmark_filter"
 AGENTTRAINER_RUN_PERFORMANCE_TESTS=1 \
     AGENTTRAINER_BENCHMARK_STRESS_PROFILE=1 \
     AGENTTRAINER_BENCHMARK_SUSTAINED_STEPS="${AGENTTRAINER_BENCHMARK_STRESS_STEPS:-192}" \
     AGENTTRAINER_BENCHMARK_SUSTAINED_BASELINE_STEPS="${AGENTTRAINER_BENCHMARK_STRESS_BASELINE_STEPS:-0}" \
-    swift test -c release --skip-build --filter "$benchmark_filter"
+    swift test --build-system native -c release --skip-build --filter "$benchmark_filter"

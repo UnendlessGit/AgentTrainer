@@ -219,32 +219,6 @@ final class TrainingEngine: @unchecked Sendable {
             channels: profile.channels,
             restrictions: profile.effectiveRestrictions
         )
-        let correctionIndices = dataset.manifest.segments
-            .filter { $0.effectivePurpose == .daggerCorrection }
-            .flatMap { Array($0.start..<($0.start + $0.count)) }
-        let correctionProbeIndices = dataset.representativeValidationIndices(
-            from: correctionIndices,
-            limit: Self.recommendedValidationSampleLimit(
-                total: correctionIndices.count,
-                batchSize: profile.training.batchSize,
-                segmentCount: max(1, dataset.manifest.segments.count { $0.effectivePurpose == .daggerCorrection })
-            ),
-            channels: profile.channels,
-            restrictions: profile.effectiveRestrictions
-        )
-        let ordinaryRehearsalIndices = split.validation.isEmpty
-            ? dataset.representativeValidationIndices(
-                from: dataset.manifest.segments
-                    .filter { $0.effectivePurpose == .demonstration }
-                    .flatMap { Array($0.start..<($0.start + $0.count)) },
-                limit: Self.recommendedValidationSampleLimit(
-                    total: split.train.count,
-                    batchSize: profile.training.batchSize,
-                    segmentCount: max(1, dataset.manifest.segments.count { $0.effectivePurpose == .demonstration })
-                ),
-                channels: profile.channels,
-                restrictions: profile.effectiveRestrictions
-            ) : []
         let (reusesValidationVisionFeatures, validationEvaluationIndices): (Bool, [Int]) = {
             let plan = dataset.visionBatchPlan(at: representativeValidationIndices)
             guard plan.reuseRatio >= Self.minimumVisionReuseRatio else {
@@ -377,7 +351,7 @@ final class TrainingEngine: @unchecked Sendable {
             : recordings.filter { $0.manifest.capture.showsCursor }.count * 2 >= recordings.count
 
         let resetsSelectionBaseline = !restore.isExactResume || restore.captureValidationBaseline
-        if split.validation.isEmpty, correctionProbeIndices.isEmpty, resetsSelectionBaseline {
+        if split.validation.isEmpty, resetsSelectionBaseline {
             // A checkpoint from an older split may contain a score and best
             // weights even when the current disjoint split cannot hold out any
             // honest samples. Never publish that stale score as if it applied.
@@ -388,16 +362,6 @@ final class TrainingEngine: @unchecked Sendable {
             state.bestTrainingLoss = nil
             state.bestElapsed = nil
             state.bestExperienceSeconds = nil
-            state.currentValidationReport = nil
-            state.bestValidationReport = nil
-            state.schedulerBestMetric = nil
-            state.schedulerPlateauEpochs = 0
-        } else if split.validation.isEmpty, resetsSelectionBaseline {
-            // A correction run may use ordinary training rows as a fixed
-            // rehearsal probe, but that is not honest held-out validation.
-            // Never carry the source version's old validation number forward.
-            state.validationHistory.removeAll(keepingCapacity: false)
-            state.bestValidationLoss = nil
             state.currentValidationReport = nil
             state.bestValidationReport = nil
             state.schedulerBestMetric = nil
@@ -422,24 +386,11 @@ final class TrainingEngine: @unchecked Sendable {
                     validationStep: validationStep,
                     reusesVisionFeatures: reusesValidationVisionFeatures
                 )
-            } else if !correctionProbeIndices.isEmpty, !ordinaryRehearsalIndices.isEmpty {
-                ordinaryBaseline = try evaluate(
-                    model: model,
-                    dataset: dataset,
-                    indices: ordinaryRehearsalIndices,
-                    profile: profile,
-                    positiveClassWeightValues: positiveClassWeightValues,
-                    inputBufferPool: inputBufferPool,
-                    validationStep: validationStep,
-                    reusesVisionFeatures: false
-                )
             }
             if let ordinaryBaseline {
                 guard ordinaryBaseline.loss.isFinite else {
                     throw AgentTrainerError.model("The selected brain produced an invalid ordinary-behavior baseline on the current recordings.")
                 }
-                state.correctionBaselineOrdinaryLoss = ordinaryBaseline.loss
-                state.correctionBaselineOrdinaryReport = ordinaryBaseline.report
                 if !split.validation.isEmpty {
                     state.validationHistory = [ordinaryBaseline.loss]
                     state.bestValidationLoss = ordinaryBaseline.loss
@@ -449,25 +400,7 @@ final class TrainingEngine: @unchecked Sendable {
                     state.schedulerPlateauEpochs = 0
                 }
             }
-            if !correctionProbeIndices.isEmpty {
-                let correctionBaseline = try evaluate(
-                    model: model,
-                    dataset: dataset,
-                    indices: correctionProbeIndices,
-                    profile: profile,
-                    positiveClassWeightValues: positiveClassWeightValues,
-                    inputBufferPool: inputBufferPool,
-                    validationStep: validationStep,
-                    reusesVisionFeatures: false
-                )
-                guard correctionBaseline.loss.isFinite else {
-                    throw AgentTrainerError.model("The selected brain produced an invalid DAgger correction baseline.")
-                }
-                state.currentCorrectionLoss = correctionBaseline.loss
-                state.bestCorrectionLoss = correctionBaseline.loss
-                state.bestIsPostCorrection = false
-            }
-            if ordinaryBaseline != nil || !correctionProbeIndices.isEmpty {
+            if ordinaryBaseline != nil {
                 state.bestGlobalStep = state.globalStep
                 state.bestEpoch = state.batchOffset > 0 ? state.epoch + 1 : state.epoch
                 state.bestTrainingLoss = state.lossHistory.last
@@ -476,6 +409,7 @@ final class TrainingEngine: @unchecked Sendable {
                 state.bestDemonstratedKeyCodes = restore.baselineDemonstratedKeyCodes
                 state.bestChannels = restore.baselineVersion?.channels
                 state.bestTraining = restore.baselineVersion?.training
+                state.bestOutputCapabilities = restore.baselineVersion?.outputCapabilities
                 state.bestTrainingShowsCursor = restore.baselineVersion?.trainingShowsCursor
                 state.bestRecommendedMouseMode = restore.baselineVersion?.recommendedMouseMode
                 capturedWarmStartBaseline = true
@@ -655,7 +589,6 @@ final class TrainingEngine: @unchecked Sendable {
             trainingLoss: state.lossHistory.last ?? 0,
             epochTrainingLoss: state.epochLossHistory?.last,
             validationLoss: state.validationHistory.last,
-            correctionLoss: state.currentCorrectionLoss,
             validationReport: state.currentValidationReport,
             effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
             learningRateScale: Double(optimizer.learningRateScale),
@@ -831,7 +764,6 @@ final class TrainingEngine: @unchecked Sendable {
                         futureStateLoss: result.futureStateLoss,
                         epochTrainingLoss: epochSampleCount > 0 ? epochWeightedLoss / Double(epochSampleCount) : nil,
                         validationLoss: state.validationHistory.last,
-                        correctionLoss: state.currentCorrectionLoss,
                         validationReport: state.currentValidationReport,
                         effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
                         learningRateScale: Double(optimizer.learningRateScale),
@@ -912,7 +844,6 @@ final class TrainingEngine: @unchecked Sendable {
             var capturedBest = false
             var validationSelectionStatus: String?
             var monitorMetric = epochTrainingLoss
-            var ordinaryEvaluation: ValidationEvaluation?
             if !split.validation.isEmpty {
                 let validation = try evaluate(
                     model: model,
@@ -924,7 +855,6 @@ final class TrainingEngine: @unchecked Sendable {
                     validationStep: validationStep,
                     reusesVisionFeatures: reusesValidationVisionFeatures
                 )
-                ordinaryEvaluation = validation
                 let validationLoss = validation.loss
                 guard validationLoss.isFinite else {
                     throw AgentTrainerError.model("Validation became numerically unstable, so the current epoch was not published. Lower the learning rate or reset this brain's learning state.")
@@ -933,85 +863,27 @@ final class TrainingEngine: @unchecked Sendable {
                 state.currentValidationReport = validation.report
                 state.validationHistory.append(validationLoss)
                 if state.validationHistory.count > 2_048 { state.validationHistory.removeFirst(1_024) }
-                if correctionProbeIndices.isEmpty {
-                    let improvesAggregate = validationLoss < (state.bestValidationLoss ?? .infinity)
-                    let regressesSparseHead = state.bestValidationReport.map {
-                        validation.report.hasSevereBinaryRegression(comparedTo: $0)
-                    } ?? false
-                    if improvesAggregate, !regressesSparseHead {
-                        state.bestValidationLoss = validationLoss
-                        state.bestGlobalStep = state.globalStep
-                        state.bestEpoch = state.epoch
-                        state.bestTrainingLoss = epochTrainingLoss
-                        state.bestElapsed = baseElapsed + started.duration(to: .now).seconds
-                        state.bestExperienceSeconds = state.experienceSeconds
-                        state.bestValidationReport = validation.report
-                        state.bestDemonstratedKeyCodes = state.demonstratedKeyCodes
-                        state.bestChannels = profile.channels
-                        state.bestTraining = profile.training
-                        state.bestTrainingShowsCursor = state.trainingShowsCursor
-                        state.bestRecommendedMouseMode = state.recommendedMouseMode
-                        capturedBest = true
-                    } else if improvesAggregate, regressesSparseHead {
-                        validationSelectionStatus = "Held-out loss improved, but the runnable best brain was retained because a sparse control head regressed sharply"
-                    }
-                }
-            }
-            if !correctionProbeIndices.isEmpty {
-                if ordinaryEvaluation == nil, !ordinaryRehearsalIndices.isEmpty {
-                    ordinaryEvaluation = try evaluate(
-                        model: model,
-                        dataset: dataset,
-                        indices: ordinaryRehearsalIndices,
-                        profile: profile,
-                        positiveClassWeightValues: positiveClassWeightValues,
-                        inputBufferPool: inputBufferPool,
-                        validationStep: validationStep,
-                        reusesVisionFeatures: false
-                    )
-                }
-                let correction = try evaluate(
-                    model: model,
-                    dataset: dataset,
-                    indices: correctionProbeIndices,
-                    profile: profile,
-                    positiveClassWeightValues: positiveClassWeightValues,
-                    inputBufferPool: inputBufferPool,
-                    validationStep: validationStep,
-                    reusesVisionFeatures: false
-                )
-                guard correction.loss.isFinite,
-                      ordinaryEvaluation?.loss.isFinite != false else {
-                    throw AgentTrainerError.model("DAgger candidate evaluation became numerically unstable, so this epoch was not published.")
-                }
-                state.currentCorrectionLoss = correction.loss
-                let decision = Self.correctionCandidateDecision(
-                    correctionLoss: correction.loss,
-                    bestCorrectionLoss: state.bestCorrectionLoss,
-                    ordinaryLoss: ordinaryEvaluation?.loss,
-                    baselineOrdinaryLoss: state.correctionBaselineOrdinaryLoss,
-                    ordinaryReport: ordinaryEvaluation?.report,
-                    baselineOrdinaryReport: state.correctionBaselineOrdinaryReport
-                )
-                if decision.accepts {
-                    state.bestCorrectionLoss = correction.loss
-                    state.bestValidationLoss = split.validation.isEmpty ? nil : ordinaryEvaluation?.loss
+                let improvesAggregate = validationLoss < (state.bestValidationLoss ?? .infinity)
+                let regressesSparseHead = state.bestValidationReport.map {
+                    validation.report.hasSevereBinaryRegression(comparedTo: $0)
+                } ?? false
+                if improvesAggregate, !regressesSparseHead {
+                    state.bestValidationLoss = validationLoss
                     state.bestGlobalStep = state.globalStep
                     state.bestEpoch = state.epoch
                     state.bestTrainingLoss = epochTrainingLoss
                     state.bestElapsed = baseElapsed + started.duration(to: .now).seconds
                     state.bestExperienceSeconds = state.experienceSeconds
-                    state.bestValidationReport = split.validation.isEmpty ? nil : ordinaryEvaluation?.report
-                    state.bestIsPostCorrection = true
+                    state.bestValidationReport = validation.report
                     state.bestDemonstratedKeyCodes = state.demonstratedKeyCodes
                     state.bestChannels = profile.channels
                     state.bestTraining = profile.training
+                    state.bestOutputCapabilities = nil
                     state.bestTrainingShowsCursor = state.trainingShowsCursor
                     state.bestRecommendedMouseMode = state.recommendedMouseMode
                     capturedBest = true
-                    validationSelectionStatus = "DAgger correction improved while ordinary behavior stayed within the regression guard"
-                } else if decision.correctionImproved {
-                    validationSelectionStatus = "DAgger fit improved, but the runnable best brain was retained because ordinary behavior regressed beyond the guard"
+                } else if improvesAggregate, regressesSparseHead {
+                    validationSelectionStatus = "Held-out loss improved, but the runnable best brain was retained because a sparse control head regressed sharply"
                 }
             }
             let schedulerStatus = updateAdaptiveLearningRate(
@@ -1039,7 +911,6 @@ final class TrainingEngine: @unchecked Sendable {
                 trainingLoss: epochTrainingLoss,
                 epochTrainingLoss: epochTrainingLoss,
                 validationLoss: state.validationHistory.last,
-                correctionLoss: state.currentCorrectionLoss,
                 validationReport: state.currentValidationReport,
                 effectiveLearningRate: Double(optimizer.effectiveLearningRate()),
                 learningRateScale: Double(optimizer.learningRateScale),
@@ -1063,75 +934,15 @@ final class TrainingEngine: @unchecked Sendable {
         }
 
         state.elapsed = baseElapsed + started.duration(to: .now).seconds
-        var capturedFinalCorrectionCandidate = false
-        if !correctionProbeIndices.isEmpty,
-           state.globalStep != state.bestGlobalStep {
-            let ordinary: ValidationEvaluation?
-            if !split.validation.isEmpty {
-                ordinary = try evaluate(
-                    model: model, dataset: dataset,
-                    indices: validationEvaluationIndices, profile: profile,
-                    positiveClassWeightValues: positiveClassWeightValues,
-                    inputBufferPool: inputBufferPool, validationStep: validationStep,
-                    reusesVisionFeatures: reusesValidationVisionFeatures
-                )
-            } else if !ordinaryRehearsalIndices.isEmpty {
-                ordinary = try evaluate(
-                    model: model, dataset: dataset,
-                    indices: ordinaryRehearsalIndices, profile: profile,
-                    positiveClassWeightValues: positiveClassWeightValues,
-                    inputBufferPool: inputBufferPool, validationStep: validationStep,
-                    reusesVisionFeatures: false
-                )
-            } else {
-                ordinary = nil
-            }
-            let correction = try evaluate(
-                model: model, dataset: dataset,
-                indices: correctionProbeIndices, profile: profile,
-                positiveClassWeightValues: positiveClassWeightValues,
-                inputBufferPool: inputBufferPool, validationStep: validationStep,
-                reusesVisionFeatures: false
-            )
-            state.currentCorrectionLoss = correction.loss
-            let decision = Self.correctionCandidateDecision(
-                correctionLoss: correction.loss,
-                bestCorrectionLoss: state.bestCorrectionLoss,
-                ordinaryLoss: ordinary?.loss,
-                baselineOrdinaryLoss: state.correctionBaselineOrdinaryLoss,
-                ordinaryReport: ordinary?.report,
-                baselineOrdinaryReport: state.correctionBaselineOrdinaryReport
-            )
-            if decision.accepts {
-                state.bestCorrectionLoss = correction.loss
-                state.bestValidationLoss = split.validation.isEmpty ? nil : ordinary?.loss
-                state.bestGlobalStep = state.globalStep
-                state.bestEpoch = state.batchOffset > 0 ? state.epoch + 1 : state.epoch
-                state.bestTrainingLoss = state.lossHistory.last
-                state.bestElapsed = state.elapsed
-                state.bestExperienceSeconds = state.experienceSeconds
-                state.bestValidationReport = split.validation.isEmpty ? nil : ordinary?.report
-                state.bestIsPostCorrection = true
-                state.bestDemonstratedKeyCodes = state.demonstratedKeyCodes
-                state.bestChannels = profile.channels
-                state.bestTraining = profile.training
-                state.bestTrainingShowsCursor = state.trainingShowsCursor
-                state.bestRecommendedMouseMode = state.recommendedMouseMode
-                capturedFinalCorrectionCandidate = true
-            }
-        }
-        if latestSnapshot?.version.globalStep != state.globalStep || capturedFinalCorrectionCandidate {
-            try await saveCheckpoint(
-                profile: profile, model: model, optimizer: optimizer,
-                randomState: randomState, state: state,
-                captureBest: capturedFinalCorrectionCandidate
-            )
+        if latestSnapshot?.version.globalStep != state.globalStep {
+            try await saveCheckpoint(profile: profile, model: model, optimizer: optimizer,
+                randomState: randomState, state: state)
         }
         let final = try await publishRunnableSnapshot(
             profile: profile,
             state: state,
             completed: true,
-            preferBest: !split.validation.isEmpty || !correctionProbeIndices.isEmpty
+            preferBest: !split.validation.isEmpty
         )
         return final
     }
@@ -1168,7 +979,6 @@ final class TrainingEngine: @unchecked Sendable {
             offset: futureStateConfiguration.actionOffset(actionFPS: profile.training.actionFPS),
             sampleStride: futureStateConfiguration.sampleStride
         ) : nil
-        let trainingWeights = dataset.trainingWeightBatch(at: indices)
 
         func appendContextDescriptor(
             to descriptors: inout [MetalArrayBufferPool.Descriptor]
@@ -1189,9 +999,7 @@ final class TrainingEngine: @unchecked Sendable {
 
         func appendAuxiliaryDescriptors(
             to descriptors: inout [MetalArrayBufferPool.Descriptor]
-        ) -> (weights: Int, futureActions: Int?, futureActionMasks: Int?, futureImages: Int?, futureMap: Int?, futureStateMasks: Int?) {
-            let weights = descriptors.count
-            descriptors.append(.init([count], dtype: .float32))
+        ) -> (futureActions: Int?, futureActionMasks: Int?, futureImages: Int?, futureMap: Int?, futureStateMasks: Int?) {
             var futureActions: Int?, futureActionMasks: Int?
             if usesFutureActions {
                 futureActions = descriptors.count
@@ -1211,14 +1019,13 @@ final class TrainingEngine: @unchecked Sendable {
                 futureStateMasks = descriptors.count
                 descriptors.append(.init([count], dtype: .float32))
             }
-            return (weights, futureActions, futureActionMasks, futureImages, futureMap, futureStateMasks)
+            return (futureActions, futureActionMasks, futureImages, futureMap, futureStateMasks)
         }
 
         func populateAuxiliaries(
             _ destinations: [UnsafeMutableRawBufferPointer],
-            indices auxiliaryIndices: (weights: Int, futureActions: Int?, futureActionMasks: Int?, futureImages: Int?, futureMap: Int?, futureStateMasks: Int?)
+            indices auxiliaryIndices: (futureActions: Int?, futureActionMasks: Int?, futureImages: Int?, futureMap: Int?, futureStateMasks: Int?)
         ) {
-            trainingWeights.withUnsafeBytes { destinations[auxiliaryIndices.weights].copyMemory(from: $0) }
             if let futureActionBatch,
                let rows = auxiliaryIndices.futureActions,
                let masks = auxiliaryIndices.futureActionMasks {
@@ -1359,8 +1166,7 @@ final class TrainingEngine: @unchecked Sendable {
         } else {
             contextValues = MLXArray.zeros([actions.dim(0), 1], dtype: .float32)
         }
-        let sampleWeights = arrays[cursor]
-        cursor += 1
+        let sampleWeights = MLXArray.ones([actions.dim(0)], dtype: .float32)
 
         let futureActionConfiguration = profile.training.effectiveFutureActionPrediction
         let usesFutureActions = includeAuxiliaries
@@ -1532,41 +1338,6 @@ final class TrainingEngine: @unchecked Sendable {
         let diversity = min(8_192, max(1, min(128, segmentCount)) * 64)
         let statistical = min(8_192, Int(Double(total).squareRoot() * 32))
         return min(total, max(baseline, diversity, statistical))
-    }
-
-    static func correctionCandidateDecision(
-        correctionLoss: Double,
-        bestCorrectionLoss: Double?,
-        ordinaryLoss: Double?,
-        baselineOrdinaryLoss: Double?,
-        ordinaryReport: ValidationReport?,
-        baselineOrdinaryReport: ValidationReport?
-    ) -> (accepts: Bool, correctionImproved: Bool) {
-        let previous = bestCorrectionLoss ?? .infinity
-        let requiredImprovement = previous.isFinite
-            ? max(0.000_001, abs(previous) * 0.002)
-            : 0
-        let correctionImproved = correctionLoss.isFinite
-            && correctionLoss < previous - requiredImprovement
-        let ordinaryLossIsSafe: Bool
-        if let ordinaryLoss, let baselineOrdinaryLoss,
-           ordinaryLoss.isFinite, baselineOrdinaryLoss.isFinite {
-            let tolerance = max(0.0005, abs(baselineOrdinaryLoss) * 0.02)
-            ordinaryLossIsSafe = ordinaryLoss <= baselineOrdinaryLoss + tolerance
-        } else {
-            ordinaryLossIsSafe = ordinaryLoss?.isFinite != false
-        }
-        let sparseHeadsAreSafe = !(
-            ordinaryReport.flatMap { current in
-                baselineOrdinaryReport.map {
-                    current.hasSevereBinaryRegression(comparedTo: $0)
-                }
-            } ?? false
-        )
-        return (
-            correctionImproved && ordinaryLossIsSafe && sparseHeadsAreSafe,
-            correctionImproved
-        )
     }
 
     static func adaptivePlateauUpdate(
@@ -1788,15 +1559,7 @@ final class TrainingEngine: @unchecked Sendable {
         )
         if dataset.manifest.segments.count > 1 {
             let segments = dataset.manifest.segments
-            // Explicit expert corrections are scarce aggregated training data,
-            // not honest deployment-distribution validation. Keep every DAgger
-            // segment in training and hold out only ordinary demonstrations.
-            let validationEligible = segments.indices.filter {
-                segments[$0].effectivePurpose == .demonstration
-            }
-            guard !validationEligible.isEmpty else {
-                return (Array(0..<dataset.count), [])
-            }
+            let validationEligible = Array(segments.indices)
             let shuffledSegments = shuffled(validationEligible, seed: seed)
             let validationCount = min(
                 max(0, validationEligible.count - 1),
@@ -1853,9 +1616,6 @@ final class TrainingEngine: @unchecked Sendable {
                 if validationSegments.contains(i) { validation += values } else { train += values }
             }
             return (train, validation)
-        }
-        if dataset.manifest.segments.first?.effectivePurpose == .daggerCorrection {
-            return (Array(0..<dataset.count), [])
         }
         let validationCount = Int(Double(dataset.count) * fraction)
         let proposedValidationStart = max(0, dataset.count - validationCount)
@@ -1924,11 +1684,6 @@ final class TrainingEngine: @unchecked Sendable {
         resumeCompatibleTraining.epochs = 0
         resumeCompatibleTraining.maximumSteps = 0
         resumeCompatibleTraining.checkpointInterval = 0
-        // DAgger capture settings affect only future recording publication.
-        // Every saved correction persists its actual boundary and loss weight
-        // in RecordingTrainingIdentity, so editing capture defaults must not
-        // discard an otherwise exact optimizer continuation.
-        resumeCompatibleTraining.dagger = nil
         var normalizedChannels = profile.channels
         normalizedChannels.absoluteMouse = profile.channels.mouseMovement
         normalizedChannels.relativeMouse = profile.channels.mouseMovement
@@ -1986,7 +1741,6 @@ final class TrainingEngine: @unchecked Sendable {
             : state.epochLossHistory?.last ?? state.lossHistory.last ?? 0
         let displayedValidationLoss = usesBest ? state.bestValidationLoss : state.validationHistory.last
         let displayedValidationReport = usesBest ? state.bestValidationReport : state.currentValidationReport
-        let displayedCorrectionLoss = usesBest ? state.bestCorrectionLoss : state.currentCorrectionLoss
         let displayedChannels = usesBest ? state.bestChannels ?? profile.channels : profile.channels
         let displayedTraining = usesBest ? state.bestTraining ?? profile.training : profile.training
         let displayedDemonstratedKeys = usesBest
@@ -2001,7 +1755,7 @@ final class TrainingEngine: @unchecked Sendable {
         let version = ModelVersionManifest(
             id: UUID(),
             name: usesBest
-                ? (state.bestIsPostCorrection == true ? "Best Corrected Brain • Epoch \(displayedEpoch) • Step \(displayedStep)" : "Best Brain • Epoch \(displayedEpoch) • Step \(displayedStep)")
+                ? "Best Brain • Epoch \(displayedEpoch) • Step \(displayedStep)"
                 : completed ? "Brain • Epoch \(displayedEpoch) • Step \(displayedStep)" : "Autosave • Epoch \(displayedEpoch) • Step \(displayedStep)",
             createdAt: Date(),
             globalStep: displayedStep,
@@ -2023,8 +1777,8 @@ final class TrainingEngine: @unchecked Sendable {
             trainingShowsCursor: displayedCursorVisibility,
             recommendedMouseMode: displayedMouseMode,
             validationReport: displayedValidationReport,
-            correctionLoss: displayedCorrectionLoss,
-            contextSchema: state.contextSchema
+            contextSchema: state.contextSchema,
+            outputCapabilities: usesBest ? state.bestOutputCapabilities : nil
         )
         let destination = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
@@ -2386,14 +2140,10 @@ private struct CheckpointState: Codable {
     var currentEpochSampleCount: Int? = nil
     var currentValidationReport: ValidationReport? = nil
     var bestValidationReport: ValidationReport? = nil
-    var currentCorrectionLoss: Double? = nil
-    var bestCorrectionLoss: Double? = nil
-    var correctionBaselineOrdinaryLoss: Double? = nil
-    var correctionBaselineOrdinaryReport: ValidationReport? = nil
-    var bestIsPostCorrection: Bool? = nil
     var bestDemonstratedKeyCodes: Set<UInt16>? = nil
     var bestChannels: ActionChannels? = nil
     var bestTraining: TrainingConfiguration? = nil
+    var bestOutputCapabilities: ModelOutputCapabilities? = nil
     var bestTrainingShowsCursor: Bool? = nil
     var bestRecommendedMouseMode: MouseControlMode? = nil
     /// Optional preserves checkpoints written before generic context. Exact

@@ -17,7 +17,6 @@ let package = Package(
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift")
             ],
             linkerSettings: [
@@ -32,13 +31,15 @@ let package = Package(
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("Accelerate"),
-                .linkedFramework("IOKit"),
-                .linkedFramework("Network")
+                .linkedFramework("IOKit")
             ]
         ),
         .testTarget(
             name: "AgentTrainerTests",
-            dependencies: ["AgentTrainer"]
+            dependencies: [
+                "AgentTrainer",
+                .product(name: "MLXOptimizers", package: "mlx-swift")
+            ]
         )
     ]
 )

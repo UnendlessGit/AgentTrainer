@@ -28,10 +28,6 @@ struct RecordingTrainingIdentity: Codable, Hashable, Sendable {
     let pixelHeight: Int
     let eventCount: Int
     let supervisionStart: Double
-    let purpose: RecordingPurpose
-    let sourceProfileID: UUID?
-    let sourceVersionID: UUID?
-    let trainingWeight: Double
     let context: [ContextIdentity]
     let videoFile: String
     let eventFile: String
@@ -57,10 +53,6 @@ struct RecordingTrainingIdentity: Codable, Hashable, Sendable {
         pixelHeight = manifest.pixelHeight
         eventCount = manifest.eventCount
         supervisionStart = manifest.effectiveSupervisionStart
-        purpose = manifest.effectivePurpose
-        sourceProfileID = manifest.sourceProfileID
-        sourceVersionID = manifest.sourceVersionID
-        trainingWeight = manifest.effectiveTrainingWeight
         context = manifest.effectiveContextAssignments.map {
             ContextIdentity(fieldID: $0.fieldID, valueID: $0.valueID)
         }.sorted {
@@ -179,20 +171,12 @@ struct CacheSegment: Codable, Hashable, Sendable {
     var start: Int
     var count: Int
     /// First perception owned by this recording. It can precede the first
-    /// supervised row when a DAgger package includes pre-mistake context.
+    /// supervised row in legacy packages with earlier observation context.
     var observationStart: Int? = nil
-    var purpose: RecordingPurpose? = nil
-    var trainingWeight: Double? = nil
     /// One immutable recording-level selection, expanded to rows only when a
     /// batch is gathered. Optional keeps caches from earlier schemas decodable
     /// long enough to reject them by schema version.
     var contextAssignments: [ContextAssignment]? = nil
-
-    var effectivePurpose: RecordingPurpose { purpose ?? .demonstration }
-    var effectiveTrainingWeight: Float {
-        let value = trainingWeight ?? 1
-        return Float(value.isFinite ? min(20, max(1, value)) : 1)
-    }
 }
 
 struct DatasetCacheManifest: Codable, Hashable, Sendable {
@@ -339,10 +323,8 @@ final class CachedDataset: @unchecked Sendable {
         for segment in decoded.segments {
             let end = segmentEnd.addingReportingOverflow(segment.count)
             let observationStart = segment.observationStart ?? 0
-            let weight = segment.trainingWeight ?? 1
             guard segment.start == segmentEnd, segment.count >= 0, !end.overflow,
                   observationStart >= 0, observationStart < max(1, decoded.observationCount),
-                  weight.isFinite, (1...20).contains(weight),
                   Self.contextAssignments(
                       segment.contextAssignments ?? [],
                       belongTo: contextSchema
@@ -1143,15 +1125,6 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
-    func trainingWeightBatch(at indices: [Int]) -> Data {
-        let values = indices.map { index in
-            let segment = segmentIndex(for: index)
-            return manifest.segments.indices.contains(segment)
-                ? manifest.segments[segment].effectiveTrainingWeight : 1
-        }
-        return values.withUnsafeBytes { Data($0) }
-    }
-
     /// Expands one recording-level categorical vector per requested row. When
     /// CNN work is shared, one vector per unique visual sequence is sufficient;
     /// a sequence cannot cross a recording boundary, and the assertion below
@@ -1434,8 +1407,6 @@ actor DatasetCacheBuilder {
                         start: start,
                         count: appended.samples,
                         observationStart: observationCount - appended.observations,
-                        purpose: recording.manifest.effectivePurpose,
-                        trainingWeight: recording.manifest.effectiveTrainingWeight,
                         contextAssignments: recording.manifest.effectiveContextAssignments
                     ))
                 }

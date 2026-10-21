@@ -20,7 +20,7 @@ private func XCTAssertThrowsErrorAsync<T>(
 
 final class DomainTests: XCTestCase {
     func testCurrentTrainingDataSchemaIncludesGenericContextContract() {
-        XCTAssertEqual(TrainingDataContract.schemaVersion, 13)
+        XCTAssertEqual(TrainingDataContract.schemaVersion, 14)
     }
 
     func testGenericContextSchemaUsesStableIDsAndExplicitBlankSegments() throws {
@@ -368,15 +368,6 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(oneBit.videoRangeChroma[240], 240)
         XCTAssertTrue(oneBit.videoRangeLuma.allSatisfy { (16...235).contains(Int($0)) })
         XCTAssertTrue(oneBit.videoRangeChroma.allSatisfy { (16...240).contains(Int($0)) })
-        var packedNeutral = Data([64, 96, 160, 224, 128, 128])
-        try oneBit.quantizePacked(
-            &packedNeutral,
-            spec: PreprocessingSpec(
-                width: 2, height: 2, colorMode: .color,
-                bitDepth: 1, chroma: .yuv420
-            )
-        )
-        XCTAssertEqual(Array(packedNeutral.suffix(2)), [128, 128])
     }
 
     func testRecordingMetricsUseExactFramesBytesAndFolderSeconds() {
@@ -427,10 +418,6 @@ final class DomainTests: XCTestCase {
         let changedSampling = try RecordingTrainingIdentity(recording: RecordingItem(manifest: manifest, directory: directory))
         XCTAssertNotEqual(original, changedSampling)
         manifest.trimStart = 0
-        manifest.trainingWeight = 4
-        let changedCorrectionWeight = try RecordingTrainingIdentity(recording: RecordingItem(manifest: manifest, directory: directory))
-        XCTAssertNotEqual(original, changedCorrectionWeight)
-        manifest.trainingWeight = nil
         let fieldID = UUID(), valueID = UUID()
         manifest.contextAssignments = [ContextAssignment(
             fieldID: fieldID,
@@ -924,7 +911,6 @@ final class DomainTests: XCTestCase {
                 colorBits: 6,
                 compression: 0.7
             ),
-            leadUpSeconds: 4.5,
             contextAssignments: [ContextAssignment(
                 fieldID: UUID(),
                 fieldName: "Scenario",
@@ -936,7 +922,6 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(validated.name, "Gameplay")
         XCTAssertEqual(validated.effectiveRecordingVisuals.width, 1600)
         XCTAssertEqual(validated.effectiveRecordingVisuals.colorBits, 6)
-        XCTAssertEqual(validated.effectiveLeadUpSeconds, 4.5)
         XCTAssertEqual(validated.contextAssignments?.first?.fieldName, "Scenario")
         var invalid = preset
         invalid.captureFPS = .nan
@@ -953,21 +938,13 @@ final class DomainTests: XCTestCase {
         let encoded = try JSONEncoder().encode(preset)
         var legacyPreset = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         legacyPreset.removeValue(forKey: "recordingVisuals")
-        legacyPreset.removeValue(forKey: "leadUpSeconds")
         legacyPreset.removeValue(forKey: "contextAssignments")
         let decodedLegacy = try JSONDecoder().decode(
             RecordingPreset.self,
             from: JSONSerialization.data(withJSONObject: legacyPreset)
         )
         XCTAssertEqual(decodedLegacy.effectiveRecordingVisuals, RecordingVisualSettings())
-        XCTAssertEqual(decodedLegacy.effectiveLeadUpSeconds, 3)
         XCTAssertNil(decodedLegacy.contextAssignments)
-
-        let oldDAgger = try JSONDecoder().decode(
-            DAggerConfiguration.self,
-            from: Data("{\"preRollSeconds\":3,\"correctionWeight\":4}".utf8)
-        )
-        XCTAssertEqual(oldDAgger.correctionWeight, 4)
     }
 
     func testInputEventReaderRejectsUnsupportedAndTruncatedFiles() throws {
@@ -3782,8 +3759,8 @@ final class DomainTests: XCTestCase {
         )
     }
 
-    func testDAggerCacheUsesPreTriggerFramesAsContextButNotAsTargets() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dagger-cache-\(UUID().uuidString)", isDirectory: true)
+    func testLegacyRecordingSupervisionBoundaryKeepsEarlierFramesAsContextOnly() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("legacy-boundary-cache-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = WorkspaceStore(root: root)
         try await store.prepare()
@@ -3796,23 +3773,22 @@ final class DomainTests: XCTestCase {
         let base: UInt64 = 3_000_000_000
         let writer = try InputEventWriter(url: directory.appendingPathComponent("events.atrevents"))
         writer.append(InputSample(timestampNanos: base, kind: .mouseMove, x: 8, y: 8))
-        // AI-executed pre-roll control. It may inform the recurrent context but
-        // must never become an imitation target for the correction segment.
+        // Earlier recorded input may inform the recurrent context but
+        // must never become a supervised target before the saved boundary.
         writer.append(InputSample(timestampNanos: base + 100_000_000, kind: .key, keyCode: 10, isDown: true))
         writer.append(InputSample(timestampNanos: base + 550_000_000, kind: .key, keyCode: 10, isDown: false))
-        // Explicit expert correction after the supervision boundary.
+        // Supervised input after the saved boundary.
         writer.append(InputSample(timestampNanos: base + 650_000_000, kind: .key, keyCode: 13, isDown: true))
         writer.append(InputSample(timestampNanos: base + 800_000_000, kind: .key, keyCode: 13, isDown: false))
         let eventCount = try writer.finish()
         let manifest = RecordingManifest(
-            id: recordingID, name: "DAgger cache", createdAt: Date(),
+            id: recordingID, name: "Legacy boundary cache", createdAt: Date(),
             hostStartNanos: base, duration: 1,
             capture: CaptureSpec(requestedFPS: 10),
             globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
             pixelWidth: 16, pixelHeight: 16, deliveredFPS: 10,
             frameCount: 11, eventCount: eventCount,
-            trimStart: 0, trimEnd: 1, supervisionStart: 0.6,
-            purpose: .daggerCorrection, sourceProfileID: UUID(), sourceVersionID: UUID(), trainingWeight: 4
+            trimStart: 0, trimEnd: 1, supervisionStart: 0.6
         )
         try await store.writeRecording(manifest, to: directory)
         var profile = AIProfile.fresh()
@@ -3826,8 +3802,6 @@ final class DomainTests: XCTestCase {
         ) { _, _ in }
 
         XCTAssertEqual(dataset.manifest.segments.first?.observationStart, 0)
-        XCTAssertEqual(dataset.manifest.segments.first?.effectivePurpose, .daggerCorrection)
-        XCTAssertEqual(dataset.manifest.segments.first?.effectiveTrainingWeight, 4)
         XCTAssertEqual(dataset.count, 9, "Only 0.6s through 1.0s should produce 20 FPS expert targets, inclusive.")
         XCTAssertFalse(dataset.demonstratedKeyCodes().contains(10), "Pre-roll AI actions are context, not supervised capability.")
         XCTAssertTrue(dataset.demonstratedKeyCodes().contains(13))
@@ -3837,7 +3811,6 @@ final class DomainTests: XCTestCase {
             type: Float.self
         ).asArray(Float.self)
         XCTAssertTrue(firstContext[ActionLayout.keyboard.lowerBound + 10] > 0.5)
-        XCTAssertEqual(dataset.trainingWeightBatch(at: [0]).withUnsafeBytes { $0.load(as: Float.self) }, 4)
     }
 
     func testRealVideoCacheSupportsCurrentOnlyProfilesWithoutPastArtifacts() async throws {
@@ -4976,25 +4949,6 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(maskedActionLoss.item(Float.self), 0, accuracy: 1e-7)
 
         let currentTargets = MLXArray.zeros([batch, ActionLayout.count])
-        let ordinaryLoss = model.loss(
-            logits: immediate,
-            targets: currentTargets,
-            positiveWeights: classWeights,
-            sampleWeights: MLXArray.ones([batch])
-        )
-        let correctionLoss = model.loss(
-            logits: immediate,
-            targets: currentTargets,
-            positiveWeights: classWeights,
-            sampleWeights: MLXArray([Float](repeating: 4, count: batch))
-        )
-        MLX.eval(ordinaryLoss, correctionLoss)
-        XCTAssertEqual(
-            correctionLoss.item(Float.self),
-            4 * ordinaryLoss.item(Float.self),
-            accuracy: 1e-4,
-            "A homogeneous DAgger batch must retain correction emphasis after reduction."
-        )
         let auxiliaryGradient = valueAndGrad(model: model) { model, arrays in
             let temporal = model.currentOnlyTemporalFeatures(currentImages: arrays[0])
             let fused = model.fusedFeatures(temporalFeatures: temporal)
@@ -5291,217 +5245,97 @@ final class DomainTests: XCTestCase {
         )
     }
 
-    func testDAggerRowsKeepCorrectionWeightFutureBoundariesAndTrainingOnlySplit() throws {
-        let rowCount = 8
-        let sequences = (0..<rowCount).map { [UInt32($0)] }
-        let actions = (0..<rowCount).map { row -> [Float] in
-            var values = [Float](repeating: 0, count: ActionLayout.count)
-            values[0] = Float(row) / Float(rowCount)
-            return values
+    func testVideoTrainingCheckpointResumeAndInferenceRoundTrip() async throws {
+        // TrainingEngine deliberately uses the process-wide workspace. The
+        // supported test runner supplies a disposable root before it is created.
+        guard ProcessInfo.processInfo.environment["AGENTTRAINER_WORKSPACE_ROOT"] != nil else {
+            throw XCTSkip("Run through ./test.sh to isolate training artifacts from the user library.")
         }
-        let demonstrationID = UUID(), correctionID = UUID()
-        let fixture = try makeSyntheticDataset(
-            name: "dagger-boundaries",
-            pastFrameCount: 0,
-            sequences: sequences,
-            actionRows: actions,
-            segments: [
-                CacheSegment(recordingID: demonstrationID, start: 0, count: 4, observationStart: 0, purpose: .demonstration, trainingWeight: 1),
-                CacheSegment(recordingID: correctionID, start: 4, count: 4, observationStart: 4, purpose: .daggerCorrection, trainingWeight: 4)
-            ]
-        )
-        defer { try? FileManager.default.removeItem(at: fixture.directory) }
-        let weights = fixture.dataset.trainingWeightBatch(at: [0, 4]).withUnsafeBytes {
-            Array($0.bindMemory(to: Float.self))
+        let store = WorkspaceStore.shared
+        try await store.prepare()
+        var profile = AIProfile.fresh(name: "Pipeline regression")
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        profile.training.architecture = ArchitectureSpec(convolutionChannels: [4], kernelSizes: [3], strides: [2],
+            visualEmbedding: 8, recurrentWidth: 8, fusionWidths: [8], dropout: 0)
+        profile.training.precision = .float32
+        profile.training.perceptionFPS = 10
+        profile.training.actionFPS = 20
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 1, downsampleFactor: 2)
+        profile.training.batchSize = 4
+        profile.training.epochs = 1
+        profile.training.validationSplit = 0.5
+        profile.training.checkpointInterval = 1
+        var recordings: [RecordingItem] = []
+        for index in 0..<2 {
+            let id = UUID()
+            let directory = try await store.createRecordingDirectory(id: id)
+            try await writeTestMovie(to: directory.appendingPathComponent("capture.mov"),
+                width: 16, height: 16, frameCount: 11, fps: 10)
+            let base: UInt64 = 3_000_000_000
+            let writer = try InputEventWriter(url: directory.appendingPathComponent("events.atrevents"))
+            writer.append(InputSample(timestampNanos: base, kind: .mouseMove, x: 8, y: 8))
+            writer.append(InputSample(timestampNanos: base + 100_000_000, kind: .key, keyCode: 13, isDown: true))
+            writer.append(InputSample(timestampNanos: base + 800_000_000, kind: .key, keyCode: 13, isDown: false))
+            let count = try writer.finish()
+            let manifest = RecordingManifest(id: id, name: "Pipeline \(index)", createdAt: Date(),
+                hostStartNanos: base, duration: 1, capture: CaptureSpec(requestedFPS: 10),
+                globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
+                pixelWidth: 16, pixelHeight: 16, deliveredFPS: 10, frameCount: 11, eventCount: count)
+            try await store.writeRecording(manifest, to: directory)
+            recordings.append(RecordingItem(manifest: manifest, directory: directory))
         }
-        XCTAssertEqual(weights, [1, 4])
+        profile.recordingIDs = recordings.map(\.id)
+        try await store.saveProfile(profile)
+        defer {
+            // The test-runner root is also removed at exit, including on failure.
+            for recording in recordings { try? FileManager.default.removeItem(at: recording.directory) }
+        }
 
-        let future = fixture.dataset.futureActionBatch(at: [2, 3, 4, 7], offsets: [1, 2])
-        let masks = future.masks.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        XCTAssertEqual(masks, [1, 0, 0, 0, 1, 1, 0, 0])
-        let state = fixture.dataset.futureStateBatchPlan(at: [2, 3, 4, 7], offset: 1, sampleStride: 1)
-        XCTAssertEqual(state.masks, [1, 0, 1, 0])
+        let engine = TrainingEngine()
+        func train(_ profile: AIProfile, pauseAfterFirstStep: Bool) async throws -> TrainingCompletion {
+            try await withCheckedThrowingContinuation { continuation in
+                engine.start(profile: profile, recordings: recordings,
+                    runSettings: TrainingRunSettings(maximumSteps: 0, autosaveSteps: 1),
+                    metrics: { value, status in
+                        if pauseAfterFirstStep, value.globalStep > 0 { engine.pauseAndSave() }
+                        if !pauseAfterFirstStep, status.contains("continuing to epoch") {
+                            XCTAssertTrue(status.contains("Restored exact checkpoint"), status)
+                        }
+                    }, completion: { result in
+                        continuation.resume(with: result)
+                    })
+            }
+        }
+        let paused = try await train(profile, pauseAfterFirstStep: true)
+        XCTAssertFalse(paused.completed)
+        XCTAssertEqual(paused.version.globalStep, 1)
+        XCTAssertTrue(paused.version.trainingLoss.isFinite)
+        let checkpoint = await store.checkpointDirectory(profileID: profile.id)
+        for file in ["weights.safetensors", "optimizer.safetensors", "random.safetensors", "state.json"] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: checkpoint.appendingPathComponent(file).path))
+        }
+        let completed = try await train(paused.profile, pauseAfterFirstStep: false)
+        XCTAssertTrue(completed.completed)
+        XCTAssertGreaterThan(completed.profile.trainingProgress?.globalStep ?? 0, 1)
+        XCTAssertNotNil(completed.version.validationLoss)
+        XCTAssertNotNil(completed.version.validationReport)
+        XCTAssertEqual(completed.version.demonstratedKeyCodes, [13])
+        let persisted = await store.version(profileID: profile.id, versionID: completed.version.id)
+        var expected = completed.version
+        expected.createdAt = try XCTUnwrap(persisted).createdAt
+        XCTAssertEqual(persisted, expected)
 
-        let split = TrainingEngine().splitIndices(dataset: fixture.dataset, fraction: 0.5, seed: 9)
-        XCTAssertTrue(Set(4..<8).isSubset(of: Set(split.train)))
-        XCTAssertTrue(Set(0..<4).isSubset(of: Set(split.train)), "The sole ordinary demonstration must remain rehearsal data.")
-        XCTAssertTrue(split.validation.allSatisfy { $0 < 4 })
-    }
-
-    func testCorrectionAwareBestBrainAcceptsSmallOrdinaryTradeoffButRejectsRegression() {
-        let acceptable = TrainingEngine.correctionCandidateDecision(
-            correctionLoss: 0.7,
-            bestCorrectionLoss: 1,
-            ordinaryLoss: 0.505,
-            baselineOrdinaryLoss: 0.5,
-            ordinaryReport: nil,
-            baselineOrdinaryReport: nil
-        )
-        XCTAssertTrue(acceptable.accepts)
-        XCTAssertTrue(acceptable.correctionImproved)
-
-        let regressed = TrainingEngine.correctionCandidateDecision(
-            correctionLoss: 0.6,
-            bestCorrectionLoss: 1,
-            ordinaryLoss: 0.52,
-            baselineOrdinaryLoss: 0.5,
-            ordinaryReport: nil,
-            baselineOrdinaryReport: nil
-        )
-        XCTAssertFalse(regressed.accepts)
-        XCTAssertTrue(regressed.correctionImproved)
-
-        let noCorrectionGain = TrainingEngine.correctionCandidateDecision(
-            correctionLoss: 0.9995,
-            bestCorrectionLoss: 1,
-            ordinaryLoss: 0.49,
-            baselineOrdinaryLoss: 0.5,
-            ordinaryReport: nil,
-            baselineOrdinaryReport: nil
-        )
-        XCTAssertFalse(noCorrectionGain.accepts)
-        XCTAssertFalse(noCorrectionGain.correctionImproved)
-    }
-
-    func testDAggerManifestRequiresExplicitValidSupervisionMetadata() {
-        var manifest = RecordingManifest(
-            id: UUID(), name: "Correction", createdAt: Date(), hostStartNanos: 10,
-            duration: 3, capture: CaptureSpec(), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 100, height: 100)),
-            pixelWidth: 64, pixelHeight: 64, deliveredFPS: 30, eventCount: 2,
-            trimStart: 0, trimEnd: 3, supervisionStart: 2,
-            purpose: .daggerCorrection, sourceProfileID: UUID(), sourceVersionID: UUID(), trainingWeight: 4
-        )
-        XCTAssertTrue(manifest.isStructurallyValid)
-        manifest.supervisionStart = 3.1
-        XCTAssertFalse(manifest.isStructurallyValid)
-        manifest.supervisionStart = 2
-        manifest.sourceVersionID = nil
-        XCTAssertFalse(manifest.isStructurallyValid)
-        manifest.sourceVersionID = UUID()
-        manifest.droppedFrameCount = -1
-        XCTAssertFalse(manifest.isStructurallyValid)
-    }
-
-    func testDAggerRecordQualityLeadUpIsByteBounded() throws {
-        let preprocessing = try PreprocessingSpec(
-            width: 1280,
-            height: 720,
-            colorMode: .color,
-            bitDepth: 8,
-            chroma: .yuv420,
-            resizePolicy: .stretch
-        ).validated()
-        let sizing = DAggerContextSizing.recordingFrameCapacity(
-            preprocessing: preprocessing,
-            framesPerSecond: 60,
-            leadUpSeconds: 3
-        )
-        XCTAssertGreaterThanOrEqual(sizing.maximum, sizing.requested)
-        XCTAssertLessThanOrEqual(
-            sizing.requested * preprocessing.sampleByteCount,
-            DAggerConfiguration.maximumBufferedContextBytes
-        )
-    }
-
-    func testDAggerStartupBufferIsByteBoundedAndReportsOverflowWithoutDiscardingAcceptedData() {
-        let spec = PreprocessingSpec(width: 1, height: 1, colorMode: .grayscale)
-        let controls = [Float](repeating: 0, count: ActionLayout.count)
-        let frame = DAggerFrame(
-            timestampNanos: 1,
-            packedVision: Data([128]),
-            preprocessing: spec,
-            executedControls: controls
-        )
-        let frameBytes = frame.packedVision.count
-            + controls.count * MemoryLayout<Float>.size + 64
-        var frames = DAggerStartupBuffer(
-            maximumSamples: 4,
-            maximumFrameBytes: frameBytes * 2
-        )
-        frames.append(frame)
-        var second = frame; second.timestampNanos = 2; frames.append(second)
-        var third = frame; third.timestampNanos = 3; frames.append(third)
-        XCTAssertEqual(frames.frames.map(\.timestampNanos), [1, 2])
-        XCTAssertTrue(frames.overflowed)
-
-        var samples = DAggerStartupBuffer(maximumSamples: 2, maximumFrameBytes: frameBytes)
-        samples.append(InputSample(timestampNanos: 1, kind: .key, keyCode: 1, isDown: true))
-        samples.append(InputSample(timestampNanos: 2, kind: .key, keyCode: 1, isDown: false))
-        samples.append(InputSample(timestampNanos: 3, kind: .key, keyCode: 2, isDown: true))
-        XCTAssertEqual(samples.samples.count, 2)
-        XCTAssertTrue(samples.overflowed)
-        samples.reset()
-        XCTAssertTrue(samples.samples.isEmpty)
-        XCTAssertTrue(samples.frames.isEmpty)
-        XCTAssertFalse(samples.overflowed)
-    }
-
-    func testDAggerCaptureQualityRejectsStaleVideoAboveFivePercentDrops() {
-        XCTAssertTrue(DAggerCaptureQuality.accepts(encoded: 95, dropped: 5))
-        XCTAssertFalse(DAggerCaptureQuality.accepts(encoded: 94, dropped: 6))
-        XCTAssertFalse(DAggerCaptureQuality.accepts(encoded: 0, dropped: 0))
-        XCTAssertEqual(
-            DAggerCaptureQuality.droppedFrameFraction(encoded: 90, dropped: 10),
-            0.1,
-            accuracy: 0.000_001
-        )
-    }
-
-    func testDAggerRecorderProducesNativeVideoAndBalancedExpertEvents() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("dagger-recorder-\(UUID().uuidString).atrrecord", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let profileID = UUID(), versionID = UUID(), recordingID = UUID()
-        let spec = PreprocessingSpec(
-            width: 4,
-            height: 4,
-            colorMode: .color,
-            bitDepth: 6,
-            chroma: .yuv420,
-            resizePolicy: .stretch
-        )
-        let rect = CGRect(x: 20, y: 30, width: 100, height: 80)
-        let request = DAggerCaptureRequest(
-            recordingID: recordingID,
-            directory: directory,
-            profileID: profileID,
-            versionID: versionID,
-            profileName: "Test",
-            destinationFolderID: UUID(),
-            excludedKeyCodes: [],
-            preprocessing: spec,
-            capture: CaptureSpec(requestedFPS: 30),
-            captureRect: rect,
-            perceptionFPS: 30,
-            actionFPS: 60,
-            leadUpSeconds: 3,
-            correctionWeight: 4
-        )
-        var controls = [Float](repeating: 0, count: ActionLayout.count)
-        controls[0] = 0.5; controls[1] = 0.5
-        let base: UInt64 = 1_000_000_000
-        let recorder = try DAggerRecorder(
-            request: request,
-            correctionStartHostNanos: base + 70_000_000,
-            preRoll: [
-                DAggerFrame(timestampNanos: base, packedVision: Data(repeating: 80, count: spec.sampleByteCount), preprocessing: spec, executedControls: controls),
-                DAggerFrame(timestampNanos: base + 35_000_000, packedVision: Data(repeating: 100, count: spec.sampleByteCount), preprocessing: spec, executedControls: controls)
-            ],
-            initialDroppedFrameCount: 2
-        )
-        recorder.append(InputSample(timestampNanos: base + 75_000_000, kind: .key, keyCode: 12, isDown: true))
-        recorder.append(DAggerFrame(timestampNanos: base + 90_000_000, packedVision: Data(repeating: 130, count: spec.sampleByteCount), preprocessing: spec, executedControls: controls))
-        let result = try await recorder.finish(endHostNanos: base + 120_000_000)
-        XCTAssertEqual(result.frameCount, 3)
-        XCTAssertEqual(result.droppedFrameCount, 2)
-        XCTAssertEqual(result.firstFrameHostNanos, base)
-        XCTAssertEqual(result.supervisionStart, 0.07, accuracy: 0.000_001)
-        let events = try InputEventReader.read(url: directory.appendingPathComponent("events.atrevents"))
-        XCTAssertTrue(events.contains { $0.kind == .key && $0.keyCode == 12 && $0.isDown })
-        XCTAssertTrue(events.contains { $0.kind == .key && $0.keyCode == 12 && !$0.isDown })
-        let asset = AVURLAsset(url: directory.appendingPathComponent("capture.mov"))
-        let track = try await asset.loadTracks(withMediaType: .video).first
-        XCTAssertNotNil(track)
+        let model = AgentPolicy(profile: completed.profile)
+        let versionDirectory = await store.versionDirectory(profileID: profile.id, versionID: completed.version.id)
+        try model.loadWeights(from: versionDirectory.appendingPathComponent(completed.version.weightsFile))
+        model.train(false)
+        let inputs = temporalModelInputs(profile: profile, batch: 1, value: 0.5)
+        let logits = model(currentImages: inputs.current, pastImages: inputs.past, pastControls: inputs.controls)
+        let output = model.activatedPredictions(logits: logits)
+        MLX.eval(output)
+        XCTAssertEqual(output.shape, [1, ActionLayout.count])
+        XCTAssertTrue(output.asArray(Float.self).allSatisfy(\.isFinite))
+        try await store.deleteProfile(completed.profile)
     }
 
     private func actionFloat(_ data: Data, index: Int) -> Float {

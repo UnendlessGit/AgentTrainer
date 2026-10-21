@@ -131,7 +131,7 @@ struct LibraryView: View {
                     .disabled(model.selectedRecordings.isEmpty)
                 Button("Context Fields…") { showsContextCatalog = true }
                     .primaryButton(color: ATColor.amber)
-                    .disabled(model.recordingIsActiveOrStarting || model.daggerLifecycleIsActive)
+                    .disabled(model.recordingIsActiveOrStarting)
             }
         }
     }
@@ -233,15 +233,11 @@ struct LibraryView: View {
                             .frame(maxWidth: .infinity, minHeight: 150).background(Color.black).clipShape(RoundedRectangle(cornerRadius: ATCorner.scaled(10), style: .continuous))
                         TextField("Recording name", text: $renameText).font(.title3.bold()).textFieldStyle(.plain)
                             .onSubmit { Task { await model.renameRecording(item, name: renameText) } }
-                        HStack { StatusPill(text: durationString(effectiveDuration(item)), color: ATColor.cyan); StatusPill(text: "\(item.manifest.pixelWidth)×\(item.manifest.pixelHeight)", color: ATColor.violet); StatusPill(text: "\(Int(item.manifest.deliveredFPS.rounded())) FPS", color: ATColor.green); if item.manifest.effectivePurpose == .daggerCorrection { StatusPill(text: "DAgger \(item.manifest.effectiveTrainingWeight.formatted())×", color: ATColor.coral) } }
+                        HStack { StatusPill(text: durationString(effectiveDuration(item)), color: ATColor.cyan); StatusPill(text: "\(item.manifest.pixelWidth)×\(item.manifest.pixelHeight)", color: ATColor.violet); StatusPill(text: "\(Int(item.manifest.deliveredFPS.rounded())) FPS", color: ATColor.green) }
                         HStack { StatusPill(text: "\(item.manifest.encodedFrameCount.formatted()) frames", color: ATColor.amber); if let dropped = item.manifest.droppedFrameCount, dropped > 0 { StatusPill(text: "\(dropped) dropped", color: ATColor.coral) }; StatusPill(text: storageString(item.storageBytes), color: ATColor.violet); Spacer() }
                         HStack { Label("\(item.manifest.eventCount) inputs", systemImage: "cursorarrow.click.2"); Spacer(); Label(item.manifest.capture.kind.rawValue, systemImage: "viewfinder") }.font(.caption).foregroundStyle(.secondary)
                         if item.manifest.trimStart > 0 || (item.manifest.trimEnd ?? item.manifest.duration) < item.manifest.duration {
                             Label("Uses \(item.manifest.trimStart.formatted(.number.precision(.fractionLength(2))))s – \((item.manifest.trimEnd ?? item.manifest.duration).formatted(.number.precision(.fractionLength(2))))s", systemImage: "scissors").font(.caption).foregroundStyle(ATColor.amber)
-                        }
-                        if item.manifest.effectivePurpose == .daggerCorrection {
-                            Label("Lead-up context: \(item.manifest.effectiveSupervisionStart.formatted(.number.precision(.fractionLength(2))))s • expert labels begin after the explicit trigger", systemImage: "arrow.triangle.branch")
-                                .font(.caption).foregroundStyle(ATColor.coral)
                         }
                         Divider()
                         HStack {
@@ -490,9 +486,6 @@ private struct LibraryRecordingRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(item.manifest.name).font(.subheadline.bold()).lineLimit(1)
-                    if item.manifest.effectivePurpose == .daggerCorrection {
-                        StatusPill(text: "DAgger", color: ATColor.coral)
-                    }
                 }
                 HStack(spacing: 10) {
                     Label(duration, systemImage: "clock")

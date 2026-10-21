@@ -244,7 +244,6 @@ actor WorkspaceStore {
                    manifest.id.uuidString.caseInsensitiveCompare(item.lastPathComponent) == .orderedSame,
                    manifest.artifactFileNamesAreSafe,
                    manifest.contextSchemaIsValid,
-                   manifest.reinforcementMetadataIsValid,
                    FileManager.default.fileExists(atPath: item.appendingPathComponent(manifest.weightsFile).path) {
                     compatibleVersionIDs.insert(manifest.id)
                 } else {
@@ -283,26 +282,6 @@ actor WorkspaceStore {
                 }
             }
 
-            let reinforcementCheckpoint = profileRoot.appendingPathComponent(
-                "RLCheckpoint",
-                isDirectory: true
-            )
-            if FileManager.default.fileExists(atPath: reinforcementCheckpoint.path) {
-                let checkpointMarker = reinforcementCheckpoint
-                    .appendingPathComponent("model-schema.json")
-                let checkpointSchema = (try? Data(contentsOf: checkpointMarker))
-                    .flatMap { try? decoder.decode(Int.self, from: $0) }
-                if checkpointSchema != currentSchema {
-                    try archiveModelArtifact(
-                        reinforcementCheckpoint,
-                        profileRoot: profileRoot,
-                        category: "RL Checkpoints",
-                        storedSchema: checkpointSchema ?? storedSchema
-                    )
-                    archived += 1
-                }
-            }
-
             let activeIsCompatible = profile.activeVersionID.map(compatibleVersionIDs.contains) ?? false
             if profile.activeVersionID != nil && !activeIsCompatible {
                 profile.activeVersionID = nil
@@ -317,7 +296,6 @@ actor WorkspaceStore {
                 profile.training.visualAugmentation = VisualAugmentationConfiguration()
                 profile.training.futureActionPrediction = FutureActionPredictionConfiguration()
                 profile.training.futureStatePrediction = FutureStatePredictionConfiguration()
-                profile.training.dagger = DAggerConfiguration()
                 if !profile.training.learningRate.isFinite || profile.training.learningRate <= 0 {
                     profile.training.learningRate = 0.0003
                 } else {
@@ -1181,10 +1159,7 @@ actor WorkspaceStore {
                     updatedAt: active.createdAt,
                     savedBrainCount: versionDirectoryCount(profileID: profile.id),
                     trainingDurationSeconds: active.trainingDurationSeconds,
-                    experienceDurationSeconds: active.experienceDurationSeconds,
-                    reinforcementEpisodes: active.reinforcementLearningSummary?.episode,
-                    reinforcementUpdates: active.reinforcementLearningSummary?.update,
-                    reinforcementAverageReturn: active.reinforcementLearningSummary?.averageEpisodeReturn
+                    experienceDurationSeconds: active.experienceDurationSeconds
                 )
             }
             // Profiles from earlier builds already have a cheap progress row but
@@ -1199,14 +1174,6 @@ actor WorkspaceStore {
                 }
                 if progress.experienceDurationSeconds == nil {
                     progress.experienceDurationSeconds = active?.experienceDurationSeconds ?? checkpoint.experience
-                }
-                if let reinforcement = active?.reinforcementLearningSummary {
-                    progress.reinforcementEpisodes = progress.reinforcementEpisodes
-                        ?? reinforcement.episode
-                    progress.reinforcementUpdates = progress.reinforcementUpdates
-                        ?? reinforcement.update
-                    progress.reinforcementAverageReturn = progress.reinforcementAverageReturn
-                        ?? reinforcement.averageEpisodeReturn
                 }
                 profile.trainingProgress = progress
             }
@@ -1303,65 +1270,17 @@ actor WorkspaceStore {
         profileDirectory(profileID).appendingPathComponent("Checkpoint", isDirectory: true)
     }
 
-    func reinforcementCheckpointDirectory(profileID: UUID) -> URL {
-        profileDirectory(profileID).appendingPathComponent(
-            "RLCheckpoint",
-            isDirectory: true
-        )
-    }
-
     func saveVersionManifest(_ manifest: ModelVersionManifest, profileID: UUID) throws {
         var manifest = manifest
         manifest.name = manifest.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !manifest.name.isEmpty, manifest.artifactFileNamesAreSafe,
               manifest.contextSchemaIsValid,
-              manifest.reinforcementMetadataIsValid else {
+              manifest.outputCapabilities?.isValid != false else {
             throw AgentTrainerError.storage("The model version manifest contains an invalid name or artifact filename.")
         }
         let directory = versionDirectory(profileID: profileID, versionID: manifest.id)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try atomicWrite(try encoder.encode(manifest), to: directory.appendingPathComponent("manifest.json"))
-    }
-
-    /// Finalizes an RL actor snapshot after the session has synchronously
-    /// written and verified its immutable weights. Keeping profile activation
-    /// inside this actor prevents a saved brain and list-row progress from
-    /// pointing at different versions.
-    func commitReinforcementVersion(
-        _ manifest: ModelVersionManifest,
-        profile requestedProfile: AIProfile,
-        progress: TrainingProgressSummary
-    ) throws -> AIProfile {
-        guard manifest.effectiveTrainingOrigin == .reinforcementLearning,
-              manifest.reinforcementLearningSummary != nil,
-              manifest.reinforcementActionSpace != nil else {
-            throw AgentTrainerError.storage("The RL model version is missing its training provenance or immutable action allowlist.")
-        }
-        let directory = versionDirectory(
-            profileID: requestedProfile.id,
-            versionID: manifest.id
-        )
-        let weights = directory.appendingPathComponent(manifest.weightsFile)
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: weights.path, isDirectory: &isDirectory),
-              !isDirectory.boolValue else {
-            throw AgentTrainerError.storage("The RL actor snapshot is missing its immutable weights.")
-        }
-        try saveVersionManifest(manifest, profileID: requestedProfile.id)
-        var updatedProgress = progress
-        updatedProgress.savedBrainCount = versionDirectoryCount(profileID: requestedProfile.id)
-        var updated = requestedProfile
-        updated.activeVersionID = manifest.id
-        updated.trainingProgress = updatedProgress
-        try saveProfile(updated)
-        let removed = try pruneAutosaveVersions(profile: updated, keeping: 10)
-        if removed > 0 {
-            var refreshedProgress = updatedProgress
-            refreshedProgress.savedBrainCount = versionDirectoryCount(profileID: updated.id)
-            updated.trainingProgress = refreshedProgress
-            try saveProfile(updated)
-        }
-        return updated
     }
 
     func listVersions(profileID: UUID) -> [ModelVersionManifest] {
@@ -1373,7 +1292,6 @@ actor WorkspaceStore {
                   manifest.schemaVersion == ModelContract.schemaVersion,
                   manifest.artifactFileNamesAreSafe,
                   manifest.contextSchemaIsValid,
-                  manifest.reinforcementMetadataIsValid,
                   manifest.id.uuidString.caseInsensitiveCompare(url.lastPathComponent) == .orderedSame else { return nil }
             return manifest
         }.sorted { $0.createdAt > $1.createdAt }
@@ -1387,7 +1305,7 @@ actor WorkspaceStore {
               manifest.schemaVersion == ModelContract.schemaVersion,
               manifest.artifactFileNamesAreSafe,
               manifest.contextSchemaIsValid,
-              manifest.reinforcementMetadataIsValid else { return nil }
+              manifest.outputCapabilities?.isValid != false else { return nil }
         return manifest
     }
 
@@ -1528,10 +1446,7 @@ actor WorkspaceStore {
                 updatedAt: version.createdAt,
                 savedBrainCount: listVersions(profileID: profile.id).count,
                 trainingDurationSeconds: version.trainingDurationSeconds,
-                experienceDurationSeconds: version.experienceDurationSeconds,
-                reinforcementEpisodes: version.reinforcementLearningSummary?.episode,
-                reinforcementUpdates: version.reinforcementLearningSummary?.update,
-                reinforcementAverageReturn: version.reinforcementLearningSummary?.averageEpisodeReturn
+                experienceDurationSeconds: version.experienceDurationSeconds
             )
             try saveProfile(updated)
             if backupWasCreated {

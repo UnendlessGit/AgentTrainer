@@ -66,7 +66,7 @@ struct CaptureSpec: Codable, Hashable, Sendable {
     }
 }
 
-/// Human-facing video controls shared by ordinary Record and DAgger capture.
+/// Human-facing video controls for saved recordings.
 /// The encoder deliberately keeps bitrate and codec details behind one simple
 /// compression amount while preserving the exact chosen visual contract in the
 /// recording manifest and in user presets.
@@ -124,8 +124,6 @@ struct RecordingPreset: Codable, Hashable, Identifiable, Sendable {
     var excludedKeyCodes: Set<UInt16>
     /// Optional for transparent decoding of presets saved before 2.2.
     var recordingVisuals: RecordingVisualSettings? = nil
-    /// DAgger lead-up is a universal Record setting, never part of an AI.
-    var leadUpSeconds: Double? = nil
     /// Optional for presets saved before generic recording context existed.
     /// Definitions are snapshotted so a preset remains understandable even if
     /// the workspace catalog is later imported, renamed, or relocated.
@@ -133,11 +131,6 @@ struct RecordingPreset: Codable, Hashable, Identifiable, Sendable {
 
     var effectiveRecordingVisuals: RecordingVisualSettings {
         recordingVisuals ?? RecordingVisualSettings()
-    }
-
-    var effectiveLeadUpSeconds: Double {
-        let value = leadUpSeconds ?? 3
-        return value.isFinite ? value : 3
     }
 
     func validated() throws -> Self {
@@ -162,9 +155,6 @@ struct RecordingPreset: Codable, Hashable, Identifiable, Sendable {
             throw AgentTrainerError.invalidConfiguration("Region recording presets require a positive width and height.")
         }
         _ = try effectiveRecordingVisuals.validated()
-        guard (0.25...15).contains(effectiveLeadUpSeconds) else {
-            throw AgentTrainerError.invalidConfiguration("Recording lead-up must be from 0.25 through 15 seconds.")
-        }
         _ = try ContextAssignment.validatedList(contextAssignments ?? [])
         return value
     }
@@ -564,16 +554,10 @@ enum ModelContract {
 /// a data-only correction can invalidate caches/checkpoints without needlessly
 /// changing tensor shapes. Policy v6 itself is an intentional weight break.
 enum TrainingDataContract {
-    /// Version 11 lets a correction recording retain pre-mistake observations
-    /// and executed controls as causal context while beginning supervised action
-    /// targets only when the expert explicitly starts correcting.
-    /// Version 12 changes stochastic batching from one augmentation per batch
-    /// to one per supervised row. Older checkpoints may warm-start their
-    /// weights, but must not restore optimizer/random state as an exact resume.
-    /// Version 13 adds one recording-level generic context vector to every
-    /// supervised row. Context-free datasets retain a zero-width vector and the
-    /// exact established Policy-v6 tensor layout.
-    static let schemaVersion = 13
+    /// Version 14 removes recording-purpose weighting and special split rules.
+    /// Legacy supervision boundaries and context IDs remain meaningful. Rebuild
+    /// caches and warm-start compatible weights with a fresh optimizer sequence.
+    static let schemaVersion = 14
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -876,53 +860,6 @@ struct FutureStatePredictionConfiguration: Codable, Hashable, Sendable {
     }
 }
 
-/// AI-specific correction emphasis. Capture appearance and lead-up belong to
-/// the universal Record workflow so ordinary and DAgger recordings never drift.
-struct DAggerConfiguration: Codable, Hashable, Sendable {
-    static let maximumBufferedContextBytes = 512 * 1_024 * 1_024
-    var correctionWeight = 4.0
-
-    func validated() throws -> Self {
-        guard correctionWeight.isFinite, (1...20).contains(correctionWeight) else {
-            throw AgentTrainerError.invalidConfiguration(
-                "DAgger correction weight must be from 1 through 20."
-            )
-        }
-        return self
-    }
-}
-
-enum DAggerContextSizing {
-    static func recordingFrameCapacity(
-        preprocessing: PreprocessingSpec,
-        framesPerSecond: Double,
-        leadUpSeconds: Double
-    ) -> (requested: Int, maximum: Int) {
-        guard framesPerSecond.isFinite, framesPerSecond > 0,
-              leadUpSeconds.isFinite, leadUpSeconds > 0 else { return (0, 0) }
-        let overhead = ActionLayout.count * MemoryLayout<Float>.size + 64
-        let requested = max(2, Int(ceil(leadUpSeconds * framesPerSecond)) + 2)
-        let stride = preprocessing.sampleByteCount.addingReportingOverflow(overhead)
-        guard !stride.overflow, stride.partialValue > 0 else { return (requested, 0) }
-        return (requested, DAggerConfiguration.maximumBufferedContextBytes / stride.partialValue)
-    }
-
-}
-
-enum DAggerCaptureQuality {
-    static let maximumDroppedFrameFraction = 0.05
-
-    static func droppedFrameFraction(encoded: Int, dropped: Int) -> Double {
-        Double(max(0, dropped)) / Double(max(1, max(0, encoded) + max(0, dropped)))
-    }
-
-    static func accepts(encoded: Int, dropped: Int) -> Bool {
-        encoded > 0
-            && droppedFrameFraction(encoded: encoded, dropped: dropped)
-                <= maximumDroppedFrameFraction
-    }
-}
-
 struct TrainingConfiguration: Codable, Hashable, Sendable {
     var epochs = 40
     var batchSize = 32
@@ -951,11 +888,10 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     var minimumLearningRateRatio: Double? = 0.05
     var binaryFocalGamma: Double? = 1.5
     /// Optional fields preserve decoding of profile metadata created before
-    /// these training features existed. Fresh profiles persist all four.
+    /// these training features existed. Fresh profiles persist all three.
     var visualAugmentation: VisualAugmentationConfiguration? = VisualAugmentationConfiguration()
     var futureActionPrediction: FutureActionPredictionConfiguration? = FutureActionPredictionConfiguration()
     var futureStatePrediction: FutureStatePredictionConfiguration? = FutureStatePredictionConfiguration()
-    var dagger: DAggerConfiguration? = DAggerConfiguration()
 
     var effectiveMaximumSteps: Int { maximumSteps ?? 10_000 }
     var effectiveTemporalVision: TemporalVisionConfiguration {
@@ -981,7 +917,6 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     var effectiveFutureStatePrediction: FutureStatePredictionConfiguration {
         futureStatePrediction ?? FutureStatePredictionConfiguration(enabled: false)
     }
-    var effectiveDAgger: DAggerConfiguration { dagger ?? DAggerConfiguration() }
 }
 
 struct TrainingRunSettings: Codable, Hashable, Sendable {
@@ -1043,11 +978,6 @@ struct InputState: Equatable, Sendable {
     static let empty = InputState()
 }
 
-enum RecordingPurpose: String, Codable, Sendable {
-    case demonstration
-    case daggerCorrection
-}
-
 struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
     var schemaVersion = 4
     var id: UUID
@@ -1073,25 +1003,14 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
     var folderID: UUID?
     var thumbnailFile: String?
     var excludedKeyCodes: Set<UInt16>?
-    /// DAgger packages begin video/context before expert supervision. Ordinary
-    /// demonstrations leave this nil and supervise from trimStart as before.
+    /// Retains the label boundary of legacy recordings whose video starts
+    /// before supervised input. Earlier frames remain observation context only.
     var supervisionStart: Double? = nil
-    var purpose: RecordingPurpose? = nil
-    var sourceProfileID: UUID? = nil
-    var sourceVersionID: UUID? = nil
-    /// Per-row loss emphasis. Corrections default above one so a short, valuable
-    /// intervention is not drowned by hours of ordinary demonstrations.
-    var trainingWeight: Double? = nil
     /// Optional keeps every recording created before 2.3 directly decodable.
     /// Selected names are snapshotted to keep a standalone package portable.
     var contextAssignments: [ContextAssignment]? = nil
 
-    var effectivePurpose: RecordingPurpose { purpose ?? .demonstration }
     var effectiveSupervisionStart: Double { supervisionStart ?? trimStart }
-    var effectiveTrainingWeight: Double {
-        let value = trainingWeight ?? 1
-        return value.isFinite ? min(20, max(1, value)) : 1
-    }
     var effectiveContextAssignments: [ContextAssignment] {
         (try? ContextAssignment.validatedList(contextAssignments ?? [])) ?? []
     }
@@ -1101,12 +1020,9 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
         let end = trimEnd ?? duration
         let safeFileNames = [videoFile, eventFile] + (thumbnailFile.map { [$0] } ?? [])
         let supervision = effectiveSupervisionStart
-        let weight = trainingWeight ?? 1
         let recordingVisualsAreValid = capture.recordingVisuals.map {
             (try? $0.validated()) != nil
         } ?? true
-        let daggerMetadataIsValid = effectivePurpose != .daggerCorrection
-            || (sourceProfileID != nil && sourceVersionID != nil && supervisionStart != nil)
         let contextIsValid = (try? ContextAssignment.validatedList(
             contextAssignments ?? []
         )) != nil
@@ -1124,8 +1040,6 @@ struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
             && trimStart.isFinite && trimStart >= 0 && trimStart <= duration
             && end.isFinite && end >= trimStart && end <= duration
             && supervision.isFinite && supervision >= trimStart && supervision <= end
-            && weight.isFinite && (1...20).contains(weight)
-            && daggerMetadataIsValid
             && contextIsValid
             && safeFileNames.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0") }
     }
@@ -1250,6 +1164,41 @@ struct ValidationReport: Codable, Hashable, Sendable {
     }
 }
 
+/// Persisted disable-only output limits. This small data contract keeps imported
+/// brains inside their original capabilities without retaining a training method.
+struct ModelOutputCapabilities: Codable, Hashable, Sendable {
+    var allowedKeyCodes: Set<UInt16> = []
+    var allowedMouseButtons: Set<UInt8> = []
+    var allowsAbsoluteMouseMovement = false
+    var allowsRelativeMouseMovement = false
+    var allowsScroll = false
+
+    var isValid: Bool {
+        allowedKeyCodes.allSatisfy { $0 < 128 }
+            && allowedMouseButtons.allSatisfy { $0 < 8 }
+    }
+
+    func restricting(_ channels: ActionChannels, mouseMode: MouseControlMode) -> ActionChannels {
+        var result = channels
+        result.mouseMovement = channels.mouseMovement && (mouseMode == .relative
+            ? allowsRelativeMouseMovement : allowsAbsoluteMouseMovement)
+        result.buttons = channels.buttons && !allowedMouseButtons.isEmpty
+        result.scroll = channels.scroll && allowsScroll
+        result.keyboard = channels.keyboard && allowedKeyCodes.contains {
+            !ActionLayout.commandOptionControlKeyCodeSet.contains($0)
+        }
+        result.modifiers = channels.modifiers
+            && !allowedKeyCodes.isDisjoint(with: ActionLayout.allModifierKeyCodes)
+        return result
+    }
+
+    func restricting(_ restrictions: ActionRestrictions) -> ActionRestrictions {
+        var result = restrictions
+        result.blockedMouseButtons.formUnion((UInt8(0)...7).filter { !allowedMouseButtons.contains($0) })
+        return result
+    }
+}
+
 struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     var schemaVersion = ModelContract.schemaVersion
     var id: UUID
@@ -1295,54 +1244,17 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     /// Optional keeps existing manifests decodable. New brains retain the
     /// per-head held-out report that justified best-brain selection.
     var validationReport: ValidationReport? = nil
-    /// Fixed DAgger correction-probe loss used alongside ordinary validation
-    /// when publishing a correction-aware best brain.
-    var correctionLoss: Double? = nil
     /// Nil is the exact context-free Policy-v6 contract used before 2.3.
     /// Context-trained brains snapshot only fields and values observed during
     /// their own training run, independent of later Library edits.
     var contextSchema: ModelContextSchema? = nil
-    /// Nil means the established demonstration-training path. RL versions use
-    /// the same actor weights and add only provenance/capability metadata.
-    var trainingOrigin: ModelTrainingOrigin? = nil
-    var reinforcementLearningSummary: ReinforcementLearningSummary? = nil
-    /// RL has an explicit allowlist that must remain immutable with its actor.
-    /// Demonstration-trained versions leave this nil and retain existing Run
-    /// semantics exactly.
-    var reinforcementActionSpace: ReinforcementActionSpace? = nil
-    /// Immutable sampling/filter semantics used to collect this RL actor and to
-    /// execute it later in normal Run. Nil migrates 2.4.0 RL brains to the safe
-    /// current defaults without affecting demonstration-trained versions.
-    var reinforcementActionBehavior: ReinforcementActionBehavior? = nil
+    /// Optional immutable output limits retained when importing older brains.
+    var outputCapabilities: ModelOutputCapabilities? = nil
 
     var effectiveContextSchema: ModelContextSchema { contextSchema ?? .empty }
-    var effectiveTrainingOrigin: ModelTrainingOrigin {
-        trainingOrigin ?? .demonstration
-    }
 
     var contextSchemaIsValid: Bool {
         (try? effectiveContextSchema.validated()) != nil
-    }
-
-    var reinforcementMetadataIsValid: Bool {
-        guard effectiveTrainingOrigin == .reinforcementLearning else {
-            return reinforcementLearningSummary == nil
-                && reinforcementActionSpace == nil
-                && reinforcementActionBehavior == nil
-        }
-        guard let summary = reinforcementLearningSummary,
-              let actionSpace = reinforcementActionSpace,
-              (try? actionSpace.validated()) != nil,
-              reinforcementActionBehavior.map({
-                  (try? $0.validated()) != nil
-              }) ?? true else { return false }
-        return summary.episode >= 0 && summary.update >= 0
-            && summary.environmentSteps >= 0
-            && summary.episode <= 1_000_000_000
-            && summary.update <= 1_000_000_000
-            && summary.environmentSteps <= 1_000_000_000_000
-            && summary.lastEpisodeReturn.isFinite
-            && summary.averageEpisodeReturn.isFinite
     }
 
     /// Manifest filenames are treated as leaf names, never paths. A damaged or
@@ -1355,6 +1267,66 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+extension ModelVersionManifest {
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, id, name, createdAt, globalStep, trainingLoss, validationLoss
+        case preprocessing, channels, training, weightsFile, optimizerFile, trainingStateFile
+        case randomStateFile, epoch, isAutosave, demonstratedKeyCodes, relativeMouseScale
+        case trainingDataSchema, trainingDurationSeconds, experienceDurationSeconds
+        case trainingShowsCursor, recommendedMouseMode, validationReport, contextSchema
+        case outputCapabilities
+    }
+
+    /// Decode only the old immutable limits; obsolete algorithms, settings,
+    /// summaries, and sampling state are intentionally ignored.
+    private enum LegacyCodingKeys: String, CodingKey {
+        case outputCapabilities = "reinforcementActionSpace"
+        case trainingOrigin
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        globalStep = try container.decode(Int.self, forKey: .globalStep)
+        trainingLoss = try container.decode(Double.self, forKey: .trainingLoss)
+        validationLoss = try container.decodeIfPresent(Double.self, forKey: .validationLoss)
+        preprocessing = try container.decode(PreprocessingSpec.self, forKey: .preprocessing)
+        channels = try container.decode(ActionChannels.self, forKey: .channels)
+        training = try container.decode(TrainingConfiguration.self, forKey: .training)
+        weightsFile = try container.decode(String.self, forKey: .weightsFile)
+        optimizerFile = try container.decodeIfPresent(String.self, forKey: .optimizerFile)
+        trainingStateFile = try container.decodeIfPresent(String.self, forKey: .trainingStateFile)
+        randomStateFile = try container.decodeIfPresent(String.self, forKey: .randomStateFile)
+        epoch = try container.decodeIfPresent(Int.self, forKey: .epoch)
+        isAutosave = try container.decodeIfPresent(Bool.self, forKey: .isAutosave)
+        demonstratedKeyCodes = try container.decodeIfPresent(Set<UInt16>.self, forKey: .demonstratedKeyCodes)
+        relativeMouseScale = try container.decodeIfPresent(Float.self, forKey: .relativeMouseScale)
+        trainingDataSchema = try container.decodeIfPresent(Int.self, forKey: .trainingDataSchema)
+        trainingDurationSeconds = try container.decodeIfPresent(Double.self, forKey: .trainingDurationSeconds)
+        experienceDurationSeconds = try container.decodeIfPresent(Double.self, forKey: .experienceDurationSeconds)
+        trainingShowsCursor = try container.decodeIfPresent(Bool.self, forKey: .trainingShowsCursor)
+        recommendedMouseMode = try container.decodeIfPresent(MouseControlMode.self, forKey: .recommendedMouseMode)
+        validationReport = try container.decodeIfPresent(ValidationReport.self, forKey: .validationReport)
+        contextSchema = try container.decodeIfPresent(ModelContextSchema.self, forKey: .contextSchema)
+        let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+        outputCapabilities = try container.decodeIfPresent(ModelOutputCapabilities.self, forKey: .outputCapabilities)
+            ?? legacy.decodeIfPresent(ModelOutputCapabilities.self, forKey: .outputCapabilities)
+        // A legacy online actor without its allowlist must never acquire every
+        // output simply because its unsupported metadata was omitted.
+        if outputCapabilities == nil,
+           try legacy.decodeIfPresent(String.self, forKey: .trainingOrigin) == "reinforcementLearning" {
+            outputCapabilities = ModelOutputCapabilities()
+        }
+        guard outputCapabilities?.isValid != false else {
+            throw DecodingError.dataCorruptedError(forKey: .outputCapabilities, in: container,
+                debugDescription: "Model output limits contain an unsupported key or mouse button.")
+        }
+    }
+}
+
 struct TrainingProgressSummary: Codable, Hashable, Sendable {
     var globalStep: Int
     var epoch: Int
@@ -1363,9 +1335,6 @@ struct TrainingProgressSummary: Codable, Hashable, Sendable {
     /// Optional for backward-compatible decoding of existing profile.json files.
     var trainingDurationSeconds: Double? = nil
     var experienceDurationSeconds: Double? = nil
-    var reinforcementEpisodes: Int? = nil
-    var reinforcementUpdates: Int? = nil
-    var reinforcementAverageReturn: Double? = nil
 }
 
 struct AIProfile: Codable, Hashable, Identifiable, Sendable {
@@ -1383,9 +1352,6 @@ struct AIProfile: Codable, Hashable, Identifiable, Sendable {
     /// A cheap list-row summary. It avoids scanning every autosave manifest just
     /// to show how much an AI has trained.
     var trainingProgress: TrainingProgressSummary?
-    /// Optional preserves profile decoding while keeping every RL setting
-    /// profile-local and independent from the demonstration trainer.
-    var reinforcementLearning: ReinforcementLearningConfiguration? = nil
     /// Sticky once Crystal V4 is discovered, so renaming the profile cannot
     /// accidentally remove its user-requested protection.
     var deletionProtected: Bool?
@@ -1397,9 +1363,6 @@ struct AIProfile: Codable, Hashable, Identifiable, Sendable {
 
     var effectiveFolderIDs: [UUID] { recordingFolderIDs ?? [] }
     var effectiveRestrictions: ActionRestrictions { restrictions ?? ActionRestrictions() }
-    var effectiveReinforcementLearning: ReinforcementLearningConfiguration {
-        reinforcementLearning ?? ReinforcementLearningConfiguration()
-    }
     var isDeletionProtected: Bool {
         deletionProtected == true || Self.isProtectedModelName(name)
     }
@@ -1506,7 +1469,6 @@ struct TrainingMetrics: Sendable {
     var futureStateLoss = 0.0
     var epochTrainingLoss: Double?
     var validationLoss: Double?
-    var correctionLoss: Double?
     var validationReport: ValidationReport?
     var effectiveLearningRate = 0.0
     var learningRateScale = 1.0
@@ -1586,11 +1548,6 @@ struct HotkeyBinding: Codable, Hashable, Sendable {
     static let panic = HotkeyBinding(keyCode: 53, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
     static let record = HotkeyBinding(keyCode: 15, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
     static let run = HotkeyBinding(keyCode: 0, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
-    static let reinforcementLearning = HotkeyBinding(
-        keyCode: 37,
-        carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8)
-    )
-
     static func mouse(_ button: UInt8, carbonModifiers: UInt32 = 0) -> Self {
         HotkeyBinding(keyCode: 0, carbonModifiers: carbonModifiers, mouseButton: button)
     }
@@ -1600,22 +1557,19 @@ struct HotkeySettings: Codable, Hashable, Sendable {
     var panic = HotkeyBinding.panic
     var record = HotkeyBinding.record
     var run = HotkeyBinding.run
-    var reinforcementLearning = HotkeyBinding.reinforcementLearning
 
     init(
         panic: HotkeyBinding = .panic,
         record: HotkeyBinding = .record,
-        run: HotkeyBinding = .run,
-        reinforcementLearning: HotkeyBinding = .reinforcementLearning
+        run: HotkeyBinding = .run
     ) {
         self.panic = panic
         self.record = record
         self.run = run
-        self.reinforcementLearning = reinforcementLearning
     }
 
     private enum CodingKeys: String, CodingKey {
-        case panic, record, run, reinforcementLearning
+        case panic, record, run
     }
 
     init(from decoder: Decoder) throws {
@@ -1623,10 +1577,6 @@ struct HotkeySettings: Codable, Hashable, Sendable {
         panic = try container.decodeIfPresent(HotkeyBinding.self, forKey: .panic) ?? .panic
         record = try container.decodeIfPresent(HotkeyBinding.self, forKey: .record) ?? .record
         run = try container.decodeIfPresent(HotkeyBinding.self, forKey: .run) ?? .run
-        reinforcementLearning = try container.decodeIfPresent(
-            HotkeyBinding.self,
-            forKey: .reinforcementLearning
-        ) ?? .reinforcementLearning
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1634,26 +1584,6 @@ struct HotkeySettings: Codable, Hashable, Sendable {
         try container.encode(panic, forKey: .panic)
         try container.encode(record, forKey: .record)
         try container.encode(run, forKey: .run)
-        try container.encode(reinforcementLearning, forKey: .reinforcementLearning)
-    }
-
-    /// Adding the fourth shortcut must not erase three valid user-owned
-    /// shortcuts merely because one of them already used the new default.
-    func resolvingReinforcementConflict() -> Self {
-        let established = [panic, record, run]
-        guard Set(established).count == established.count else {
-            return HotkeySettings()
-        }
-        guard established.contains(reinforcementLearning) else { return self }
-        var result = self
-        let modifiers = HotkeyBinding.reinforcementLearning.carbonModifiers
-        let candidates = [37, 17, 40, 3, 45].map {
-            HotkeyBinding(keyCode: UInt32($0), carbonModifiers: modifiers)
-        }
-        result.reinforcementLearning = candidates.first {
-            !established.contains($0)
-        } ?? HotkeyBinding.reinforcementLearning
-        return result
     }
 }
 

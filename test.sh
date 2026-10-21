@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT="${0:A:h}"
 cd "$ROOT"
 
+# Test sessions must never publish training artifacts into the user library.
+TEST_WORKSPACE="$(mktemp -d "${TMPDIR:-/tmp}/agenttrainer-tests.XXXXXX")"
+trap 'rm -rf "$TEST_WORKSPACE"' EXIT
+export AGENTTRAINER_WORKSPACE_ROOT="$TEST_WORKSPACE"
+
 # Xcode produces MLX's required Metal library. Refresh it when dependency
 # resolution changes, without touching the installed app or release artifacts.
 XCODE_PRODUCTS="$ROOT/.build/xcode/Build/Products"
@@ -28,7 +33,7 @@ if [[ -z "$METALLIB" || ! -f "$METALLIB" ]]; then
   exit 1
 fi
 
-swift test -c debug list >/dev/null
+swift test --build-system native -c debug list >/dev/null
 TEST_BUNDLE="$(find "$ROOT/.build" -type d -path '*/debug/AgentTrainerPackageTests.xctest' ! -path '*/xcode/*' | head -1)"
 if [[ -z "$TEST_BUNDLE" || ! -d "$TEST_BUNDLE/Contents/MacOS" ]]; then
   echo "SwiftPM did not produce the AgentTrainer test bundle." >&2
@@ -36,4 +41,4 @@ if [[ -z "$TEST_BUNDLE" || ! -d "$TEST_BUNDLE/Contents/MacOS" ]]; then
 fi
 TEST_MACOS="$TEST_BUNDLE/Contents/MacOS"
 cp "$METALLIB" "$TEST_MACOS/mlx.metallib"
-swift test -c debug
+swift test --build-system native -c debug

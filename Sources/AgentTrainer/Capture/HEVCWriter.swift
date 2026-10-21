@@ -34,64 +34,15 @@ enum HEVCEncodingConfiguration {
     }
 }
 
-/// One quantization contract for both native video-range capture surfaces and
-/// the full-range packed frames used by DAgger. Luma uses the requested number
-/// of levels. Chroma is quantized symmetrically around its exact neutral code,
-/// preventing low-bit grayscale content from acquiring a color cast.
+/// Legal-range quantization preserves neutral chroma in low-bit recordings.
 struct RecordingColorQuantizationTables: Sendable {
-    let fullRangeLuma: [UInt8]
-    let fullRangeChroma: [UInt8]
     let videoRangeLuma: [UInt8]
     let videoRangeChroma: [UInt8]
 
     init(bits: Int) {
         let bits = min(8, max(1, bits))
-        fullRangeLuma = Self.luma(bits: bits, lower: 0, upper: 255)
-        fullRangeChroma = Self.chroma(bits: bits, lower: 0, neutral: 128, upper: 255)
         videoRangeLuma = Self.luma(bits: bits, lower: 16, upper: 235)
         videoRangeChroma = Self.chroma(bits: bits, lower: 16, neutral: 128, upper: 240)
-    }
-
-    func quantizePacked(_ packed: inout Data, spec: PreprocessingSpec) throws {
-        let lumaCount = spec.width * spec.height
-        let chromaWidth = spec.chroma == .yuv444 ? spec.width : (spec.width + 1) / 2
-        let chromaHeight = spec.chroma == .yuv420 ? (spec.height + 1) / 2 : spec.height
-        let chromaCount = spec.colorMode == .color ? chromaWidth * chromaHeight : 0
-        guard packed.count == lumaCount + 2 * chromaCount else {
-            throw AgentTrainerError.capture("The Record-quality DAgger frame had an invalid packed size.")
-        }
-        let result: vImage_Error = packed.withUnsafeMutableBytes { raw in
-            guard let base = raw.baseAddress else { return kvImageNullPointerArgument }
-            func apply(_ offset: Int, count: Int, table: [UInt8]) -> vImage_Error {
-                guard count > 0 else { return kvImageNoError }
-                var image = vImage_Buffer(
-                    data: base.advanced(by: offset),
-                    height: 1,
-                    width: vImagePixelCount(count),
-                    rowBytes: count
-                )
-                return table.withUnsafeBufferPointer {
-                    vImageTableLookUp_Planar8(
-                        &image,
-                        &image,
-                        $0.baseAddress!,
-                        vImage_Flags(kvImageNoFlags)
-                    )
-                }
-            }
-            let y = apply(0, count: lumaCount, table: fullRangeLuma)
-            guard y == kvImageNoError, chromaCount > 0 else { return y }
-            let cb = apply(lumaCount, count: chromaCount, table: fullRangeChroma)
-            guard cb == kvImageNoError else { return cb }
-            return apply(
-                lumaCount + chromaCount,
-                count: chromaCount,
-                table: fullRangeChroma
-            )
-        }
-        guard result == kvImageNoError else {
-            throw AgentTrainerError.capture("The Record Color Bit transform failed (vImage \(result)).")
-        }
     }
 
     private static func luma(bits: Int, lower: Int, upper: Int) -> [UInt8] {
@@ -247,9 +198,7 @@ final class HEVCWriter: @unchecked Sendable {
         }
     }
 
-    /// DAgger already owns exact Record-ready frames. Rewrapping a reconstructed
-    /// bi-planar surface as a timed sample lets it use the same required
-    /// hardware HEVC path without starting a second ScreenCaptureKit stream.
+    /// Wrap a quantized surface in the original capture timestamp.
     func append(_ pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
         if generatedFormatDescription == nil {
             var description: CMVideoFormatDescription?

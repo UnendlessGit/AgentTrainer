@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.4.5. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.46. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -21,13 +21,8 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Storage/InputEventFile.swift` — fixed-width binary event writer and validated mapped reader
 - `Preprocessing/VisionPreprocessor.swift` — Metal resize, color conversion, packing, and MLX expansion
 - `Training/DatasetCache.swift` — causal frame/action pairing and memory-mapped datasets
-- `Training/DAggerRecorder.swift` — bounded correction video/input publication from Record-quality live frames
 - `Training/PolicyNetwork.swift` — Policy v6, predictive objectives, augmentation, and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
-- `Training/ReinforcementLearningDomain.swift` — RL configuration, explicit action allowlist, bounded sizing, provenance, and live metrics
-- `Training/ReinforcementLearningPolicy.swift` — hybrid action distribution, shared Policy-v6 actor, isolated critic, GAE, and clipped PPO updates
-- `Training/ReinforcementLearningEngine.swift` — live capture/action scheduling, episode lifecycle, reward association, RL checkpoints, and actor publication
-- `Training/RewardWebSocket.swift` — single-client hosted WebSocket, bounded high-rate reward aggregation, customizable protocol messages, and reconnect admission
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
 - `Agent/AgentRuntime.swift` — capture, inference scheduling, prediction latching, and teardown
 - `Agent/InputInjector.swift` — final output firewall and synthetic HID events
@@ -36,7 +31,6 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `UI/ContextLabelsView.swift` — reusable context pickers, Library bulk editor, and field/value manager
 - `UI/` — views, themes, HUD, diagnostics, and CNN visualization
 - `Tests/AgentTrainerTests/DomainTests.swift` — contract, corruption, concurrency, storage, MLX, and rendering coverage
-- `Tests/AgentTrainerTests/ReinforcementLearningTests.swift` — policy, hosted protocol, migration, safety, rollout, checkpoint, and runtime-semantics coverage
 - `Tests/AgentTrainerTests/TrainingPerformanceTests.swift` — opt-in release hardware benchmark and trajectory checks
 
 ## Concurrency ownership
@@ -52,15 +46,7 @@ Capture, runtime, training, and injection use dedicated locks and queues because
 - Post key/button releases while holding the same injector lock used by execution. A stop/restart or permission off/on transition must not overtake a release.
 - Keep callbacks to UI state outside low-level locks.
 - Treat start and stop as re-entrant operations; duplicate requests must coalesce or return.
-- RL startup and teardown follow the same rule. Stop action admission, drain the action queue, release controls, stop capture, drain inference/update work, then publish the final actor. A stop during asynchronous startup must invalidate the launch before a late capture or input monitor can survive it.
-- RL inference and PPO mutation are serialized on one session queue. During an update, connection loss, reward staleness pause, or episode reset, clear the prediction latch and temporal ring and release synthetic controls before admitting another action.
-- The WebSocket receive path may run at 30–60 Hz or faster, but it must reduce messages into one lock-bounded accumulator. Never replace it with an unbounded continuation, task-per-reward, or retained message array.
-- `RewardWebSocketServer` is an actor over one `NWListener` and at most one admitted `NWConnection`. Callback generations must reject late listener/connection state after stop or restart. A disconnected client may reconnect to the still-listening server during the safety grace period; a second concurrent client is rejected.
-- An RL stop during asynchronous model/listener/rewarder startup must atomically fail the final state-install guard. No late optimizer, listener, capture, input monitor, or injector enable may repopulate a stopped session.
 - A background task may publish only bounded snapshots to the main actor.
-- An explicit DAgger trigger must synchronously suspend inference and new AI action admission before recorder construction. Buffer early physical samples and Record-quality frames until the recorder is installed; ordinary takeover must never enter correction mode. The main UI and capture-excluded HUD must expose DAgger Recording rather than Run during this interval.
-- Stopping DAgger resumes the resident Run session before publication finishes, but only after clearing its temporal ring and prediction latch. No stale pre-correction action may execute after the transition.
-- Admit DAgger preprocessing work and enqueue it under the same runtime lock that orders the stop drain marker; a marker must never overtake a counted frame. Input events stream to disk. At the trigger, the rolling ring relinquishes its payload to the recorder and startup buffering is limited to the unused part of the single 512 MB visual-payload budget; correction frames are not retained in a second ring.
 
 ## Capture and recording contracts
 
@@ -83,7 +69,7 @@ Capture status matters: complete/started frames are usable, idle frames may reus
 
 New saved video requests a bi-planar video-range 4:2:0 ScreenCaptureKit surface at the selected even Record resolution and passes the default 8-bit path directly to the required hardware HEVC Main encoder. Lower Color Bit settings use pooled accelerated, legal-range-aware luma/chroma quantization; neutral chroma remains exactly neutral even at one bit. The user-facing compression amount maps monotonically to a resolution/FPS-aware bitrate while codec, GOP, and profile details remain internal. Live model capture remains BGRA because it is consumed directly rather than encoded. Existing/imported recording artifacts remain byte-preserving and are never migrated implicitly.
 
-`RecordingVisualSettings` owns output width/height, ratio-lock state, Color Bit, and compression. Universal DAgger lead-up sits beside it in workflow settings. Recording presets must snapshot both along with the pre-existing source, destination, FPS, cursor, region, trim, input blacklist, and generic context assignments; presets saved before 2.2/2.3 decode visual/context additions to safe defaults.
+`RecordingVisualSettings` owns output width/height, ratio-lock state, Color Bit, and compression. Recording presets must snapshot these along with the pre-existing source, destination, FPS, cursor, region, trim, input blacklist, and generic context assignments; presets saved before 2.2/2.3 decode visual/context additions to safe defaults.
 
 Current `RecordingManifest` schema is 4. Schema 4 adds optional generic context assignments. Each assignment has a field ID/name and value ID/name, and a manifest may select at most one value per field. IDs carry training identity; names are portable display snapshots. Context names are trimmed, bounded, free of control characters, and unique without locale-dependent comparison. A context edit changes only `manifest.json`; it never rewrites video or input.
 
@@ -91,17 +77,11 @@ Current recording manifests persist the exact successfully encoded frame count. 
 
 Capture-source discovery is a live list, not a one-shot bootstrap result. Refresh it on app activation, display topology changes, application launch/termination, and through a bounded two-second poll while a source picker is visible. Publish only changed, stably sorted snapshots, discard stale overlapping results, and do not disturb an active capture.
 
-The input event tap is backed by a low-rate physical-state reconciliation pass. Reconciliation reads the HID-system hardware table, never the foreground session's mutable accumulated event state: another app's event sources must not synthesize a release for a physically held key. A poll is also revision-guarded, so a snapshot taken before a concurrent first-frame or DAgger seed is discarded instead of overwriting newer physical truth. If macOS disables the tap or drops a transition, the next valid pass emits only the missing key, modifier, or mouse-button edges. Recording shutdown appends balanced releases for every logical control still held. The first complete screen frame seeds controls that were already held during asynchronous startup. Shortcut and blacklist filters apply to both ordinary and reconciled input.
+The input event tap is backed by a low-rate physical-state reconciliation pass. Reconciliation reads the HID-system hardware table, never the foreground session's mutable accumulated event state: another app's event sources must not synthesize a release for a physically held key. A poll is also revision-guarded, so a snapshot taken before a concurrent first-frame recording seed is discarded instead of overwriting newer physical truth. If macOS disables the tap or drops a transition, the next valid pass emits only the missing key, modifier, or mouse-button edges. Recording shutdown appends balanced releases for every logical control still held. The first complete screen frame seeds controls that were already held during asynchronous startup. Shortcut and blacklist filters apply to both ordinary and reconciled input.
 
 Live HUD state and persisted recording state are intentionally separate. The HUD reduces blacklist-sanitized physical samples immediately, so a held modifier or mouse button is visible on its down edge; monotonic state revisions prevent cross-thread UI delivery from restoring an older state. The event file may briefly buffer modifier transitions to determine whether they belong to a global shortcut, but it preserves their original timestamps and separately held modifiers. Global shortcut suppression ends with the trigger/modifier release lifecycle; it must never consume an unrelated input merely because it occurs inside an expiry window. Caps Lock is normalized to a tap and Fn/Globe retains physical key edges so both remain in the ordinary keyboard action space.
 
 Saved HEVC sessions end on the shared host clock even when ScreenCaptureKit reports only idle frames. Dataset construction materializes the last decoded frame at every configured perception interval until a newer frame becomes causal; a static screen must not collapse temporal spacing or observation count.
-
-DAgger uses the normal Record shortcut only while Run is active. Triggering it suspends inference, drains AI output, and records physical expert input while a Record-quality capture pipeline continues. Its native schema-4 recording manifest stores `.daggerCorrection`, source profile/version, supervision start, bounded training weight, and the Run context active at the trigger. Pre-trigger AI controls are causal context only; action labels begin at `supervisionStart`. The rolling video uses the frozen Record source, FPS, cursor, resolution, Color Bit, compression, and universal lead-up. If the AI's immutable cursor-visibility contract differs from Record, a dedicated capture stream preserves both contracts rather than changing model input.
-
-DAgger packages receive balanced terminal releases, follow recording shortcut/blacklist filtering, are automatically attached to their source profile, and remain normal Library/import/export artifacts. Starting, saving, or stopping a correction is single-flight. A failed start resumes output; panic/Run stop finalizes any admitted correction after releasing synthetic controls.
-
-Startup buffering is byte/count bounded and overflow is a surfaced failure, never silent truncation. Encoder/queue drops are persisted in the manifest: discard a correction above 5% visual drops because continuing expert events against stale held video can poison causal alignment; smaller drop counts remain visible in Library and diagnostics. A pending DAgger directory keeps storage relocation, folder deletion, profile deletion/editing, and application termination busy through manifest/thumbnail/profile publication. If its destination folder vanished externally, publication remaps to a live fallback.
 
 ## Vision and dataset contracts
 
@@ -122,7 +102,7 @@ Temporal vision is either current-only or an explicit three-part input:
 
 The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context. Zero frames disables the temporal branch: runtime and training consume only current vision and do not allocate past-image or past-control input buffers.
 
-`TrainingDataContract.schemaVersion` is 13. Version 12 versions the per-sample augmentation draw/sampling contract; version 13 adds recording-level generic context conditioning. Older checkpoints may warm-start compatible context-free weights but never claim an exact optimizer/random-state resume across a data-schema change. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, supervision boundaries, weighting, context IDs/selections, or target meaning changes. Display-only context renames refresh the tiny cache manifest without repacking pixels. A cache has:
+`TrainingDataContract.schemaVersion` is 14. Version 14 removes per-recording emphasis and purpose-dependent splits; generic context conditioning and the Policy-v6 weight layout remain unchanged. Older checkpoints may warm-start compatible context-free weights but never claim an exact optimizer/random-state resume across a data-schema change. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, supervision boundaries, context IDs/selections, or target meaning changes. Display-only context renames refresh the tiny cache manifest without repacking pixels. A cache has:
 
 - `current-observations.bin` — one full-resolution packed image per perception
 - `past-observations.bin` — one reduced packed image of the same perception
@@ -132,7 +112,7 @@ The default is four past frames, two perception intervals apart, with a 2× line
 
 The cache manifest snapshots a deterministic `ModelContextSchema`. Fields and values are UUID-sorted for tensor stability and include only values assigned by at least one selected recording. Each `CacheSegment` stores that recording's assignments once; batch gathering expands them to a multi-hot Float row. Each value owns one dimension, at most one value per field is active, and an unassigned field is an all-zero segment. Context-free caches have no context descriptor or Metal allocation.
 
-Each `CacheSegment` owns both an action-row start and an observation start. They are equal for ordinary demonstrations; DAgger observation context may begin earlier. Cache validation derives past indices from the observation start, never the first supervised row. Segment purpose and training weight are persisted. Weight reduction normalizes over included unweighted rows so homogeneous correction batches retain their intended emphasis.
+Each `CacheSegment` owns both an action-row start and an observation start. Legacy recordings may have observation context before supervised targets. Cache validation derives past indices from the observation start, never the first supervised row. All recordings use equal sample emphasis; mask weights remain shared by padding and future-prediction objectives.
 
 Future action rows/previous rows and future observation maps are gathered from existing cache data at training time. Every horizon is masked at segment boundaries. Future-state targets use a configurable stride and deduplicate repeated observation indices before visual encoding. No future label or image may cross a recording boundary.
 
@@ -156,21 +136,9 @@ Every frame-control row includes normalized absolute cursor position, raw relati
 
 `ModelContract.schemaVersion` is 6 and the weight format is `AgentTrainer.Policy.v6`.
 
-Demonstration training and RL intentionally share that exact actor layout. RL must save the actor alone as an ordinary Policy-v6 `weights.safetensors`, so either trainer can warm-start the other and normal Run stays unaware of rewards. The RL critic is a separate session-owned module over fused actor features; it appears only in `RLCheckpoint/rl.weights.safetensors` and must never become a runtime dependency.
+All training uses behavioral cloning. Older feature settings decode as unknown keys and are omitted when saved. `ModelOutputCapabilities` retains only immutable key/button/movement/scroll limits from imported model manifests; it is not a trainer or action distribution. Missing legacy limits fail closed. Run always uses the established deterministic activations and the shared output firewall.
 
-RL uses clipped PPO with GAE. Binary controls use Bernoulli logits; absolute mouse samples are sigmoid-bounded Gaussians and relative mouse/scroll samples are tanh-bounded Gaussians. Cursor, Game Camera, and scroll have independent fixed exploration deviations; one shared continuous deviation is a legacy decode-only setting. Store the pre-transform continuous latent in the rollout so a later PPO pass recomputes the exact category-specific transformed policy density. Actor, visual encoder, recurrent path, fusion stack, and critic must all remain inside the differentiated closure; precomputing actor temporal features outside `valueAndGrad` silently prevents end-to-end RL learning. Supervised dropout remains unchanged, but PPO likelihood updates disable it: a new random dropout mask must never be mistaken for policy divergence from the stored action probability.
-
-`ReinforcementActionBehavior` is an immutable RL runtime contract. After sampling, absolute cursor output starts from the real cursor, applies configured smoothing, and obeys a maximum normalized step. Relative Game Camera output applies smoothing, a dead zone, and a maximum magnitude before `GameCameraContract.deltaScale` and Run sensitivity. Scroll has its own smoothing. The distribution sample—not the transformed executable output—remains the PPO likelihood action; the executable transform is deterministic actuator behavior and is also supplied as temporal control context.
-
-Normal Run must inspect RL provenance and compile raw actor logits. It samples every allowed binary with the saved Bernoulli temperature on each fresh perception, applies the saved action behavior, and publishes the sanitized executable row. It uses the deterministic continuous mean rather than exploration noise. Sending activated probabilities through the demonstration runtime's `0.5` threshold is forbidden because it turns a stochastic learned policy into permanently held modal controls. Demonstration versions still compile their established activated deterministic output.
-
-`ReinforcementActionSpace` is an explicit allowlist. A category with no selected member is disabled. It supports the complete usable macOS virtual-key range 0–127, with modifier `flagsChanged` capture, and mouse buttons 0–7. At collection and normal Run, an RL version's immutable allowlist is intersected with saved/current channels, profile restrictions, selected mouse mode, live output permissions, allowed keys, and the control region. Collection must have at least one executable action after this full intersection. Changing a live permission that changes an active RL distribution stops and saves rather than silently collecting an action the injector cannot execute. Demonstration versions leave `reinforcementActionSpace` nil and retain their established runtime semantics.
-
-Changing hosted transport timing, protocol names, episode limits, or publication cadence does not invalidate learned state. The exact RL checkpoint signature does include actor layout, context layout, action space, action behavior, mouse mode, critic layout, PPO/reward objective, and seed. Activating another brain makes a mismatched RL checkpoint ineligible; RL then warm-starts the selected actor and initializes a fresh critic/optimizer. A pre-2.4.5 RL checkpoint is intentionally not claimed as an exact resume under the new distribution/action contract; its active Policy-v6 actor remains a valid warm start.
-
-`maximumEpisodes`, runnable publication cadence, and checkpoint cadence are relative to the current start-to-stop session. Lifetime episode/update/environment counters remain cumulative. An episode boundary marks the final transition before environment reset. Preferred PPO updates use at least four transitions; shorter terminal segments remain in the bounded rollout across episodes, and GAE stops at their terminal separator. A maximum-episode or safe/final stop updates a valid one-to-three-transition final batch rather than discarding collected experience.
-
-Episode timers begin only after initial capture is live and exclude reset/start delays, connection/staleness pauses, and PPO time. Boundary protocol order is `episode_finished`, optional `training_update_started` / `training_update_finished`, `episode_starting`, delay/reset, then `episode_started`. Rewards received during a declared PPO update are ignored and counted; a done signal received during the update is retained and triggers the boundary without briefly re-enabling output.
+Legacy recording `supervisionStart` remains a data compatibility contract: pre-boundary images and controls are observation context, never action labels. Dataset schema 14 rebuilds packed caches and safely warm-starts compatible active weights with a fresh optimizer/random sequence. There are no special recording purposes, per-recording loss weights, or purpose-specific validation splits.
 
 A runnable version is immutable. Runtime current vision, temporal vision, architecture, precision, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
 
@@ -192,8 +160,6 @@ Current Policy v6 combines:
 Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. Past control rows are masked for half of training samples while past images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
 
 Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Configurable photometric augmentation samples one transform per supervised row and applies it identically to only that row's current, past, and future frames. It never moves pixels. Augmented training expands deduplicated observations to row shape before the CNN and uses the diversity-oriented sampler; validation and augmentation-off training retain deterministic visual reuse. Future-action loss weights near horizons more strongly. Future-state loss predicts a stopped-gradient latent change from fused context plus the demonstrated current action; it never generates pixels. Conservative default auxiliary weights are gated by a matched-update causal held-out test at 1% immediate-loss drift. Do not change these semantics without updating tests and the relevant schema.
-
-DAgger rows are always training data, but at least one ordinary demonstration must also remain for rehearsal whenever one exists. On a warm start, fixed ordinary and correction probes score the unmodified source brain. A candidate replaces it only when correction fit improves materially and ordinary loss/per-head behavior remains inside the regression guard. `best.weights` must snapshot the exact demonstrated keys, channels, training/runtime contract, cursor visibility, and mouse recommendation belonging to those weights; never pair an old baseline with current capabilities.
 
 The performance path preserves those semantics:
 
@@ -217,7 +183,7 @@ An exact checkpoint contains weights, both AdamW moment sets, optimizer metadata
 
 Checkpoint and version activation are transactions. A profile must never point at one brain while its checkpoint resumes another. Weights-only activation intentionally removes an unrelated resumable checkpoint so later training begins a fresh optimizer from the selected brain.
 
-Completed ordinary training publishes the lowest acceptable held-out-validation brain. Correction training publishes the best correction-improving candidate that passes its ordinary regression guard. Periodic autosaves are bounded and never prune the active or protected brain.
+Completed ordinary training publishes the lowest acceptable held-out-validation brain. Periodic autosaves are bounded and never prune the active or protected brain.
 
 ## Runtime safety contracts
 
@@ -229,7 +195,6 @@ The final executable action is the intersection of:
 4. demonstrated key codes
 5. live cursor and keyboard permissions
 6. the allowed control region unless full-Mac control is enabled
-7. for RL versions, the immutable action behavior that samples binaries and bounds/stabilizes continuous output
 
 Every mutable profile channel is a disable-only runtime firewall over the immutable saved channels—including mouse movement, buttons, scroll, keyboard, and modifiers. A current editor switch may never enable a head the saved brain did not learn or continue executing a head the user disabled.
 
@@ -241,18 +206,6 @@ Run reads context fields and values only from the active immutable version, neve
 
 All synthetic events carry `agentTrainerSyntheticTag`; input safety monitors ignore that tag. Panic and normal stop both drain action work and release held state.
 
-Ordinary `AgentRuntime` never constructs `RewardWebSocketServer`. An RL-published version runs with no connection or reward signal; its immutable RL metadata narrows capabilities and defines policy sampling/stabilization. RL itself reuses Run's frozen source, region, frame mode, mouse execution, Game Camera, safety, cursor/keyboard permissions, preview, and immutable context vocabulary. A live context change creates an episode boundary. A live output-permission change that alters the on-policy action space stops and saves.
-
-The RL shortcut is the sole normal start/stop surface. Panic and application termination may stop RL for safety, but no button or menu item may start it. Panic, Record, Run, and RL shortcuts must remain distinct and capture/safety-excluded.
-
-The reward transport is one app-wide `RewardWebSocketServerSettings` value persisted with workflow settings, never active per-profile transport. AgentTrainer hosts `ws://`; the rewarder connects as a client. The default is `ws://127.0.0.1:47831`, `acceptLocalOnly`, one client, explicit port 1024–65535, no credentials/query/fragment, and a 64 KiB maximum message. Trusted-LAN listening is explicit and warning-bearing. `wss://` is not accepted because the app does not invent or persist a TLS server identity.
-
-`RewardWebSocketMessageNames` owns the editable incoming `type`, `reward`, and `done` fields; incoming episode-finished and heartbeat type values; and outgoing episode-finished, episode-starting, episode-started, update-started, and update-finished values. Names are trimmed, bounded, control-free, collision-checked, and frozen at session start. Outgoing metadata keys `episode`, `timestamp`, `reason`, `return`, `steps`, and `next_episode` remain stable. Default 2.4.0 aliases remain receive-compatible only while default naming is active.
-
-Reward JSON accepts one finite numeric configured reward field, an optional configured boolean done field, the configured episode-finished type, or the configured heartbeat type. Booleans masquerading as numbers, non-finite/coerced strings, wrong field types, oversized messages, and semantically empty objects are invalid. Rewards received between perceptions use sum/mean/latest reduction without retaining individual messages.
-
-Any server/client disconnect immediately releases controls and clears stale prediction/temporal/filter state. Default safety checkpoints, publishes any updated actor, and stops after the configured reconnect grace. A toggle may instead remain safely paused while the listener admits a reconnect. Reward/heartbeat staleness and cumulative invalid-message floods have separate stop-and-save toggles. Capture loss, stale inference, target focus loss, physical input, panic, relevant output-permission changes, and application termination use the same ordered release/checkpoint/publication path. Every final stop refreshes the exact RL checkpoint; even a partial final rollout is updated when nonempty.
-
 ## Storage contracts
 
 Default root:
@@ -262,8 +215,6 @@ Default root:
 ```
 
 Training data (`Recordings`, `Caches`, folder index, context-field catalog) and model data (`Profiles`, versions, checkpoints, contract markers) can be relocated independently.
-
-Each profile may own both `Checkpoint` (demonstration optimizer state) and `RLCheckpoint` (combined actor/critic, optimizer, MLX random state, and RL state). Learning reset moves/removes both transactionally. Duplication copies both. Model-contract audit archives an incompatible RL checkpoint rather than interpreting it under a new actor schema.
 
 Relocation must:
 
@@ -297,13 +248,13 @@ Theme controls are bounded and global. Motion honors Reduce Motion, can be disab
 
 User-facing technical values must be derived from shared contract helpers such as `NeuralInputSizing` and `ModelSizing`, not duplicated formulas.
 
-AI Models exposes Training Configuration as separate Training Data and Reinforcement Learning tabs. The RL tab keeps common episode/rollout settings visible, places PPO, per-category exploration/stabilization, reward, environment lifecycle, and persistence controls under one Advanced disclosure, displays estimated retained rollout memory, and uses an inverse blocked-key editor: only selected keys/buttons/movement modes are executable. The one universal hosted endpoint, access controls, stop-and-save toggles, and every protocol name live in Settings → Reward WebSocket. Run may display live RL status and metrics but must not add a start/stop button.
-
 Library recording rows and inspectors expose encoded frames plus logical package MB/GB. Folder headers aggregate every recording in that folder—not only search results—and show total recordings, frames, logical bytes, and full recorded seconds. Newly created manifests use exact frame counts; legacy estimates must remain compatible and non-destructive.
 
 Recording presets are user-owned, editable snapshots of Record-page settings. Applying a preset must tolerate an unavailable source or deleted destination without inventing an identifier. Library range selection follows the visible folder/search order; bulk manifest moves roll back as a set, and bulk deletion stages all recording directories before cleanup. Global shortcuts may use keyboard keys or any macOS mouse-button number, including additional side buttons, and must remain excluded from recording and human-input safety hooks.
 
 Context UI uses one shared generic field/value catalog. Record freezes selections at startup. Library single and multi-selection pickers may set or clear any field; mixed bulk values stay unchanged until explicitly replaced. Catalog renames update affected recording snapshots transactionally. Deleting a field/value requires confirmation and transactionally removes matching recording assignments, while immutable model-version schemas remain unchanged. Run renders a context card only when the active brain's schema is non-empty and starts every trained field blank.
+
+The scripts explicitly select SwiftPM's `native` backend. Newer Swift toolchains may default to a different backend and output layout; do not silently change backend, executable discovery, or Metal-library placement independently. `test.sh` supplies a disposable `AGENTTRAINER_WORKSPACE_ROOT` for the real training/checkpoint integration test.
 
 ## Validation and release
 
@@ -315,9 +266,8 @@ Before release:
 4. Confirm `CFBundleShortVersionString` and `CFBundleVersion`.
 5. Quit AgentTrainer and run `./build.sh`.
 6. Verify `/Applications/AgentTrainer.app` launches and reports the intended version.
-7. Exercise permission refresh, ordinary recording start/stop, explicit DAgger start/correct/stop, ordinary takeover without recording, correction warm-start, training pause/resume, agent panic, and updater UI.
-8. Against AgentTrainer's loopback-hosted WebSocket, exercise high-rate rewards, custom names end to end, heartbeat, remote `done`, strict lifecycle ordering, single-client admission, disconnect/reconnect release behavior, reward staleness, stop-and-save, keybind-only start/stop, an RL update from a demonstration brain, demonstration warm-start from an RL brain, and normal stochastic Run of the RL actor with no rewarder.
-9. Verify the DMG and `SHA256SUMS.txt` in `outputs`.
-10. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
+7. Exercise permission refresh, recording start/stop, human takeover, training pause/resume, agent panic, and updater UI.
+8. Verify the DMG and `SHA256SUMS.txt` in `outputs`.
+9. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
 
 `build.sh` creates a fully signed staging bundle, transactionally installs it into `/Applications/AgentTrainer.app` by default, and then packages the DMG/source/checksums. Override the install path with `APP_PATH`; override signing with `CODE_SIGN_IDENTITY` and optionally `CODE_SIGN_KEYCHAIN`.

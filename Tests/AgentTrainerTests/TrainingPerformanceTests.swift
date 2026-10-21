@@ -7,169 +7,6 @@ import XCTest
 /// Opt-in hardware benchmark. Normal CI remains deterministic and quick; use
 /// `./benchmark.sh` to exercise the complete packed temporal-vision data path.
 final class TrainingPerformanceTests: XCTestCase {
-    func testReinforcementPPOUpdateMeasuresDefaultProfileThroughputAndMemory() throws {
-        guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_RL_PERFORMANCE_TESTS"] == "1" else {
-            throw XCTSkip("Set AGENTTRAINER_RUN_RL_PERFORMANCE_TESTS=1 to run the online PPO benchmark.")
-        }
-        try Device.withDefaultDevice(.gpu) {
-            MLXMemoryLifecycle.configure()
-            let profile = AIProfile.fresh(name: "RL Performance")
-            var configuration = ReinforcementLearningConfiguration()
-            configuration.actionSpace = ReinforcementActionSpace(
-                allowedKeyCodes: [13]
-            )
-            let plan = try ReinforcementActionPlan.make(
-                profile: profile,
-                configuration: configuration,
-                mouseMode: .absolute
-            )
-            let optimizer = try ReinforcementPolicyOptimizer(
-                profile: profile,
-                configuration: configuration,
-                contextSchema: .empty,
-                actionPlan: plan,
-                actorWeightsURL: nil
-            )
-            let temporal = profile.training.effectiveTemporalVision
-            let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
-            let observation = ReinforcementObservation(
-                currentPacked: Data(
-                    repeating: 127,
-                    count: profile.preprocessing.sampleByteCount
-                ),
-                pastPacked: Data(
-                    repeating: 127,
-                    count: temporal.pastFrameCount * pastSpec.sampleByteCount
-                ),
-                pastControls: [Float](
-                    repeating: 0,
-                    count: temporal.pastFrameCount * ActionLayout.count
-                ),
-                contextValues: []
-            )
-            let prediction = try optimizer.prediction(for: observation)
-            var random = ReinforcementRandomGenerator(seed: configuration.seed)
-            let sample = try plan.sample(
-                logits: prediction.logits,
-                behavior: configuration.effectiveActionBehavior,
-                random: &random
-            )
-            let transitions = (0..<configuration.rolloutSteps).map { index in
-                ReinforcementTransition(
-                    observation: observation,
-                    distributionActions: sample.distributionActions,
-                    executedActions: sample.executedActions,
-                    oldLogProbability: sample.logProbability,
-                    oldValue: prediction.value,
-                    reward: index.isMultiple(of: 7) ? 1 : -0.02,
-                    terminal: index == configuration.rolloutSteps - 1
-                )
-            }
-            let memoryBefore = Memory.snapshot()
-            let began = ContinuousClock.now
-            let metrics = try optimizer.update(
-                transitions: transitions,
-                bootstrapValue: 0,
-                shuffleSeed: configuration.seed
-            )
-            let seconds = began.duration(to: .now).benchmarkSeconds
-            let memoryAfter = Memory.snapshot()
-            let throughput = Double(transitions.count) / max(0.000_001, seconds)
-            print(
-                "RL_PPO_BENCHMARK profile=default rollout=\(transitions.count) "
-                    + "optimizer_steps=\(metrics.optimizerSteps) seconds=\(seconds) "
-                    + "samples_per_second=\(throughput) policy_loss=\(metrics.policyLoss) "
-                    + "value_loss=\(metrics.valueLoss) entropy=\(metrics.entropy) "
-                    + "active_before=\(memoryBefore.activeMemory) active_after=\(memoryAfter.activeMemory) "
-                    + "cache_after=\(memoryAfter.cacheMemory) thermal=\(TrainingThermalState.current.rawValue)"
-            )
-            XCTAssertGreaterThan(metrics.optimizerSteps, 0)
-            XCTAssertLessThanOrEqual(metrics.optimizerSteps, 8)
-            XCTAssertTrue(metrics.policyLoss.isFinite)
-            XCTAssertTrue(metrics.valueLoss.isFinite)
-            XCTAssertTrue(metrics.entropy.isFinite)
-            XCTAssertGreaterThan(throughput, 0.5)
-            XCTAssertLessThan(
-                Int64(memoryAfter.activeMemory),
-                Int64(ProcessInfo.processInfo.physicalMemory) * 3 / 4
-            )
-            XCTAssertNotEqual(TrainingThermalState.current, .critical)
-        }
-    }
-
-    func testRecordQualityDAggerVideoPipelineSustainsDefaultWorkload() async throws {
-        guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_DAGGER_PERFORMANCE_TESTS"] == "1" else {
-            throw XCTSkip("Set AGENTTRAINER_RUN_DAGGER_PERFORMANCE_TESTS=1 to run the Record-quality DAgger benchmark.")
-        }
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("dagger-performance-\(UUID().uuidString).atrrecord", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let spec = PreprocessingSpec(
-            width: 1280,
-            height: 720,
-            colorMode: .color,
-            bitDepth: 8,
-            chroma: .yuv420,
-            resizePolicy: .stretch
-        )
-        var capture = CaptureSpec(requestedFPS: 60)
-        capture.recordingVisuals = RecordingVisualSettings(
-            width: 1280,
-            height: 720,
-            locksAspectRatio: true,
-            colorBits: 8,
-            compression: RecordingVisualSettings.defaultCompression
-        )
-        let request = DAggerCaptureRequest(
-            recordingID: UUID(),
-            directory: directory,
-            profileID: UUID(),
-            versionID: UUID(),
-            profileName: "Performance",
-            destinationFolderID: UUID(),
-            excludedKeyCodes: [],
-            preprocessing: spec,
-            capture: capture,
-            captureRect: CGRect(x: 0, y: 0, width: 1280, height: 720),
-            perceptionFPS: 60,
-            actionFPS: 60,
-            leadUpSeconds: 0.5,
-            correctionWeight: 4
-        )
-        let packed = Data(repeating: 128, count: spec.sampleByteCount)
-        let controls = [Float](repeating: 0, count: ActionLayout.count)
-        let startNanos: UInt64 = 1_000_000_000
-        let stepNanos: UInt64 = 1_000_000_000 / 60
-        let frames = (0..<60).map { offset in
-            DAggerFrame(
-                timestampNanos: startNanos + UInt64(offset) * stepNanos,
-                packedVision: packed,
-                preprocessing: spec,
-                executedControls: controls
-            )
-        }
-        let began = ContinuousClock.now
-        let recorder = try DAggerRecorder(
-            request: request,
-            correctionStartHostNanos: frames[30].timestampNanos,
-            preRoll: Array(frames.prefix(30))
-        )
-        for frame in frames.dropFirst(30) { recorder.append(frame) }
-        let result = try await recorder.finish(
-            endHostNanos: frames.last!.timestampNanos + stepNanos
-        )
-        let seconds = began.duration(to: .now).benchmarkSeconds
-        let throughput = Double(result.frameCount) / max(0.000_001, seconds)
-        print(
-            "DAGGER_VIDEO_BENCHMARK resolution=1280x720 frames=\(result.frameCount) "
-                + "seconds=\(seconds) frames_per_second=\(throughput) drops=\(result.droppedFrameCount)"
-        )
-        XCTAssertEqual(result.frameCount, 60)
-        XCTAssertEqual(result.droppedFrameCount, 0)
-        XCTAssertGreaterThanOrEqual(throughput, 30)
-    }
-
     func testCompiledMetalDataPathPreservesOrderedUpdatesAndMeasuresThroughput() throws {
         guard ProcessInfo.processInfo.environment["AGENTTRAINER_RUN_PERFORMANCE_TESTS"] == "1" else {
             throw XCTSkip("Set AGENTTRAINER_RUN_PERFORMANCE_TESTS=1 to run the local Metal benchmark.")
@@ -762,13 +599,16 @@ final class TrainingPerformanceTests: XCTestCase {
                 var peakActiveMemory = 0
                 var peakCacheMemory = 0
                 for index in 0..<steps {
-                    let started = ContinuousClock.now
-                    let loss = step(inputs())[0]
-                    MLX.eval(loss, model.parameters(), optimizer.stateArrays(), additionalState())
-                    let result = (
-                        seconds: started.duration(to: .now).benchmarkSeconds,
-                        loss: loss.item(Float.self)
-                    )
+                    // Match TrainingEngine's per-step Cocoa/Metal lifetime.
+                    let result = autoreleasepool {
+                        let started = ContinuousClock.now
+                        let loss = step(inputs())[0]
+                        MLX.eval(loss, model.parameters(), optimizer.stateArrays(), additionalState())
+                        return (
+                            seconds: started.duration(to: .now).benchmarkSeconds,
+                            loss: loss.item(Float.self)
+                        )
+                    }
                     windowSeconds += result.seconds
                     windowSamples += batchSize
                     let closesWindow = (index + 1).isMultiple(of: windowSize)
@@ -948,17 +788,19 @@ final class TrainingPerformanceTests: XCTestCase {
                 return result.0
             }
             func runAugmentedImmediate() -> (seconds: Double, loss: Float) {
-                let start = ContinuousClock.now
-                let loss = withRandomState(augmentedImmediateRandomState) {
-                    augmentedImmediateStep(auxiliaryInputs())[0]
+                autoreleasepool {
+                    let start = ContinuousClock.now
+                    let loss = withRandomState(augmentedImmediateRandomState) {
+                        augmentedImmediateStep(auxiliaryInputs())[0]
+                    }
+                    MLX.eval(
+                        loss,
+                        augmentedImmediateModel.parameters(),
+                        augmentedImmediateOptimizer.stateArrays(),
+                        augmentedImmediateRandomState.innerState()
+                    )
+                    return (start.duration(to: .now).benchmarkSeconds, loss.item(Float.self))
                 }
-                MLX.eval(
-                    loss,
-                    augmentedImmediateModel.parameters(),
-                    augmentedImmediateOptimizer.stateArrays(),
-                    augmentedImmediateRandomState.innerState()
-                )
-                return (start.duration(to: .now).benchmarkSeconds, loss.item(Float.self))
             }
             for _ in 0..<2 { _ = runAugmentedImmediate() }
             let augmentedIterations = usesDefaultProfile || usesStressProfile ? 6 : 12
@@ -1035,10 +877,12 @@ final class TrainingPerformanceTests: XCTestCase {
                 return result.0
             }
             func runAuxiliary() -> (seconds: Double, loss: Float) {
-                let start = ContinuousClock.now
-                let loss = withRandomState(auxiliaryRandomState) { auxiliaryStep(auxiliaryInputs())[0] }
-                MLX.eval(loss, auxiliaryModel.parameters(), auxiliaryOptimizer.stateArrays(), auxiliaryRandomState.innerState())
-                return (start.duration(to: .now).benchmarkSeconds, loss.item(Float.self))
+                autoreleasepool {
+                    let start = ContinuousClock.now
+                    let loss = withRandomState(auxiliaryRandomState) { auxiliaryStep(auxiliaryInputs())[0] }
+                    MLX.eval(loss, auxiliaryModel.parameters(), auxiliaryOptimizer.stateArrays(), auxiliaryRandomState.innerState())
+                    return (start.duration(to: .now).benchmarkSeconds, loss.item(Float.self))
+                }
             }
             for _ in 0..<2 { _ = runAuxiliary() }
             let auxiliaryIterations = usesDefaultProfile || usesStressProfile ? 6 : 12

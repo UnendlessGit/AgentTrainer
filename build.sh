@@ -100,7 +100,7 @@ xcodebuild \
   GCC_INSTRUMENT_PROGRAM_FLOW_ARCS=NO \
   build
 
-swift build -c "$CONFIGURATION"
+swift build --build-system native -c "$CONFIGURATION"
 BIN="$ROOT/.build/$CONFIGURATION/AgentTrainer"
 if [[ ! -x "$BIN" ]]; then
   BIN="$(find "$ROOT/.build" -type f -path "*/$CONFIGURATION/AgentTrainer" -perm +111 ! -path '*/xcode/*' | head -1)"
@@ -214,7 +214,7 @@ rm -rf "$OUTPUTS/AgentTrainer.app"
 SOURCE_ARCHIVE="$OUTPUTS/AgentTrainer-Source.zip"
 rm -f "$SOURCE_ARCHIVE"
 cd "$ROOT"
-/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources build.sh test.sh benchmark.sh README.md DEVELOPMENT_GUIDE.md RELEASE_NOTES_2.4.5.md -x '*.DS_Store'
+/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources build.sh test.sh benchmark.sh README.md DEVELOPMENT_GUIDE.md RELEASE_NOTES_2.46.md -x '*.DS_Store'
 
 DMG_STAGE="$BUILD_ROOT/DMG"
 DMG_APP="$DMG_STAGE/AgentTrainer.app"

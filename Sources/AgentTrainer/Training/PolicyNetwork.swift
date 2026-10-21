@@ -917,9 +917,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         if let sampleWeights {
             let rowWeights = sampleWeights.asType(dtype).reshaped([-1, 1])
             weights = weights * rowWeights
-            // A zero row is padding and leaves no denominator. Values above one
-            // are deliberate DAgger emphasis and must not divide themselves
-            // away when a locality batch contains only correction samples.
+            // Masked rows are padding and contribute no denominator.
             normalizationWeights = normalizationWeights * (rowWeights .> 0).asType(dtype)
         }
         return (raw * weights).sum() / (normalizationWeights.sum() + 1e-6)

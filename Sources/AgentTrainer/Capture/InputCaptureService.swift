@@ -679,7 +679,7 @@ struct PhysicalInputState: Sendable {
         ifUnchangedSince expectedRevision: UInt64? = nil
     ) -> [InputSample] {
         // The Core Graphics reads intentionally happen outside the lock. If an
-        // event or first-frame/DAgger seed was admitted while those reads were in
+        // event or first-frame recording seed was admitted while those reads were in
         // flight, the snapshot is stale and cannot safely release anything.
         guard expectedRevision == nil || expectedRevision == reconciliationRevision else { return [] }
         let nextTimestamp = lastTimestamp == .max ? UInt64.max : lastTimestamp + 1
