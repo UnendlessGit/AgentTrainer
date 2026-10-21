@@ -290,7 +290,7 @@ actor WorkspaceStore {
 
             // A compatible saved brain or checkpoint proves that this profile
             // already uses the current contract. Never rewrite its settings.
-            if compatibleVersionIDs.isEmpty && !keepsCheckpoint {
+            if compatibleVersionIDs.isEmpty && !keepsCheckpoint && (storedSchema ?? 1) < 6 {
                 profile.training.architecture = migratedArchitecture(profile.training.architecture)
                 profile.training.temporalVision = TemporalVisionConfiguration()
                 profile.training.visualAugmentation = VisualAugmentationConfiguration()

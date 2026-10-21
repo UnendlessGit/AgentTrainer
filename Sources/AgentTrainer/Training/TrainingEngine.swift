@@ -66,6 +66,9 @@ final class TrainingEngine: @unchecked Sendable {
     typealias CompletionHandler = @Sendable (Result<TrainingCompletion, Error>) -> Void
 
     private let lock = NSLock()
+    private let ablateActionTiming: Bool
+
+    init(ablateActionTiming: Bool = false) { self.ablateActionTiming = ablateActionTiming }
     private var task: Task<Void, Never>?
     private var pauseRequested = false
     private var stopRequested = false
@@ -303,11 +306,14 @@ final class TrainingEngine: @unchecked Sendable {
                 currentImages: batch.currentImages,
                 pastImages: batch.pastImages,
                 pastControls: batch.pastControls,
-                visionToPast: batch.visionToPast
+                visionToPast: batch.visionToPast,
+                sampleToVision: batch.sampleToVision,
+                currentTiming: batch.currentTiming, pastTiming: batch.pastTiming
             )
             let uniqueLogits = model.logits(
                 temporalFeatures: temporalFeatures,
-                contextValues: batch.contextValues
+                contextValues: batch.contextValues,
+                sampleToVision: batch.sampleToVision
             )
             let logits: MLXArray
             if let sampleToVision = batch.sampleToVision,
@@ -331,6 +337,8 @@ final class TrainingEngine: @unchecked Sendable {
         // The raw event stream is authoritative, including taps shorter than one
         // action interval. Refresh after restoring an older checkpoint.
         state.demonstratedKeyCodes = demonstratedKeys
+        state.outputCapabilities = ModelOutputCapabilities.trained(positiveWeights: positiveClassWeightValues,
+            channels: profile.channels, restrictions: profile.effectiveRestrictions)
         // Legacy checkpoints did not persist sample-to-recording order. Preserve
         // their current epoch order, then make every subsequent save enforce it.
         if state.recordingOrder == nil { state.recordingOrder = recordingOrder }
@@ -458,7 +466,8 @@ final class TrainingEngine: @unchecked Sendable {
                 batch.futureActionPreviousTargets,
                 batch.futureActionMasks,
                 futureStateImages,
-                batch.futureStateMasks
+                batch.futureStateMasks,
+                batch.currentTiming, batch.pastTiming
             ])
             // The row map is integer metadata, not a differentiable input.
             // Capture it in the compiled graph instead of asking valueAndGrad
@@ -475,7 +484,9 @@ final class TrainingEngine: @unchecked Sendable {
                     pastImages: arrays[1],
                     pastControls: arrays[2],
                     visionToPast: visionToPast,
-                    sampleToVision: sampleToVision
+                    sampleToVision: sampleToVision,
+                    currentTiming: arrays[arrays.count - 2],
+                    pastTiming: arrays[arrays.count - 1]
                 )
                 let fusedFeatures = model.fusedFeatures(
                     temporalFeatures: temporalFeatures,
@@ -878,7 +889,7 @@ final class TrainingEngine: @unchecked Sendable {
                     state.bestDemonstratedKeyCodes = state.demonstratedKeyCodes
                     state.bestChannels = profile.channels
                     state.bestTraining = profile.training
-                    state.bestOutputCapabilities = nil
+                    state.bestOutputCapabilities = state.outputCapabilities
                     state.bestTrainingShowsCursor = state.trainingShowsCursor
                     state.bestRecommendedMouseMode = state.recommendedMouseMode
                     capturedBest = true
@@ -1051,6 +1062,29 @@ final class TrainingEngine: @unchecked Sendable {
             }
         }
 
+        let timing = dataset.timingBatch(at: indices)
+        func appendTimingDescriptors(to descriptors: inout [MetalArrayBufferPool.Descriptor]) -> Int {
+            let start = descriptors.count
+            descriptors.append(.init([count, TemporalInputContract.valueCount], dtype: .float32))
+            if temporal.pastFrameCount > 0 {
+                descriptors.append(.init([count, temporal.pastFrameCount, TemporalInputContract.valueCount], dtype: .float32))
+            }
+            return start
+        }
+        func populateTiming(_ destinations: [UnsafeMutableRawBufferPointer], at start: Int) {
+            timing.current.withUnsafeBytes { destinations[start].copyMemory(from: $0) }
+            TemporalInputContract.sanitize(destinations[start].bindMemory(to: Float.self), rows: count,
+                channels: profile.channels, restrictions: profile.effectiveRestrictions)
+            if ablateActionTiming { TemporalInputContract.ablate(destinations[start].bindMemory(to: Float.self), rows: count) }
+            if temporal.pastFrameCount > 0 {
+                timing.past.withUnsafeBytes { destinations[start + 1].copyMemory(from: $0) }
+                let rows = count * temporal.pastFrameCount
+                TemporalInputContract.sanitize(destinations[start + 1].bindMemory(to: Float.self), rows: rows,
+                    channels: profile.channels, restrictions: profile.effectiveRestrictions)
+                if ablateActionTiming { TemporalInputContract.ablate(destinations[start + 1].bindMemory(to: Float.self), rows: rows) }
+            }
+        }
+
         if temporal.pastFrameCount == 0 {
             var descriptors: [MetalArrayBufferPool.Descriptor] = [
                 .init([visionCount, profile.preprocessing.sampleByteCount], dtype: .uint8)
@@ -1060,6 +1094,7 @@ final class TrainingEngine: @unchecked Sendable {
             descriptors.append(.init([count, 2, ActionLayout.count], dtype: .float32))
             let contextIndex = appendContextDescriptor(to: &descriptors)
             let auxiliaryIndices = appendAuxiliaryDescriptors(to: &descriptors)
+            let timingIndex = appendTimingDescriptors(to: &descriptors)
             return try inputBufferPool.makeArrays(descriptors) { destinations in
                 let actionDestination = destinations[actionIndex]
                 dataset.populateCurrentOnlyTrainingBatch(
@@ -1081,6 +1116,7 @@ final class TrainingEngine: @unchecked Sendable {
                 )
                 populateContext(destinations, at: contextIndex)
                 populateAuxiliaries(destinations, indices: auxiliaryIndices)
+                populateTiming(destinations, at: timingIndex)
             }
         }
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
@@ -1103,6 +1139,7 @@ final class TrainingEngine: @unchecked Sendable {
         )
         let contextIndex = appendContextDescriptor(to: &descriptors)
         let auxiliaryIndices = appendAuxiliaryDescriptors(to: &descriptors)
+        let timingIndex = appendTimingDescriptors(to: &descriptors)
         return try inputBufferPool.makeArrays(descriptors) { destinations in
             let actionDestination = destinations[actionIndex]
             if let visionPlan {
@@ -1143,6 +1180,7 @@ final class TrainingEngine: @unchecked Sendable {
             )
             populateContext(destinations, at: contextIndex)
             populateAuxiliaries(destinations, indices: auxiliaryIndices)
+            populateTiming(destinations, at: timingIndex)
         }
     }
 
@@ -1209,6 +1247,8 @@ final class TrainingEngine: @unchecked Sendable {
         if temporal.pastFrameCount == 0 {
             let visionCount = arrays[0].dim(0)
             return ExpandedTrainingBatch(
+                currentTiming: arrays[arrays.count - 1],
+                pastTiming: MLXArray.zeros([1, 1, TemporalInputContract.valueCount], dtype: .float32),
                 currentImages: VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
                 pastImages: MLXArray.zeros(
                     [visionCount, 1, 1, 1, profile.preprocessing.channelCount],
@@ -1231,6 +1271,8 @@ final class TrainingEngine: @unchecked Sendable {
         }
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         return ExpandedTrainingBatch(
+            currentTiming: arrays[arrays.count - 2],
+            pastTiming: arrays[arrays.count - 1],
             currentImages: VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
             pastImages: reusesVisionFeatures
                 ? VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec)
@@ -1670,6 +1712,7 @@ final class TrainingEngine: @unchecked Sendable {
     private func profileSignature(_ profile: AIProfile, recordings: [RecordingItem]) throws -> String {
         struct TrainingIdentity: Encodable {
             let trainingDataSchema: Int
+            let ablateActionTiming: Bool
             let preprocessing: PreprocessingSpec
             let channels: ActionChannels
             let training: TrainingConfiguration
@@ -1690,7 +1733,7 @@ final class TrainingEngine: @unchecked Sendable {
         let recordingIdentities = try recordings
             .map { try RecordingTrainingIdentity(recording: $0) }
             .sorted { $0.id.uuidString < $1.id.uuidString }
-        let identity = TrainingIdentity(trainingDataSchema: TrainingDataContract.schemaVersion, preprocessing: profile.preprocessing, channels: normalizedChannels, training: resumeCompatibleTraining, recordings: recordingIdentities, folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString }, restrictions: profile.effectiveRestrictions)
+        let identity = TrainingIdentity(trainingDataSchema: TrainingDataContract.schemaVersion, ablateActionTiming: ablateActionTiming, preprocessing: profile.preprocessing, channels: normalizedChannels, training: resumeCompatibleTraining, recordings: recordingIdentities, folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString }, restrictions: profile.effectiveRestrictions)
         return SHA256.hash(data: try encoder.encode(identity)).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -1778,7 +1821,7 @@ final class TrainingEngine: @unchecked Sendable {
             recommendedMouseMode: displayedMouseMode,
             validationReport: displayedValidationReport,
             contextSchema: state.contextSchema,
-            outputCapabilities: usesBest ? state.bestOutputCapabilities : nil
+            outputCapabilities: usesBest ? state.bestOutputCapabilities ?? state.outputCapabilities : state.outputCapabilities
         )
         let destination = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
@@ -1971,6 +2014,8 @@ private struct TrainingPerformanceWindow {
 }
 
 private struct ExpandedTrainingBatch {
+    let currentTiming: MLXArray
+    let pastTiming: MLXArray
     let currentImages: MLXArray
     let pastImages: MLXArray
     let pastControls: MLXArray
@@ -2144,6 +2189,7 @@ private struct CheckpointState: Codable {
     var bestChannels: ActionChannels? = nil
     var bestTraining: TrainingConfiguration? = nil
     var bestOutputCapabilities: ModelOutputCapabilities? = nil
+    var outputCapabilities: ModelOutputCapabilities? = nil
     var bestTrainingShowsCursor: Bool? = nil
     var bestRecommendedMouseMode: MouseControlMode? = nil
     /// Optional preserves checkpoints written before generic context. Exact

@@ -357,12 +357,12 @@ private struct ProfileEditor: View {
                         VStack(alignment: .leading, spacing: 9) {
                             HStack {
                                 Text("Temporal frame context").font(.subheadline.bold()).foregroundStyle(ATColor.cyan)
-                                InfoTip("Set Past frames to 0 for current-frame-only vision. Otherwise each decision adds real lower-resolution past frames paired with all controls demonstrated during their perception intervals. No motion-difference image is generated.")
+                                InfoTip("Each decision receives elapsed time, frame age, control hold durations, and recent press/release and movement timing. Set Past frames to 0 to disable past images; current timing remains available. Past images carry their own causal controls and timing.")
                                 Spacer()
                             }
                             let temporal = draft.training.effectiveTemporalVision
                             HStack {
-                                IntField("Past frames", value: temporalIntBinding(\.pastFrameCount), help: "Number of causal screen frames supplied before the current frame (0–\(TemporalVisionConfiguration.maximumPastFrameCount)). Zero disables temporal memory.")
+                                IntField("Past frames", value: temporalIntBinding(\.pastFrameCount), help: "Number of causal screen frames supplied before the current frame (0–\(TemporalVisionConfiguration.maximumPastFrameCount)). Zero disables past images; explicit timing remains available.")
                                 IntField("Frames apart", value: temporalIntBinding(\.frameSpacing), help: "Distance between selected frames in Perception FPS intervals (1–\(TemporalVisionConfiguration.maximumFrameSpacing)). 1 means consecutive perceptions.")
                                     .disabled(temporal.pastFrameCount == 0)
                                 IntField("Past downscale", value: temporalIntBinding(\.downsampleFactor), help: "Linear resolution reduction for every past frame (1×–\(TemporalVisionConfiguration.maximumDownsampleFactor)×). 2 means half width and half height while preserving aspect, color mode, chroma, and bit detail.")
@@ -372,8 +372,8 @@ private struct ProfileEditor: View {
                             HStack(spacing: 10) {
                                 StatusPill(text: "Current \(draft.preprocessing.width) × \(draft.preprocessing.height)", color: ATColor.green)
                                 if temporal.pastFrameCount == 0 {
-                                    StatusPill(text: "Temporal memory off", color: ATColor.amber)
-                                    Text("Only the exact current frame is cached, trained, and used at runtime.")
+                                    StatusPill(text: "Past images off • timing active", color: ATColor.amber)
+                                    Text("Each decision uses the exact current frame and explicit timing.")
                                         .font(.caption).foregroundStyle(.secondary)
                                 } else {
                                     StatusPill(text: "Past \(pastSpec.width) × \(pastSpec.height)", color: ATColor.cyan)
@@ -440,7 +440,7 @@ private struct ProfileEditor: View {
                             Spacer()
                             InfoTip("Changing scheduler or loss settings keeps the active brain weights but safely starts a new optimizer sequence. Older profiles remain on their exact legacy schedule until you explicitly select Adaptive Cosine + Plateau.")
                         }
-                        HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives and records a new screen perception. Temporal spacing is measured in these frame intervals. It cannot exceed Action FPS."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the AI may update mouse, keyboard, button, and scroll output."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
+                        HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives and records a new screen perception. Temporal spacing is measured in these frame intervals. It cannot exceed Action FPS."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the lightweight policy makes a fresh action decision using cached vision, current frame age, and actual posted-control history."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
                         HStack { Text("Architecture preset").foregroundStyle(.secondary); Button("Small") { draft.training.architecture = .small }.primaryButton(); Button("Balanced") { draft.training.architecture = .balanced }.primaryButton(); Button("Large") { draft.training.architecture = .large }.primaryButton() }
                         HStack { IntField("Visual width", value: $draft.training.architecture.visualEmbedding, help: "How much visual information is kept after the shared current/past convolution layers."); IntField("Recurrent width", value: $draft.training.architecture.recurrentWidth, help: "Capacity used to integrate the paired past-frame visual embeddings and controls."); Picker("Temporal encoder", selection: $draft.training.architecture.recurrentKind) { ForEach(RecurrentKind.allCases) { Text($0.rawValue).tag($0) } } }
                         HStack {
@@ -580,7 +580,7 @@ private struct ProfileEditor: View {
 
     private var temporalFormatDetail: String {
         if draft.training.effectiveTemporalVision.pastFrameCount == 0 {
-            return "Temporal payloads are omitted; compatibility cache placeholders stay empty and the network receives current vision only."
+            return "Past-image and past-control buffers are omitted. The network still receives current vision and explicit causal timing on every action decision."
         }
         let colorDetail = draft.preprocessing.colorMode == .color
             ? "color mode and \(draft.preprocessing.chroma.rawValue) chroma"
@@ -748,8 +748,14 @@ private struct NeuralNetworkInputOverview: View {
                 NeuralInputBreakdown(
                     title: "Frame-aligned controls",
                     value: "\(input.pastControlValues.formatted()) values",
-                    detail: "\(input.pastFrameCount.formatted()) frames × \(input.actionValuesPerPastFrame.formatted()) complete outputs • \(input.temporalLookbackSeconds.formatted(.number.precision(.fractionLength(3))))s lookback",
+                    detail: "\(input.pastFrameCount.formatted()) frames × \(input.actionValuesPerPastFrame.formatted()) causal controls • \(input.temporalLookbackSeconds.formatted(.number.precision(.fractionLength(3))))s lookback",
                     color: ATColor.green
+                )
+                NeuralInputBreakdown(
+                    title: "Explicit timing",
+                    value: "\(input.timingValues.formatted()) Float32 values",
+                    detail: "Current decision and past observations: hold ages, edges, durations, movement intervals, frame age, and validity",
+                    color: ATColor.coral
                 )
                 if input.contextValues > 0 {
                     NeuralInputBreakdown(
@@ -763,13 +769,13 @@ private struct NeuralNetworkInputOverview: View {
 
             HStack(spacing: 8) {
                 Image(systemName: "memorychip").foregroundStyle(ATColor.cyan)
-                Text("Nominal input payload at \(profile.training.precision.rawValue): \(bytes(input.nominalBytesPerDecision)) per decision • \(bytes(input.nominalBytesPerTrainingBatch)) per batch")
+                Text("Nominal payload (\(profile.training.precision.rawValue) + Float32 timing): \(bytes(input.nominalBytesPerDecision)) per decision • \(bytes(input.nominalBytesPerTrainingBatch)) per batch")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 Spacer()
             }
             HStack(spacing: 8) {
                 Image(systemName: "speedometer").foregroundStyle(ATColor.green)
-                Text("At \(profile.training.perceptionFPS.formatted()) Perception FPS: up to \(input.runtimeValuesPerSecond.formatted()) input values/s from \(bytes(input.packedVisionBytesPerSecond)) of packed vision/s")
+                Text("Perception \(profile.training.perceptionFPS.formatted()) FPS • actions \(profile.training.actionFPS.formatted()) FPS • \(input.runtimeValuesPerSecond.formatted()) nominal input values/s • \(bytes(input.packedVisionBytesPerSecond)) packed vision/s")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 Spacer()
             }
@@ -1702,7 +1708,7 @@ struct RunView: View {
                                 }
                                 LabeledContent("Perception", value: "\(profile.training.perceptionFPS.formatted()) FPS")
                                 LabeledContent("Action", value: "\(profile.training.actionFPS.formatted()) FPS")
-                                Text(profile.training.actionFPS > profile.training.perceptionFPS ? "Held keys/buttons persist between perception updates; camera and scroll deltas run once per new prediction." : "Actions execute independently; additive camera and scroll deltas never replay on a stale prediction.").font(.caption).foregroundStyle(.secondary)
+                                Text("A fresh timing-aware decision runs at Action FPS using the latest encoded vision. Frame age and actual posted controls update between perceptions; each movement and scroll output executes once.").font(.caption).foregroundStyle(.secondary)
                                 Divider(); Toggle("Stop immediately on my input", isOn: $model.safety.stopOnHumanInput); Toggle("Stop if target focus is lost", isOn: $model.safety.stopOnFocusLoss); Toggle("Allow full-Mac control", isOn: $model.safety.allowFullMac).tint(ATColor.coral)
                                 Divider(); Toggle("Show exact AI-vision PIP", isOn: $model.showVisionPreview).tint(ATColor.green); if model.showVisionPreview { Toggle("Update exactly with AI perception", isOn: $model.visionPreviewMatchesPerception).tint(ATColor.cyan); if !model.visionPreviewMatchesPerception { LabeledNumber("Independent PIP FPS", value: $model.visionPreviewFPS) }; Text(model.visionPreviewMatchesPerception ? "The preview updates on the same processed frames as the AI." : "Preview refresh is independent; AI perception remains \(profile.training.perceptionFPS.formatted()) FPS.").font(.caption).foregroundStyle(.secondary) }
                                 Divider()
@@ -1751,7 +1757,9 @@ struct RunView: View {
                                 Text("Live runtime").font(.headline)
                                 LabeledContent("Perception", value: model.runtimeMetrics.perceptionFPS.formatted(.number.precision(.fractionLength(1))) + " FPS")
                                 LabeledContent("Actions", value: model.runtimeMetrics.actionFPS.formatted(.number.precision(.fractionLength(1))) + " FPS")
-                                LabeledContent("Inference latency", value: model.runtimeMetrics.latencyMilliseconds.formatted(.number.precision(.fractionLength(1))) + " ms")
+                                LabeledContent("Visual encoding", value: model.runtimeMetrics.latencyMilliseconds.formatted(.number.precision(.fractionLength(1))) + " ms")
+                                LabeledContent("Action inference", value: model.runtimeMetrics.actionInferenceMilliseconds.formatted(.number.precision(.fractionLength(1))) + " ms")
+                                LabeledContent("Source-frame age", value: model.runtimeMetrics.observationAgeMilliseconds.formatted(.number.precision(.fractionLength(1))) + " ms")
                                 LabeledContent("Dropped frames", value: "\(model.runtimeMetrics.droppedFrames)")
                                 if let progress = profile.trainingProgress { LabeledContent("Training", value: "\(progress.globalStep) steps • epoch \(progress.epoch)") }
                                 Text("The capture-excluded bottom-right HUD shows AI inputs during Run.").font(.caption).foregroundStyle(ATColor.violet)

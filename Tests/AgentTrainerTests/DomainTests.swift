@@ -20,7 +20,7 @@ private func XCTAssertThrowsErrorAsync<T>(
 
 final class DomainTests: XCTestCase {
     func testCurrentTrainingDataSchemaIncludesGenericContextContract() {
-        XCTAssertEqual(TrainingDataContract.schemaVersion, 14)
+        XCTAssertEqual(TrainingDataContract.schemaVersion, 15)
     }
 
     func testGenericContextSchemaUsesStableIDsAndExplicitBlankSegments() throws {
@@ -120,7 +120,7 @@ final class DomainTests: XCTestCase {
             actualParameterCount,
             ModelSizing.parameterCount(profile, contextSchema: schema)
         )
-        let temporal = MLXArray.zeros([2, 12], dtype: .float32)
+        let temporal = MLXArray.zeros([2, 12 + TemporalInputContract.embeddingWidth], dtype: .float32)
         let contexts = MLXArray([Float(1), 0, 0, 1], [2, 2])
         let conditioned = policy.fusedFeatures(
             temporalFeatures: temporal,
@@ -491,13 +491,13 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(input.pastControlValues, 4 * 146)
         XCTAssertEqual(input.frameSpacingSeconds, 0.2, accuracy: 0.000_001)
         XCTAssertEqual(input.temporalLookbackSeconds, 0.8, accuracy: 0.000_001)
-        XCTAssertEqual(input.valuesPerDecision, 75 + 4 * (30 + 146))
-        XCTAssertEqual(input.runtimeValuesPerSecond, 10 * (75 + 4 * (30 + 146)))
-        XCTAssertEqual(input.packedVisionBytesPerSecond, 670)
-        XCTAssertEqual(input.valuesPerTrainingBatch, 2 * (75 + 4 * (30 + 146)))
+        XCTAssertEqual(input.valuesPerDecision, 75 + 4 * (30 + 146) + 5 * Int64(TemporalInputContract.valueCount))
+        XCTAssertEqual(input.runtimeValuesPerSecond, 10 * (75 + 4 * 30) + 20 * (4 * 146 + 5 * Int64(TemporalInputContract.valueCount)))
+        XCTAssertEqual(input.packedVisionBytesPerSecond, 370)
+        XCTAssertEqual(input.valuesPerTrainingBatch, 2 * (75 + 4 * (30 + 146) + 5 * Int64(TemporalInputContract.valueCount)))
         XCTAssertEqual(input.quantizationLevels, 4)
         XCTAssertEqual(input.effectivePackedBits, 67 * 2)
-        XCTAssertEqual(input.nominalBytesPerTrainingBatch, 2 * 2 * (75 + 4 * (30 + 146)))
+        XCTAssertEqual(input.nominalBytesPerTrainingBatch, 2 * 2 * (75 + 4 * (30 + 146)) + 2 * 4 * 5 * Int64(TemporalInputContract.valueCount))
     }
 
     func testNeuralInputSizingKeepsPastGrayscaleAtNativeLowerResolution() {
@@ -515,8 +515,8 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(input.pastPackedVisionValuesPerFrame, 6)
         XCTAssertEqual(input.pastFrameCount, 1)
         XCTAssertEqual(input.pastControlValues, 146)
-        XCTAssertEqual(input.valuesPerDecision, 209)
-        XCTAssertEqual(input.nominalBytesPerDecision, 209 * 4)
+        XCTAssertEqual(input.valuesPerDecision, 209 + 2 * Int64(TemporalInputContract.valueCount))
+        XCTAssertEqual(input.nominalBytesPerDecision, (209 + 2 * Int64(TemporalInputContract.valueCount)) * 4)
     }
 
     func testZeroPastFramesIsAValidatedCurrentOnlyContract() throws {
@@ -535,7 +535,7 @@ final class DomainTests: XCTestCase {
         XCTAssertEqual(input.frameSpacingSeconds, 0)
         XCTAssertEqual(input.temporalLookbackSeconds, 0)
         XCTAssertEqual(input.totalPackedVisionValues, input.currentPackedVisionValues)
-        XCTAssertEqual(input.valuesPerDecision, input.currentFirstConvolutionValues)
+        XCTAssertEqual(input.valuesPerDecision, input.currentFirstConvolutionValues + Int64(TemporalInputContract.valueCount))
 
         profile.training.architecture = .small
         profile.training.precision = .float32
@@ -3690,6 +3690,66 @@ final class DomainTests: XCTestCase {
         }
     }
 
+    func testTemporalCacheRetainsRealPTSAtTrimsAndNeverReadsFutureEdges() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("timing-cache-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceStore(root: root)
+        try await store.prepare()
+        let directory = try await store.createRecordingDirectory(id: UUID())
+        try await writeTestMovie(to: directory.appendingPathComponent("capture.mov"), width: 16, height: 16, frameCount: 3, fps: 10)
+        let origin: UInt64 = 1_000_000_000
+        let writer = try InputEventWriter(url: directory.appendingPathComponent("events.atrevents"))
+        let events = [
+            InputSample(timestampNanos: origin + 25_000_000, kind: .key, keyCode: 13, isDown: true),
+            InputSample(timestampNanos: origin + 51_000_000, kind: .key, keyCode: 15, isDown: true),
+            InputSample(timestampNanos: origin + 54_000_000, kind: .key, keyCode: 15, isDown: false),
+            InputSample(timestampNanos: origin + 90_000_000, kind: .key, keyCode: 14, isDown: true),
+            InputSample(timestampNanos: origin + 180_000_000, kind: .key, keyCode: 13, isDown: false),
+            InputSample(timestampNanos: origin + 190_000_000, kind: .key, keyCode: 14, isDown: false)
+        ]
+        events.forEach(writer.append)
+        let eventCount = try writer.finish()
+        let originalEvents = try Data(contentsOf: directory.appendingPathComponent("events.atrevents"))
+        let originalVideo = try Data(contentsOf: directory.appendingPathComponent("capture.mov"))
+        let manifest = RecordingManifest(id: UUID(), name: "Trimmed sparse video", createdAt: Date(), hostStartNanos: origin,
+            duration: 0.3, capture: CaptureSpec(requestedFPS: 10), globalRect: CodableRect(CGRect(x: 0, y: 0, width: 16, height: 16)),
+            pixelWidth: 16, pixelHeight: 16, deliveredFPS: 10, eventCount: eventCount, trimStart: 0.05, trimEnd: 0.25)
+        var profile = AIProfile.fresh()
+        profile.preprocessing = PreprocessingSpec(width: 8, height: 8, colorMode: .grayscale)
+        profile.training.perceptionFPS = 60; profile.training.actionFPS = 60
+        profile.training.temporalVision = TemporalVisionConfiguration(pastFrameCount: 2, frameSpacing: 1, downsampleFactor: 2)
+        let cache = try await DatasetCacheBuilder(workspace: store).cache(for: profile,
+            recordings: [RecordingItem(manifest: manifest, directory: directory)]) { _, _ in }
+        XCTAssertEqual(cache.count, 12)
+        XCTAssertEqual(cache.observationTime(at: 0).query, 50_000_000)
+        XCTAssertEqual(cache.observationTime(at: 0).source, 0, "The frame before the trim remains causal; a later decoded frame must not be rebased to 50 ms.")
+        for i in 0..<cache.manifest.observationCount {
+            XCTAssertLessThanOrEqual(cache.observationTime(at: i).source, cache.observationTime(at: i).query)
+        }
+        let timing = cache.timingBatch(at: [0, 1])
+        let values = MLXArray(timing.current, [2, TemporalInputContract.valueCount], type: Float.self).asArray(Float.self)
+        let held = TemporalInputContract.clockCount + TemporalInputContract.controlLookup[ActionLayout.keyboard.lowerBound + 13]! * TemporalInputContract.controlWidth
+        let tap = TemporalInputContract.clockCount + TemporalInputContract.controlLookup[ActionLayout.keyboard.lowerBound + 15]! * TemporalInputContract.controlWidth
+        let future = TemporalInputContract.clockCount + TemporalInputContract.controlLookup[ActionLayout.keyboard.lowerBound + 14]! * TemporalInputContract.controlWidth
+        XCTAssertEqual(values[held], 1)
+        XCTAssertEqual(values[held + 1], 0.025 / 0.25, accuracy: 1e-6)
+        XCTAssertEqual(values[held + 3], 1)
+        XCTAssertEqual(values[tap], 0)
+        XCTAssertEqual(values[tap + 12], 0, "A future tap must not leak into the current decision.")
+        XCTAssertEqual(values[future], 0)
+        XCTAssertEqual(values[TemporalInputContract.valueCount + tap + 10], 0.003 / 0.25, accuracy: 1e-6)
+        XCTAssertEqual(cache.action(at: 0)[ActionLayout.keyboard.lowerBound + 15], 1, "The same tap belongs in the following action target.")
+        XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("events.atrevents")), originalEvents)
+        XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("capture.mov")), originalVideo)
+        let cacheRoot = await store.cacheDirectory()
+        let cacheDirectory = cacheRoot.appendingPathComponent(cache.manifest.key + ".atrcache")
+        var corrupt = try Data(contentsOf: cacheDirectory.appendingPathComponent("observation-times.bin"))
+        var futurePTS = UInt64(51_000_000).littleEndian
+        withUnsafeBytes(of: &futurePTS) { corrupt.replaceSubrange(8..<16, with: $0) }
+        try corrupt.write(to: cacheDirectory.appendingPathComponent("observation-times.bin"))
+        XCTAssertThrowsError(try CachedDataset(directory: cacheDirectory))
+    }
+
     func testRealVideoCacheDeduplicatesPerceptionFramesAndPreservesSubTickControls() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("video-cache-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -3735,6 +3795,23 @@ final class DomainTests: XCTestCase {
         let dataset = try await DatasetCacheBuilder(workspace: store).cache(for: profile, recordings: [RecordingItem(manifest: manifest, directory: directory)]) { _, _ in }
 
         XCTAssertGreaterThan(dataset.count, dataset.manifest.observationCount)
+        // Action ticks sharing one perception still have different historical
+        // ages. Timing must remain at action-row shape through CNN reuse.
+        let rows = Array(0..<dataset.count)
+        let plan = dataset.visionBatchPlan(at: rows)
+        let sharedPair = try XCTUnwrap(zip(rows, rows.dropFirst()).first { first, second in
+            plan.sampleToVision[first] == plan.sampleToVision[second]
+                && plan.uniqueSequences[Int(plan.sampleToVision[first])].indices.dropFirst().contains { $0 != UInt32.max }
+        })
+        let timingRows = [sharedPair.0, sharedPair.1]
+        let timingBatch = dataset.timingBatch(at: timingRows)
+        let pastTiming = MLXArray(timingBatch.past,
+            [2, 2, TemporalInputContract.valueCount], type: Float.self).asArray(Float.self)
+        let sequence = plan.uniqueSequences[Int(plan.sampleToVision[sharedPair.0])]
+        for frame in 0..<2 where sequence.indices[frame + 1] != UInt32.max {
+            let offset = frame * TemporalInputContract.valueCount + 10
+            XCTAssertGreaterThan(pastTiming[2 * TemporalInputContract.valueCount + offset], pastTiming[offset])
+        }
         XCTAssertGreaterThanOrEqual(dataset.manifest.observationCount, 5)
         XCTAssertTrue(dataset.demonstratedKeyCodes().contains(13))
         XCTAssertEqual(dataset.manifest.preprocessing.width, 8)
@@ -3802,7 +3879,7 @@ final class DomainTests: XCTestCase {
         ) { _, _ in }
 
         XCTAssertEqual(dataset.manifest.segments.first?.observationStart, 0)
-        XCTAssertEqual(dataset.count, 9, "Only 0.6s through 1.0s should produce 20 FPS expert targets, inclusive.")
+        XCTAssertEqual(dataset.count, 8, "Only positive-duration intervals from 0.6s up to 1.0s are expert targets.")
         XCTAssertFalse(dataset.demonstratedKeyCodes().contains(10), "Pre-roll AI actions are context, not supervised capability.")
         XCTAssertTrue(dataset.demonstratedKeyCodes().contains(13))
         let firstContext = MLXArray(
@@ -3943,7 +4020,7 @@ final class DomainTests: XCTestCase {
         let fixture = try makeSyntheticDataset(
             name: "split",
             pastFrameCount: 1,
-            sequences: Array(repeating: [0, .max], count: 6),
+            sequences: (0..<6).map { [UInt32($0 / 2), .max] },
             actionRows: actionRows,
             segments: segments
         )
@@ -3967,7 +4044,9 @@ final class DomainTests: XCTestCase {
             return CacheSegment(recordingID: UUID(), start: start, count: count)
         }
         let rowCount = counts.reduce(0, +)
-        let sequences = Array(repeating: [UInt32(0), .max], count: rowCount)
+        let sequences = segments.enumerated().flatMap { position, segment in
+            Array(repeating: [UInt32(position), .max], count: segment.count)
+        }
         let rows = Array(repeating: [Float](repeating: 0, count: ActionLayout.count), count: rowCount)
         let fixture = try makeSyntheticDataset(
             name: "sample-balanced-split",
@@ -5416,7 +5495,14 @@ final class DomainTests: XCTestCase {
         precondition(sequences.count == actionRows.count)
         precondition(actionRows.allSatisfy { $0.count == ActionLayout.count })
         precondition(sequences.allSatisfy { $0.count == pastFrameCount + 1 })
-        let segments = segments ?? [CacheSegment(recordingID: UUID(), start: 0, count: sequences.count)]
+        let segments = (segments ?? [CacheSegment(recordingID: UUID(), start: 0, count: sequences.count)]).map { supplied in
+            var segment = supplied
+            if segment.observationStart == nil {
+                segment.observationStart = Int(sequences[segment.start..<(segment.start + segment.count)]
+                    .flatMap { $0 }.filter { $0 != UInt32.max }.min() ?? 0)
+            }
+            return segment
+        }
         precondition(segments.reduce(0) { $0 + $1.count } == sequences.count)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).atrcache", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -5471,6 +5557,26 @@ final class DomainTests: XCTestCase {
             var actions = Data(capacity: actionRows.count * ActionLayout.count * MemoryLayout<Float>.size)
             for row in actionRows { row.withUnsafeBytes { actions.append(contentsOf: $0) } }
             try actions.write(to: directory.appendingPathComponent("actions.bin"))
+            try Data(count: sequences.count * TemporalInputContract.rowBytes).write(to: directory.appendingPathComponent("decision-timing.bin"))
+            try Data(count: (pastFrameCount > 0 ? observationCount : 0) * TemporalInputContract.rowBytes).write(to: directory.appendingPathComponent("frame-timing.bin"))
+            var observationTimes = Data(), decisionTimes = Data()
+            func appendTime(_ value: UInt64, to data: inout Data) {
+                var little = value.littleEndian
+                withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+            }
+            for observation in 0..<observationCount {
+                let time = UInt64(observation) * 33_333_334
+                appendTime(time, to: &observationTimes); appendTime(time, to: &observationTimes)
+            }
+            var previousTime: UInt64?
+            for (row, sequence) in sequences.enumerated() {
+                if segments.contains(where: { $0.start == row }) { previousTime = nil }
+                let time = max(UInt64(sequence[0]) * 33_333_334, previousTime.map { $0 + 16_666_667 } ?? 0)
+                appendTime(time, to: &decisionTimes); appendTime(16_666_667, to: &decisionTimes)
+                previousTime = time
+            }
+            try observationTimes.write(to: directory.appendingPathComponent("observation-times.bin"))
+            try decisionTimes.write(to: directory.appendingPathComponent("decision-times.bin"))
             return (try CachedDataset(directory: directory), directory)
         } catch {
             try? FileManager.default.removeItem(at: directory)

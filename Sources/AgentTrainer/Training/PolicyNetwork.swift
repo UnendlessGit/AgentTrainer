@@ -31,6 +31,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
     @ModuleInfo var visualNormalization: LayerNorm
     @ModuleInfo var pastVisualProjection: Linear?
     @ModuleInfo var pastVisualNormalization: LayerNorm?
+    @ModuleInfo var timingProjection: Linear
+    @ModuleInfo var timingNormalization: LayerNorm
     @ModuleInfo var gru: GRU?
     @ModuleInfo var lstm: LSTM?
     @ModuleInfo var fusion: [Linear]
@@ -99,16 +101,18 @@ final class AgentPolicy: Module, @unchecked Sendable {
             pastVisualProjection = nil
             pastVisualNormalization = nil
         }
+        timingProjection = Linear(TemporalInputContract.valueCount, TemporalInputContract.embeddingWidth, bias: false)
+        timingNormalization = LayerNorm(dimensions: TemporalInputContract.embeddingWidth)
         if architecture.recurrentKind == .gru {
-            gru = GRU(inputSize: architecture.visualEmbedding + ActionLayout.count, hiddenSize: architecture.recurrentWidth)
+            gru = GRU(inputSize: architecture.visualEmbedding + ActionLayout.count + TemporalInputContract.embeddingWidth, hiddenSize: architecture.recurrentWidth)
             lstm = nil
         } else {
             gru = nil
-            lstm = LSTM(inputSize: architecture.visualEmbedding + ActionLayout.count, hiddenSize: architecture.recurrentWidth)
+            lstm = LSTM(inputSize: architecture.visualEmbedding + ActionLayout.count + TemporalInputContract.embeddingWidth, hiddenSize: architecture.recurrentWidth)
         }
         var fusionLayers: [Linear] = []
         var fusionNormalizations: [LayerNorm] = []
-        var fusionInput = architecture.visualEmbedding + architecture.recurrentWidth
+        var fusionInput = architecture.visualEmbedding + architecture.recurrentWidth + TemporalInputContract.embeddingWidth
             + contextSchema.inputValueCount
         for width in architecture.fusionWidths {
             fusionLayers.append(Linear(fusionInput, max(1, width)))
@@ -453,42 +457,51 @@ final class AgentPolicy: Module, @unchecked Sendable {
         pastImages: MLXArray,
         pastControls: MLXArray,
         visionToPast: MLXArray? = nil,
-        sampleToVision: MLXArray? = nil
+        sampleToVision: MLXArray? = nil,
+        currentTiming: MLXArray? = nil,
+        pastTiming: MLXArray? = nil
     ) -> MLXArray {
         temporalFeatures(
             currentVisualFeatures: visualActivations(images: currentImages).last!,
             pastImages: pastImages,
             pastControls: pastControls,
             visionToPast: visionToPast,
-            sampleToVision: sampleToVision
+            sampleToVision: sampleToVision,
+            currentTiming: currentTiming,
+            pastTiming: pastTiming
         )
     }
 
     func currentOnlyTemporalFeatures(
         currentImages: MLXArray,
-        sampleToVision: MLXArray? = nil
+        sampleToVision: MLXArray? = nil,
+        currentTiming: MLXArray? = nil
     ) -> MLXArray {
         currentOnlyTemporalFeatures(
             currentVisualEmbedding: visualEmbedding(
                 visualFeatures: visualActivations(images: currentImages).last!
             ),
-            sampleToVision: sampleToVision
+            sampleToVision: sampleToVision,
+            currentTiming: currentTiming
         )
     }
 
     func currentOnlyTemporalFeatures(
         currentVisualFeatures: MLXArray,
-        sampleToVision: MLXArray? = nil
+        sampleToVision: MLXArray? = nil,
+        currentTiming: MLXArray? = nil
     ) -> MLXArray {
         currentOnlyTemporalFeatures(
             currentVisualEmbedding: visualEmbedding(visualFeatures: currentVisualFeatures),
-            sampleToVision: sampleToVision
+            sampleToVision: sampleToVision,
+            currentTiming: currentTiming
         )
     }
 
     private func currentOnlyTemporalFeatures(
         currentVisualEmbedding: MLXArray,
-        sampleToVision: MLXArray?
+        sampleToVision: MLXArray?,
+        currentTiming: MLXArray? = nil
     ) -> MLXArray {
         var current = currentVisualEmbedding
         if let sampleToVision {
@@ -501,7 +514,9 @@ final class AgentPolicy: Module, @unchecked Sendable {
             [current.dim(0), profile.training.architecture.recurrentWidth],
             dtype: dtype
         )
-        return concatenated([current, emptyTemporalState], axis: -1)
+        let keep = training ? MLXRandom.bernoulli(Float(0.5), [current.dim(0), 1]).asType(.float32) : nil
+        return concatenated([current, emptyTemporalState,
+            timingEmbedding(currentTiming, batch: current.dim(0), keep: keep)], axis: -1)
     }
 
     func temporalFeatures(
@@ -509,14 +524,18 @@ final class AgentPolicy: Module, @unchecked Sendable {
         pastImages: MLXArray,
         pastControls: MLXArray,
         visionToPast: MLXArray? = nil,
-        sampleToVision: MLXArray? = nil
+        sampleToVision: MLXArray? = nil,
+        currentTiming: MLXArray? = nil,
+        pastTiming: MLXArray? = nil
     ) -> MLXArray {
         temporalFeatures(
             currentVisualEmbedding: visualEmbedding(visualFeatures: currentVisualFeatures),
             pastImages: pastImages,
             pastControls: pastControls,
             visionToPast: visionToPast,
-            sampleToVision: sampleToVision
+            sampleToVision: sampleToVision,
+            currentTiming: currentTiming,
+            pastTiming: pastTiming
         )
     }
 
@@ -525,18 +544,20 @@ final class AgentPolicy: Module, @unchecked Sendable {
         pastImages: MLXArray,
         pastControls: MLXArray,
         visionToPast: MLXArray? = nil,
-        sampleToVision: MLXArray? = nil
+        sampleToVision: MLXArray? = nil,
+        currentTiming: MLXArray? = nil,
+        pastTiming: MLXArray? = nil
     ) -> MLXArray {
         let temporal = profile.training.effectiveTemporalVision
         if temporal.pastFrameCount == 0 {
             return currentOnlyTemporalFeatures(
                 currentVisualEmbedding: currentVisualEmbedding,
-                sampleToVision: sampleToVision
+                sampleToVision: sampleToVision,
+                currentTiming: currentTiming
             )
         }
         precondition(pastControls.ndim == 3, "Past controls must have shape [batch, frames, controls].")
-        var currentVisualEmbedding = currentVisualEmbedding
-        var controls = pastControls.asType(dtype)
+        let controls = pastControls.asType(dtype)
         let visionCount = currentVisualEmbedding.dim(0)
         let frameCount = pastControls.dim(1)
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
@@ -598,6 +619,24 @@ final class AgentPolicy: Module, @unchecked Sendable {
             ])
         }
 
+        return encodedTemporalFeatures(current: currentVisualEmbedding,
+            past: pastEmbedding, controls: controls, currentTiming: currentTiming,
+            pastTiming: pastTiming, sampleToVision: sampleToVision)
+    }
+
+    func encodedTemporalFeatures(
+        current: MLXArray, past: MLXArray?, controls: MLXArray?,
+        currentTiming: MLXArray?, pastTiming: MLXArray?, sampleToVision: MLXArray? = nil
+    ) -> MLXArray {
+        guard profile.training.effectiveTemporalVision.pastFrameCount > 0,
+              var pastEmbedding = past, var controls else {
+            return currentOnlyTemporalFeatures(currentVisualEmbedding: current,
+                sampleToVision: sampleToVision, currentTiming: currentTiming)
+        }
+        controls = controls.asType(dtype)
+        var currentVisualEmbedding = current
+        let visionCount = current.dim(0)
+        let frameCount = pastEmbedding.dim(1)
         // CNN features are deterministic and safe to share. During training we
         // gather them back to action-row shape before control masking and the
         // recurrent/fusion stack. This retains one independent mask and one
@@ -621,12 +660,22 @@ final class AgentPolicy: Module, @unchecked Sendable {
         // held keys and buttons are still an easy shortcut. Mask only the
         // control half for half of training samples; past vision always remains
         // visible and inference always receives the full paired sequence.
+        var controlKeep: MLXArray?
         if training {
             let keepProbability: Float = 0.5
             let mask = MLXRandom.bernoulli(keepProbability, [batch, 1, 1]).asType(dtype)
             controls = controls * mask
+            controlKeep = mask.asType(.float32)
         }
-        let temporalSteps = concatenated([pastEmbedding, controls], axis: -1)
+        var timing = pastTiming ?? MLXArray.zeros([visionCount, frameCount, TemporalInputContract.valueCount], dtype: .float32)
+        if timing.dim(0) != batch {
+            guard let sampleToVision, timing.dim(0) == visionCount else {
+                preconditionFailure("Historical timing requires one causal row per action or visual sequence.")
+            }
+            timing = timing.take(sampleToVision, axis: 0)
+        }
+        let temporalTiming = timingEmbedding(timing, batch: batch, keep: controlKeep)
+        let temporalSteps = concatenated([pastEmbedding, controls, temporalTiming], axis: -1)
         let recurrent: MLXArray
         if let gru {
             recurrent = gru(temporalSteps)[.ellipsis, -1, 0...]
@@ -638,7 +687,21 @@ final class AgentPolicy: Module, @unchecked Sendable {
                 dtype: dtype
             )
         }
-        return concatenated([currentVisualEmbedding, recurrent], axis: -1)
+        return concatenated([currentVisualEmbedding, recurrent,
+            timingEmbedding(currentTiming, batch: batch, keep: controlKeep?.reshaped([batch, 1]))], axis: -1)
+    }
+
+    /// Duration projection accumulates in Float32 even for a low-bit visual
+    /// model. Casting only the embedding retains short-tap distinctions.
+    func timingEmbedding(_ inputs: MLXArray?, batch: Int, keep: MLXArray? = nil) -> MLXArray {
+        var values = inputs ?? MLXArray.zeros([batch, TemporalInputContract.valueCount], dtype: .float32)
+        precondition(values.dim(-1) == TemporalInputContract.valueCount)
+        values = values.asType(.float32)
+        if let keep {
+            values = concatenated([values[.ellipsis, 0..<16], values[.ellipsis, 16...] * keep], axis: -1)
+        }
+        let projected = values.matmul(timingProjection.weight.asType(.float32).T)
+        return silu(timingNormalization(projected)).asType(dtype)
     }
 
     func fusedFeatures(
@@ -724,13 +787,17 @@ final class AgentPolicy: Module, @unchecked Sendable {
         currentVisualFeatures: MLXArray,
         pastImages: MLXArray,
         pastControls: MLXArray,
-        contextValues: MLXArray? = nil
+        contextValues: MLXArray? = nil,
+        currentTiming: MLXArray? = nil,
+        pastTiming: MLXArray? = nil
     ) -> MLXArray {
         logits(
             temporalFeatures: temporalFeatures(
                 currentVisualFeatures: currentVisualFeatures,
                 pastImages: pastImages,
-                pastControls: pastControls
+                pastControls: pastControls,
+                currentTiming: currentTiming,
+                pastTiming: pastTiming
             ),
             contextValues: contextValues
         )
@@ -740,13 +807,17 @@ final class AgentPolicy: Module, @unchecked Sendable {
         currentImages: MLXArray,
         pastImages: MLXArray,
         pastControls: MLXArray,
-        contextValues: MLXArray? = nil
+        contextValues: MLXArray? = nil,
+        currentTiming: MLXArray? = nil,
+        pastTiming: MLXArray? = nil
     ) -> MLXArray {
         logits(
             temporalFeatures: temporalFeatures(
                 currentImages: currentImages,
                 pastImages: pastImages,
-                pastControls: pastControls
+                pastControls: pastControls,
+                currentTiming: currentTiming,
+                pastTiming: pastTiming
             ),
             contextValues: contextValues
         )
@@ -767,22 +838,26 @@ final class AgentPolicy: Module, @unchecked Sendable {
         currentImages: MLXArray,
         pastImages: MLXArray,
         pastControls: MLXArray,
-        contextValues: MLXArray? = nil
+        contextValues: MLXArray? = nil,
+        currentTiming: MLXArray? = nil,
+        pastTiming: MLXArray? = nil
     ) -> MLXArray {
         activatedPredictions(logits: callAsFunction(
             currentImages: currentImages,
             pastImages: pastImages,
             pastControls: pastControls,
-            contextValues: contextValues
+            contextValues: contextValues,
+            currentTiming: currentTiming, pastTiming: pastTiming
         ))
     }
 
     func currentOnlyPredictions(
         currentImages: MLXArray,
-        contextValues: MLXArray? = nil
+        contextValues: MLXArray? = nil,
+        currentTiming: MLXArray? = nil
     ) -> MLXArray {
         activatedPredictions(logits: logits(
-            temporalFeatures: currentOnlyTemporalFeatures(currentImages: currentImages),
+            temporalFeatures: currentOnlyTemporalFeatures(currentImages: currentImages, currentTiming: currentTiming),
             contextValues: contextValues
         ))
     }
@@ -815,12 +890,14 @@ final class AgentPolicy: Module, @unchecked Sendable {
         targets: MLXArray,
         positiveWeights: MLXArray? = nil,
         previousTargets: MLXArray? = nil,
-        sampleWeights: MLXArray? = nil
+        sampleWeights: MLXArray? = nil,
+        currentTiming: MLXArray? = nil, pastTiming: MLXArray? = nil
     ) -> MLXArray {
         let logits = callAsFunction(
             currentImages: currentImages,
             pastImages: pastImages,
-            pastControls: pastControls
+            pastControls: pastControls,
+            currentTiming: currentTiming, pastTiming: pastTiming
         )
         return loss(
             logits: logits,

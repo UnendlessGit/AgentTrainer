@@ -491,8 +491,9 @@ struct TemporalVisionConfiguration: Codable, Hashable, Sendable {
         spacingSeconds(perceptionFPS: perceptionFPS) * Double(pastFrameCount)
     }
 
-    func validated(current: PreprocessingSpec) throws -> Self {
-        guard (Self.minimumPastFrameCount...Self.maximumPastFrameCount).contains(pastFrameCount),
+    func validated(current: PreprocessingSpec, visualEmbedding: Int = 0) throws -> Self {
+        guard (0...16_384).contains(visualEmbedding),
+              (Self.minimumPastFrameCount...Self.maximumPastFrameCount).contains(pastFrameCount),
               (1...Self.maximumFrameSpacing).contains(frameSpacing),
               (1...Self.maximumDownsampleFactor).contains(downsampleFactor) else {
             throw AgentTrainerError.invalidConfiguration(
@@ -502,7 +503,7 @@ struct TemporalVisionConfiguration: Codable, Hashable, Sendable {
         let past = try pastFrameSpec(from: current).validated()
         let spacedFrameCount = pastFrameCount.multipliedReportingOverflow(by: frameSpacing)
         let retainedFrameCount = spacedFrameCount.partialValue.addingReportingOverflow(pastFrameCount > 0 ? 1 : 0)
-        let retainedBytes = retainedFrameCount.partialValue.multipliedReportingOverflow(by: past.sampleByteCount)
+        let retainedBytes = retainedFrameCount.partialValue.multipliedReportingOverflow(by: past.sampleByteCount + TemporalInputContract.rowBytes + (ActionLayout.count + max(0, visualEmbedding)) * MemoryLayout<Float>.size)
         guard !spacedFrameCount.overflow, !retainedFrameCount.overflow, !retainedBytes.overflow,
               retainedBytes.partialValue <= Self.maximumRuntimeTemporalBytes else {
             throw AgentTrainerError.invalidConfiguration(
@@ -542,11 +543,11 @@ enum MouseControlMode: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 enum ModelContract {
-    /// Version 6 adds fixed-layout multi-horizon action and action-conditioned
-    /// latent-dynamics heads. They are training-only auxiliaries: the immediate
-    /// action path stays direct and remains the only runtime output.
-    static let schemaVersion = 6
-    static let weightFormat = "AgentTrainer.Policy.v6"
+    /// Version 7 adds the shared explicit-timing projection, recurrent timing
+    /// inputs, and current decision timing. Version 6 artifacts are archived;
+    /// source recordings retain their existing timestamped binary format.
+    static let schemaVersion = 7
+    static let weightFormat = "AgentTrainer.Policy.v7"
 }
 
 /// Version of the causal pairing between a captured frame and the controls the
@@ -554,10 +555,10 @@ enum ModelContract {
 /// a data-only correction can invalidate caches/checkpoints without needlessly
 /// changing tensor shapes. Policy v6 itself is an intentional weight break.
 enum TrainingDataContract {
-    /// Version 14 removes recording-purpose weighting and special split rules.
-    /// Legacy supervision boundaries and context IDs remain meaningful. Rebuild
-    /// caches and warm-start compatible weights with a fresh optimizer sequence.
-    static let schemaVersion = 14
+    /// Version 15 retains source/query/decision times and strictly causal timing
+    /// rows. Trimmed videos keep their real PTS origin, past controls describe
+    /// trailing intervals, and zero-duration terminal labels are omitted.
+    static let schemaVersion = 15
 }
 
 /// Stable training/runtime contract for locked-cursor game cameras. Raw HID
@@ -939,8 +940,9 @@ enum TrainingContinuationPlan {
     static func remainingSteps(completedEpoch: Int, batchOffset: Int, targetEpoch: Int, samplesPerEpoch: Int, batchSize: Int) -> Int {
         let stepsPerEpoch = max(1, Int(ceil(Double(max(1, samplesPerEpoch)) / Double(max(1, batchSize)))))
         let completedBatches = min(stepsPerEpoch, Int(ceil(Double(max(0, batchOffset)) / Double(max(1, batchSize)))))
-        let epochsRemainingAfterCurrent = max(0, targetEpoch - max(0, completedEpoch) - (batchOffset > 0 ? 1 : 0))
-        let currentEpochRemaining = batchOffset > 0 ? max(0, stepsPerEpoch - completedBatches) : (targetEpoch > completedEpoch ? stepsPerEpoch : 0)
+        guard targetEpoch > completedEpoch else { return 0 }
+        let epochsRemainingAfterCurrent = max(0, targetEpoch - completedEpoch - 1)
+        let currentEpochRemaining = max(0, stepsPerEpoch - completedBatches)
         return currentEpochRemaining + epochsRemainingAfterCurrent * stepsPerEpoch
     }
 }
@@ -1173,6 +1175,26 @@ struct ModelOutputCapabilities: Codable, Hashable, Sendable {
     var allowsRelativeMouseMovement = false
     var allowsScroll = false
 
+    /// A class with no positive training targets is deliberately omitted from
+    /// binary loss. Its random logits must never become executable controls.
+    static func trained(positiveWeights: [Float], channels: ActionChannels, restrictions: ActionRestrictions) -> Self {
+        let learned = Set(ActionLayout.learnableBinaryIndices(channels: channels, restrictions: restrictions)
+            .filter { positiveWeights.indices.contains($0) && positiveWeights[$0] > 0 })
+        var keys = Set<UInt16>()
+        for code in UInt16(0)..<128 where !ActionLayout.allModifierKeyCodes.contains(code)
+            && learned.contains(ActionLayout.keyboard.lowerBound + Int(code)) {
+            keys.insert(code)
+        }
+        let modifiers: [UInt16] = [56, 59, 58, 55]
+        for modifier in 0..<4 where learned.contains(ActionLayout.modifiers.lowerBound + modifier) {
+            keys.insert(modifiers[modifier])
+        }
+        let buttons = Set((UInt8(0)..<8).filter { learned.contains(ActionLayout.buttons.lowerBound + Int($0)) })
+        return Self(allowedKeyCodes: keys, allowedMouseButtons: buttons,
+            allowsAbsoluteMouseMovement: channels.mouseMovement,
+            allowsRelativeMouseMovement: channels.mouseMovement, allowsScroll: channels.scroll)
+    }
+
     var isValid: Bool {
         allowedKeyCodes.allSatisfy { $0 < 128 }
             && allowedMouseButtons.allSatisfy { $0 < 8 }
@@ -1201,6 +1223,7 @@ struct ModelOutputCapabilities: Codable, Hashable, Sendable {
 
 struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     var schemaVersion = ModelContract.schemaVersion
+    var temporalInputVersion: Int? = TemporalInputContract.version
     var id: UUID
     var name: String
     var createdAt: Date
@@ -1255,6 +1278,7 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
 
     var contextSchemaIsValid: Bool {
         (try? effectiveContextSchema.validated()) != nil
+            && (schemaVersion != ModelContract.schemaVersion || temporalInputVersion == TemporalInputContract.version)
     }
 
     /// Manifest filenames are treated as leaf names, never paths. A damaged or
@@ -1269,7 +1293,7 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
 
 extension ModelVersionManifest {
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, id, name, createdAt, globalStep, trainingLoss, validationLoss
+        case schemaVersion, temporalInputVersion, id, name, createdAt, globalStep, trainingLoss, validationLoss
         case preprocessing, channels, training, weightsFile, optimizerFile, trainingStateFile
         case randomStateFile, epoch, isAutosave, demonstratedKeyCodes, relativeMouseScale
         case trainingDataSchema, trainingDurationSeconds, experienceDurationSeconds
@@ -1287,6 +1311,8 @@ extension ModelVersionManifest {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        temporalInputVersion = try container.decodeIfPresent(Int.self, forKey: .temporalInputVersion)
+            ?? (schemaVersion == 7 ? 1 : nil)
         id = try container.decode(UUID.self, forKey: .id)
         name = try container.decode(String.self, forKey: .name)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
@@ -1497,6 +1523,8 @@ struct RuntimeMetrics: Sendable {
     var perceptionFPS = 0.0
     var actionFPS = 0.0
     var latencyMilliseconds = 0.0
+    var actionInferenceMilliseconds = 0.0
+    var observationAgeMilliseconds = 0.0
     var frameCount = 0
     var actionCount = 0
     var droppedFrames = 0
@@ -1649,13 +1677,15 @@ enum ModelSizing {
         }
         let recurrent = max(1, architecture.recurrentWidth)
         let gates = architecture.recurrentKind == .gru ? 3 : 4
-        let temporalStepWidth = add(Int64(max(1, architecture.visualEmbedding)), Int64(ActionLayout.count))
+        let temporalStepWidth = add(Int64(max(1, architecture.visualEmbedding)), Int64(ActionLayout.count + TemporalInputContract.embeddingWidth))
+        total = add(total, multiply(Int64(TemporalInputContract.valueCount), Int64(TemporalInputContract.embeddingWidth)))
+        total = add(total, 2 * Int64(TemporalInputContract.embeddingWidth))
         total = add(total, multiply(multiply(Int64(gates), Int64(recurrent)), add(add(temporalStepWidth, Int64(recurrent)), 1)))
         // MLX's GRU has the usual three-gate bias plus a separate hidden-state
         // candidate bias (`bhn`) of one value per hidden unit. LSTM uses only
         // its four-gate bias, which is already included above.
         if architecture.recurrentKind == .gru { total = add(total, Int64(recurrent)) }
-        var fusionInput = max(1, architecture.visualEmbedding) + recurrent
+        var fusionInput = max(1, architecture.visualEmbedding) + recurrent + TemporalInputContract.embeddingWidth
             + max(0, contextSchema.inputValueCount)
         for width in architecture.fusionWidths {
             total = add(total, multiply(add(Int64(fusionInput), 1), Int64(max(1, width))))
@@ -1723,6 +1753,7 @@ struct NeuralInputSummary: Hashable, Sendable {
     var frameSpacing: Int64
     var actionValuesPerPastFrame: Int64
     var pastControlValues: Int64
+    var timingValues: Int64
     var contextValues: Int64
     var frameSpacingSeconds: Double
     var temporalLookbackSeconds: Double
@@ -1803,15 +1834,18 @@ enum NeuralInputSizing {
         let actionValues = Int64(ActionLayout.count)
         let controls = multiply(pastFrameCount, actionValues)
         let contextValues = Int64(max(0, contextSchema.inputValueCount))
+        let timingValues = multiply(1 + pastFrameCount, Int64(TemporalInputContract.valueCount))
         let pastVision = multiply(pastFrameCount, pastConvolution)
         let perDecision = add(
             currentConvolution,
-            add(pastVision, add(controls, contextValues))
+            add(pastVision, add(controls, add(contextValues, timingValues)))
         )
         let perceptionFPS = profile.training.perceptionFPS.isFinite ? max(0, profile.training.perceptionFPS) : 0
-        let runtimeValuesPerSecond = rate(perDecision, fps: perceptionFPS)
+        let actionFPS = profile.training.actionFPS.isFinite ? max(0, profile.training.actionFPS) : 0
+        let runtimeValuesPerSecond = add(rate(add(currentConvolution, pastVision), fps: perceptionFPS),
+            rate(add(controls, add(contextValues, timingValues)), fps: actionFPS))
         let totalPackedVision = add(currentCounts.packed, multiply(pastFrameCount, pastCounts.packed))
-        let packedVisionBytesPerSecond = rate(totalPackedVision, fps: perceptionFPS)
+        let packedVisionBytesPerSecond = rate(add(currentCounts.packed, pastFrameCount > 0 ? pastCounts.packed : 0), fps: perceptionFPS)
         let batchSize = max(1, Int64(profile.training.batchSize))
         let perBatch = multiply(perDecision, batchSize)
 
@@ -1840,6 +1874,7 @@ enum NeuralInputSizing {
             frameSpacing: Int64(max(1, temporal.frameSpacing)),
             actionValuesPerPastFrame: actionValues,
             pastControlValues: controls,
+            timingValues: timingValues,
             contextValues: contextValues,
             frameSpacingSeconds: temporal.spacingSeconds(perceptionFPS: perceptionFPS),
             temporalLookbackSeconds: temporal.lookbackSeconds(perceptionFPS: perceptionFPS),
@@ -1851,8 +1886,8 @@ enum NeuralInputSizing {
             quantizationLevels: levels,
             effectivePackedBits: meaningfulBits,
             bytesPerModelValue: scalarBytes,
-            nominalBytesPerDecision: multiply(perDecision, scalarBytes),
-            nominalBytesPerTrainingBatch: multiply(perBatch, scalarBytes)
+            nominalBytesPerDecision: add(multiply(perDecision - timingValues, scalarBytes), multiply(timingValues, 4)),
+            nominalBytesPerTrainingBatch: multiply(add(multiply(perDecision - timingValues, scalarBytes), multiply(timingValues, 4)), batchSize)
         )
     }
 

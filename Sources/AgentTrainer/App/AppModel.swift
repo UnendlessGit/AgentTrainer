@@ -1647,7 +1647,7 @@ final class AppModel: ObservableObject {
         }
         _ = try profile.preprocessing.validated()
         let training = profile.training
-        _ = try training.effectiveTemporalVision.validated(current: profile.preprocessing)
+        _ = try training.effectiveTemporalVision.validated(current: profile.preprocessing, visualEmbedding: profile.training.architecture.visualEmbedding)
         _ = try training.effectiveVisualAugmentation.validated()
         _ = try training.effectiveFutureActionPrediction.validated()
         _ = try training.effectiveFutureStatePrediction.validated()

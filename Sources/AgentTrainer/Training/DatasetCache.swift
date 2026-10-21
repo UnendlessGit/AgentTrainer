@@ -195,6 +195,8 @@ struct DatasetCacheManifest: Codable, Hashable, Sendable {
     var actionValuesPerSample: Int
     var segments: [CacheSegment]
     var contextSchema: ModelContextSchema? = nil
+    var temporalInputVersion = TemporalInputContract.version
+    var temporalInputValues = TemporalInputContract.valueCount
 
     var observationIndexValuesPerSample: Int { 1 + temporalVision.pastFrameCount }
     var effectiveContextSchema: ModelContextSchema { contextSchema ?? .empty }
@@ -271,6 +273,10 @@ final class CachedDataset: @unchecked Sendable {
     private let observationIndices: Data
     private let frameActions: Data
     private let actions: Data
+    private let decisionTiming: Data
+    private let frameTiming: Data
+    private let observationTimes: Data
+    private let decisionTimes: Data
     private let segmentContextVectors: [[Float]]
 
     init(directory: URL) throws {
@@ -287,7 +293,9 @@ final class CachedDataset: @unchecked Sendable {
         let expectedPastBytes = decoded.temporalVision.pastFrameCount > 0
             ? decoded.pastPreprocessing.sampleByteCount
             : 0
-        guard decoded.sampleCount >= 0,
+        guard decoded.temporalInputVersion == TemporalInputContract.version,
+              decoded.temporalInputValues == TemporalInputContract.valueCount,
+              decoded.sampleCount >= 0,
               decoded.observationCount >= 0,
               decoded.sampleCount == 0 || decoded.observationCount > 0,
               decoded.observationCount <= Int(UInt32.max),
@@ -388,6 +396,67 @@ final class CachedDataset: @unchecked Sendable {
             return true
         }
         guard mappingsAreValid else { throw AgentTrainerError.storage("The dataset cache contains an invalid frame index.") }
+        func timingFile(_ name: String, rows: Int, stride: Int) throws -> Data {
+            let size = rows.multipliedReportingOverflow(by: stride)
+            guard !size.overflow else { throw AgentTrainerError.storage("The temporal cache exceeds addressable memory.") }
+            let data = try Data(contentsOf: directory.appendingPathComponent(name), options: .alwaysMapped)
+            guard data.count == size.partialValue else { throw AgentTrainerError.storage("The temporal cache is incomplete or corrupt: \(name).") }
+            Self.adviseAdaptiveAccess(data)
+            return data
+        }
+        decisionTiming = try timingFile("decision-timing.bin", rows: decoded.sampleCount, stride: TemporalInputContract.rowBytes)
+        frameTiming = try timingFile("frame-timing.bin", rows: retainedFrameActionCount, stride: TemporalInputContract.rowBytes)
+        observationTimes = try timingFile("observation-times.bin", rows: decoded.observationCount, stride: 16)
+        decisionTimes = try timingFile("decision-times.bin", rows: decoded.sampleCount, stride: 16)
+        func time(_ data: Data, _ index: Int, _ field: Int) -> UInt64 {
+            data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: index * 16 + field * 8, as: UInt64.self).littleEndian }
+        }
+        for (position, segment) in decoded.segments.enumerated() where segment.count > 0 {
+            guard let lower = segment.observationStart else {
+                throw AgentTrainerError.storage("The temporal cache is missing its recording observation boundary.")
+            }
+            let upper: Int
+            if position + 1 < decoded.segments.count {
+                guard let next = decoded.segments[position + 1].observationStart else {
+                    throw AgentTrainerError.storage("The temporal cache is missing its recording observation boundary.")
+                }
+                upper = next
+            } else { upper = decoded.observationCount }
+            guard lower >= 0, upper > lower, upper <= decoded.observationCount else {
+                throw AgentTrainerError.storage("The temporal cache contains overlapping recording timelines.")
+            }
+            var previousQuery: UInt64?
+            var previousSource: UInt64?
+            for observation in lower..<upper {
+                let query = time(observationTimes, observation, 0)
+                let source = time(observationTimes, observation, 1)
+                guard source <= query, previousQuery.map({ query > $0 }) ?? true,
+                      previousSource.map({ source >= $0 }) ?? true else {
+                    throw AgentTrainerError.storage("The temporal cache contains a future or unordered video frame.")
+                }
+                previousQuery = query; previousSource = source
+            }
+            previousQuery = nil
+            for sample in segment.start..<(segment.start + segment.count) {
+                let current = loadedObservationIndices.withUnsafeBytes {
+                    Int($0.loadUnaligned(fromByteOffset: sample * decoded.observationIndexValuesPerSample * 4, as: UInt32.self).littleEndian)
+                }
+                let query = time(decisionTimes, sample, 0)
+                let duration = time(decisionTimes, sample, 1)
+                guard (lower..<upper).contains(current), query >= time(observationTimes, current, 0),
+                      duration > 0, !query.addingReportingOverflow(duration).overflow,
+                      previousQuery.map({ query > $0 }) ?? true else {
+                    throw AgentTrainerError.storage("The temporal cache contains an invalid action interval.")
+                }
+                previousQuery = query
+            }
+        }
+        for data in [decisionTiming, frameTiming] {
+            let valid = data.withUnsafeBytes { bytes in
+                bytes.bindMemory(to: Float.self).allSatisfy { $0.isFinite && abs($0) < 1_000_000 }
+            }
+            guard valid else { throw AgentTrainerError.storage("The temporal cache contains invalid model inputs.") }
+        }
         Self.adviseAdaptiveAccess(loadedCurrentObservations)
         Self.adviseAdaptiveAccess(loadedPastObservations)
         Self.adviseAdaptiveAccess(loadedObservationIndices)
@@ -895,6 +964,64 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
+    /// Timing is always gathered at action-row shape. Repeated image indices
+    /// cannot collapse decisions with different elapsed times or control edges.
+    func timingBatch(at indices: [Int]) -> (current: Data, past: Data) {
+        let stride = TemporalInputContract.rowBytes
+        let sequences = indices.map { observationSequence(at: $0) }
+        let frames = manifest.temporalVision.pastFrameCount
+        var current = Data(count: indices.count * stride)
+        var past = Data(count: indices.count * frames * stride)
+        current.withUnsafeMutableBytes { destination in
+            decisionTiming.withUnsafeBytes { source in
+                for (row, sample) in indices.enumerated() {
+                    destination[row * stride..<(row + 1) * stride].copyBytes(from: source[sample * stride..<(sample + 1) * stride])
+                }
+            }
+        }
+        past.withUnsafeMutableBytes { destination in
+            frameTiming.withUnsafeBytes { source in
+                for (row, sequence) in sequences.enumerated() {
+                    let currentTime = decisionTime(at: indices[row]).query
+                    var previousTime: UInt64?
+                    for frame in 0..<frames {
+                        let mapped = sequence.indices[frame + 1]
+                        guard mapped != UInt32.max else { continue }
+                        let index = Int(mapped)
+                        let start = (row * frames + frame) * stride
+                        let buffer = UnsafeMutableRawBufferPointer(rebasing: destination[start..<(start + stride)])
+                        buffer.copyMemory(from: UnsafeRawBufferPointer(rebasing: source[index * stride..<(index + 1) * stride]))
+                        let time = observationTime(at: index).query
+                        let floats = buffer.bindMemory(to: Float.self)
+                        var clock = Array(floats.prefix(TemporalInputContract.clockCount))
+                        for i in 10..<16 { clock[i] = 0 }
+                        TemporalInputContract.putTime(TemporalInputContract.seconds(currentTime, since: time), in: &clock, at: 10)
+                        if let previousTime {
+                            TemporalInputContract.putTime(TemporalInputContract.seconds(time, since: previousTime), in: &clock, at: 13)
+                        }
+                        for i in 10..<16 { floats[i] = clock[i] }
+                        previousTime = time
+                    }
+                }
+            }
+        }
+        return (current, past)
+    }
+
+    func observationTime(at index: Int) -> (query: UInt64, source: UInt64) {
+        observationTimes.withUnsafeBytes { bytes in
+            (bytes.loadUnaligned(fromByteOffset: index * 16, as: UInt64.self).littleEndian,
+             bytes.loadUnaligned(fromByteOffset: index * 16 + 8, as: UInt64.self).littleEndian)
+        }
+    }
+
+    func decisionTime(at index: Int) -> (query: UInt64, duration: UInt64) {
+        decisionTimes.withUnsafeBytes { bytes in
+            (bytes.loadUnaligned(fromByteOffset: index * 16, as: UInt64.self).littleEndian,
+             bytes.loadUnaligned(fromByteOffset: index * 16 + 8, as: UInt64.self).littleEndian)
+        }
+    }
+
     /// Per-output positive weights for class-balanced binary control losses.
     /// A keyboard tensor has 128 mostly-zero values, so unweighted BCE rewards
     /// an inert policy. Weights are derived only from the training split and are
@@ -1363,11 +1490,18 @@ actor DatasetCacheBuilder {
 
         let temporary = root.appendingPathComponent(".\(key).\(UUID().uuidString).tmp", isDirectory: true)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        // Cover failures opening writers as well as failures during packing.
+        // On success the published directory has already moved away.
+        defer { try? FileManager.default.removeItem(at: temporary) }
         let currentObservations = try BufferedFileWriter(url: temporary.appendingPathComponent("current-observations.bin"), capacity: 8 * 1_024 * 1_024)
         let pastObservations = try BufferedFileWriter(url: temporary.appendingPathComponent("past-observations.bin"), capacity: 8 * 1_024 * 1_024)
         let observationIndices = try BufferedFileWriter(url: temporary.appendingPathComponent("observation-indices.bin"), capacity: 1 * 1_024 * 1_024)
         let frameActions = try BufferedFileWriter(url: temporary.appendingPathComponent("frame-actions.bin"), capacity: 1 * 1_024 * 1_024)
         let actions = try BufferedFileWriter(url: temporary.appendingPathComponent("actions.bin"), capacity: 1 * 1_024 * 1_024)
+        let decisionTiming = try BufferedFileWriter(url: temporary.appendingPathComponent("decision-timing.bin"), capacity: 4 * 1_024 * 1_024)
+        let frameTiming = try BufferedFileWriter(url: temporary.appendingPathComponent("frame-timing.bin"), capacity: 4 * 1_024 * 1_024)
+        let observationTimesFile = try BufferedFileWriter(url: temporary.appendingPathComponent("observation-times.bin"), capacity: 1 * 1_024 * 1_024)
+        let decisionTimesFile = try BufferedFileWriter(url: temporary.appendingPathComponent("decision-times.bin"), capacity: 1 * 1_024 * 1_024)
         var segments: [CacheSegment] = []
         var sampleCount = 0
         var observationCount = 0
@@ -1393,6 +1527,8 @@ actor DatasetCacheBuilder {
                     observationIndices: observationIndices,
                     frameActions: frameActions,
                     actions: actions,
+                    decisionTiming: decisionTiming, frameTiming: frameTiming,
+                    observationTimesFile: observationTimesFile, decisionTimesFile: decisionTimesFile,
                     progress: { recordingFraction in
                         let overall = min(0.999, (completedDuration + recordingDuration * recordingFraction) / totalUsableDuration)
                         progress(overall, "Packing \(recording.manifest.name) • \(Int((overall * 100).rounded()))%")
@@ -1413,6 +1549,8 @@ actor DatasetCacheBuilder {
             }
             try currentObservations.finish(); try pastObservations.finish()
             try observationIndices.finish(); try frameActions.finish(); try actions.finish()
+            try decisionTiming.finish(); try frameTiming.finish()
+            try observationTimesFile.finish(); try decisionTimesFile.finish()
             let temporal = profile.training.effectiveTemporalVision
             let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
             let manifest = DatasetCacheManifest(
@@ -1433,11 +1571,14 @@ actor DatasetCacheBuilder {
             )
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(manifest).write(to: temporary.appendingPathComponent("manifest.json"), options: .atomic)
+            let validated = try CachedDataset(directory: temporary)
             if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
             try FileManager.default.moveItem(at: temporary, to: directory)
             progress(1, "Dataset cache ready")
-            return try CachedDataset(directory: directory)
+            return validated
         } catch {
+            try? decisionTiming.finish(); try? frameTiming.finish()
+            try? observationTimesFile.finish(); try? decisionTimesFile.finish()
             try? currentObservations.finish(); try? pastObservations.finish()
             try? observationIndices.finish(); try? frameActions.finish(); try? actions.finish()
             try? FileManager.default.removeItem(at: temporary)
@@ -1470,13 +1611,15 @@ actor DatasetCacheBuilder {
         observationIndices: BufferedFileWriter,
         frameActions: BufferedFileWriter,
         actions: BufferedFileWriter,
+        decisionTiming: BufferedFileWriter, frameTiming: BufferedFileWriter,
+        observationTimesFile: BufferedFileWriter, decisionTimesFile: BufferedFileWriter,
         progress: (Double) -> Void
     ) async throws -> (samples: Int, observations: Int) {
         guard let preprocessor else { throw AgentTrainerError.model("Metal preprocessing is unavailable.") }
         guard recording.manifest.isStructurallyValid, recording.manifest.hostStartNanos > 0 else {
             throw AgentTrainerError.storage("\(recording.manifest.name) has an invalid recording timeline or manifest.")
         }
-        let temporal = try profile.training.effectiveTemporalVision.validated(current: profile.preprocessing)
+        let temporal = try profile.training.effectiveTemporalVision.validated(current: profile.preprocessing, visualEmbedding: profile.training.architecture.visualEmbedding)
         let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
         let events = try InputEventReader.mapped(url: recording.directory.appendingPathComponent(recording.manifest.eventFile))
         let asset = AVURLAsset(url: recording.directory.appendingPathComponent(recording.manifest.videoFile))
@@ -1489,7 +1632,7 @@ actor DatasetCacheBuilder {
             min(trainingEnd, recording.manifest.effectiveSupervisionStart)
         )
         guard trainingEnd > trainingStart, trainingEnd > supervisionStart else { return (0, 0) }
-        reader.timeRange = CMTimeRange(start: CMTime(seconds: trainingStart, preferredTimescale: 1_000_000_000), duration: CMTime(seconds: trainingEnd - trainingStart, preferredTimescale: 1_000_000_000))
+        reader.timeRange = CMTimeRange(start: .zero, duration: CMTime(seconds: trainingEnd, preferredTimescale: 1_000_000_000))
         // H.264/HEVC are natively decoded by VideoToolbox into bi-planar YUV.
         // Requesting BGRA forced a full-resolution conversion (about 30 MB for
         // each 3456x2168 frame) before Metal immediately converted it back to
@@ -1505,7 +1648,7 @@ actor DatasetCacheBuilder {
         let actionInterval = 1 / max(0.0001, profile.training.actionFPS)
         let perceptionInterval = 1 / max(0.0001, profile.training.perceptionFPS)
         var nextPerception = trainingStart
-        var firstPTS: CMTime?
+        var sourceTimes: [Double] = []
         var observationTimes: [Double] = []
         observationTimes.reserveCapacity(max(1, Int((trainingEnd - trainingStart) * profile.training.perceptionFPS)))
         let usableDuration = trainingEnd - trainingStart
@@ -1561,12 +1704,21 @@ actor DatasetCacheBuilder {
         }
 
         var lastDecodedBuffer: CVPixelBuffer?
+        var lastDecodedTime = 0.0
         while let sample = output.copyNextSampleBuffer(), let buffer = sample.imageBuffer {
             try Task.checkCancellation()
             let pts = sample.presentationTimeStamp
-            if firstPTS == nil { firstPTS = pts }
-            guard let firstPTS else { continue }
-            let t = trainingStart + max(0, CMTimeGetSeconds(pts - firstPTS))
+            let t = CMTimeGetSeconds(pts)
+            guard t.isFinite, t >= 0 else { continue }
+            if t > trainingEnd { break }
+            guard lastDecodedBuffer == nil || t >= lastDecodedTime else {
+                throw AgentTrainerError.storage("Decoded video presentation times are not ordered.")
+            }
+            if lastDecodedBuffer == nil, t > nextPerception {
+                // An imported video can begin after zero. Never assign that
+                // first available image to an earlier perception or target.
+                nextPerception = trainingStart + ceil((t - trainingStart) / perceptionInterval) * perceptionInterval
+            }
             if t >= nextProgressTime {
                 progress(min(1, max(0, (t - trainingStart) / usableDuration)))
                 nextProgressTime = t + progressInterval
@@ -1577,8 +1729,9 @@ actor DatasetCacheBuilder {
                 // interval in that gap from the held frame. This is essential for
                 // static screens, where ScreenCaptureKit may emit only idle status.
                 let heldStart = observationTimes.count
-                while nextPerception < min(trainingEnd, t) - 0.000_001 {
+                while nextPerception < min(trainingEnd, t) {
                     observationTimes.append(min(trainingEnd, max(trainingStart, nextPerception)))
+                    sourceTimes.append(lastDecodedTime)
                     nextPerception += perceptionInterval
                 }
                 try appendPackedObservations(
@@ -1586,18 +1739,21 @@ actor DatasetCacheBuilder {
                     repetitions: observationTimes.count - heldStart
                 )
             }
-            if nextPerception <= min(trainingEnd, t) + 0.000_001 {
+            if nextPerception <= min(trainingEnd, t) {
                 observationTimes.append(min(trainingEnd, max(trainingStart, nextPerception)))
+                sourceTimes.append(t)
                 try appendPackedObservations(buffer, repetitions: 1)
                 nextPerception += perceptionInterval
             }
             lastDecodedBuffer = buffer
+            lastDecodedTime = t
         }
         if reader.status == .failed { throw reader.error ?? AgentTrainerError.storage("Video decoding failed while building the cache.") }
         if let lastDecodedBuffer {
             let heldStart = observationTimes.count
             while nextPerception <= trainingEnd + 0.000_001 {
                 observationTimes.append(min(trainingEnd, max(trainingStart, nextPerception)))
+                sourceTimes.append(lastDecodedTime)
                 nextPerception += perceptionInterval
             }
             try appendPackedObservations(
@@ -1608,12 +1764,17 @@ actor DatasetCacheBuilder {
         while !pendingPackedFrames.isEmpty { try writeOldestPackedFrame() }
         guard !observationTimes.isEmpty else { progress(1); return (0, 0) }
 
+        for (index, time) in observationTimes.enumerated() {
+            try observationTimesFile.appendLittleEndian(UInt64((time * 1e9).rounded()))
+            try observationTimesFile.appendLittleEndian(UInt64((sourceTimes[index] * 1e9).rounded()))
+        }
+
         let initialPointer = events.first { $0.kind == .mouseMove || $0.kind == .mouseButton || $0.kind == .scroll }
         func makePrimedAccumulator(at seconds: Double) throws -> (ActionAccumulator, Int) {
             let startNanos = try absoluteHostNanos(recording.manifest, seconds: seconds)
             var accumulator = ActionAccumulator(manifest: recording.manifest, initialPointer: initialPointer)
             var eventIndex = 0
-            while eventIndex < events.count, events[eventIndex].timestampNanos <= startNanos {
+            while eventIndex < events.count, events[eventIndex].timestampNanos < startNanos {
                 accumulator.consume(events[eventIndex])
                 eventIndex += 1
             }
@@ -1623,41 +1784,60 @@ actor DatasetCacheBuilder {
             return (accumulator, eventIndex)
         }
 
-        let primed = try makePrimedAccumulator(at: trainingStart)
         if hasTemporalMemory {
-            // Build one comprehensive control row for every perception
-            // interval only when a temporal branch can consume it.
-            var frameAccumulator = primed.0
-            var frameEventIndex = primed.1
-            for observation in observationTimes.indices {
-                let intervalEnd = observation + 1 < observationTimes.count
-                    ? min(trainingEnd, observationTimes[observation + 1])
-                    : trainingEnd
-                let endNanos = try absoluteHostNanos(recording.manifest, seconds: intervalEnd)
-                while frameEventIndex < events.count, events[frameEventIndex].timestampNanos < endNanos {
-                    frameAccumulator.consume(events[frameEventIndex])
-                    frameEventIndex += 1
+            var timeline = CausalControlTimeline(origin: recording.manifest.hostStartNanos)
+            var frameAccumulator = ActionAccumulator(manifest: recording.manifest, initialPointer: initialPointer)
+            var eventIndex = 0
+            var previousTime: Double?
+            for (observation, time) in observationTimes.enumerated() {
+                let hostTime = try absoluteHostNanos(recording.manifest, seconds: time)
+                while eventIndex < events.count, events[eventIndex].timestampNanos < hostTime {
+                    timeline.consume(events[eventIndex]); frameAccumulator.consume(events[eventIndex]); eventIndex += 1
                 }
+                if observation == 0 {
+                    timeline.endInterval(at: hostTime); frameAccumulator.endTick()
+                }
+                let features = timeline.features(at: hostTime,
+                    frameTime: try absoluteHostNanos(recording.manifest, seconds: sourceTimes[observation]),
+                    perceptionInterval: previousTime.map { time - $0 }, rect: recording.manifest.globalRect.cgRect)
+                try features.withUnsafeBytes { try frameTiming.append($0) }
                 try frameAccumulator.withActionBytes { try frameActions.append($0) }
-                frameAccumulator.endTick()
+                timeline.endInterval(at: hostTime); frameAccumulator.endTick(); previousTime = time
             }
         }
 
         // Action targets retain their independently configured rate. Every row
         // maps its current perception plus the exact requested causal frame
         // spacing; unavailable leading slots use the reserved sentinel.
-        let targetPrimed = try makePrimedAccumulator(at: supervisionStart)
+        let firstAction = max(supervisionStart, observationTimes[0])
+        let targetPrimed = try makePrimedAccumulator(at: firstAction)
         var targetAccumulator = targetPrimed.0
         var targetEventIndex = targetPrimed.1
-        var nextAction = supervisionStart
+        var nextAction = firstAction
         var currentLocalObservation = 0
         var sampleCount = 0
-        while nextAction <= trainingEnd + 0.000_001 {
+        var decisionTimeline = CausalControlTimeline(origin: recording.manifest.hostStartNanos)
+        var decisionEventIndex = 0
+        while nextAction < trainingEnd - 0.000_000_001 {
             while currentLocalObservation + 1 < observationTimes.count,
-                  observationTimes[currentLocalObservation + 1] <= nextAction + 0.000_001 {
+                  observationTimes[currentLocalObservation + 1] <= nextAction {
                 currentLocalObservation += 1
             }
+            let decisionHostTime = try absoluteHostNanos(recording.manifest, seconds: nextAction)
+            while decisionEventIndex < events.count, events[decisionEventIndex].timestampNanos < decisionHostTime {
+                decisionTimeline.consume(events[decisionEventIndex]); decisionEventIndex += 1
+            }
+            if sampleCount == 0 { decisionTimeline.endInterval(at: decisionHostTime) }
+            let features = decisionTimeline.features(at: decisionHostTime,
+                frameTime: try absoluteHostNanos(recording.manifest, seconds: sourceTimes[currentLocalObservation]),
+                perceptionInterval: currentLocalObservation > 0
+                    ? observationTimes[currentLocalObservation] - observationTimes[currentLocalObservation - 1] : nil,
+                rect: recording.manifest.globalRect.cgRect)
+            try features.withUnsafeBytes { try decisionTiming.append($0) }
+            decisionTimeline.endInterval(at: decisionHostTime)
             let targetEnd = min(trainingEnd, nextAction + actionInterval)
+            try decisionTimesFile.appendLittleEndian(UInt64((nextAction * 1e9).rounded()))
+            try decisionTimesFile.appendLittleEndian(UInt64(((targetEnd - nextAction) * 1e9).rounded()))
             let targetEndNanos = try absoluteHostNanos(recording.manifest, seconds: targetEnd)
             while targetEventIndex < events.count, events[targetEventIndex].timestampNanos < targetEndNanos {
                 targetAccumulator.consume(events[targetEventIndex])

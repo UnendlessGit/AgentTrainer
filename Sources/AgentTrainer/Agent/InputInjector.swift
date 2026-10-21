@@ -7,6 +7,7 @@ final class InputInjector: @unchecked Sendable {
 
     private let eventSink: @Sendable (CGEvent) -> Void
     private let cursorWarp: @Sendable (CGPoint) -> Void
+    private let monotonicClock: @Sendable () -> UInt64
     private let hidEventSource = CGEventSource(stateID: .hidSystemState)
     private let lock = NSLock()
     private var heldKeys: Set<UInt16> = []
@@ -19,13 +20,50 @@ final class InputInjector: @unchecked Sendable {
     private var lastStateReportTime = 0.0
     private var lastReportedState = InputState.empty
     private var fullMacRect = CGRect.zero
+    private var decisionTimeline = CausalControlTimeline(origin: DispatchTime.now().uptimeNanoseconds)
+    private var perceptionTimeline = CausalControlTimeline(origin: DispatchTime.now().uptimeNanoseconds)
+    private var lastPerceptionQuery: UInt64?
+    private var perceptionInterval: Double?
+
+    struct TemporalSnapshot: Sendable {
+        let timestamp: UInt64
+        let features: [Float]
+        let controls: [Float]
+    }
+
+    /// Queries are serialized with posting and permission-driven releases.
+    /// Separate interval integrators keep action and perception rates independent.
+    func temporalSnapshot(frameTime: UInt64, rect: CGRect, perception: Bool = false) -> TemporalSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = monotonicClock()
+        if perception {
+            perceptionInterval = lastPerceptionQuery.map { TemporalInputContract.seconds(now, since: $0) }
+            lastPerceptionQuery = now
+            let features = perceptionTimeline.features(at: now, frameTime: frameTime,
+                perceptionInterval: perceptionInterval, rect: rect)
+            let controls = perceptionTimeline.controlValues(rect: rect)
+            perceptionTimeline.endInterval(at: now)
+            return TemporalSnapshot(timestamp: now, features: features, controls: controls)
+        }
+        let features = decisionTimeline.features(at: now, frameTime: frameTime,
+            perceptionInterval: perceptionInterval, rect: rect)
+        let controls = decisionTimeline.controlValues(rect: rect)
+        decisionTimeline.endInterval(at: now)
+        return TemporalSnapshot(timestamp: now, features: features, controls: controls)
+    }
 
     init(
         eventSink: @escaping @Sendable (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
-        cursorWarp: @escaping @Sendable (CGPoint) -> Void = { point in _ = CGWarpMouseCursorPosition(point) }
+        cursorWarp: @escaping @Sendable (CGPoint) -> Void = { point in _ = CGWarpMouseCursorPosition(point) },
+        monotonicClock: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     ) {
         self.eventSink = eventSink
         self.cursorWarp = cursorWarp
+        self.monotonicClock = monotonicClock
+        let origin = monotonicClock()
+        decisionTimeline = CausalControlTimeline(origin: origin, censorInitialOnsets: false)
+        perceptionTimeline = CausalControlTimeline(origin: origin, censorInitialOnsets: false)
     }
 
     func enable(outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions()) {
@@ -46,6 +84,12 @@ final class InputInjector: @unchecked Sendable {
         // Display discovery crosses into WindowServer. Cache it once per run
         // instead of repeating the query at the action rate.
         fullMacRect = Self.combinedScreenRect()
+        let origin = monotonicClock()
+        decisionTimeline = CausalControlTimeline(origin: origin, censorInitialOnsets: false)
+        perceptionTimeline = CausalControlTimeline(origin: origin, censorInitialOnsets: false)
+        lastPerceptionQuery = nil; perceptionInterval = nil
+        let seed = InputSample(timestampNanos: origin, kind: .mouseMove, x: cursor.x, y: cursor.y)
+        decisionTimeline.consume(seed); perceptionTimeline.consume(seed)
         enabled = true; usedGameCamera = false; lastStateReportTime = 0; lastReportedState = .empty; lock.unlock()
         onState?(.empty)
     }
@@ -106,10 +150,11 @@ final class InputInjector: @unchecked Sendable {
                 usedGameCamera = true
             }
         } else if predictionIsFresh, outputPermissions.cursorMovement, channels.mouseMovement {
+            let previousCursor = cursor
             let normalizedX = min(1, max(0, prediction[0]))
             let normalizedY = min(1, max(0, prediction[1]))
             cursor = CGPoint(x: captureRect.minX + CGFloat(normalizedX) * captureRect.width, y: captureRect.minY + CGFloat(normalizedY) * captureRect.height).clamped(to: allowed)
-            postMove(to: cursor)
+            postMove(to: cursor, from: previousCursor)
         }
 
         if channels.buttons {
@@ -144,10 +189,11 @@ final class InputInjector: @unchecked Sendable {
         let desiredKeys = outputPermissions.keyboard && channels.keyboard ? Set<UInt16>((0..<128).compactMap {
             let code = UInt16($0)
             return prediction[14 + $0] >= 0.5
-                && !ActionLayout.commandOptionControlKeyCodeSet.contains(code)
+                && !ActionLayout.allModifierKeyCodes.contains(code)
                 && allowedKeyCodes.contains(code)
                 && restrictions.allowsKey(code) ? code : nil
         }) : []
+        if desiredKeys.contains(63) { desiredModifiers |= CGEventFlags.maskSecondaryFn.rawValue }
         var desiredWithModifiers = desiredKeys
         for i in 0..<4 where desiredModifiers & modifierMasks[i].rawValue != 0 { desiredWithModifiers.insert(modifierKeys[i]) }
         for key in heldKeys.subtracting(desiredWithModifiers) { postKey(key, down: false, flags: CGEventFlags(rawValue: desiredModifiers)) }
@@ -183,9 +229,11 @@ final class InputInjector: @unchecked Sendable {
 
     func releaseAll() { disableAndReleaseAll() }
 
-    private func postMove(to point: CGPoint) {
+    private func postMove(to point: CGPoint, from previous: CGPoint) {
         let movement = movementEvent()
         guard let event = CGEvent(mouseEventSource: hidEventSource, mouseType: movement.type, mouseCursorPosition: point, mouseButton: movement.button) else { return }
+        event.setIntegerValueField(.mouseEventDeltaX, value: Int64((point.x - previous.x).rounded()))
+        event.setIntegerValueField(.mouseEventDeltaY, value: Int64((point.y - previous.y).rounded()))
         post(event)
     }
 
@@ -234,12 +282,52 @@ final class InputInjector: @unchecked Sendable {
     private func postKey(_ code: UInt16, down: Bool, flags: CGEventFlags) {
         guard let event = CGEvent(keyboardEventSource: hidEventSource, virtualKey: code, keyDown: down) else { return }
         event.flags = flags
-        post(event)
+        post(event, logicalSample: InputSample(timestampNanos: 0,
+            kind: ActionLayout.allModifierKeyCodes.contains(code) ? .flags : .key,
+            keyCode: code, modifiers: flags.rawValue, isDown: down))
     }
 
-    private func post(_ event: CGEvent) {
+    private func post(_ event: CGEvent, logicalSample: InputSample? = nil) {
         event.setIntegerValueField(.eventSourceUserData, value: agentTrainerSyntheticTag)
+        // Core Graphics creates flagsChanged for modifier keys. Preserve the
+        // explicit flags passed by postKey for those events as well.
+        let isKey = logicalSample != nil || event.type == .keyDown || event.type == .keyUp || event.type == .flagsChanged
+        if !isKey { event.flags = CGEventFlags(rawValue: modifiers) }
+        let time = monotonicClock()
+        event.timestamp = time
         eventSink(event)
+        if var sample = logicalSample {
+            sample.timestampNanos = time
+            sample.modifiers = event.flags.rawValue
+            decisionTimeline.consume(sample); perceptionTimeline.consume(sample)
+            return
+        }
+        let location = event.location
+        var sample = InputSample(timestampNanos: time, kind: .mouseMove,
+            x: location.x, y: location.y, modifiers: event.flags.rawValue)
+        switch event.type {
+        case .keyDown, .keyUp:
+            sample.kind = .key
+            sample.keyCode = UInt16(clamping: event.getIntegerValueField(.keyboardEventKeycode))
+            sample.isDown = event.type == .keyDown
+            if ActionLayout.allModifierKeyCodes.contains(sample.keyCode) { sample.kind = .flags }
+        case .flagsChanged:
+            sample.kind = .flags
+            sample.keyCode = UInt16(clamping: event.getIntegerValueField(.keyboardEventKeycode))
+        case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+            sample.kind = .mouseButton
+            sample.button = UInt8(clamping: event.getIntegerValueField(.mouseEventButtonNumber))
+            sample.isDown = [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type)
+        case .scrollWheel:
+            sample.kind = .scroll
+            sample.scrollX = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
+            sample.scrollY = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            sample.deltaX = Double(event.getIntegerValueField(.mouseEventDeltaX))
+            sample.deltaY = Double(event.getIntegerValueField(.mouseEventDeltaY))
+        default: return
+        }
+        decisionTimeline.consume(sample); perceptionTimeline.consume(sample)
     }
 
     private func movementEvent() -> (type: CGEventType, button: CGMouseButton) {

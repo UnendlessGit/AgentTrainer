@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.47. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.50. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -21,8 +21,9 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Storage/InputEventFile.swift` — fixed-width binary event writer and validated mapped reader
 - `Preprocessing/VisionPreprocessor.swift` — Metal resize, color conversion, packing, and MLX expansion
 - `Training/DatasetCache.swift` — causal frame/action pairing and memory-mapped datasets
-- `Training/PolicyNetwork.swift` — Policy v6, predictive objectives, augmentation, and resumable AdamW
+- `Training/PolicyNetwork.swift` — Policy v7, predictive objectives, augmentation, and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
+- `Core/TemporalInputs.swift` — versioned timing vocabulary and shared causal control reducer
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
 - `Agent/AgentRuntime.swift` — capture, inference scheduling, prediction latching, and teardown
 - `Agent/InputInjector.swift` — final output firewall and synthetic HID events
@@ -92,7 +93,7 @@ Packed observations are `UInt8`:
 
 MLX expands each packed image independently to dense RGB-like channels at its native configured size. The visual encoder appends generated X/Y coordinate planes internally.
 
-Temporal vision is either current-only or an explicit three-part input:
+Temporal vision is current-only or includes a historical sequence. Timing is always present. The visual/control portion contains:
 
 1. one current frame at the exact configured `PreprocessingSpec`
 2. `pastFrameCount` real causal frames at `pastFrameSpec`, ordered oldest to newest
@@ -100,15 +101,23 @@ Temporal vision is either current-only or an explicit three-part input:
 
 `TemporalVisionConfiguration` owns past-frame count, spacing in Perception FPS intervals, and linear downscale. Its displayed seconds are nominal values derived from configured Perception FPS; dropped or delayed live perceptions can increase wall-clock separation. The reduced specification must copy color mode, chroma layout, bit detail, and resize policy from the current frame. Width and height use the same scale, with only unavoidable integer-pixel rounding. Never resize past images back to current resolution and never synthesize difference, optical-flow, or motion channels.
 
-The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context. Zero frames disables the temporal branch: runtime and training consume only current vision and do not allocate past-image or past-control input buffers.
+The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context. Zero frames omits the recurrent visual history and past-image/control/timing buffers; current decision timing remains available. The retained-context limit includes packed pixels, Float32 controls/timing, and cached visual embeddings.
 
-`TrainingDataContract.schemaVersion` is 14. Version 14 removes per-recording emphasis and purpose-dependent splits; generic context conditioning and the Policy-v6 weight layout remain unchanged. Older checkpoints may warm-start compatible context-free weights but never claim an exact optimizer/random-state resume across a data-schema change. Dataset caches are disposable and must be invalidated when causal frame selection, frame-control pairing, static-frame cadence, current-only layout, supervision boundaries, context IDs/selections, or target meaning changes. Display-only context renames refresh the tiny cache manifest without repacking pixels. A cache has:
+`TrainingDataContract.schemaVersion` is 15. This changes causal frame selection, trailing control pairing, timing inputs, and supervision endpoints; older caches rebuild. Model schema 7 requires retraining, with incompatible brains/checkpoints archived rather than claiming a warm start or exact v6 resume. Display-only context renames still refresh the tiny cache manifest without repacking pixels. A cache has:
 
-- `current-observations.bin` — one full-resolution packed image per perception
-- `past-observations.bin` — one reduced packed image of the same perception
-- `observation-indices.bin` — current plus configured past indices for every action row; unavailable segment-leading frames use `UInt32.max`
-- `frame-actions.bin` — one complete control row per perception interval
-- `actions.bin` — action-rate targets; the immediately preceding target remains separate for transition weighting
+- `current-observations.bin` — one full-resolution packed image per perception tick
+- `past-observations.bin` — one reduced packed image per tick, omitted for current-only
+- `observation-indices.bin` — current plus configured past indices for every action row; missing history uses `UInt32.max`
+- `frame-actions.bin` — complete trailing-interval controls, omitted for current-only
+- `actions.bin` — forward action targets; the previous target remains separate for transition weighting
+- `decision-timing.bin` — 2,190 Float32 timing values per action decision
+- `frame-timing.bin` — the same vocabulary per historical observation, omitted for current-only
+- `observation-times.bin` — little-endian UInt64 query time and actual source PTS per observation, relative to recording origin
+- `decision-times.bin` — little-endian UInt64 query time and positive target interval duration per action row
+
+All files have validated sizes and bounded arithmetic. Timing rows must be finite; segment-owned clock metadata is monotonic and causal, including source PTS ≤ observation query ≤ action query. Decode begins at movie time zero, retaining the last causal source PTS at a trim rather than rebasing the first decoded frame. Targets cover `[t, min(t + actionInterval, trimEnd))`; inputs contain only events strictly before `t`. Priming preserves pre-trim hold onset history. Zero-duration endpoint targets are excluded.
+
+The detailed timing layout, source audit, ablation procedure, and measurements are in [TEMPORAL_DESIGN.md](TEMPORAL_DESIGN.md).
 
 The cache manifest snapshots a deterministic `ModelContextSchema`. Fields and values are UUID-sorted for tensor stability and include only values assigned by at least one selected recording. Each `CacheSegment` stores that recording's assignments once; batch gathering expands them to a multi-hot Float row. Each value owns one dimension, at most one value per field is active, and an unassigned field is an all-zero segment. Context-free caches have no context descriptor or Metal allocation.
 
@@ -134,30 +143,31 @@ Every frame-control row includes normalized absolute cursor position, raw relati
 
 ## Model and training contracts
 
-`ModelContract.schemaVersion` is 6 and the weight format is `AgentTrainer.Policy.v6`.
+`ModelContract.schemaVersion` is 7 and the weight format is `AgentTrainer.Policy.v7`.
 
-All training uses behavioral cloning. Older feature settings decode as unknown keys and are omitted when saved. `ModelOutputCapabilities` retains only immutable key/button/movement/scroll limits from imported model manifests; it is not a trainer or action distribution. Missing legacy limits fail closed. Run always uses the established deterministic activations and the shared output firewall.
+All training uses behavioral cloning. Older feature settings decode as unknown keys and are omitted when saved. `ModelOutputCapabilities` snapshots immutable key/button/movement/scroll limits. Native v7 publication derives binary capabilities from positive supervised classes in the training split, so loss-masked heads cannot post random events. Imported limits remain immutable; this is not an action distribution. Missing legacy limits fail closed. Run always uses the established deterministic activations and the shared output firewall.
 
-Legacy recording `supervisionStart` remains a data compatibility contract: pre-boundary images and controls are observation context, never action labels. Dataset schema 14 rebuilds packed caches and safely warm-starts compatible active weights with a fresh optimizer/random sequence. There are no special recording purposes, per-recording loss weights, or purpose-specific validation splits.
+Legacy recording `supervisionStart` remains a data compatibility contract: pre-boundary images and controls are observation context, never action labels. Dataset schema 15 rebuilds packed caches; incompatible v6 brains/checkpoints are archived and must be retrained. Migration from v6 preserves profile architecture and temporal settings. There are no special recording purposes, per-recording loss weights, or purpose-specific validation splits.
 
 A runnable version is immutable. Runtime current vision, temporal vision, architecture, precision, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
 
 Dropout is stochastic training regularization, not part of the learned tensor layout. It is normalized out of `LearnedBrainContract`: editing only dropout must preserve the active brain and load its weights into the next run. Because the stochastic objective changed, the exact optimizer/checkpoint signature still includes dropout and begins a fresh optimizer sequence rather than claiming an invalid exact resume.
 
-Current Policy v6 combines:
+Current Policy v7 combines:
 
 - one shared convolutional encoder for the real current and past images
 - independent X/Y coordinate planes at each image's native resolution
 - attention or legacy flattened visual pooling
-- a GRU/LSTM sequence over each past visual embedding concatenated with that frame's 146 controls
-- fusion of the current visual embedding with the final temporal state
+- a shared Float32 timing projection (2,190 → 64, no bias) plus LayerNorm, cast to configured model precision
+- a GRU/LSTM sequence over each past visual embedding, its 146 controls, and its 64 timing values
+- fusion of current visual embedding, final temporal state, and current 64-value timing embedding
 - optional raw categorical context concatenated immediately before the fusion stack
 - per-head bounded activations
 - a fixed four-horizon future-action head and an action-conditioned latent-state-delta head; both are training-only and add no runtime action latency
 
-`ModelVersionManifest.contextSchema` is the immutable display and tensor vocabulary for a context-trained brain. It is nil for every pre-2.3/context-free brain. Empty context adds no tensor, parameter, input descriptor, or compiled-step argument, preserving the exact existing Policy-v6 weight layout. A warm start is allowed only when ordered field/value IDs match; display-name changes alone are layout-compatible. The first fusion layer is the only learned shape widened by context values.
+`ModelVersionManifest.contextSchema` is the immutable display and tensor vocabulary for a context-trained brain. It is nil for every pre-2.3/context-free brain. Empty context adds no tensor, parameter, input descriptor, or compiled-step argument, preserving the exact existing Policy-v7 weight layout. A warm start is allowed only when ordered field/value IDs match; display-name changes alone are layout-compatible. The first fusion layer is the only learned shape widened by context values.
 
-Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. Past control rows are masked for half of training samples while past images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
+Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. One per-sample keep mask drops the historical controls and all current/historical control-derived timing (including cursor) for half of training samples while visual clocks, validity, and images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
 
 Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Configurable photometric augmentation samples one transform per supervised row and applies it identically to only that row's current, past, and future frames. It never moves pixels. Augmented training expands deduplicated observations to row shape before the CNN and uses the diversity-oriented sampler; validation and augmentation-off training retain deterministic visual reuse. Future-action loss weights near horizons more strongly. Future-state loss predicts a stopped-gradient latent change from fused context plus the demonstrated current action; it never generates pixels. Conservative default auxiliary weights are gated by a matched-update causal held-out test at 1% immediate-loss drift. Do not change these semantics without updating tests and the relevant schema.
 
@@ -168,10 +178,10 @@ The performance path preserves those semantics:
 - Dataset files are required memory mappings with adaptive VM advice. Epochs randomize small collections of temporally local lanes rather than every row globally, so each optimizer batch remains diverse while macOS can read ahead the contiguous mapped pages inside each lane. A batch gathers packed vision, frame controls, and target/previous-target rows once into pooled Metal shared memory; MLX expands packed `UInt8` vision inside the compiled graph.
 - With augmentation off, current images are encoded once per distinct temporal sequence. Overlapping causal windows additionally encode each distinct reduced-resolution past observation once, then gather those deterministic embeddings to their exact frame slots. With augmentation on, rows are expanded before encoding so independent sample transforms cannot be collapsed. No label, loss term, update, or temporal control is removed, duplicated, averaged, or reused as another label.
 - Above the measured workload crossover, the coordinate contribution to the first convolution is evaluated once per batch and the established GroupNorm layout uses MLX's fused Metal layer-normalization kernel. Small tensors retain the lower-overhead kernels.
-- Validation shares deterministic temporal work and head logits before gathering them back to every held-out label, then derives loss and predictions from that one compiled forward graph.
+- Validation reuses deterministic CNN embeddings, gathers them to action-row shape, then computes timing-conditioned recurrence and head logits independently for every held-out label. Sharing images must never share final predictions across distinct timing rows.
 - CPU gathering of the next batch overlaps the current Metal graph. Every optimizer step still evaluates the complete model, AdamW moments, scheduler, and MLX random state before advancing the checkpoint cursor.
 - Live diagnostics publish a rolling pipelined-step time, mapped-input time, peak-throughput retention, MLX active/cache/peak memory, and macOS thermal pressure. Metrics are rate-limited and chart histories are presentation-bounded so observing a run does not grow UI work with optimizer-step count.
-- The release benchmark separately executes the complete Policy-v6 stochastic objective and runs the same sustained-window retention/memory/thermal checks. It gates the required per-sample augmentation path at 3× the augmentation-off reused core, then gates both predictive heads together at 2× that augmented immediate path. The immediate-only reference/optimized paths still isolate encoder equivalence and throughput, while the two-stage gate prevents one semantic cost from hiding a regression in the other.
+- The release benchmark separately executes the complete Policy-v7 stochastic objective and runs the same sustained-window retention/memory/thermal checks. It gates the required per-sample augmentation path at 3× the augmentation-off reused core, then gates both predictive heads together at 2× that augmented immediate path. The immediate-only reference/optimized paths still isolate encoder equivalence and throughput, while the two-stage gate prevents one semantic cost from hiding a regression in the other.
 
 Do not queue stateful optimizer steps merely to improve a benchmark. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
 
@@ -200,7 +210,11 @@ Every mutable profile channel is a disable-only runtime firewall over the immuta
 
 Predictions must contain 146 finite values. Held keys/buttons may persist between fresh predictions, but cursor deltas and scroll are transient. The prediction latch consumes transient outputs once.
 
-At runtime, every successfully inferred perception stores its reduced packed image with the sanitized controls predicted for that interval. Exact spaced frames are selected from a fixed-capacity circular buffer; unavailable startup slots duplicate the current reduced image with zero controls. This matches training padding without target leakage and keeps sampling/appending O(1).
+At runtime, every successfully encoded perception stores its reduced packed image and evaluated embedding with controls/timing reduced from events actually posted under the injector lock. Predictions that permissions, restrictions, rounding, or clipping prevented from executing never enter this history. Forced releases do. Exact spaced frames use a fixed-capacity circular buffer; unavailable startup slots duplicate the current reduced image with zero controls and invalid timing.
+
+CNN encoding runs at Perception FPS; a lightweight timing-conditioned head runs at Action FPS. Both share one serialized MLX queue. Newest-frame work coalesces to one pending image and yields after each encode; action work admits at most one pending head/execution. Revisions discard obsolete context/permission results both after inference and before posting. Stop drains action work/releases, drains capture/inference, then drains late action callbacks before allowing restart. An independent action-timer watchdog stops stale predictions even if MLX work is pending. Idle perceptions retain the true original source-frame timestamp.
+
+Two independent injector interval reducers keep action and perception rates correct. Historical query ages are recomputed at each action tick; source-frame age is retained separately. Runtime diagnostics and visualization/saliency graphs receive the same timing vocabulary. Head latency and source-frame age are exposed separately from visual encoding latency. At 60 Hz execution remains approximately 16.7 ms; nanosecond input provenance is not an arbitrary sub-tick output scheduler.
 
 Run reads context fields and values only from the active immutable version, never the mutable workspace catalog. Selecting another brain clears every Run selection to blank. A live context change increments a runtime revision, clears temporal/prediction state, drains and releases old-context held controls on the action queue, and discards inference already in flight under the previous revision before admitting a new-context prediction.
 
@@ -261,7 +275,7 @@ The scripts explicitly select SwiftPM's `native` backend. Newer Swift toolchains
 Before release:
 
 1. Run `./test.sh`.
-2. Run `./benchmark.sh` and compare original/optimized throughput plus matched-update training and validation loss on the same idle Mac. Check the full auxiliary-objective overhead/memory line and every sustained window for stable throughput, bounded MLX cache, and nominal thermal pressure.
+2. Run `./benchmark-temporal.sh` for the approved isolated 20-epoch ablation (completed arms are evaluation-only), then run `./benchmark.sh` and compare original/optimized throughput plus matched-update training and validation loss on the same idle Mac. Check the full auxiliary-objective overhead/memory line and every sustained window for stable throughput, bounded MLX cache, and nominal thermal pressure.
 3. Run `git diff --check`.
 4. Confirm `CFBundleShortVersionString` and `CFBundleVersion`.
 5. Quit AgentTrainer and run `./build.sh`.

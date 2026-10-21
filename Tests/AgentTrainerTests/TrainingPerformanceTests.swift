@@ -228,6 +228,28 @@ final class TrainingPerformanceTests: XCTestCase {
             let visionToPastData = visionToPast.withUnsafeBytes { Data($0) }
             let mappingData = mapping.withUnsafeBytes { Data($0) }
             let actionData = actionRows.withUnsafeBytes { Data($0) }
+            // Non-zero, row-specific timing exercises the actual v7 projection
+            // and prevents a zero-input constant fold from hiding its cost.
+            var decisionTiming = [Float](), historicalTiming = [Float]()
+            for row in 0..<batchSize {
+                var values = [Float](repeating: 0, count: TemporalInputContract.valueCount)
+                TemporalInputContract.putClock(in: &values, interval: 1 / profile.training.actionFPS,
+                    perceptionInterval: 1 / profile.training.perceptionFPS, frameAge: Double(row % labelsPerVision) / profile.training.actionFPS)
+                let index = ActionLayout.keyboard.lowerBound + row % 32
+                let slot = TemporalInputContract.controlLookup[index]!
+                values[TemporalInputContract.clockCount + slot * TemporalInputContract.controlWidth] = 1
+                TemporalInputContract.putTime(Double(row + 1) / 100, in: &values,
+                    at: TemporalInputContract.clockCount + slot * TemporalInputContract.controlWidth + 1)
+                decisionTiming += values
+                for frame in 0..<frameCount {
+                    var history = values
+                    TemporalInputContract.putTime(Double(frameCount - frame) * Double(temporal.frameSpacing) / profile.training.perceptionFPS,
+                        in: &history, at: 10)
+                    historicalTiming += history
+                }
+            }
+            let decisionTimingData = decisionTiming.withUnsafeBytes { Data($0) }
+            let historicalTimingData = historicalTiming.withUnsafeBytes { Data($0) }
             let positiveWeights = MLXArray.ones([ActionLayout.count])
             let bufferPool = try MetalArrayBufferPool(maximumCachedBytes: 512 * 1_024 * 1_024)
 
@@ -252,7 +274,9 @@ final class TrainingPerformanceTests: XCTestCase {
                     past,
                     MLXArray(copied(fullControlData), [batchSize, frameCount, ActionLayout.count], type: Float.self),
                     MLXArray(copied(targetData), [batchSize, ActionLayout.count], type: Float.self),
-                    MLXArray(copied(previousTargetData), [batchSize, ActionLayout.count], type: Float.self)
+                    MLXArray(copied(previousTargetData), [batchSize, ActionLayout.count], type: Float.self),
+                    MLXArray(copied(decisionTimingData), [batchSize, TemporalInputContract.valueCount], type: Float.self),
+                    MLXArray(copied(historicalTimingData), [batchSize, frameCount, TemporalInputContract.valueCount], type: Float.self)
                 ]
             }
 
@@ -261,12 +285,16 @@ final class TrainingPerformanceTests: XCTestCase {
                     .init([batchSize, currentBytesPerSample], dtype: .uint8),
                     .init([batchSize, frameCount, pastBytesPerFrame], dtype: .uint8),
                     .init([batchSize, frameCount, ActionLayout.count], dtype: .float32),
-                    .init([batchSize, 2, ActionLayout.count], dtype: .float32)
+                    .init([batchSize, 2, ActionLayout.count], dtype: .float32),
+                    .init([batchSize, TemporalInputContract.valueCount], dtype: .float32),
+                    .init([batchSize, frameCount, TemporalInputContract.valueCount], dtype: .float32)
                 ]) { destinations in
                     fullCurrentData.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
                     fullPastData.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
                     fullControlData.withUnsafeBytes { destinations[2].copyMemory(from: $0) }
                     actionData.withUnsafeBytes { destinations[3].copyMemory(from: $0) }
+                    decisionTimingData.withUnsafeBytes { destinations[4].copyMemory(from: $0) }
+                    historicalTimingData.withUnsafeBytes { destinations[5].copyMemory(from: $0) }
                 }
             }
 
@@ -277,7 +305,9 @@ final class TrainingPerformanceTests: XCTestCase {
                     .init([uniqueSequenceCount, frameCount, ActionLayout.count], dtype: .float32),
                     .init([uniqueSequenceCount, frameCount], dtype: .int32),
                     .init([batchSize], dtype: .int32),
-                    .init([batchSize, 2, ActionLayout.count], dtype: .float32)
+                    .init([batchSize, 2, ActionLayout.count], dtype: .float32),
+                    .init([batchSize, TemporalInputContract.valueCount], dtype: .float32),
+                    .init([batchSize, frameCount, TemporalInputContract.valueCount], dtype: .float32)
                 ]) { destinations in
                     uniqueCurrentData.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
                     deduplicatedPastData.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
@@ -285,6 +315,8 @@ final class TrainingPerformanceTests: XCTestCase {
                     visionToPastData.withUnsafeBytes { destinations[3].copyMemory(from: $0) }
                     mappingData.withUnsafeBytes { destinations[4].copyMemory(from: $0) }
                     actionData.withUnsafeBytes { destinations[5].copyMemory(from: $0) }
+                    decisionTimingData.withUnsafeBytes { destinations[6].copyMemory(from: $0) }
+                    historicalTimingData.withUnsafeBytes { destinations[7].copyMemory(from: $0) }
                 }
             }
 
@@ -300,7 +332,8 @@ final class TrainingPerformanceTests: XCTestCase {
                             pastControls: inputs[2],
                             targets: inputs[3],
                             positiveWeights: positiveWeights,
-                            previousTargets: inputs[4]
+                            previousTargets: inputs[4],
+                            currentTiming: inputs[5], pastTiming: inputs[6]
                         )]
                     }(model, arrays)
                     optimizer.update(
@@ -325,7 +358,7 @@ final class TrainingPerformanceTests: XCTestCase {
                         VisionPreprocessor.mlxPastFrameTensor(arrays[1], spec: pastSpec),
                         arrays[2],
                         actions[0..., 0, 0...],
-                        actions[0..., 1, 0...]
+                        actions[0..., 1, 0...], arrays[4], arrays[5]
                     ]
                     let result = valueAndGrad(model: model) { model, values in
                         [model.loss(
@@ -334,7 +367,8 @@ final class TrainingPerformanceTests: XCTestCase {
                             pastControls: values[2],
                             targets: values[3],
                             positiveWeights: positiveWeights,
-                            previousTargets: values[4]
+                            previousTargets: values[4],
+                            currentTiming: values[5], pastTiming: values[6]
                         )]
                     }(model, inputs)
                     optimizer.update(
@@ -357,7 +391,7 @@ final class TrainingPerformanceTests: XCTestCase {
                     let uniqueInputs = [
                         VisionPreprocessor.mlxTensor(arrays[0], spec: profile.preprocessing),
                         VisionPreprocessor.mlxTensor(arrays[1], spec: pastSpec),
-                        arrays[2]
+                        arrays[2], arrays[6], arrays[7]
                     ]
                     let targets = actions[0..., 0, 0...]
                     let previousTargets = actions[0..., 1, 0...]
@@ -367,7 +401,8 @@ final class TrainingPerformanceTests: XCTestCase {
                             pastImages: values[1],
                             pastControls: values[2],
                             visionToPast: arrays[3],
-                            sampleToVision: arrays[4]
+                            sampleToVision: arrays[4],
+                            currentTiming: values[3], pastTiming: values[4]
                         )
                         let logits = model.logits(temporalFeatures: uniqueTemporal)
                         return [model.loss(
@@ -464,7 +499,8 @@ final class TrainingPerformanceTests: XCTestCase {
             func legacyValidation() -> [MLXArray] {
                 let inputs = baselineInputs()
                 let logits = validationModel.callAsFunction(
-                    currentImages: inputs[0], pastImages: inputs[1], pastControls: inputs[2]
+                    currentImages: inputs[0], pastImages: inputs[1], pastControls: inputs[2],
+                    currentTiming: inputs[5], pastTiming: inputs[6]
                 )
                 return [
                     validationModel.loss(
@@ -485,7 +521,8 @@ final class TrainingPerformanceTests: XCTestCase {
                     currentImages: current,
                     pastImages: past,
                     pastControls: arrays[2],
-                    visionToPast: arrays[3]
+                    visionToPast: arrays[3], sampleToVision: arrays[4],
+                    currentTiming: arrays[6], pastTiming: arrays[7]
                 )
                 let uniqueLogits = validationModel.logits(temporalFeatures: temporalFeatures)
                 let logits = arrays[4].dim(0) == uniqueLogits.dim(0)
@@ -544,7 +581,8 @@ final class TrainingPerformanceTests: XCTestCase {
                     let logits = validationModel.logits(
                         currentVisualFeatures: currentFeatures,
                         pastImages: past,
-                        pastControls: arrays[2]
+                        pastControls: arrays[2],
+                        currentTiming: arrays[4], pastTiming: arrays[5]
                     )
                     return [validationModel.activatedPredictions(logits: logits)]
                 }
@@ -580,6 +618,32 @@ final class TrainingPerformanceTests: XCTestCase {
                     + "speedup=\(legacyInferenceSeconds / max(0.000_001, acceleratedInferenceSeconds)) "
                     + "max_prediction_delta=\(inferencePredictionDelta)"
             )
+
+            let cachedBatch = fusedInputs()
+            let cachedCurrent = validationModel.visualEmbedding(visualFeatures: validationModel.visualActivations(
+                images: VisionPreprocessor.mlxTensor(cachedBatch[0], spec: profile.preprocessing)[0..<1]).last!)
+            let cachedPast = validationModel.pastVisualEmbedding(visualFeatures: validationModel.pastVisualActivations(
+                images: VisionPreprocessor.mlxPastFrameTensor(cachedBatch[1], spec: pastSpec)[0..<1]
+                    .reshaped([frameCount, pastSpec.height, pastSpec.width, pastSpec.channelCount])).last!)
+                .reshaped([1, frameCount, profile.training.architecture.visualEmbedding])
+            let cachedHeadInputs = [cachedCurrent, cachedPast, cachedBatch[2][0..<1], cachedBatch[4][0..<1], cachedBatch[5][0..<1]]
+            MLX.eval(cachedHeadInputs)
+            let cachedHead = compile(inputs: [validationModel]) { arrays in
+                let features = validationModel.encodedTemporalFeatures(current: arrays[0], past: arrays[1],
+                    controls: arrays[2], currentTiming: arrays[3], pastTiming: arrays[4])
+                return [validationModel.activatedPredictions(logits: validationModel.logits(temporalFeatures: features))]
+            }
+            for _ in 0..<3 { MLX.eval(cachedHead(cachedHeadInputs)) }
+            var headMilliseconds: [Double] = []
+            for _ in 0..<64 {
+                let began = ContinuousClock.now
+                MLX.eval(cachedHead(cachedHeadInputs))
+                headMilliseconds.append(began.duration(to: .now).benchmarkSeconds * 1_000)
+            }
+            headMilliseconds.sort()
+            let headP95 = headMilliseconds[Int(Double(headMilliseconds.count - 1) * 0.95)]
+            XCTAssertLessThan(headP95, 1_000 / 60, "The cached single-decision head must fit a 60 Hz action budget.")
+            print("CACHED_ACTION_HEAD_BENCHMARK profile=\(profileName) p50_ms=\(headMilliseconds[headMilliseconds.count / 2]) p95_ms=\(headP95)")
 
             func runSustainedBenchmark(
                 path: String,
@@ -668,7 +732,7 @@ final class TrainingPerformanceTests: XCTestCase {
                 optimizer: fusedOptimizer
             )
 
-            // Exercise the complete Policy-v6 production objective as a
+            // Exercise the complete Policy-v7 production objective as a
             // separate hardware gate. The core benchmark above isolates the
             // deduplicated encoder optimization; this path adds shared visual
             // per-sample augmentation, multi-horizon actions, future latent dynamics, and
@@ -715,7 +779,9 @@ final class TrainingPerformanceTests: XCTestCase {
                     .init([batchSize, horizonCount], dtype: .float32),
                     .init([batchSize, currentBytesPerSample], dtype: .uint8),
                     .init([batchSize], dtype: .int32),
-                    .init([batchSize], dtype: .float32)
+                    .init([batchSize], dtype: .float32),
+                    .init([batchSize, TemporalInputContract.valueCount], dtype: .float32),
+                    .init([batchSize, frameCount, TemporalInputContract.valueCount], dtype: .float32)
                 ]) { destinations in
                     fullCurrentData.withUnsafeBytes { destinations[0].copyMemory(from: $0) }
                     fullPastData.withUnsafeBytes { destinations[1].copyMemory(from: $0) }
@@ -729,6 +795,8 @@ final class TrainingPerformanceTests: XCTestCase {
                     fullCurrentData.withUnsafeBytes { destinations[9].copyMemory(from: $0) }
                     futureMapData.withUnsafeBytes { destinations[10].copyMemory(from: $0) }
                     futureStateMaskData.withUnsafeBytes { destinations[11].copyMemory(from: $0) }
+                    decisionTimingData.withUnsafeBytes { destinations[12].copyMemory(from: $0) }
+                    historicalTimingData.withUnsafeBytes { destinations[13].copyMemory(from: $0) }
                 }
             }
             let augmentedImmediateModel = AgentPolicy(profile: profile)
@@ -768,7 +836,8 @@ final class TrainingPerformanceTests: XCTestCase {
                     let temporalFeatures = candidate.temporalFeatures(
                         currentImages: values[0],
                         pastImages: values[1],
-                        pastControls: values[2]
+                        pastControls: values[2],
+                        currentTiming: values[3], pastTiming: values[4]
                     )
                     return [candidate.loss(
                         logits: candidate.logits(temporalFeatures: temporalFeatures),
@@ -777,7 +846,7 @@ final class TrainingPerformanceTests: XCTestCase {
                         previousTargets: actions[0..., 1, 0...],
                         sampleWeights: arrays[6]
                     )]
-                }(augmentedImmediateModel, [current, past, arrays[2]])
+                }(augmentedImmediateModel, [current, past, arrays[2], arrays[12], arrays[13]])
                 augmentedImmediateOptimizer.update(
                     model: augmentedImmediateModel,
                     gradients: result.1,
@@ -834,7 +903,7 @@ final class TrainingPerformanceTests: XCTestCase {
                     let temporalFeatures = candidate.temporalFeatures(
                         currentImages: values[0], pastImages: values[1],
                         pastControls: values[2], visionToPast: nil,
-                        sampleToVision: nil
+                        sampleToVision: nil, currentTiming: values[4], pastTiming: values[5]
                     )
                     let fused = candidate.fusedFeatures(temporalFeatures: temporalFeatures)
                     let immediate = candidate.loss(
@@ -867,7 +936,7 @@ final class TrainingPerformanceTests: XCTestCase {
                         + futureActionWeight * futureAction
                         + futureStateWeight * futureState
                     return [total]
-                }(auxiliaryModel, [current, past, arrays[2], futureImages])
+                }(auxiliaryModel, [current, past, arrays[2], futureImages, arrays[12], arrays[13]])
                 auxiliaryOptimizer.update(
                     model: auxiliaryModel, gradients: result.1,
                     targetType: auxiliaryModel.dtype,
@@ -924,7 +993,7 @@ final class TrainingPerformanceTests: XCTestCase {
                 withRandomState(auxiliaryRandomState) { auxiliaryStep(arrays) }
             }
             runSustainedBenchmark(
-                path: "policy-v6-full",
+                path: "policy-v7-full",
                 steps: sustainedSteps,
                 step: auxiliarySustainedStep,
                 inputs: auxiliaryInputs,
