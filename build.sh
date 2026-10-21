@@ -32,49 +32,16 @@ if [[ ! -w "$APP_PARENT" ]]; then
   exit 1
 fi
 
-# Stable signing preserves the app's designated requirement and therefore its
-# Screen Recording, Input Monitoring, and Accessibility grants. Prefer the
-# identity already used by the installed app; otherwise use the first valid
-# identity in the selected keychain search scope.
-if [[ -n "$SIGN_KEYCHAIN" ]]; then
-  IDENTITIES="$(security find-identity -v -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null || true)"
-else
-  IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
-fi
-if [[ -z "$SIGN_IDENTITY" && -d "$APP" ]]; then
-  CURRENT_AUTHORITY="$(codesign -d --verbose=4 "$APP" 2>&1 | awk -F= '/^Authority=/{print $2; exit}' || true)"
-  if [[ -n "$CURRENT_AUTHORITY" ]] && grep -Fq "\"$CURRENT_AUTHORITY\"" <<< "$IDENTITIES"; then
-    SIGN_IDENTITY="$CURRENT_AUTHORITY"
-  fi
-fi
-if [[ -z "$SIGN_IDENTITY" ]]; then
-  SIGN_IDENTITY="$(print -r -- "$IDENTITIES" | awk -F'"' '/^[[:space:]]*[0-9]+\)/ { print $2; exit }')"
-fi
-if [[ -z "$SIGN_IDENTITY" ]]; then
-  if [[ "${ALLOW_ADHOC_SIGNING:-0}" == "1" ]]; then
-    SIGN_IDENTITY="-"
-  else
-    echo "No stable code-signing identity was found. Set CODE_SIGN_IDENTITY (and optionally CODE_SIGN_KEYCHAIN), or use ALLOW_ADHOC_SIGNING=1 for a disposable build that will need fresh permissions." >&2
-    exit 1
-  fi
-fi
+# Resolve an exact certificate and retain the app's permission identity across
+# clean builds. Never fall back to a different identity or to ad-hoc signing.
+source "$ROOT/scripts/signing.sh"
+configure_signing
 
-# `find-identity` can see identities in a locked non-default keychain, while
-# codesign cannot use their private keys. Discover the identity's keychain
-# without relying on a machine-specific path, then unlock it. Local development
-# keychains commonly use an empty password; protected keychains can provide
-# CODE_SIGN_KEYCHAIN_PASSWORD.
-if [[ "$SIGN_IDENTITY" != "-" && -z "$SIGN_KEYCHAIN" ]]; then
-  for candidate in "${(@f)$(security list-keychains -d user | sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//')}"; do
-    if security find-identity -v -p codesigning "$candidate" 2>/dev/null | grep -Fq "\"$SIGN_IDENTITY\""; then
-      SIGN_KEYCHAIN="$candidate"
-      break
-    fi
-  done
-fi
 SIGN_KEYCHAIN_ARGUMENTS=()
 if [[ -n "$SIGN_KEYCHAIN" ]]; then
-  security unlock-keychain -p "${CODE_SIGN_KEYCHAIN_PASSWORD:-}" "$SIGN_KEYCHAIN" >/dev/null 2>&1 || true
+  if [[ -n "${CODE_SIGN_KEYCHAIN_PASSWORD:-}" ]]; then
+    security unlock-keychain -p "$CODE_SIGN_KEYCHAIN_PASSWORD" "$SIGN_KEYCHAIN"
+  fi
   SIGN_KEYCHAIN_ARGUMENTS=(--keychain "$SIGN_KEYCHAIN")
 fi
 
@@ -170,7 +137,8 @@ mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
 /bin/cp "$METALLIB" "$STAGED_APP/Contents/MacOS/mlx.metallib"
 /bin/cp "$METALLIB" "$STAGED_APP/Contents/Resources/mlx.metallib"
 sign_app_bundle "$STAGED_APP"
-codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
+verify_permission_identity "$STAGED_APP"
+save_signing_pin
 
 # Copy onto the target volume first, then swap complete bundles. A failed copy,
 # move, or signature check restores the previous installation.
@@ -180,7 +148,7 @@ INCOMING="$APP_PARENT/.AgentTrainer Build Incoming.$$.app"
 BACKUP="$APP_PARENT/.AgentTrainer Build Backup.$$.app"
 rm -rf "$INCOMING" "$BACKUP"
 /usr/bin/ditto --rsrc --extattr "$STAGED_APP" "$INCOMING"
-codesign --verify --deep --strict --verbose=2 "$INCOMING"
+verify_permission_identity "$INCOMING"
 
 if [[ "$APP_WAS_PRESENT" == "1" ]]; then
   /bin/mv "$APP" "$BACKUP"
@@ -190,7 +158,7 @@ if [[ "$APP_WAS_PRESENT" == "1" ]]; then
     fi
     exit 1
   fi
-  if ! codesign --verify --deep --strict --verbose=2 "$APP"; then
+  if ! verify_permission_identity "$APP"; then
     rm -rf "$APP"
     if ! /bin/mv "$BACKUP" "$APP"; then
       echo "Signature verification failed. The previous app remains at $BACKUP and must be restored manually." >&2
@@ -202,7 +170,7 @@ if [[ "$APP_WAS_PRESENT" == "1" ]]; then
   fi
 else
   /bin/mv "$INCOMING" "$APP"
-  if ! codesign --verify --deep --strict --verbose=2 "$APP"; then
+  if ! verify_permission_identity "$APP"; then
     rm -rf "$APP"
     exit 1
   fi
@@ -214,7 +182,7 @@ rm -rf "$OUTPUTS/AgentTrainer.app"
 SOURCE_ARCHIVE="$OUTPUTS/AgentTrainer-Source.zip"
 rm -f "$SOURCE_ARCHIVE"
 cd "$ROOT"
-/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources build.sh test.sh benchmark.sh README.md DEVELOPMENT_GUIDE.md RELEASE_NOTES_2.46.md -x '*.DS_Store'
+/usr/bin/zip -qry "$SOURCE_ARCHIVE" Package.swift Package.resolved Sources Tests Resources build.sh test.sh benchmark.sh scripts AGENTS.md README.md DEVELOPMENT_GUIDE.md RELEASE_NOTES_*.md -x '*.DS_Store'
 
 DMG_STAGE="$BUILD_ROOT/DMG"
 DMG_APP="$DMG_STAGE/AgentTrainer.app"
@@ -228,7 +196,7 @@ rm -rf "$DMG_APP/Contents/_CodeSignature"
 rm -f "$DMG_APP/Contents/Resources/mlx.metallib"
 xcrun strip -x -S "$DMG_APP/Contents/MacOS/AgentTrainer"
 sign_app_bundle "$DMG_APP"
-codesign --verify --deep --strict --verbose=2 "$DMG_APP"
+verify_permission_identity "$DMG_APP"
 ln -s /Applications "$DMG_STAGE/Applications"
 hdiutil create -quiet -volname "AgentTrainer $VERSION" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG"
 if [[ "$SIGN_IDENTITY" != "-" ]]; then
@@ -252,3 +220,4 @@ echo "Installed app: $APP"
 echo "Disk image: $DMG ($DMG_BYTES bytes)"
 echo "Installation: $([[ "$APP_WAS_PRESENT" == "1" ]] && echo 'replaced transactionally' || echo 'created')"
 echo "Signed with: $SIGN_IDENTITY"
+if [[ "$SIGN_IDENTITY" != "-" ]]; then echo "Permission identity pinned: $SIGN_STATE"; fi

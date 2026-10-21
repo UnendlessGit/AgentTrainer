@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.46. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.47. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -271,3 +271,5 @@ Before release:
 9. Confirm no machine-specific paths, signing identities, generated files, or user data entered the source archive.
 
 `build.sh` creates a fully signed staging bundle, transactionally installs it into `/Applications/AgentTrainer.app` by default, and then packages the DMG/source/checksums. Override the install path with `APP_PATH`; override signing with `CODE_SIGN_IDENTITY` and optionally `CODE_SIGN_KEYCHAIN`.
+
+`scripts/signing.sh` resolves exact usable certificate fingerprints, rejects revoked/ambiguous identities, and pins the certificate and designated requirement outside the checkout in `~/Library/Application Support/AgentTrainer/BuildSigning`. Never fall back to another certificate or ad-hoc signing when the pinned key is unavailable. Before replacement and after DMG stripping/signing, require the same designated requirement as the installed app and saved pin. Explicit certificate renewal must pass that same check. Keep these machine-local pins and private keys out of source/distribution archives. Run `zsh scripts/test-signing.sh` for focused signing regressions (also included in `test.sh`).

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="${0:A:h}"
 cd "$ROOT"
+zsh "$ROOT/scripts/test-signing.sh"
 
 # Test sessions must never publish training artifacts into the user library.
 TEST_WORKSPACE="$(mktemp -d "${TMPDIR:-/tmp}/agenttrainer-tests.XXXXXX")"

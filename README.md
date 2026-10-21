@@ -1,8 +1,10 @@
-# AgentTrainer 2.46
+# AgentTrainer 2.47
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training behavioral cloning policies with MLX, and running those policies with explicit safety controls.
 
 Recordings, models, settings, and diagnostics stay on the Mac. Network use is limited to the public GitHub Releases check. AgentTrainer does not upload training data or telemetry.
+
+Download the signed macOS installer from the [latest GitHub Release](https://github.com/UnendlessGit/AgentTrainer/releases/latest). Version 2.47 preserves the app's signing identity across rebuilds and updates. On this Mac, updates signed with the same identity should retain existing privacy permissions. A new Mac still needs permissions granted once; building from source requires your own signing key.
 
 ## Requirements
 
@@ -129,17 +131,19 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.46.dmg`
+- `AgentTrainer-2.47.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 
-The build reuses the installed app's signing identity when available. You can select one explicitly:
+The build selects an exact, usable certificate fingerprint, excluding revoked certificates. It reuses the installed app's signing identity and saves a machine-local certificate/permission-identity pin in `~/Library/Application Support/AgentTrainer/BuildSigning`. This survives clean builds and repository updates. Every installed and packaged bundle must retain that same designated requirement; a missing key or identity change stops the build before replacement instead of silently resetting permissions. Keep using `./build.sh` and the same installed app path for future updates.
+
+You can select a certificate explicitly (an exact SHA-1 fingerprint is preferred when names are duplicated):
 
 ```sh
 CODE_SIGN_IDENTITY="Developer ID Application: Example" ./build.sh
 ```
 
-Set `CODE_SIGN_KEYCHAIN` when the identity is outside the normal keychain search list. Use `APP_PATH` to install into another Applications folder. `ALLOW_ADHOC_SIGNING=1` is intended only for disposable development builds because an ad-hoc identity changes between builds and macOS permissions may need to be granted again.
+Set `CODE_SIGN_KEYCHAIN` when the identity is outside the normal keychain search list; unlock it normally or provide `CODE_SIGN_KEYCHAIN_PASSWORD` for a protected build keychain. Use `APP_PATH` to install into another Applications folder. `ALLOW_ADHOC_SIGNING=1` is intended only for disposable development builds without an existing stable permission identity. It cannot override an installed identity or a saved pin. Certificate renewal can be selected explicitly, but must preserve the designated requirement. The pin contains public certificate/requirement information, never private keys, and is excluded from distribution artifacts.
 
 ## Data and privacy
 
