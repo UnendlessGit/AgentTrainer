@@ -15,6 +15,9 @@ final class AgentPolicy: Module, @unchecked Sendable {
     let profile: AIProfile
     let contextSchema: ModelContextSchema
     let dtype: DType
+    private let legacyMovementFeedback: Bool
+    private let _movementSensitivity: Float
+    static let maximumHistoryGain: Float = 0.4
     // Leading underscore deliberately keeps this deterministic tensor out of
     // MLX Module reflection. It is an input buffer, not a learned parameter;
     // putting it in AdamW would waste two Float32 moment arrays and allow
@@ -45,9 +48,15 @@ final class AgentPolicy: Module, @unchecked Sendable {
     @ModuleInfo var modifierHead: Linear
     @ModuleInfo var futureActionHead: Linear
     @ModuleInfo var futureStateHead: Linear
+    @ModuleInfo var movementIntentHead: Linear
+    @ModuleInfo var futureMovementIntentHead: Linear
+    @ModuleInfo var movementHistoryAttention: Linear
+    @ModuleInfo var movementHistoryGain: Linear
     @ModuleInfo var dropout: Dropout
 
-    init(profile: AIProfile, contextSchema: ModelContextSchema = .empty) {
+    init(profile: AIProfile, contextSchema: ModelContextSchema = .empty, legacyMovementFeedback: Bool = false, movementSensitivity: Double = 1) {
+        self.legacyMovementFeedback = legacyMovementFeedback
+        _movementSensitivity = Float(movementSensitivity.isFinite ? min(100, max(0.01, movementSensitivity)) : 1)
         self.profile = profile
         self.contextSchema = contextSchema
         dtype = switch profile.training.precision {
@@ -135,6 +144,10 @@ final class AgentPolicy: Module, @unchecked Sendable {
             fusionInput + ActionLayout.count,
             architecture.visualEmbedding
         )
+        movementIntentHead = Linear(fusionInput, 2)
+        futureMovementIntentHead = Linear(fusionInput, 2 * FutureActionPredictionConfiguration.maximumHorizonCount)
+        movementHistoryAttention = Linear(fusionInput, 2 * (1 + profile.training.effectiveTemporalVision.pastFrameCount))
+        movementHistoryGain = Linear(fusionInput, 2)
         dropout = Dropout(p: Float(min(0.999, max(0, architecture.dropout))))
         super.init()
         if dtype != .float32 { update(parameters: mapParameters { $0.asType(self.dtype) }) }
@@ -515,8 +528,12 @@ final class AgentPolicy: Module, @unchecked Sendable {
             dtype: dtype
         )
         let keep = training ? MLXRandom.bernoulli(Float(0.5), [current.dim(0), 1]).asType(.float32) : nil
-        return concatenated([current, emptyTemporalState,
+        let decision = concatenated([current, emptyTemporalState,
             timingEmbedding(currentTiming, batch: current.dim(0), keep: keep)], axis: -1)
+        let motor = concatenated([current, emptyTemporalState,
+            timingEmbedding(motorTiming(currentTiming), batch: current.dim(0), keep: keep)], axis: -1)
+        let history = movementHistory(current: currentTiming, past: nil, batch: current.dim(0), keep: keep)
+        return concatenated([decision, motor, history], axis: -1)
     }
 
     func temporalFeatures(
@@ -674,21 +691,71 @@ final class AgentPolicy: Module, @unchecked Sendable {
             }
             timing = timing.take(sampleToVision, axis: 0)
         }
-        let temporalTiming = timingEmbedding(timing, batch: batch, keep: controlKeep)
-        let temporalSteps = concatenated([pastEmbedding, controls, temporalTiming], axis: -1)
+        // Both streams reuse the CNN and learned recurrent/fusion weights.
+        // Only the motor stream excludes cursor/movement/scroll history, so
+        // its own continuous commands cannot become evidence for another turn.
+        let fullSteps = concatenated([pastEmbedding, controls,
+            timingEmbedding(timing, batch: batch, keep: controlKeep)], axis: -1)
+        let motorSteps = concatenated([pastEmbedding, motorControls(controls),
+            timingEmbedding(motorTiming(timing), batch: batch, keep: controlKeep)], axis: -1)
+        let steps = concatenated([fullSteps, motorSteps], axis: 0)
         let recurrent: MLXArray
-        if let gru {
-            recurrent = gru(temporalSteps)[.ellipsis, -1, 0...]
-        } else if let lstm {
-            recurrent = lstm(temporalSteps).0[.ellipsis, -1, 0...]
-        } else {
-            recurrent = MLXArray.zeros(
-                [batch, profile.training.architecture.recurrentWidth],
-                dtype: dtype
-            )
+        if let gru { recurrent = gru(steps)[.ellipsis, -1, 0...] }
+        else if let lstm { recurrent = lstm(steps).0[.ellipsis, -1, 0...] }
+        else { recurrent = MLXArray.zeros([2 * batch, profile.training.architecture.recurrentWidth], dtype: dtype) }
+        let currentKeep = controlKeep?.reshaped([batch, 1])
+        let decision = concatenated([currentVisualEmbedding, recurrent[0..<batch],
+            timingEmbedding(currentTiming, batch: batch, keep: currentKeep)], axis: -1)
+        let motor = concatenated([currentVisualEmbedding, recurrent[batch..<(2 * batch)],
+            timingEmbedding(motorTiming(currentTiming), batch: batch, keep: currentKeep)], axis: -1)
+        let history = movementHistory(current: currentTiming, past: timing, batch: batch, keep: currentKeep)
+        return concatenated([decision, motor, history], axis: -1)
+    }
+
+    /// Each history window is a non-expanding average of actual posted deltas.
+    /// Never amplify a short/jittered interval. Runtime sensitivity is removed
+    /// before reuse so the closed feedback gain remains bounded at any setting.
+    private func movementHistory(current: MLXArray?, past: MLXArray?, batch: Int, keep: MLXArray?) -> MLXArray {
+        func window(_ values: MLXArray) -> MLXArray {
+            let values = values.asType(.float32)
+            let seconds = exp(clip(values[.ellipsis, 2..<3], min: 0, max: 2) * Float(Foundation.log(61.0))) - 1
+            let nominal = Float(1 / max(0.0001, profile.training.actionFPS))
+            let valid = ((values[.ellipsis, 0..<1] .> 0) .&& (values[.ellipsis, 3..<4] .> 0) .&& (seconds .> 0)).asType(.float32)
+            // Rates retain raw magnitude beyond the displacement clip. Decode
+            // in Float32, average long windows, and never enlarge short ones.
+            let rate = values[.ellipsis, (TemporalInputContract.motionOffset + 2)..<(TemporalInputContract.motionOffset + 4)]
+            let signedRate = sign(rate) * (exp(minimum(abs(rate), Float(Foundation.log1p(1e12)))) - 1)
+            let delta = clip(signedRate * minimum(seconds, nominal) / _movementSensitivity, min: -1, max: 1) * valid
+            return concatenated([delta, valid], axis: -1)
         }
-        return concatenated([currentVisualEmbedding, recurrent,
-            timingEmbedding(currentTiming, batch: batch, keep: controlKeep?.reshaped([batch, 1]))], axis: -1)
+        let current = current ?? MLXArray.zeros([batch, TemporalInputContract.valueCount], dtype: .float32)
+        var windows = [window(current).expandedDimensions(axis: 1)]
+        let count = profile.training.effectiveTemporalVision.pastFrameCount
+        if count > 0 {
+            windows.append(window(past ?? MLXArray.zeros([batch, count, TemporalInputContract.valueCount], dtype: .float32)))
+        }
+        var history = concatenated(windows, axis: 1).reshaped([batch, 3 * (count + 1)])
+        if let keep { history = history * keep.asType(.float32) }
+        return history.asType(dtype)
+    }
+
+    /// Preserve discrete held/edge durations and observation clocks. Full
+    /// motion timing remains available to decision/predictive learning. Motor
+    /// base and stopping confidence are independent of continuous feedback;
+    /// the explicit bounded history path is the only motion reuse.
+    private func motorTiming(_ values: MLXArray?) -> MLXArray? {
+        guard let values, !legacyMovementFeedback else { return values }
+        return concatenated([values[.ellipsis, 0..<16],
+            MLXArray.zeros(like: values[.ellipsis, 16..<18]),
+            values[.ellipsis, 18..<TemporalInputContract.motionOffset],
+            MLXArray.zeros(like: values[.ellipsis, TemporalInputContract.motionOffset...])], axis: -1)
+    }
+
+    private func motorControls(_ values: MLXArray) -> MLXArray {
+        guard !legacyMovementFeedback else { return values }
+        return concatenated([MLXArray.zeros(like: values[.ellipsis, 0..<4]),
+            values[.ellipsis, 4..<12], MLXArray.zeros(like: values[.ellipsis, 12..<14]),
+            values[.ellipsis, 14...]], axis: -1)
     }
 
     /// Duration projection accumulates in Float32 even for a low-bit visual
@@ -709,7 +776,11 @@ final class AgentPolicy: Module, @unchecked Sendable {
         contextValues: MLXArray? = nil,
         sampleToVision: MLXArray? = nil
     ) -> MLXArray {
-        var fused = temporalFeatures
+        let width = profile.training.architecture.visualEmbedding + profile.training.architecture.recurrentWidth + TemporalInputContract.embeddingWidth
+        let historyWidth = 3 * (1 + profile.training.effectiveTemporalVision.pastFrameCount)
+        precondition(temporalFeatures.dim(-1) == 2 * width + historyWidth)
+        let batch = temporalFeatures.dim(0)
+        var fused = concatenated([temporalFeatures[.ellipsis, 0..<width], temporalFeatures[.ellipsis, width..<(2 * width)]], axis: 0)
         if contextSchema.inputValueCount > 0 {
             var context = contextValues ?? MLXArray.zeros(
                 [temporalFeatures.dim(0), contextSchema.inputValueCount],
@@ -730,7 +801,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
                 }
                 context = context.take(sampleToVision, axis: 0)
             }
-            fused = concatenated([fused, context.asType(dtype)], axis: -1)
+            let pairedContext = concatenated([context, context], axis: 0).asType(dtype)
+            fused = concatenated([fused, pairedContext], axis: -1)
         }
         for (index, layer) in fusion.enumerated() {
             fused = layer(fused)
@@ -739,13 +811,38 @@ final class AgentPolicy: Module, @unchecked Sendable {
             }
             fused = dropout(silu(fused))
         }
-        return fused
+        return concatenated([fused[0..<batch], fused[batch..<(2 * batch)], temporalFeatures[.ellipsis, (2 * width)...]], axis: -1)
+    }
+
+    private var fusionWidth: Int {
+        profile.training.architecture.fusionWidths.last ?? (profile.training.architecture.visualEmbedding + profile.training.architecture.recurrentWidth + TemporalInputContract.embeddingWidth + contextSchema.inputValueCount)
+    }
+    private func decisionFeatures(_ features: MLXArray) -> MLXArray { features[.ellipsis, 0..<fusionWidth] }
+    private func motorFeatures(_ features: MLXArray) -> MLXArray { features[.ellipsis, fusionWidth..<(2 * fusionWidth)] }
+
+    /// Weights and gain depend on visual/discrete/clock context, never on the
+    /// motion being fed back. Convex attention and gain < 0.5 prevent both
+    /// amplification and a one-pixel rounding fixed point at sensitivity 1.
+    private func relativeLogits(_ raw: MLXArray, fused: MLXArray) -> MLXArray {
+        guard !legacyMovementFeedback, profile.training.effectiveMovementHistoryMode == .bounded else { return raw }
+        let count = 1 + profile.training.effectiveTemporalVision.pastFrameCount
+        let history = fused[.ellipsis, (2 * fusionWidth)...].asType(.float32).reshaped([fused.dim(0), count, 3])
+        let motor = motorFeatures(fused)
+        let attention = movementHistoryAttention(motor).asType(.float32).reshaped([fused.dim(0), count, 2])
+        let valid = history[.ellipsis, 2..<3] .> 0
+        let weights = softmax(which(valid, attention, MLXArray(Float(-10_000))), axis: 1)
+        var prior = (weights * history[.ellipsis, 0..<2]).sum(axis: 1)
+            * (Self.maximumHistoryGain * sigmoid(movementHistoryGain(motor).asType(.float32)))
+        if raw.ndim == 3 { prior = prior.expandedDimensions(axis: 1) }
+        let combined = clip(tanh(raw.asType(.float32)) + prior, min: -0.9999, max: 0.9999)
+        return (0.5 * log((1 + combined) / (1 - combined))).asType(dtype)
     }
 
     func logits(fusedFeatures fused: MLXArray) -> MLXArray {
+        let decision = decisionFeatures(fused), motor = motorFeatures(fused)
         return concatenated([
-            absoluteMouseHead(fused), relativeMouseHead(fused), buttonHead(fused),
-            scrollHead(fused), keyboardHead(fused), modifierHead(fused)
+            absoluteMouseHead(motor), relativeLogits(relativeMouseHead(motor), fused: fused), buttonHead(decision),
+            scrollHead(motor), keyboardHead(decision), modifierHead(decision), movementIntentHead(motor)
         ], axis: -1)
     }
 
@@ -766,11 +863,15 @@ final class AgentPolicy: Module, @unchecked Sendable {
     }
 
     func futureActionLogits(fusedFeatures: MLXArray) -> MLXArray {
-        futureActionHead(fusedFeatures).reshaped([
-            fusedFeatures.dim(0),
-            FutureActionPredictionConfiguration.maximumHorizonCount,
-            ActionLayout.count
-        ])
+        let batch = fusedFeatures.dim(0)
+        let streams = concatenated([decisionFeatures(fusedFeatures), motorFeatures(fusedFeatures)], axis: 0)
+        let raw = futureActionHead(streams).reshaped([2 * batch,
+            FutureActionPredictionConfiguration.maximumHorizonCount, ActionLayout.count])
+        let decision = raw[0..<batch], motor = raw[batch..<(2 * batch)]
+        let intent = futureMovementIntentHead(motorFeatures(fusedFeatures)).reshaped([batch,
+            FutureActionPredictionConfiguration.maximumHorizonCount, 2])
+        return concatenated([motor[.ellipsis, 0..<2], relativeLogits(motor[.ellipsis, 2..<4], fused: fusedFeatures), decision[.ellipsis, 4..<12],
+            motor[.ellipsis, 12..<14], decision[.ellipsis, 14...], intent], axis: -1)
     }
 
     func futureStateDelta(
@@ -778,7 +879,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
         currentActions: MLXArray
     ) -> MLXArray {
         futureStateHead(concatenated([
-            fusedFeatures,
+            decisionFeatures(fusedFeatures),
             currentActions.asType(dtype)
         ], axis: -1))
     }
@@ -826,12 +927,19 @@ final class AgentPolicy: Module, @unchecked Sendable {
     func activatedPredictions(logits: MLXArray) -> MLXArray {
         concatenated([
             sigmoid(logits[.ellipsis, ActionLayout.absoluteMouse]),
-            tanh(logits[.ellipsis, ActionLayout.relativeMouse]),
+            tanh(logits[.ellipsis, ActionLayout.relativeMouse]) * movementIntent(logits: logits),
             sigmoid(logits[.ellipsis, ActionLayout.buttons]),
             tanh(logits[.ellipsis, ActionLayout.scroll]),
             sigmoid(logits[.ellipsis, ActionLayout.keyboard]),
             sigmoid(logits[.ellipsis, ActionLayout.modifiers])
         ], axis: -1)
+    }
+
+    private func movementIntent(logits: MLXArray) -> MLXArray {
+        guard !legacyMovementFeedback, logits.dim(-1) == PolicyLogitsLayout.count else {
+            return MLXArray.ones(like: logits[.ellipsis, ActionLayout.relativeMouse])
+        }
+        return (logits[.ellipsis, PolicyLogitsLayout.movementIntent] .> 0).asType(dtype)
     }
 
     func predictions(
@@ -938,7 +1046,21 @@ final class AgentPolicy: Module, @unchecked Sendable {
                 targets: targets[.ellipsis, ActionLayout.relativeMouse],
                 sampleWeights: sampleWeights
             )
-            losses.append((absolute + relative) / 2)
+            var movement = absolute + relative
+            if !legacyMovementFeedback, logits.dim(-1) == PolicyLogitsLayout.count {
+                let active = (abs(targets[.ellipsis, ActionLayout.relativeMouse].asType(.float32)) .>= (0.5 / GameCameraContract.deltaScale)).asType(dtype)
+                let intentLoss = binaryCrossEntropy(logits: logits[.ellipsis, PolicyLogitsLayout.movementIntent], targets: active, reduction: .none)
+                let classWeights = positiveWeights?[.ellipsis, ActionLayout.relativeMouse] ?? MLXArray.ones([2], dtype: dtype)
+                var weights = 1 + active * (classWeights - 1)
+                var normalization = weights
+                if let sampleWeights {
+                    let rows = sampleWeights.asType(dtype).reshaped([-1, 1])
+                    weights = weights * rows
+                    normalization = normalization * (rows .> 0).asType(dtype)
+                }
+                movement = movement + 0.25 * (intentLoss * weights).sum() / (normalization.sum() + 1e-6)
+            }
+            losses.append(movement / 2)
         }
         if channels.buttons { losses.append(binaryControlLoss(logits: logits, targets: targets, previous: previous, positiveWeights: positiveWeights, sampleWeights: sampleWeights, range: ActionLayout.buttons)) }
         if channels.scroll { losses.append(activeContinuousLoss(predictions: tanh(logits[.ellipsis, ActionLayout.scroll]), targets: targets[.ellipsis, ActionLayout.scroll], sampleWeights: sampleWeights)) }

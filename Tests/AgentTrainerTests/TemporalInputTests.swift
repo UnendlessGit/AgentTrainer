@@ -425,16 +425,16 @@ final class TemporalInputTests: XCTestCase {
     }
 
     func testImmutableCapabilitiesExcludeUntargetedButtonsAndBlockedKeys() {
-        var weights = [Float](repeating: 0, count: ActionLayout.count)
+        var weights = [Int](repeating: 0, count: ActionLayout.count)
         weights[ActionLayout.keyboard.lowerBound + 13] = 2
         weights[142] = 2
-        let capabilities = ModelOutputCapabilities.trained(positiveWeights: weights,
+        let capabilities = ModelOutputCapabilities.trained(positiveCounts: weights,
             channels: .all, restrictions: ActionRestrictions())
         XCTAssertEqual(capabilities.allowedKeyCodes, [13, 56])
         XCTAssertTrue(capabilities.allowedMouseButtons.isEmpty)
         XCTAssertFalse(capabilities.restricting(.all, mouseMode: .relative).buttons)
         weights[4] = 2
-        let blocked = ModelOutputCapabilities.trained(positiveWeights: weights, channels: .all,
+        let blocked = ModelOutputCapabilities.trained(positiveCounts: weights, channels: .all,
             restrictions: ActionRestrictions(blockedKeyCodes: [13, 60], blockedMouseButtons: [0]))
         XCTAssertTrue(blocked.allowedKeyCodes.isEmpty)
         XCTAssertTrue(blocked.allowedMouseButtons.isEmpty)

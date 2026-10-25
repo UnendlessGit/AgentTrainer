@@ -40,6 +40,6 @@ cp "$METALLIB" "$TEST_BUNDLE/Contents/MacOS/mlx.metallib"
 # them. Its persistent workspace permits exact interruption/resume, and an arm
 # that has reached epoch 20 is evaluated without starting another epoch block.
 export AGENTTRAINER_TEMPORAL_DATA_ROOT="${AGENTTRAINER_TEMPORAL_DATA_ROOT:-$HOME/Library/Application Support/AgentTrainer}"
-export AGENTTRAINER_WORKSPACE_ROOT="${AGENTTRAINER_TEMPORAL_WORKSPACE_ROOT:-$ROOT/work/temporal-evaluation-v7}"
+export AGENTTRAINER_WORKSPACE_ROOT="${AGENTTRAINER_TEMPORAL_WORKSPACE_ROOT:-$ROOT/work/temporal-evaluation-v8}"
 mkdir -p "$AGENTTRAINER_WORKSPACE_ROOT"
 swift test --build-system native -c release --skip-build --filter 'TemporalExperimentTests.testBladeBallTemporalAblation'

@@ -207,10 +207,13 @@ final class TrainingEngine: @unchecked Sendable {
             // the potentially large membership set and use the normal shuffle.
             return detected.count == split.train.count ? [] : detected
         }()
-        let positiveClassWeightValues = dataset.positiveClassWeights(
+        var positiveClassWeightValues = dataset.positiveClassWeights(
             at: split.train,
             restrictions: profile.effectiveRestrictions
         )
+        let intentWeights = dataset.movementIntentWeights(at: split.train)
+        for axis in 0..<2 { positiveClassWeightValues[2 + axis] = intentWeights[axis] }
+
         let validationSampleLimit = Self.recommendedValidationSampleLimit(
             total: split.validation.count,
             batchSize: profile.training.batchSize,
@@ -337,7 +340,7 @@ final class TrainingEngine: @unchecked Sendable {
         // The raw event stream is authoritative, including taps shorter than one
         // action interval. Refresh after restoring an older checkpoint.
         state.demonstratedKeyCodes = demonstratedKeys
-        state.outputCapabilities = ModelOutputCapabilities.trained(positiveWeights: positiveClassWeightValues,
+        state.outputCapabilities = ModelOutputCapabilities.trained(positiveCounts: dataset.binaryPositiveCounts(at: split.train),
             channels: profile.channels, restrictions: profile.effectiveRestrictions)
         // Legacy checkpoints did not persist sample-to-recording order. Preserve
         // their current epoch order, then make every subsequent save enforce it.
@@ -2065,13 +2068,14 @@ private struct BinaryValidationAccumulator {
     }
 }
 
-private struct ValidationAccumulator {
+struct ValidationAccumulator {
     let profile: AIProfile
     let activeBinaryIndices: Set<Int>
     private var binary = BinaryValidationAccumulator()
     private var buttons = BinaryValidationAccumulator()
     private var keyboard = BinaryValidationAccumulator()
     private var modifiers = BinaryValidationAccumulator()
+    private var movement = BinaryValidationAccumulator()
     private var absoluteError = 0.0
     private var absoluteCount = 0
     private var relativeError = 0.0
@@ -2137,6 +2141,10 @@ private struct ValidationAccumulator {
         for index in range {
             let prediction = predictions[base + index]
             let target = targets[base + index]
+            if isRelativeMouse {
+                movement.consume(predicted: (prediction * GameCameraContract.deltaScale).rounded() != 0,
+                    target: (target * GameCameraContract.deltaScale).rounded() != 0)
+            }
             if abs(target) > 0.0001 {
                 if isRelativeMouse {
                     relativeError += Double(abs(prediction - target))
@@ -2147,7 +2155,8 @@ private struct ValidationAccumulator {
                 }
             } else {
                 idleContinuousCount += 1
-                if abs(prediction) > 0.05 { idleContinuousFalseActions += 1 }
+                let scale: Float = isRelativeMouse ? GameCameraContract.deltaScale : 20
+                if (prediction * scale).rounded() != 0 { idleContinuousFalseActions += 1 }
             }
         }
     }
@@ -2164,7 +2173,8 @@ private struct ValidationAccumulator {
             activeScrollMAE: scrollCount > 0 ? scrollError / Double(scrollCount) : nil,
             idleContinuousFalseActionRate: idleContinuousCount > 0
                 ? Double(idleContinuousFalseActions) / Double(idleContinuousCount)
-                : nil
+                : nil,
+            movement: movement.metrics
         )
     }
 }

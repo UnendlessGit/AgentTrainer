@@ -1,10 +1,10 @@
-# AgentTrainer 2.50
+# AgentTrainer 2.51
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training behavioral cloning policies with MLX, and running those policies with explicit safety controls.
 
 Recordings, models, settings, and diagnostics stay on the Mac. Network use is limited to the public GitHub Releases check. AgentTrainer does not upload training data or telemetry.
 
-Download the signed macOS installer from the [latest GitHub Release](https://github.com/UnendlessGit/AgentTrainer/releases/latest). Version 2.50 preserves the app's signing identity across rebuilds and updates. On this Mac, updates signed with the same identity should retain existing privacy permissions. A new Mac still needs permissions granted once; building from source requires your own signing key.
+Download the signed macOS installer from the [latest GitHub Release](https://github.com/UnendlessGit/AgentTrainer/releases/latest). Version 2.51 preserves the app's signing identity across rebuilds and updates. On this Mac, updates signed with the same identity should retain existing privacy permissions. A new Mac still needs permissions granted once; building from source requires your own signing key.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ The capture-source picker refreshes while Record or Run is visible, and reacts i
 
 ## Compatibility
 
-Version 2.50 introduces Policy v7 (model schema 7, dataset schema 15). Existing recordings keep their original video and input bytes. Disposable training caches rebuild. Incompatible brains and checkpoints are preserved in the managed archive; profiles keep their architecture and temporal settings, and require retraining from their recordings. There is no exact v6-to-v7 optimizer resume or weight conversion. Exact pause/resume remains available within the new contract.
+Version 2.51 introduces Policy v8 (model schema 8). Existing recordings and schema-15 training caches remain compatible. Incompatible brains and checkpoints are preserved in the managed archive; profiles keep their architecture and temporal settings, and require retraining from their recordings. There is no exact v7-to-v8 optimizer resume or weight conversion. Exact pause/resume remains available within v8.
 
 Older DAgger/reinforcement-learning settings remain inactive. Saved supervision boundaries still allow earlier frames and held-control history as context while excluding earlier actions from labels. Training uses whole-recording held-out splits and equal recording emphasis.
 
@@ -54,7 +54,7 @@ Context is a generic user-defined categorical system. AgentTrainer does not ship
 - Training snapshots only fields and values actually observed in the AI's selected recordings. Each value occupies one stable categorical input; a missing field is an all-zero segment rather than an invented hidden category.
 - Run loads the immutable vocabulary from the selected brain. Every trained field appears blank so the current operating context can be chosen, and changes take effect on the next perception after stale temporal/action state is released. A brain trained without context shows no context controls.
 
-Context-free Policy-v7 brains omit the categorical tensor. Adding or changing trained categorical IDs changes the learned contract; renaming display labels does not.
+Context-free Policy-v8 brains omit the categorical tensor. Adding or changing trained categorical IDs changes the learned contract; renaming display labels does not.
 
 ## Temporal vision
 
@@ -69,13 +69,21 @@ The default context is four past frames, two perception intervals apart, at half
 
 ## Explicit temporal inputs
 
-Policy v7 receives elapsed time on every action decision, even when Past frames is `0`. Each supported key, modifier, and mouse button has held state, continuous hold age, press/release recency, last completed hold duration, interval edge counts, and held-time fraction. Mouse movement and scrolling include displacement, sample counts, first/last sample timing, observed spans, and real-time rates.
+Policy v8 receives elapsed time on every action decision, even when Past frames is `0`. Each supported key, modifier, and mouse button has held state, continuous hold age, press/release recency, last completed hold duration, interval edge counts, and held-time fraction. Mouse movement and scrolling include displacement, sample counts, first/last sample timing, observed spans, and real-time rates.
 
 Current and historical inputs also carry observation intervals, source-frame age, historical age/separation, and validity indicators. Unknown startup hold durations and missing history remain explicitly unknown. Nanosecond clocks are subtracted before conversion to Float32; short linear and longer logarithmic encodings preserve both taps and long holds. Event spans describe observed samples, not an inferred duration of physical device motion.
 
 The CNN runs at Perception FPS. A separate lightweight policy runs at Action FPS with cached visual embeddings, fresh timing, and feedback from the events actually posted after restrictions, clipping, and rounding. Two decisions sharing one image can therefore produce different actions. At 60 Action FPS the configured execution resolution is approximately 16.7 ms; this does not add arbitrary sub-tick HID scheduling.
 
-The local matched Blade Ball experiment used all 145 recordings, whole-recording held-out data, 60/60 FPS, 128×128 vision, focal gamma 0, and exactly 20 epochs per arm. Timing improved immediate held-out loss by 5.2% and relative mouse error by 13.8%. A controlled identical-image duration task reached 95.3% accuracy. Some real-data edge-timing and scroll errors worsened; offline results do not establish better gameplay. Method, full measurements, and input contracts are in [TEMPORAL_DESIGN.md](TEMPORAL_DESIGN.md).
+The earlier Policy-v7 matched Blade Ball experiment used all 145 recordings, whole-recording held-out data, 60/60 FPS, 128×128 vision, focal gamma 0, and exactly 20 epochs per arm. Timing improved immediate held-out loss by 5.2% and relative mouse error by 13.8%. A controlled identical-image duration task reached 95.3% accuracy. Some real-data edge-timing and scroll errors worsened; offline results do not establish better gameplay. Method, full measurements, and input contracts are in [TEMPORAL_DESIGN.md](TEMPORAL_DESIGN.md).
+
+## Mouse movement and stopping
+
+The movement-memory setting is saved with each trained brain. **Bounded movement history** retains recent executed movement through a limited, time-normalized history path. **Visual timing only** predicts mouse movement without feeding previous cursor, movement, or scroll values into its motor path. Both preserve real visual history, discrete-control timing, and observation clocks; the keyboard/button path still receives complete control history.
+
+Relative movement has separate learned per-axis activity decisions. They allow an exact stop rather than repeatedly posting a small regression residual. The bounded path cannot change these decisions, its own attention weights, or the independent base movement prediction. This limits direct feedback amplification; it does not guarantee stability of an arbitrary game or eliminate the need for representative demonstrations.
+
+Validation now reports mouse activity recall and idle false moves at the actual half-pixel rounding threshold for default 1× sensitivity. The opt-in `./benchmark-mouse.sh` compares two 20-epoch candidates trained only on real recordings and exercises production event posting into a private sink, including feedback from the commands actually posted. Recorded video cannot respond to those commands, so this check supplements a live-game comparison. Architecture, reproduction details, and measured limitations are in [MOVEMENT_CONTROL.md](MOVEMENT_CONTROL.md).
 
 ## Generalization and predictive learning
 
@@ -85,7 +93,7 @@ The AI editor independently configures three training-only features. None delays
 - **Future Action Prediction** predicts up to four configurable action horizons. Near horizons receive more weight, teaching intent and smoother continuation while the immediate head remains the sole runtime output.
 - **Future State Prediction** predicts an action-conditioned change in the learned visual state. It uses stopped-gradient latent targets and never generates future images; repeated future observations are deduplicated before encoding.
 
-The auxiliary heads have a fixed Policy-v7 layout, so these settings can warm-start compatible v7 brain weights. Conservative default loss weights passed a matched-update causal held-out test with no more than 1% immediate-policy loss drift while both auxiliary objectives improved.
+The auxiliary heads have a fixed Policy-v8 layout, so these settings can warm-start compatible v8 brain weights. Conservative default loss weights passed a matched-update causal held-out test with no more than 1% immediate-policy loss drift while both auxiliary objectives improved.
 
 ## Safety
 
@@ -116,7 +124,7 @@ Run the opt-in release benchmark for a compact fixture, the default vision/model
 ./benchmark.sh
 ```
 
-The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, cached action-head p50/p95 latency, and learning-quality deltas against the pre-optimization graph. It also executes the complete Policy-v7 objective—including independent per-sample augmentation and both predictive heads—and reports its overhead, memory, and thermal state. Default and temporal-stress runs report sustained windows for both the optimized core path and the full Policy-v7 objective. Low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
+The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, cached action-head p50/p95 latency, and learning-quality deltas against the pre-optimization graph. It also executes the complete Policy-v8 objective—including independent per-sample augmentation and both predictive heads—and reports its overhead, memory, and thermal state. Default and temporal-stress runs report sustained windows for both the optimized core path and the full Policy-v8 objective. Low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
 
 Run the optional local Blade Ball timing experiment (requires the existing 145-recording folder):
 
@@ -124,7 +132,15 @@ Run the optional local Blade Ball timing experiment (requires the existing 145-r
 ./benchmark-temporal.sh
 ```
 
-It writes isolated artifacts under ignored `work/temporal-evaluation-v7`, never modifies the original recordings or existing profiles, disables the step cap/repetition, and stops each arm after 20 epochs. Running it again evaluates completed arms without adding epochs.
+It writes isolated artifacts under ignored `work/temporal-evaluation-v8`, never modifies the original recordings or existing profiles, disables the step cap/repetition, and stops each arm after 20 epochs. Running it again evaluates completed arms without adding epochs.
+
+Run the local real-Reborn mouse-feedback comparison (requires the 39-recording fixture and preserved v7 reference):
+
+```sh
+./benchmark-mouse.sh
+```
+
+It uses ignored `work/mouse-comparison-v8`, trains each candidate for exactly 20 epochs, and evaluates completed candidates without further training. No global input is posted. See [MOVEMENT_CONTROL.md](MOVEMENT_CONTROL.md) for the feedback method and its limits.
 
 Build, sign, package, and install:
 
@@ -147,7 +163,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.50.dmg`
+- `AgentTrainer-2.51.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

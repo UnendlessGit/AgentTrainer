@@ -307,7 +307,9 @@ actor WorkspaceStore {
             }
             try saveProfile(profile)
         }
-        try clearCaches()
+        // Model v8 changes policy computation, not the schema-15 recording
+        // cache. Retain compatible packed data across this weight-only upgrade.
+        if (storedSchema ?? 1) < 7 { try clearCaches() }
         try atomicWrite(try encoder.encode(currentSchema), to: marker)
         try atomicWrite(try encoder.encode(currentSchema), to: auditMarker)
         return archived

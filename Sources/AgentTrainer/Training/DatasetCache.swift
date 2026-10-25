@@ -913,6 +913,23 @@ final class CachedDataset: @unchecked Sendable {
         return result
     }
 
+    /// Reduced copies of each action row's current observation. This supports
+    /// streaming encoder evaluation with the exact cached resize/packing path.
+    func reducedCurrentObservations(at indices: [Int]) -> Data {
+        let size = manifest.pastObservationBytesPerSample
+        var result = Data(count: indices.count * size)
+        guard size > 0 else { return result }
+        result.withUnsafeMutableBytes { destination in
+            pastObservations.withUnsafeBytes { source in
+                guard let output = destination.baseAddress, let input = source.baseAddress else { return }
+                for (row, sample) in indices.enumerated() {
+                    memcpy(output.advanced(by: row * size), input.advanced(by: observationIndex(at: sample, slot: 0) * size), size)
+                }
+            }
+        }
+        return result
+    }
+
     /// Returns every causal past frame at its native reduced resolution,
     /// ordered oldest to newest for each action sample.
     func pastPackedObservations(at indices: [Int]) -> Data {
@@ -1058,6 +1075,24 @@ final class CachedDataset: @unchecked Sendable {
             result[index] = min(1_024, max(1, Float(negatives) / Float(positives)))
         }
         return result
+    }
+
+    /// Confidence labels are the real per-axis movement targets. Balance their
+    /// positives separately from key/button loss so an idle classifier cannot
+    /// win simply by suppressing every movement. No labels are synthesized.
+    func movementIntentWeights(at indices: [Int]) -> [Float] {
+        var positives = [Int](repeating: 0, count: 2)
+        actions.withUnsafeBytes { bytes in
+            for row in indices {
+                for axis in 0..<2 {
+                    let bits = bytes.loadUnaligned(fromByteOffset: (row * ActionLayout.count + 2 + axis) * 4, as: UInt32.self).littleEndian
+                    if abs(Float(bitPattern: bits)) >= 0.5 / GameCameraContract.deltaScale { positives[axis] += 1 }
+                }
+            }
+        }
+        return positives.map { count in
+            count == 0 ? 1 : min(8, max(1, Float(indices.count - count) / Float(count)))
+        }
     }
 
     /// Finds action rows that carry substantially more learning signal than an

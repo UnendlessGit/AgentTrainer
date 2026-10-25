@@ -7,6 +7,7 @@ final class InputInjector: @unchecked Sendable {
 
     private let eventSink: @Sendable (CGEvent) -> Void
     private let cursorWarp: @Sendable (CGPoint) -> Void
+    private let associateCursor: @Sendable () -> Void
     private let monotonicClock: @Sendable () -> UInt64
     private let hidEventSource = CGEventSource(stateID: .hidSystemState)
     private let lock = NSLock()
@@ -56,11 +57,13 @@ final class InputInjector: @unchecked Sendable {
     init(
         eventSink: @escaping @Sendable (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
         cursorWarp: @escaping @Sendable (CGPoint) -> Void = { point in _ = CGWarpMouseCursorPosition(point) },
-        monotonicClock: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+        monotonicClock: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        associateCursor: @escaping @Sendable () -> Void = { _ = CGAssociateMouseAndMouseCursorPosition(1) }
     ) {
         self.eventSink = eventSink
         self.cursorWarp = cursorWarp
         self.monotonicClock = monotonicClock
+        self.associateCursor = associateCursor
         let origin = monotonicClock()
         decisionTimeline = CausalControlTimeline(origin: origin, censorInitialOnsets: false)
         perceptionTimeline = CausalControlTimeline(origin: origin, censorInitialOnsets: false)
@@ -271,7 +274,7 @@ final class InputInjector: @unchecked Sendable {
     }
 
     private func postNeutralGameCameraMove(at position: CGPoint) {
-        CGAssociateMouseAndMouseCursorPosition(1)
+        associateCursor()
         let neutralPoint = CGEvent(source: hidEventSource)?.location ?? position
         guard let neutral = CGEvent(mouseEventSource: hidEventSource, mouseType: .mouseMoved, mouseCursorPosition: neutralPoint, mouseButton: .left) else { return }
         neutral.setIntegerValueField(.mouseEventDeltaX, value: 0)

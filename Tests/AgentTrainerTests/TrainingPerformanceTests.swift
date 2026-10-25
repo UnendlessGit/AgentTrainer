@@ -228,7 +228,7 @@ final class TrainingPerformanceTests: XCTestCase {
             let visionToPastData = visionToPast.withUnsafeBytes { Data($0) }
             let mappingData = mapping.withUnsafeBytes { Data($0) }
             let actionData = actionRows.withUnsafeBytes { Data($0) }
-            // Non-zero, row-specific timing exercises the actual v7 projection
+            // Non-zero, row-specific timing exercises the actual v8 projection
             // and prevents a zero-input constant fold from hiding its cost.
             var decisionTiming = [Float](), historicalTiming = [Float]()
             for row in 0..<batchSize {
@@ -732,7 +732,7 @@ final class TrainingPerformanceTests: XCTestCase {
                 optimizer: fusedOptimizer
             )
 
-            // Exercise the complete Policy-v7 production objective as a
+            // Exercise the complete Policy-v8 production objective as a
             // separate hardware gate. The core benchmark above isolates the
             // deduplicated encoder optimization; this path adds shared visual
             // per-sample augmentation, multi-horizon actions, future latent dynamics, and
@@ -993,7 +993,7 @@ final class TrainingPerformanceTests: XCTestCase {
                 withRandomState(auxiliaryRandomState) { auxiliaryStep(arrays) }
             }
             runSustainedBenchmark(
-                path: "policy-v7-full",
+                path: "policy-v8-full",
                 steps: sustainedSteps,
                 step: auxiliarySustainedStep,
                 inputs: auxiliaryInputs,

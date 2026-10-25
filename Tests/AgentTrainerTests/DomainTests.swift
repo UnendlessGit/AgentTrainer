@@ -120,7 +120,7 @@ final class DomainTests: XCTestCase {
             actualParameterCount,
             ModelSizing.parameterCount(profile, contextSchema: schema)
         )
-        let temporal = MLXArray.zeros([2, 12 + TemporalInputContract.embeddingWidth], dtype: .float32)
+        let temporal = MLXArray.zeros([2, 2 * (12 + TemporalInputContract.embeddingWidth) + 3], dtype: .float32)
         let contexts = MLXArray([Float(1), 0, 0, 1], [2, 2])
         let conditioned = policy.fusedFeatures(
             temporalFeatures: temporal,
@@ -132,11 +132,11 @@ final class DomainTests: XCTestCase {
         )
         let implicitBlank = policy.fusedFeatures(temporalFeatures: temporal)
         MLX.eval(conditioned, blank, implicitBlank)
-        XCTAssertEqual(conditioned.shape, [2, 8])
+        XCTAssertEqual(conditioned.shape, [2, 19])
         XCTAssertEqual(blank.asArray(Float.self), implicitBlank.asArray(Float.self))
         let rows = conditioned.asArray(Float.self)
         XCTAssertGreaterThan(
-            zip(rows.prefix(8), rows.dropFirst(8).prefix(8)).map { abs($0 - $1) }.max() ?? 0,
+            zip(rows.prefix(8), rows.dropFirst(19).prefix(8)).map { abs($0 - $1) }.max() ?? 0,
             0.000_001
         )
     }
@@ -4460,7 +4460,7 @@ final class DomainTests: XCTestCase {
         let images = MLXRandom.uniform(low: -1, high: 1, inputs.current.shape).asType(.bfloat16)
         let past = inputs.past.asType(.bfloat16)
         let controls = inputs.controls.asType(.bfloat16)
-        let selector = MLXRandom.uniform(low: -1, high: 1, [3, ActionLayout.count]).asType(.bfloat16)
+        let selector = MLXRandom.uniform(low: -1, high: 1, [3, PolicyLogitsLayout.count]).asType(.bfloat16)
 
         func selectedLogits(_ model: AgentPolicy, _ arrays: [MLXArray], accelerated: Bool) -> MLXArray {
             let visual = model.visualActivations(
@@ -4824,9 +4824,9 @@ final class DomainTests: XCTestCase {
             )
             return (logits * inputs[3]).sum()
         }, argumentNumbers: [0])
-        var selectorValues = [Float](repeating: 0, count: ActionLayout.count)
+        var selectorValues = [Float](repeating: 0, count: PolicyLogitsLayout.count)
         selectorValues[ActionLayout.keyboard.lowerBound] = 1
-        let selector = MLXArray(selectorValues, [1, ActionLayout.count])
+        let selector = MLXArray(selectorValues, [1, PolicyLogitsLayout.count])
         let expected = standard(packedCurrent, packedPast, controls)
         let activityResults = activities.map { $0([packedCurrent, packedPast, controls]) }
         let channelResult = channels([packedCurrent, packedPast, controls])
@@ -5020,7 +5020,7 @@ final class DomainTests: XCTestCase {
             positiveWeights: classWeights
         )
         MLX.eval(immediate, futureActionLoss, futureStateLoss, maskedActionLoss)
-        XCTAssertEqual(immediate.shape, [batch, ActionLayout.count])
+        XCTAssertEqual(immediate.shape, [batch, PolicyLogitsLayout.count])
         XCTAssertTrue(futureActionLoss.item(Float.self).isFinite)
         XCTAssertTrue(futureStateLoss.item(Float.self).isFinite)
         XCTAssertGreaterThanOrEqual(futureActionLoss.item(Float.self), 0)

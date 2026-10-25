@@ -129,6 +129,7 @@ final class AppModel: ObservableObject {
     }
     private var agent: AgentRuntime?
     private var runningVersion: ModelVersionManifest?
+    var runningMovementHistoryMode: MovementHistoryMode? { runningVersion?.training.effectiveMovementHistoryMode }
     private var runningContextValues: [UUID: UUID] = [:]
     private var eventWriter: InputEventWriter?
     private var recordingDirectory: URL?

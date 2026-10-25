@@ -542,12 +542,24 @@ enum MouseControlMode: String, Codable, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 }
 
+enum MovementHistoryMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case bounded = "Bounded movement history"
+    case visualOnly = "Visual timing only"
+    var id: String { rawValue }
+}
+
 enum ModelContract {
-    /// Version 7 adds the shared explicit-timing projection, recurrent timing
-    /// inputs, and current decision timing. Version 6 artifacts are archived;
-    /// source recordings retain their existing timestamped binary format.
-    static let schemaVersion = 7
-    static let weightFormat = "AgentTrainer.Policy.v7"
+    /// Version 8 separates movement from endogenous motion history and learns
+    /// per-axis movement intent. Older brains are retained in the archive.
+    static let schemaVersion = 8
+    static let weightFormat = "AgentTrainer.Policy.v8"
+}
+
+/// Physical actions retain their 146-value layout. Confidence logits are
+/// internal supervision and never become additional executable controls.
+enum PolicyLogitsLayout {
+    static let movementIntent = ActionLayout.count..<(ActionLayout.count + 2)
+    static let count = ActionLayout.count + 2
 }
 
 /// Version of the causal pairing between a captured frame and the controls the
@@ -869,6 +881,8 @@ struct TrainingConfiguration: Codable, Hashable, Sendable {
     /// Optional preserves decoding of profiles saved before temporal vision was
     /// configurable. New profiles persist the effective default immediately.
     var temporalVision: TemporalVisionConfiguration? = TemporalVisionConfiguration()
+    var movementHistoryMode: MovementHistoryMode? = .bounded
+    var effectiveMovementHistoryMode: MovementHistoryMode { movementHistoryMode ?? .bounded }
     var perceptionFPS: Double = 30
     var actionFPS: Double = 60
     var precision: TrainingPrecision = .bfloat16
@@ -1144,6 +1158,9 @@ struct ValidationReport: Codable, Hashable, Sendable {
     var activeRelativeMouseMAE: Double?
     var activeScrollMAE: Double?
     var idleContinuousFalseActionRate: Double?
+    /// Physical per-axis movement after default-sensitivity event rounding.
+    /// Optional keeps historical reports readable without inventing counts.
+    var movement: BinaryValidationMetrics? = nil
 
     /// Aggregate weighted loss remains the primary selector, but it may hide a
     /// collapsed sparse head. On the same fixed held-out rows, reject only large
@@ -1175,11 +1192,12 @@ struct ModelOutputCapabilities: Codable, Hashable, Sendable {
     var allowsRelativeMouseMovement = false
     var allowsScroll = false
 
-    /// A class with no positive training targets is deliberately omitted from
-    /// binary loss. Its random logits must never become executable controls.
-    static func trained(positiveWeights: [Float], channels: ActionChannels, restrictions: ActionRestrictions) -> Self {
+    /// Only demonstrated positive classes establish an executable capability.
+    /// Unseen buttons are trained toward off, but negative-only training is not
+    /// evidence that a button belongs to the demonstrated action vocabulary.
+    static func trained(positiveCounts: [Int], channels: ActionChannels, restrictions: ActionRestrictions) -> Self {
         let learned = Set(ActionLayout.learnableBinaryIndices(channels: channels, restrictions: restrictions)
-            .filter { positiveWeights.indices.contains($0) && positiveWeights[$0] > 0 })
+            .filter { positiveCounts.indices.contains($0) && positiveCounts[$0] > 0 })
         var keys = Set<UInt16>()
         for code in UInt16(0)..<128 where !ActionLayout.allModifierKeyCodes.contains(code)
             && learned.contains(ActionLayout.keyboard.lowerBound + Int(code)) {
@@ -1692,12 +1710,14 @@ enum ModelSizing {
             total = add(total, multiply(2, Int64(max(1, width))))
             fusionInput = max(1, width)
         }
-        total = add(total, multiply(add(Int64(fusionInput), 1), Int64(ActionLayout.count)))
-        // Policy v6 keeps fixed auxiliary layouts even when their losses are
+        total = add(total, multiply(add(Int64(fusionInput), 1), Int64(PolicyLogitsLayout.count)))
+        let historySlots = 1 + profile.training.effectiveTemporalVision.pastFrameCount
+        total = add(total, multiply(add(Int64(fusionInput), 1), Int64(2 * historySlots + 2)))
+        // Policy v8 keeps fixed auxiliary layouts even when their losses are
         // disabled, allowing configuration changes to warm-start the same brain.
         total = add(total, multiply(
             add(Int64(fusionInput), 1),
-            Int64(ActionLayout.count * FutureActionPredictionConfiguration.maximumHorizonCount)
+            Int64(PolicyLogitsLayout.count * FutureActionPredictionConfiguration.maximumHorizonCount)
         ))
         total = add(total, multiply(
             add(Int64(fusionInput + ActionLayout.count), 1),

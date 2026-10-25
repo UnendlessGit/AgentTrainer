@@ -1,6 +1,6 @@
 # AgentTrainer Development Guide
 
-This is the durable engineering reference for AgentTrainer 2.50. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
+This is the durable engineering reference for AgentTrainer 2.51. Keep it focused on contracts that a future change must preserve; release history belongs in Git.
 
 ## Platform and dependencies
 
@@ -21,7 +21,7 @@ The product is local-first. Do not add telemetry, cloud training, or data upload
 - `Storage/InputEventFile.swift` — fixed-width binary event writer and validated mapped reader
 - `Preprocessing/VisionPreprocessor.swift` — Metal resize, color conversion, packing, and MLX expansion
 - `Training/DatasetCache.swift` — causal frame/action pairing and memory-mapped datasets
-- `Training/PolicyNetwork.swift` — Policy v7, predictive objectives, augmentation, and resumable AdamW
+- `Training/PolicyNetwork.swift` — Policy v8, predictive objectives, augmentation, and resumable AdamW
 - `Training/TrainingEngine.swift` — split construction, compiled steps, validation, checkpoints, and version publication
 - `Core/TemporalInputs.swift` — versioned timing vocabulary and shared causal control reducer
 - `Core/MetalArrayBufferPool.swift` — pooled Metal shared-memory inputs handed directly to MLX
@@ -103,7 +103,7 @@ Temporal vision is current-only or includes a historical sequence. Timing is alw
 
 The default is four past frames, two perception intervals apart, with a 2× linear downscale. Bounds are part of the public safety/performance contract: 0–32 frames, 1–240 intervals, 1×–8× downscale, and at most 512 MB of retained packed runtime context. Zero frames omits the recurrent visual history and past-image/control/timing buffers; current decision timing remains available. The retained-context limit includes packed pixels, Float32 controls/timing, and cached visual embeddings.
 
-`TrainingDataContract.schemaVersion` is 15. This changes causal frame selection, trailing control pairing, timing inputs, and supervision endpoints; older caches rebuild. Model schema 7 requires retraining, with incompatible brains/checkpoints archived rather than claiming a warm start or exact v6 resume. Display-only context renames still refresh the tiny cache manifest without repacking pixels. A cache has:
+`TrainingDataContract.schemaVersion` is 15. This changes causal frame selection, trailing control pairing, timing inputs, and supervision endpoints; older caches rebuild. Model schema 8 requires retraining, with incompatible brains/checkpoints archived rather than claiming a warm start or exact v7 resume. The v7-to-v8 upgrade retains compatible schema-15 caches. Display-only context renames still refresh the tiny cache manifest without repacking pixels. A cache has:
 
 - `current-observations.bin` — one full-resolution packed image per perception tick
 - `past-observations.bin` — one reduced packed image per tick, omitted for current-only
@@ -143,31 +143,34 @@ Every frame-control row includes normalized absolute cursor position, raw relati
 
 ## Model and training contracts
 
-`ModelContract.schemaVersion` is 7 and the weight format is `AgentTrainer.Policy.v7`.
+`ModelContract.schemaVersion` is 8 and the weight format is `AgentTrainer.Policy.v8`.
 
-All training uses behavioral cloning. Older feature settings decode as unknown keys and are omitted when saved. `ModelOutputCapabilities` snapshots immutable key/button/movement/scroll limits. Native v7 publication derives binary capabilities from positive supervised classes in the training split, so loss-masked heads cannot post random events. Imported limits remain immutable; this is not an action distribution. Missing legacy limits fail closed. Run always uses the established deterministic activations and the shared output firewall.
+All training uses behavioral cloning. Older feature settings decode as unknown keys and are omitted when saved. `ModelOutputCapabilities` snapshots immutable key/button/movement/scroll limits. Native v8 publication derives binary capabilities from positive supervised classes in the training split, so loss-masked heads cannot post random events. Imported limits remain immutable; this is not an action distribution. Missing legacy limits fail closed. Run always uses the established deterministic activations and the shared output firewall.
 
-Legacy recording `supervisionStart` remains a data compatibility contract: pre-boundary images and controls are observation context, never action labels. Dataset schema 15 rebuilds packed caches; incompatible v6 brains/checkpoints are archived and must be retrained. Migration from v6 preserves profile architecture and temporal settings. There are no special recording purposes, per-recording loss weights, or purpose-specific validation splits.
+Legacy recording `supervisionStart` remains a data compatibility contract: pre-boundary images and controls are observation context, never action labels. Dataset schema 15 remains unchanged in v8; older caches rebuild. Incompatible v7 brains/checkpoints are archived and must be retrained. Migration preserves profile architecture and temporal settings. There are no special recording purposes, per-recording loss weights, or purpose-specific validation splits.
 
 A runnable version is immutable. Runtime current vision, temporal vision, architecture, precision, channel semantics, cursor visibility, and demonstrated keys come from the version manifest, not mutable editor fields.
 
 Dropout is stochastic training regularization, not part of the learned tensor layout. It is normalized out of `LearnedBrainContract`: editing only dropout must preserve the active brain and load its weights into the next run. Because the stochastic objective changed, the exact optimizer/checkpoint signature still includes dropout and begins a fresh optimizer sequence rather than claiming an invalid exact resume.
 
-Current Policy v7 combines:
+Current Policy v8 combines (details and feedback bounds in [MOVEMENT_CONTROL.md](MOVEMENT_CONTROL.md)):
 
 - one shared convolutional encoder for the real current and past images
 - independent X/Y coordinate planes at each image's native resolution
 - attention or legacy flattened visual pooling
 - a shared Float32 timing projection (2,190 → 64, no bias) plus LayerNorm, cast to configured model precision
+- two streams sharing recurrent/fusion weights and CNN embeddings: the complete decision stream and a motor stream with cursor/movement/scroll feedback removed
 - a GRU/LSTM sequence over each past visual embedding, its 146 controls, and its 64 timing values
-- fusion of current visual embedding, final temporal state, and current 64-value timing embedding
+- fusion of current visual embedding, final temporal state, and current 64-value timing embedding in each stream
+- optional bounded movement reuse: motion-independent convex attention and gain below 0.4 over time-normalized executed history
+- two internal per-axis relative-movement activity logits; decoding still returns exactly 146 physical actions
 - optional raw categorical context concatenated immediately before the fusion stack
 - per-head bounded activations
 - a fixed four-horizon future-action head and an action-conditioned latent-state-delta head; both are training-only and add no runtime action latency
 
-`ModelVersionManifest.contextSchema` is the immutable display and tensor vocabulary for a context-trained brain. It is nil for every pre-2.3/context-free brain. Empty context adds no tensor, parameter, input descriptor, or compiled-step argument, preserving the exact existing Policy-v7 weight layout. A warm start is allowed only when ordered field/value IDs match; display-name changes alone are layout-compatible. The first fusion layer is the only learned shape widened by context values.
+`ModelVersionManifest.contextSchema` is the immutable display and tensor vocabulary for a context-trained brain. It is nil for every pre-2.3/context-free brain. Empty context adds no tensor, parameter, input descriptor, or compiled-step argument, preserving the exact existing Policy-v8 weight layout. A warm start is allowed only when ordered field/value IDs match; display-name changes alone are layout-compatible. The first fusion layer is the only learned shape widened by context values.
 
-Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. One per-sample keep mask drops the historical controls and all current/historical control-derived timing (including cursor) for half of training samples while visual clocks, validity, and images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference always receives the full paired sequence.
+Attention pooling shares its projection across current and past image sizes. Legacy flattened pooling needs distinct current and past projections because its spatial dimensions differ. One per-sample keep mask drops the historical controls and all current/historical control-derived timing (including cursor) for half of training samples while visual clocks, validity, and images remain visible; this prevents held controls from becoming an easy shortcut without deleting temporal visual evidence. Inference receives the full paired sequence; only the motor stream filters continuous control feedback. The same per-sample keep mask also covers the bounded movement path. Timing clocks and validity stay available. Movement mode is immutable per saved brain and belongs to the optimizer/checkpoint signature.
 
 Training uses class/transition weighting, focal binary loss, anti-shortcut frame-control masking, deterministic salience-balanced order, compiled MLX updates, bounded held-out evaluation, and adaptive cosine scheduling. Configurable photometric augmentation samples one transform per supervised row and applies it identically to only that row's current, past, and future frames. It never moves pixels. Augmented training expands deduplicated observations to row shape before the CNN and uses the diversity-oriented sampler; validation and augmentation-off training retain deterministic visual reuse. Future-action loss weights near horizons more strongly. Future-state loss predicts a stopped-gradient latent change from fused context plus the demonstrated current action; it never generates pixels. Conservative default auxiliary weights are gated by a matched-update causal held-out test at 1% immediate-loss drift. Do not change these semantics without updating tests and the relevant schema.
 
@@ -181,7 +184,7 @@ The performance path preserves those semantics:
 - Validation reuses deterministic CNN embeddings, gathers them to action-row shape, then computes timing-conditioned recurrence and head logits independently for every held-out label. Sharing images must never share final predictions across distinct timing rows.
 - CPU gathering of the next batch overlaps the current Metal graph. Every optimizer step still evaluates the complete model, AdamW moments, scheduler, and MLX random state before advancing the checkpoint cursor.
 - Live diagnostics publish a rolling pipelined-step time, mapped-input time, peak-throughput retention, MLX active/cache/peak memory, and macOS thermal pressure. Metrics are rate-limited and chart histories are presentation-bounded so observing a run does not grow UI work with optimizer-step count.
-- The release benchmark separately executes the complete Policy-v7 stochastic objective and runs the same sustained-window retention/memory/thermal checks. It gates the required per-sample augmentation path at 3× the augmentation-off reused core, then gates both predictive heads together at 2× that augmented immediate path. The immediate-only reference/optimized paths still isolate encoder equivalence and throughput, while the two-stage gate prevents one semantic cost from hiding a regression in the other.
+- The release benchmark separately executes the complete Policy-v8 stochastic objective and runs the same sustained-window retention/memory/thermal checks. It gates the required per-sample augmentation path at 3× the augmentation-off reused core, then gates both predictive heads together at 2× that augmented immediate path. The immediate-only reference/optimized paths still isolate encoder equivalence and throughput, while the two-stage gate prevents one semantic cost from hiding a regression in the other.
 
 Do not queue stateful optimizer steps merely to improve a benchmark. Exact resume means a saved checkpoint must continue its own versioned sampling contract, weights, moments, scheduler, and random state without skipping or replaying an update.
 
@@ -275,7 +278,7 @@ The scripts explicitly select SwiftPM's `native` backend. Newer Swift toolchains
 Before release:
 
 1. Run `./test.sh`.
-2. Run `./benchmark-temporal.sh` for the approved isolated 20-epoch ablation (completed arms are evaluation-only), then run `./benchmark.sh` and compare original/optimized throughput plus matched-update training and validation loss on the same idle Mac. Check the full auxiliary-objective overhead/memory line and every sustained window for stable throughput, bounded MLX cache, and nominal thermal pressure.
+2. Run `./benchmark-mouse.sh` for the isolated real-Reborn 20-epoch comparison (completed arms are evaluation-only), then run `./benchmark.sh` and compare original/optimized throughput plus matched-update training and validation loss on the same idle Mac. The historical `./benchmark-temporal.sh` needs its original Blade Ball library; it is not a replacement for closed-feedback or live-game checks. Check the full auxiliary-objective overhead/memory line and every sustained window for stable throughput, bounded MLX cache, and nominal thermal pressure.
 3. Run `git diff --check`.
 4. Confirm `CFBundleShortVersionString` and `CFBundleVersion`.
 5. Quit AgentTrainer and run `./build.sh`.

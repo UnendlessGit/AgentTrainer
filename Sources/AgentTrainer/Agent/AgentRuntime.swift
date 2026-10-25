@@ -175,7 +175,7 @@ final class AgentRuntime: @unchecked Sendable {
             runtimeProfile.restrictions = capabilities.restricting(profile.effectiveRestrictions)
             runtimeAllowedKeyCodes.formIntersection(capabilities.allowedKeyCodes)
         } else {
-            // Private or hand-authored v7 manifests lacking a button vocabulary
+            // Private or hand-authored manifests lacking a button vocabulary
             // cannot establish that a button's binary head was ever trained.
             runtimeProfile.channels.buttons = false
         }
@@ -186,7 +186,7 @@ final class AgentRuntime: @unchecked Sendable {
         let contextSchema = try version.effectiveContextSchema.validated()
         let initialContextVector = contextSchema.vector(selection: contextSelection)
         let startRevisions = lock.withLock { (outputPermissionsRevision, visualizationSettingsRevision) }
-        let model = AgentPolicy(profile: runtimeProfile, contextSchema: contextSchema)
+        let model = AgentPolicy(profile: runtimeProfile, contextSchema: contextSchema, movementSensitivity: mouseMode == .relative ? gameCamera.sensitivity : 1)
         let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
         model.train(false)
@@ -784,10 +784,10 @@ final class AgentRuntime: @unchecked Sendable {
         case .keyboard: ActionLayout.keyboardAndShiftIndices
         case .modifiers: Array(ActionLayout.commandOptionControl)
         }
-        var values = [Float](repeating: 0, count: ActionLayout.count)
+        var values = [Float](repeating: 0, count: PolicyLogitsLayout.count)
         let weight = 1 / Float(max(1, indices.count))
         for index in indices { values[index] = weight }
-        return MLXArray(values, [1, ActionLayout.count])
+        return MLXArray(values, [1, PolicyLogitsLayout.count])
     }
 
     private func startActionTimer(fps: Double) {

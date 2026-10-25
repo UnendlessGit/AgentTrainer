@@ -368,6 +368,15 @@ private struct ProfileEditor: View {
                                 IntField("Past downscale", value: temporalIntBinding(\.downsampleFactor), help: "Linear resolution reduction for every past frame (1×–\(TemporalVisionConfiguration.maximumDownsampleFactor)×). 2 means half width and half height while preserving aspect, color mode, chroma, and bit detail.")
                                     .disabled(temporal.pastFrameCount == 0)
                             }
+                            HStack {
+                                Picker("Movement memory", selection: Binding(
+                                    get: { draft.training.effectiveMovementHistoryMode },
+                                    set: { draft.training.movementHistoryMode = $0 }
+                                )) {
+                                    ForEach(MovementHistoryMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
+                                }
+                                InfoTip("Bounded history retains previous movement with limited feedback and learned stopping. Visual timing only omits movement feedback from mouse prediction. This setting applies when training; each saved brain keeps its own choice.")
+                            }
                             let pastSpec = temporal.pastFrameSpec(from: draft.preprocessing)
                             HStack(spacing: 10) {
                                 StatusPill(text: "Current \(draft.preprocessing.width) × \(draft.preprocessing.height)", color: ATColor.green)
@@ -1298,6 +1307,7 @@ struct TrainingView: View {
             components.append("false-positive rate \((100 * binary.falsePositiveRate).formatted(.number.precision(.fractionLength(2))))%")
         }
         if let value = report.activeRelativeMouseMAE { components.append("active mouse MAE \(value.formatted(.number.precision(.fractionLength(4))))") }
+        if let movement = report.movement { components.append("mouse activity recall \((movement.recall * 100).formatted(.number.precision(.fractionLength(1))))% • idle false moves \((movement.falsePositiveRate * 100).formatted(.number.precision(.fractionLength(1))))% at 1×") }
         if let value = report.activeScrollMAE { components.append("active scroll MAE \(value.formatted(.number.precision(.fractionLength(4))))") }
         return components.joined(separator: " • ")
     }
@@ -1694,12 +1704,12 @@ struct RunView: View {
                             VStack(alignment: .leading, spacing: 14) {
                             Text("Perception and action").font(.headline)
                             HStack { Picker("Frame mode", selection: $model.frameMode) { ForEach(FrameMode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented); InfoTip("Newest Frame stays responsive by skipping old frames when inference is busy. Every Frame preserves order by slowing capture instead of building a large queue.") }
-                            HStack { Picker("Mouse execution", selection: $model.runMouseMode) { ForEach(MouseControlMode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented); InfoTip("Auto checks the selected AI's recordings and chooses normal cursor movement or signed Game Camera deltas. This prevents a locked-camera recording from being run as positive screen coordinates, which can look like the AI only moves right and down. Use Absolute Cursor only for a visibly moving pointer.") }
+                            HStack { Picker("Mouse execution", selection: $model.runMouseMode) { ForEach(MouseControlMode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).disabled(model.agentIsActiveOrStarting); InfoTip("Auto checks the selected AI's recordings and chooses normal cursor movement or signed Game Camera deltas. This prevents a locked-camera recording from being run as positive screen coordinates, which can look like the AI only moves right and down. Use Absolute Cursor only for a visibly moving pointer.") }
                                 if model.runMouseMode != .absolute {
                                     VStack(alignment: .leading, spacing: 9) {
                                         HStack { Text(model.runMouseMode == .automatic ? "Game Camera settings (when Auto detects it)" : "Game Camera").font(.subheadline.bold()).foregroundStyle(ATColor.violet); Spacer(); Text("\(model.gameCamera.sensitivity.formatted(.number.precision(.fractionLength(2))))× sensitivity").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
-                                        Slider(value: $model.gameCamera.sensitivity, in: 0.1...3, step: 0.05).tint(ATColor.violet)
-                                        Toggle("Recenter before and after every raw delta", isOn: $model.gameCamera.recenterCursor).tint(ATColor.cyan)
+                                        Slider(value: $model.gameCamera.sensitivity, in: 0.1...3, step: 0.05).tint(ATColor.violet).disabled(model.agentIsActiveOrStarting)
+                                        Toggle("Recenter before and after every raw delta", isOn: $model.gameCamera.recenterCursor).tint(ATColor.cyan).disabled(model.agentIsActiveOrStarting)
                                         Text(model.gameCamera.recenterCursor ? "Recommended for locked-camera software. A HID-system event is posted at the capture center and the cursor is restored immediately, preventing screen-edge damping." : "Raw deltas are posted without warping. Use this only for software that rejects cursor recentering.")
                                             .font(.caption).foregroundStyle(.secondary)
                                     }
@@ -1708,6 +1718,8 @@ struct RunView: View {
                                 }
                                 LabeledContent("Perception", value: "\(profile.training.perceptionFPS.formatted()) FPS")
                                 LabeledContent("Action", value: "\(profile.training.actionFPS.formatted()) FPS")
+                                Text("Mouse mode, sensitivity, and recentering apply when Run starts.").font(.caption).foregroundStyle(.secondary)
+                                LabeledContent("Movement memory", value: (model.runningMovementHistoryMode ?? profile.training.effectiveMovementHistoryMode).rawValue)
                                 Text("A fresh timing-aware decision runs at Action FPS using the latest encoded vision. Frame age and actual posted controls update between perceptions; each movement and scroll output executes once.").font(.caption).foregroundStyle(.secondary)
                                 Divider(); Toggle("Stop immediately on my input", isOn: $model.safety.stopOnHumanInput); Toggle("Stop if target focus is lost", isOn: $model.safety.stopOnFocusLoss); Toggle("Allow full-Mac control", isOn: $model.safety.allowFullMac).tint(ATColor.coral)
                                 Divider(); Toggle("Show exact AI-vision PIP", isOn: $model.showVisionPreview).tint(ATColor.green); if model.showVisionPreview { Toggle("Update exactly with AI perception", isOn: $model.visionPreviewMatchesPerception).tint(ATColor.cyan); if !model.visionPreviewMatchesPerception { LabeledNumber("Independent PIP FPS", value: $model.visionPreviewFPS) }; Text(model.visionPreviewMatchesPerception ? "The preview updates on the same processed frames as the AI." : "Preview refresh is independent; AI perception remains \(profile.training.perceptionFPS.formatted()) FPS.").font(.caption).foregroundStyle(.secondary) }
