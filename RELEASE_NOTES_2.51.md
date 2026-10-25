@@ -1,8 +1,10 @@
-# AgentTrainer 2.51
+# AgentTrainer 2.51 candidate — live validation rejected
 
 Policy v8 addresses a reproduced mouse/game-camera regression where previous movement could amplify the next prediction. Bounded movement history retains recent executed motion through time-normalized, limited feedback. A second training option, Visual timing only, omits movement feedback from the motor path. Both preserve visual history, key/button durations, and observation timing. Separate per-axis activity decisions allow exact mouse stops.
 
 The physical action vocabulary remains 146 values. The shared CNN runs at Perception FPS and policy decisions run at Action FPS. Runtime history still reflects actual posted events after restrictions and rounding. Validation now measures idle movement at the actual half-pixel posting boundary at 1× sensitivity, and output capabilities use actual positive key/button counts.
+
+The first Reborn live comparison rejected both candidates: persistent key holds and inadequate camera movement remained, including on a recorded trial. Replay gains did not translate into acceptable live behavior. This candidate is installed locally for investigation and is not a published GitHub release.
 
 ## Migration
 

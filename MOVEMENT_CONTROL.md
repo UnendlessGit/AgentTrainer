@@ -60,7 +60,9 @@ Both corrections reduce error and runaway movement, while useful movement recall
 
 At 30/60 FPS, visual-only and bounded MAE are **2.028 / 2.174** pixels; at 15/60 FPS they are **2.049 / 2.207**. The reference worsens to **5.397 / 5.832**. Cached policy-head p95 measurements range **1.58–4.23 ms** across corrected arms/cadences on this Mac, excluding capture, CNN, queueing, and HID delivery. These are measurements, not an end-to-end 60-FPS guarantee.
 
-Bounded history has fewer idle false moves; visual-only has lower displacement error and greater useful-movement recall. These replay results do not settle the user's live Reborn preference. Neither approach is declared the live winner from training loss or replay scores.
+Bounded history has fewer idle false moves; visual-only has lower displacement error and greater useful-movement recall. These replay results do not settle the user's live Reborn preference. **Live result: both candidates were rejected.** On an unseen parkour trial with the same camera mode, the user observed persistent W/other-key/Space holds and little camera movement; the visual-only candidate moved slowly in short bursts. A follow-up on a recorded trial was somewhat better but still poor, with very similar behavior from both candidates. Neither meets the requested live-control quality. The replay improvement is insufficient for acceptance, and this candidate release has not been published.
+
+The initial replay test closed only mouse feedback while supplying demonstrated discrete controls. It therefore did not test the full live key/button feedback distribution. An expanded diagnostic closes every actual posted control and compares saved best/final checkpoints. Activity bypass and control masking in that diagnostic are inference ablations only, never synthetic training labels. Further development uses additional real recordings and another live acceptance check.
 
 ## Migration and execution limits
 
