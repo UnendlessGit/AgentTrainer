@@ -11,6 +11,7 @@ struct CaptureSourceOption: Identifiable, Hashable, Sendable {
     let name: String
     let detail: String
     let frame: CGRect
+    var pointPixelScale: CGFloat = 1
 }
 
 struct CaptureResult: Sendable {
@@ -53,10 +54,10 @@ final class CaptureService: NSObject, @unchecked Sendable {
     static func availableSources() async throws -> [CaptureSourceOption] {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         var result = content.displays.map {
-            CaptureSourceOption(id: $0.displayID, kind: .display, name: "Display \($0.displayID)", detail: "\(Int($0.width)) × \(Int($0.height))", frame: $0.frame)
+            CaptureSourceOption(id: $0.displayID, kind: .display, name: "Display \($0.displayID)", detail: "\(Int($0.width)) × \(Int($0.height))", frame: $0.frame, pointPixelScale: CGFloat($0.width) / max(1, $0.frame.width))
         }
         result += content.windows.filter { $0.isOnScreen && $0.windowLayer == 0 && $0.frame.width > 40 && $0.frame.height > 40 && $0.owningApplication?.bundleIdentifier != Bundle.main.bundleIdentifier }.map {
-            CaptureSourceOption(id: $0.windowID, kind: .window, name: $0.title.flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled Window", detail: $0.owningApplication?.applicationName ?? "Application", frame: $0.frame)
+            CaptureSourceOption(id: $0.windowID, kind: .window, name: $0.title.flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled Window", detail: $0.owningApplication?.applicationName ?? "Application", frame: $0.frame, pointPixelScale: CGFloat(SCContentFilter(desktopIndependentWindow: $0).pointPixelScale))
         }
         result.sort { lhs, rhs in
             switch (lhs.kind, rhs.kind) {
@@ -73,7 +74,20 @@ final class CaptureService: NSObject, @unchecked Sendable {
         return result
     }
 
-    func start(spec: CaptureSpec, recordingURL: URL? = nil, exactOutputSize: CGSize? = nil, queueDepth: Int = 8, onFirstFrame: (@Sendable (UInt64) -> Void)? = nil, onFrame: FrameHandler? = nil, onIdle: IdleFrameHandler? = nil, onUnexpectedStop: (@Sendable (Error) -> Void)? = nil) async throws {
+    static func snapshot(spec: CaptureSpec) async throws -> CGImage {
+        let service = CaptureService()
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        let selected = try service.makeFilterAndGeometry(spec: spec, content: content)
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(1, Int(selected.pixelSize.width.rounded()))
+        configuration.height = max(1, Int(selected.pixelSize.height.rounded()))
+        configuration.showsCursor = false
+        configuration.ignoreShadowsSingleWindow = true
+        if let rect = selected.sourceRect { configuration.sourceRect = rect }
+        return try await SCScreenshotManager.captureImage(contentFilter: selected.filter, configuration: configuration)
+    }
+
+    func start(spec: CaptureSpec, recordingURL: URL? = nil, exactOutputSize: CGSize? = nil, queueDepth: Int = 8, nativeWindowGeometry: Bool = false, onFirstFrame: (@Sendable (UInt64) -> Void)? = nil, onFrame: FrameHandler? = nil, onIdle: IdleFrameHandler? = nil, onUnexpectedStop: (@Sendable (Error) -> Void)? = nil) async throws {
         guard !isRunning else { throw AgentTrainerError.capture("A capture stream is already running.") }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
@@ -111,6 +125,7 @@ final class CaptureService: NSObject, @unchecked Sendable {
         // bound. Keeping the queue bounded avoids runaway IOSurface retention.
         config.queueDepth = min(8, max(1, queueDepth))
         config.showsCursor = spec.showsCursor
+        if nativeWindowGeometry { config.ignoreShadowsSingleWindow = true }
         config.capturesAudio = false
         // Saved video goes straight from ScreenCaptureKit's bi-planar 4:2:0
         // surface into the hardware HEVC encoder. Avoiding an intermediate
@@ -187,7 +202,7 @@ final class CaptureService: NSObject, @unchecked Sendable {
     private func makeFilterAndGeometry(spec: CaptureSpec, content: SCShareableContent) throws -> (filter: SCContentFilter, pixelSize: CGSize, sourceRect: CGRect?) {
         switch spec.kind {
         case .display, .screenRegion:
-            let display = spec.displayID.flatMap { id in content.displays.first { $0.displayID == id } } ?? content.displays.first
+            let display = spec.displayID == nil ? content.displays.first : content.displays.first { $0.displayID == spec.displayID }
             guard let display else { throw AgentTrainerError.capture("No display is available.") }
             let ownApplication = content.applications.first { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
             let excluded = ownApplication.map { [$0] } ?? []
@@ -205,7 +220,7 @@ final class CaptureService: NSObject, @unchecked Sendable {
         case .window, .windowRegion:
             guard let id = spec.windowID, let window = content.windows.first(where: { $0.windowID == id }) else { throw AgentTrainerError.capture("The selected window is no longer available.") }
             let filter = SCContentFilter(desktopIndependentWindow: window)
-            let scale = screenScale(for: window.frame)
+            let scale = CGFloat(filter.pointPixelScale)
             if spec.kind == .windowRegion, let region = spec.region?.cgRect {
                 guard region.hasFiniteComponents else { throw AgentTrainerError.capture("The selected window region is invalid.") }
                 let bounded = region.intersection(CGRect(origin: .zero, size: window.frame.size))

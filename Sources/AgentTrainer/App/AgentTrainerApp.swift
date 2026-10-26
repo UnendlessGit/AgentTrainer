@@ -11,6 +11,11 @@ struct AgentTrainerApp: App {
             RootView(model: model)
                 .frame(minWidth: 1180, minHeight: 760)
                 .onAppear { appDelegate.model = model }
+                .task {
+                    if ProcessInfo.processInfo.environment["AGENTTRAINER_RL_VALIDATION"] == "1" {
+                        await RLValidationHarness.run(model: model)
+                    }
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
@@ -103,6 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             if model.agentIsActiveOrStarting { await model.stopAgent() }
             if model.isReplaying { model.stopReenactment() }
+            if model.hasUnsavedRLProgress { sender.reply(toApplicationShouldTerminate: false); return }
             if model.recordingIsActiveOrStarting { await model.stopRecording() }
             while model.recordingIsActiveOrStarting { try? await Task.sleep(for: .milliseconds(50)) }
             while model.agentIsActiveOrStarting { try? await Task.sleep(for: .milliseconds(50)) }

@@ -53,12 +53,9 @@ configure_signing() {
     matches+=("$fingerprint")
   done
   matches=("${(@u)matches}")
-  if [[ "$SIGN_IDENTITY" == "-" || ( ${#matches} == 0 && "${ALLOW_ADHOC_SIGNING:-0}" == 1 ) ]]; then
-    if [[ -n "$EXPECTED_REQUIREMENT" ]]; then
-      signing_error "Ad-hoc signing would discard the saved permission identity. Refusing to continue."; return 1
-    fi
-    SIGN_IDENTITY="-"
-    return 0
+  if [[ "$SIGN_IDENTITY" == "-" || "${ALLOW_ADHOC_SIGNING:-0}" == 1 ]]; then
+    signing_error "Ad-hoc signing is prohibited. A valid certificate matching the saved permission identity is required."
+    return 1
   fi
   if (( ${#matches} != 1 )); then
     signing_error "Expected one usable signing certificate; found ${#matches}. Set CODE_SIGN_IDENTITY to an exact certificate fingerprint. The build will not silently switch identities. Saved pin: $SIGN_STATE"

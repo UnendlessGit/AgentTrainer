@@ -145,10 +145,12 @@ final class DomainTests: XCTestCase {
         private let lock = NSLock()
         private var stored: [(CGEventType, Int64, Int64, Int64)] = []
         private var storedWarps: [CGPoint] = []
-        func append(_ event: CGEvent) { lock.lock(); stored.append((event.type, event.getIntegerValueField(.keyboardEventKeycode), event.getIntegerValueField(.mouseEventDeltaX), event.getIntegerValueField(.mouseEventDeltaY))); lock.unlock() }
+        private var storedFlags: [CGEventFlags] = []
+        func append(_ event: CGEvent) { lock.lock(); stored.append((event.type, event.getIntegerValueField(.keyboardEventKeycode), event.getIntegerValueField(.mouseEventDeltaX), event.getIntegerValueField(.mouseEventDeltaY))); storedFlags.append(event.flags); lock.unlock() }
         func warp(_ point: CGPoint) { lock.lock(); storedWarps.append(point); lock.unlock() }
         var events: [(CGEventType, Int64, Int64, Int64)] { lock.lock(); defer { lock.unlock() }; return stored }
         var warps: [CGPoint] { lock.lock(); defer { lock.unlock() }; return storedWarps }
+        var flags: [CGEventFlags] { lock.lock(); defer { lock.unlock() }; return storedFlags }
     }
     private final class OneShotGate: @unchecked Sendable {
         private let lock = NSLock()
@@ -2517,6 +2519,21 @@ final class DomainTests: XCTestCase {
         injector.execute(prediction, profile: .fresh(), allowedKeyCodes: [], mouseMode: .absolute, captureRect: CGRect(x: 0, y: 0, width: 100, height: 100), safety: AgentSafetyPolicy())
         XCTAssertTrue(collector.events.isEmpty)
         injector.disableAndReleaseAll()
+    }
+
+    func testSharedEpisodeKeyHasTwoIndependentTapsWhileNormalActionsRemainDisabled() {
+        let collector = EventCollector()
+        let injector = InputInjector(eventSink: { collector.append($0) })
+        injector.disableAndReleaseAll()
+        injector.tapControllerKey(15); injector.tapControllerKey(15)
+        XCTAssertEqual(collector.events.map(\.0), [.keyDown, .keyUp, .keyDown, .keyUp])
+        XCTAssertEqual(collector.events.map(\.1), [15, 15, 15, 15])
+        var prediction = [Float](repeating: 0, count: ActionLayout.count); prediction[14] = 1
+        XCTAssertFalse(injector.execute(prediction, profile: .fresh(), allowedKeyCodes: [0], mouseMode: .relative,
+            captureRect: CGRect(x: 0, y: 0, width: 100, height: 100), safety: AgentSafetyPolicy()))
+        XCTAssertEqual(collector.events.count, 4)
+        injector.tapControllerKey(56)
+        XCTAssertEqual(Array(collector.flags.suffix(2)), [.maskShift, []])
     }
 
     func testRuntimePredictionLatchConsumesTransientOutputsOnce() throws {
@@ -5419,7 +5436,65 @@ final class DomainTests: XCTestCase {
         MLX.eval(output)
         XCTAssertEqual(output.shape, [1, ActionLayout.count])
         XCTAssertTrue(output.asArray(Float.self).allSatisfy(\.isFinite))
-        try await store.deleteProfile(completed.profile)
+
+        // Continue the actual video-trained brain through RL, back through
+        // demonstration training, and into RL again. Both old checkpoints stay
+        // present so this catches stale-checkpoint precedence, not just loading.
+        var switching = completed.profile
+        var rl = RLConfiguration(); rl.allowedKeys = [0, 2, 13]; rl.controlsInitialized = true
+        rl.rolloutSize = 4; rl.batchSize = 2; rl.epochs = 1; rl.normalizeRewards = false; rl.targetKL = 0.5
+        switching.rlTraining = rl; try await store.saveProfile(switching)
+        let rlRoot = await store.profileDirectory(profile.id).appendingPathComponent("RLCheckpoint")
+        let learner = RLTrainingEngine()
+        let prepared = try await learner.prepare(profile: switching, contextSchema: .empty, mouseMode: .absolute,
+            activeWeights: versionDirectory.appendingPathComponent(completed.version.weightsFile), checkpoint: rlRoot)
+        for (name, tensor) in RLWeightTransfer.copy(model) { XCTAssertEqual(prepared.0.policy[name]?.values, tensor.values) }
+        let actor = RLTrainablePolicy(policy: AgentPolicy(profile: switching))
+        try RLWeightTransfer.install(prepared.0.policy, in: actor.policy); try RLWeightTransfer.install(prepared.0.heads, in: actor.heads)
+        let pastSpec = switching.training.effectiveTemporalVision.pastFrameSpec(from: switching.preprocessing)
+        let observation = RLObservation(current: Data(repeating: 120, count: switching.preprocessing.sampleByteCount),
+            past: Array(repeating: Data(repeating: 120, count: pastSpec.sampleByteCount), count: 2),
+            controls: Array(repeating: 0, count: 2 * ActionLayout.count),
+            timing: Array(repeating: 0, count: TemporalInputContract.valueCount),
+            pastTiming: Array(repeating: 0, count: 2 * TemporalInputContract.valueCount), context: [])
+        let distribution = RLActionDistribution(profile: switching, configuration: rl, mouseMode: .absolute)
+        var random = RLRandom(state: 7), rollout: [RLTransition] = []
+        for i in 0..<4 {
+            let forward = actor.forward(observation)
+            let sample = distribution.sample(logits: forward.0.asArray(Float.self), logStd: actor.heads.logStandardDeviation.asArray(Float.self), random: &random)
+            let decision = RLDecision(observation: observation, latent: sample.latent, binary: sample.binary,
+                logProbability: sample.logProbability, value: forward.1.item(Float.self), timestamp: UInt64(i + 1), revision: 0)
+            rollout.append(RLTransition(decisions: [decision], reward: sample.binary[14] > 0 ? 1 : -1, duration: 0.05, terminal: true))
+        }
+        let learned = try await learner.update(rollout)
+        XCTAssertGreaterThan(learned.steps, 0)
+        XCTAssertTrue(prepared.0.policy.contains { learned.snapshot.policy[$0.key]?.values != $0.value.values })
+        let rlID = UUID(), stage = rlRoot.deletingLastPathComponent().appendingPathComponent(".SwitchTest")
+        _ = try await learner.save(to: stage, versionID: rlID, actorRandom: random, history: [], episodes: 4, elapsed: 2, pending: [])
+        let rlVersion = ModelVersionManifest(id: rlID, name: "RL continuation", createdAt: Date(), globalStep: learned.steps,
+            trainingLoss: learned.policyLoss, preprocessing: switching.preprocessing, channels: switching.channels, training: switching.training,
+            demonstratedKeyCodes: rl.allowedKeys, outputCapabilities: rl.capabilities(profile: switching, mouseMode: .absolute),
+            rlSummary: RLSavedSummary(updates: learned.updates, episodes: 4))
+        switching = try await store.publishRL(profileID: profile.id, version: rlVersion, staged: stage, keeping: 10)
+        let warm = expectation(description: "Demonstrations load current RL weights instead of stale BC checkpoint")
+        warm.assertForOverFulfill = false
+        let bc = TrainingEngine()
+        let continued: TrainingCompletion = try await withCheckedThrowingContinuation { continuation in
+            bc.start(profile: switching, recordings: recordings, runSettings: TrainingRunSettings(maximumSteps: 0, autosaveSteps: 1),
+                metrics: { _, status in if status.contains("Loaded the active brain for fine-tuning") { warm.fulfill() } },
+                completion: { continuation.resume(with: $0) })
+        }
+        await fulfillment(of: [warm], timeout: 2)
+        XCTAssertGreaterThan(continued.version.globalStep, completed.profile.trainingProgress?.globalStep ?? 0)
+        XCTAssertTrue([UInt16(0), 2, 13].allSatisfy { continued.version.outputCapabilities!.allowedKeyCodes.contains($0) })
+        let continuedDirectory = await store.versionDirectory(profileID: profile.id, versionID: continued.version.id)
+        let bcActor = AgentPolicy(profile: continued.profile)
+        try bcActor.loadWeights(from: continuedDirectory.appendingPathComponent(continued.version.weightsFile))
+        let again = try await RLTrainingEngine().prepare(profile: continued.profile, contextSchema: .empty, mouseMode: .absolute,
+            activeWeights: continuedDirectory.appendingPathComponent(continued.version.weightsFile), checkpoint: rlRoot)
+        for (name, tensor) in RLWeightTransfer.copy(bcActor) { XCTAssertEqual(again.0.policy[name]?.values, tensor.values) }
+        XCTAssertTrue(again.1.pending.isEmpty)
+        try await store.deleteProfile(continued.profile)
     }
 
     private func actionFloat(_ data: Data, index: Int) -> Float {

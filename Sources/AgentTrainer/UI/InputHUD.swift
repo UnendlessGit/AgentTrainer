@@ -15,6 +15,9 @@ enum HUDInputSource: String {
 
 @MainActor
 final class InputHUDModel: ObservableObject {
+    @Published private(set) var rlMetrics: RLMetrics?
+    @Published private(set) var showsRL = false
+    func updateRL(_ value: RLMetrics) { rlMetrics = value; showsRL = true }
     @Published private(set) var state = InputState.empty
     @Published private(set) var source: HUDInputSource = .human
     @Published private(set) var isVisible = false
@@ -39,7 +42,7 @@ final class InputHUDModel: ObservableObject {
     func show(source: HUDInputSource, vision: Bool = false, cnnVisualization: CNNVisualizationSettings = CNNVisualizationSettings()) {
         self.source = source; state = .empty; recentKeys = []; recentButtons = []; visionImage = nil; visionSpec = nil; showsVision = vision; cnnVisualizationImage = nil; cnnVisualizationDetail = ""; cnnVisualizationMode = cnnVisualization.mode; showsCNNVisualization = cnnVisualization.enabled; isVisible = true
     }
-    func hide() { previewRenderer.cancel(); cnnRenderer.cancel(); state = .empty; visionImage = nil; cnnVisualizationImage = nil; showsVision = false; showsCNNVisualization = false; isVisible = false }
+    func hide() { showsRL = false; rlMetrics = nil; previewRenderer.cancel(); cnnRenderer.cancel(); state = .empty; visionImage = nil; cnnVisualizationImage = nil; showsVision = false; showsCNNVisualization = false; isVisible = false }
     func update(state: InputState, source: HUDInputSource) {
         for key in state.keys.sorted() where !recentKeys.contains(key) { recentKeys.append(key) }
         for button in state.buttons.sorted() where !recentButtons.contains(button) { recentButtons.append(button) }
@@ -116,7 +119,7 @@ private final class InputHUDController {
             guard let self else { return }
             if visible { position(); panel.orderFrontRegardless() } else { panel.orderOut(nil) }
         }.store(in: &cancellables)
-        model.$showsVision.combineLatest(model.$showsCNNVisualization, model.$recentKeys).sink { [weak self] visionVisible, cnnVisible, keys in
+        model.$showsVision.combineLatest(model.$showsCNNVisualization, model.$recentKeys, model.$showsRL).sink { [weak self] visionVisible, cnnVisible, keys, rlVisible in
             guard let self else { return }
             let rowSets: [Set<UInt16>] = [
                 [53, 122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111],
@@ -129,7 +132,7 @@ private final class InputHUDController {
             let keySet = Set(keys)
             let rows = max(1, rowSets.count { !$0.isDisjoint(with: keySet) })
             let keyboardHeight = CGFloat(rows * 17)
-            panel.setContentSize(NSSize(width: 400, height: 110 + keyboardHeight + (visionVisible ? 206 : 0) + (cnnVisible ? 206 : 0)))
+            panel.setContentSize(NSSize(width: 400, height: 110 + keyboardHeight + (visionVisible ? 206 : 0) + (cnnVisible ? 206 : 0) + (rlVisible ? 76 : 0)))
             if model.isVisible { position() }
         }.store(in: &cancellables)
     }
@@ -178,6 +181,13 @@ private struct InputHUDView: View {
                 Text(model.source.rawValue).font(.system(size: 11, weight: .bold, design: .rounded)).foregroundStyle(model.source.color)
                 Spacer()
                 Text("Capture-excluded").font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
+            }
+            if let rl = model.rlMetrics {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack { Text("PPO • EPISODE \(rl.episode)").font(.system(size: 10, weight: .bold)); Spacer(); Text(String(format: "%.1fs", rl.remaining)).font(.system(size: 10, design: .monospaced)) }
+                    HStack { Text("Reward \(rl.episodeReward.formatted())"); Spacer(); Text("Best \(rl.best?.formatted() ?? "—")") }.font(.system(size: 10, design: .monospaced))
+                    Text(rl.status).font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
+                }.foregroundStyle(.green)
             }
             VisualKeyboard(usedKeys: Set(model.recentKeys), activeKeys: model.state.keys, accent: model.source.color, compact: true)
             HStack(spacing: 8) {

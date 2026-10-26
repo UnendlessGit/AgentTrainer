@@ -84,8 +84,8 @@ rm -rf "$APP"
 MOCK_IDENTITIES=""
 expect_failure configure_signing
 ALLOW_ADHOC_SIGNING=1
-configure_signing
-[[ "$SIGN_IDENTITY" == "-" ]]
-save_signing_pin
+expect_failure configure_signing
+SIGN_IDENTITY="-"
+expect_failure configure_signing
 [[ ! -e "$SIGN_STATE" ]]
 print -r -- 'Signing regression checks passed.'

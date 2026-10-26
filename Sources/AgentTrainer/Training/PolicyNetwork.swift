@@ -823,10 +823,10 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return concatenated([fused[0..<batch], fused[batch..<(2 * batch)], temporalFeatures[.ellipsis, (2 * width)...]], axis: -1)
     }
 
-    private var fusionWidth: Int {
+    var fusionWidth: Int {
         profile.training.architecture.fusionWidths.last ?? (profile.training.architecture.visualEmbedding + profile.training.architecture.recurrentWidth + TemporalInputContract.embeddingWidth + contextSchema.inputValueCount)
     }
-    private func decisionFeatures(_ features: MLXArray) -> MLXArray { features[.ellipsis, 0..<fusionWidth] }
+    func decisionFeatures(_ features: MLXArray) -> MLXArray { features[.ellipsis, 0..<fusionWidth] }
     private func motorFeatures(_ features: MLXArray) -> MLXArray { features[.ellipsis, fusionWidth..<(2 * fusionWidth)] }
 
     /// Weights and gain depend on visual/discrete/clock context, never on the
@@ -1314,6 +1314,41 @@ final class AgentPolicy: Module, @unchecked Sendable {
         try MLX.save(arrays: Dictionary(uniqueKeysWithValues: parameters().flattened()), metadata: ["format": ModelContract.weightFormat], url: url)
     }
 
+    /// Widen context projections without changing any previously learned column.
+    func loadCompatibleWeights(from url: URL, sourceContext: ModelContextSchema) throws {
+        if sourceContext.hasSameLayout(as: contextSchema) { try loadWeights(from: url); return }
+        let (source, metadata) = try MLX.loadArraysAndMetadata(url: url)
+        guard metadata["format"] == ModelContract.weightFormat else { throw AgentTrainerError.model("Incompatible policy weight contract.") }
+        let oldIDs = sourceContext.fields.flatMap { field in field.values.map { field.id.uuidString + ":" + $0.id.uuidString } }
+        let newIDs = contextSchema.fields.flatMap { field in field.values.map { field.id.uuidString + ":" + $0.id.uuidString } }
+        guard Set(oldIDs).isSubset(of: Set(newIDs)) else {
+            throw AgentTrainerError.model("The new context vocabulary would remove learned values. The original brain was preserved.")
+        }
+        var result: [String: MLXArray] = [:]
+        for (name, parameter) in parameters().flattened() {
+            guard let original = source[name] else { throw AgentTrainerError.model("Missing pretrained parameter: \(name)") }
+            let projection = name == "fusion.0.weight" || (fusion.isEmpty && name.hasSuffix(".weight")
+                && original.ndim == 2 && original.dim(1) - oldIDs.count == parameter.dim(1) - newIDs.count)
+            if projection {
+                let tail = name == "futureStateHead.weight" ? ActionLayout.count : 0
+                let prefix = original.dim(1) - oldIDs.count - tail
+                guard prefix >= 0, parameter.dim(0) == original.dim(0),
+                      parameter.dim(1) == prefix + newIDs.count + tail else { throw AgentTrainerError.model("Incompatible context projection.") }
+                var columns = [original[0..., 0..<prefix]]
+                for id in newIDs {
+                    if let old = oldIDs.firstIndex(of: id) { columns.append(original[0..., (prefix + old)..<(prefix + old + 1)]) }
+                    else { columns.append(MLXArray.zeros([original.dim(0), 1], dtype: original.dtype)) }
+                }
+                if tail > 0 { columns.append(original[0..., (original.dim(1) - tail)...]) }
+                result[name] = concatenated(columns, axis: 1).asType(parameter.dtype)
+            } else {
+                guard original.shape == parameter.shape else { throw AgentTrainerError.model("Incompatible pretrained parameter: \(name)") }
+                result[name] = original.asType(parameter.dtype)
+            }
+        }
+        try update(parameters: ModuleParameters.unflattened(result), verify: .all)
+    }
+
     func loadWeights(from url: URL) throws {
         let (arrays, metadata) = try MLX.loadArraysAndMetadata(url: url)
         let expectedFormat = legacyMovementFeedback ? "AgentTrainer.Policy.v7"
@@ -1321,7 +1356,11 @@ final class AgentPolicy: Module, @unchecked Sendable {
         guard metadata["format"] == expectedFormat else {
             throw AgentTrainerError.model("These weights use an incompatible policy contract. Retrain from the preserved recordings.")
         }
-        try update(parameters: ModuleParameters.unflattened(arrays), verify: .all)
+        let expected = Dictionary(uniqueKeysWithValues: parameters().flattened())
+        let converted = Dictionary(uniqueKeysWithValues: arrays.map { key, value in
+            (key, value.asType(expected[key]?.dtype ?? value.dtype))
+        })
+        try update(parameters: ModuleParameters.unflattened(converted), verify: .all)
     }
 }
 
@@ -1395,7 +1434,8 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         gradients: ModuleParameters,
         targetType: DType,
         gradientNorm: MLXArray? = nil,
-        maxGradientNorm: Float? = nil
+        maxGradientNorm: Float? = nil,
+        preserveParameterTypes: Bool = false
     ) {
         initialize(model: model)
         stepArray = stepArray + 1
@@ -1455,7 +1495,7 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
             let update = (m / correction1) / (sqrt(v / correction2) + epsilon)
             let next = p * decayScale - scheduledLearningRate * update
             if usesMasterWeights { masterWeights[name] = next }
-            updated.append((name, next.asType(targetType)))
+            updated.append((name, next.asType(preserveParameterTypes ? parameter.dtype : targetType)))
         }
         model.update(parameters: ModuleParameters.unflattened(updated))
     }

@@ -273,7 +273,7 @@ struct ModelsView: View {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(profile.name).font(.headline).lineLimit(1)
                                     let progress = profile.trainingProgress
-                                    Text("\(progress?.globalStep ?? 0) steps • \(progress?.epoch ?? 0) epochs")
+                                    Text(profile.learningProgressDescription)
                                         .font(.caption.bold()).foregroundStyle(progress == nil ? Color.secondary : ATColor.green)
                                     let timing = profile.trainingDurationSummary(recordings: model.recordings)
                                     Text("\(TrainingDurationFormatter.string(seconds: timing.trainingSeconds)) trained • \(timing.experienceIsEstimated ? "~" : "")\(TrainingDurationFormatter.string(seconds: timing.experienceSeconds)) experience")
@@ -318,6 +318,9 @@ struct ModelsView: View {
 
 private struct ProfileEditor: View {
     @State var draft: AIProfile
+    @State private var configurationUsesRL = false
+    @State private var sharedArchitectureExpanded = false
+    @State private var inputCapacityExpanded = false
     @State private var acceptedDraft: AIProfile
     @State private var pendingBrainReset: AIProfile?
     @State private var suppressDraftObserver = false
@@ -350,10 +353,11 @@ private struct ProfileEditor: View {
                         KeyRestrictionGrid(restrictions: Binding(get: { draft.effectiveRestrictions }, set: { draft.restrictions = $0 }), model: model)
                     }
                 }
+                DisclosureGroup("Shared timing and architecture", isExpanded: $sharedArchitectureExpanded) {
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 12) {
-                        HStack { Text("Training-data configuration").font(.headline).foregroundStyle(ATColor.green); InfoTip("Maximum Steps and Autosave Steps are universal run controls in the Training tab, so they do not change a model's learning identity. Architecture, exact vision, and temporal-context changes require a fresh brain, and the app asks before clearing training.") }
-                        HStack { IntField("Epochs per block", value: $draft.training.epochs, help: "How many complete dataset passes to add. If a block is paused, Train finishes it first; after a completed block, Train adds another block of this size."); IntField("Batch", value: $draft.training.batchSize, help: "Samples evaluated together. Larger batches use more unified memory."); Spacer() }
+                        HStack { Text("Shared timing and architecture").font(.headline).foregroundStyle(ATColor.green); InfoTip("Maximum Steps and Autosave Steps are universal run controls in the Training tab, so they do not change a model's learning identity. Architecture, exact vision, and temporal-context changes require a fresh brain, and the app asks before clearing training.") }
+
                         VStack(alignment: .leading, spacing: 9) {
                             HStack {
                                 Text("Temporal frame context").font(.subheadline.bold()).foregroundStyle(ATColor.cyan)
@@ -396,6 +400,39 @@ private struct ProfileEditor: View {
                         }
                         .padding(11)
                         .raisedGlassSurface(cornerRadius: 11, tint: ATColor.cyan)
+                        HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives and records a new screen perception. Temporal spacing is measured in these frame intervals. It cannot exceed Action FPS."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the lightweight policy makes a fresh action decision using cached vision, current frame age, and actual posted-control history."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
+                        HStack { Text("Architecture preset").foregroundStyle(.secondary); Button("Small") { draft.training.architecture = .small }.primaryButton(); Button("Balanced") { draft.training.architecture = .balanced }.primaryButton(); Button("Large") { draft.training.architecture = .large }.primaryButton() }
+                        HStack { IntField("Visual width", value: $draft.training.architecture.visualEmbedding, help: "How much visual information is kept after the shared current/past convolution layers."); IntField("Recurrent width", value: $draft.training.architecture.recurrentWidth, help: "Capacity used to integrate the paired past-frame visual embeddings and controls."); Picker("Temporal encoder", selection: $draft.training.architecture.recurrentKind) { ForEach(RecurrentKind.allCases) { Text($0.rawValue).tag($0) } } }
+                        HStack {
+                            Picker("Spatial pooling", selection: Binding(get: { draft.training.architecture.effectiveVisualPooling }, set: { draft.training.architecture.visualPooling = $0 })) { ForEach(VisualPoolingKind.allCases) { Text($0.rawValue).tag($0) } }
+                            IntField("Attention keypoints", value: Binding(get: { draft.training.architecture.effectiveAttentionHeads }, set: { draft.training.architecture.attentionHeads = $0 }), help: "Independent learned spatial queries. Each retains visual features and exact X/Y while global mean/max preserve whole-screen context.")
+                                .disabled(draft.training.architecture.effectiveVisualPooling != .attention)
+                            Spacer()
+                            InfoTip("Attention Keypoints preserves spatial position with a compact learned pool whose dense parameter count barely changes with resolution. Flattened Grid is retained only for exact compatibility with older brains.")
+                        }
+                        HStack { InfoTip("The shared encoder sees the current frame and each real reduced-resolution past frame with screen coordinates. The temporal encoder then reads every past visual embedding together with the controls tied to that frame."); Spacer() }
+                        HStack { IntArrayField("Conv channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
+                        HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs. Changing it keeps existing brain weights and starts a fresh optimizer sequence when training resumes."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft, contextSchema: selectedContextSchema).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
+                    }
+                }
+                }
+                DisclosureGroup("Model input capacity", isExpanded: $inputCapacityExpanded) {
+                NeuralNetworkInputOverview(
+                    profile: draft,
+                    contextSchema: selectedContextSchema
+                )                }
+
+                Picker("Training method", selection: $configurationUsesRL) {
+                    Text("Demonstration").tag(false)
+                    Text("Reinforcement Learning").tag(true)
+                }.pickerStyle(.segmented)
+                if configurationUsesRL {
+                    RLSettingsView(profile: $draft, model: model)
+                } else {
+                    OLEDCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Demonstration learning").font(.headline).foregroundStyle(ATColor.green)
+                        HStack { IntField("Epochs per block", value: $draft.training.epochs, help: "How many complete dataset passes to add. If a block is paused, Train finishes it first; after a completed block, Train adds another block of this size."); IntField("Batch", value: $draft.training.batchSize, help: "Samples evaluated together. Larger batches use more unified memory."); Spacer() }
                         VStack(alignment: .leading, spacing: 12) {
                             HStack {
                                 Text("Generalization and predictive learning").font(.subheadline.bold()).foregroundStyle(ATColor.violet)
@@ -449,25 +486,8 @@ private struct ProfileEditor: View {
                             Spacer()
                             InfoTip("Changing scheduler or loss settings keeps the active brain weights but safely starts a new optimizer sequence. Older profiles remain on their exact legacy schedule until you explicitly select Adaptive Cosine + Plateau.")
                         }
-                        HStack { DoubleField("Perception FPS", value: $draft.training.perceptionFPS, help: "How often the AI receives and records a new screen perception. Temporal spacing is measured in these frame intervals. It cannot exceed Action FPS."); DoubleField("Action FPS", value: $draft.training.actionFPS, help: "How often the lightweight policy makes a fresh action decision using cached vision, current frame age, and actual posted-control history."); Picker("Precision", selection: $draft.training.precision) { ForEach(TrainingPrecision.allCases) { Text($0.rawValue).tag($0) } } }
-                        HStack { Text("Architecture preset").foregroundStyle(.secondary); Button("Small") { draft.training.architecture = .small }.primaryButton(); Button("Balanced") { draft.training.architecture = .balanced }.primaryButton(); Button("Large") { draft.training.architecture = .large }.primaryButton() }
-                        HStack { IntField("Visual width", value: $draft.training.architecture.visualEmbedding, help: "How much visual information is kept after the shared current/past convolution layers."); IntField("Recurrent width", value: $draft.training.architecture.recurrentWidth, help: "Capacity used to integrate the paired past-frame visual embeddings and controls."); Picker("Temporal encoder", selection: $draft.training.architecture.recurrentKind) { ForEach(RecurrentKind.allCases) { Text($0.rawValue).tag($0) } } }
-                        HStack {
-                            Picker("Spatial pooling", selection: Binding(get: { draft.training.architecture.effectiveVisualPooling }, set: { draft.training.architecture.visualPooling = $0 })) { ForEach(VisualPoolingKind.allCases) { Text($0.rawValue).tag($0) } }
-                            IntField("Attention keypoints", value: Binding(get: { draft.training.architecture.effectiveAttentionHeads }, set: { draft.training.architecture.attentionHeads = $0 }), help: "Independent learned spatial queries. Each retains visual features and exact X/Y while global mean/max preserve whole-screen context.")
-                                .disabled(draft.training.architecture.effectiveVisualPooling != .attention)
-                            Spacer()
-                            InfoTip("Attention Keypoints preserves spatial position with a compact learned pool whose dense parameter count barely changes with resolution. Flattened Grid is retained only for exact compatibility with older brains.")
                         }
-                        HStack { InfoTip("The shared encoder sees the current frame and each real reduced-resolution past frame with screen coordinates. The temporal encoder then reads every past visual embedding together with the controls tied to that frame."); Spacer() }
-                        HStack { IntArrayField("Conv channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
-                        HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs. Changing it keeps existing brain weights and starts a fresh optimizer sequence when training resumes."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft, contextSchema: selectedContextSchema).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
                     }
-                }
-                NeuralNetworkInputOverview(
-                    profile: draft,
-                    contextSchema: selectedContextSchema
-                )
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Training recordings").font(.headline).foregroundStyle(ATColor.amber)
@@ -480,6 +500,7 @@ private struct ProfileEditor: View {
                             folderIDs: Binding(get: { draft.effectiveFolderIDs }, set: { draft.recordingFolderIDs = $0 })
                         )
                     }
+                }
                 }
                 OLEDCard {
                     VStack(alignment: .leading, spacing: 10) {
@@ -518,6 +539,15 @@ private struct ProfileEditor: View {
             .disabled(model.isProfileBusy(draft.id))
         }
         .onChange(of: draft) { _, value in handleDraftChange(value) }
+        .onChange(of: model.selectedProfile?.activeVersionID) { _, _ in
+            guard let current = model.selectedProfile, current.id == draft.id else { return }
+            let updated = draft.preservingLearning(from: current)
+            acceptedDraft = updated; suppressDraftObserver = true; draft = updated
+        }
+        .onChange(of: model.selectedProfile?.effectiveRL.rewardRegion) { _, region in
+            guard model.selectedProfileID == draft.id else { return }
+            var settings = draft.effectiveRL; settings.rewardRegion = region; draft.rlTraining = settings
+        }
         .alert(acceptedDraft.isDeletionProtected ? "Duplicate the protected AI first" : "Change configuration and reset training?", isPresented: Binding(get: { pendingBrainReset != nil }, set: { if !$0 { pendingBrainReset = nil } })) {
             Button("Cancel", role: .cancel) { pendingBrainReset = nil }
             if acceptedDraft.isDeletionProtected {
@@ -1324,7 +1354,7 @@ struct TrainingView: View {
                         Picker("AI to train", selection: $model.selectedProfileID) {
                             Text("Select an AI…").tag(UUID?.none)
                             ForEach(model.profiles) { profile in
-                                Text("\(profile.name) — \(profile.trainingProgress?.globalStep ?? 0) steps").tag(Optional(profile.id))
+                                Text("\(profile.name) — \(profile.learningProgressDescription)").tag(Optional(profile.id))
                             }
                         }
                         .frame(width: 360)
@@ -1636,12 +1666,14 @@ struct RunView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 SectionTitle("Run", "A persistent ScreenCaptureKit stream sees the exact training resolution while action execution runs independently.")
+                Picker("Execution mode", selection: $model.runUsesRL) { Text("Run").tag(false); Text("RL Training").tag(true) }
+                    .pickerStyle(.segmented).disabled(model.agentIsActiveOrStarting)
                 OLEDCard {
                     HStack {
                         Picker("AI to run", selection: $model.selectedProfileID) {
                             Text("Select an AI…").tag(UUID?.none)
                             ForEach(model.profiles) { profile in
-                                Text("\(profile.name) — \(profile.trainingProgress?.globalStep ?? 0) steps").tag(Optional(profile.id))
+                                Text("\(profile.name) — \(profile.learningProgressDescription)").tag(Optional(profile.id))
                             }
                         }
                         .frame(maxWidth: 430)
@@ -1654,8 +1686,9 @@ struct RunView: View {
                     }
                 }
                 if let profile = model.selectedProfile {
+                    if model.runUsesRL { RLDashboard(model: model) }
                     OLEDCard {
-                        HStack { VStack(alignment: .leading, spacing: 7) { Text(profile.name).font(.title2.bold()); Text("Model vision \(profile.preprocessing.width) × \(profile.preprocessing.height) — live capture will be exactly the same").foregroundStyle(ATColor.cyan); Text("\(profile.preprocessing.colorMode.rawValue), \(profile.preprocessing.bitDepth)-bit, \(profile.preprocessing.chroma.rawValue)").foregroundStyle(.secondary) }; Spacer(); StatusPill(text: model.isStartingAgent ? "Starting / stopping" : model.isRunning ? "AI running" : profile.activeVersionID == nil ? "Training required" : "Ready", color: model.agentIsActiveOrStarting ? ATColor.green : ATColor.violet) }
+                        HStack { VStack(alignment: .leading, spacing: 7) { Text(profile.name).font(.title2.bold()); Text("Model vision \(profile.preprocessing.width) × \(profile.preprocessing.height) — live capture will be exactly the same").foregroundStyle(ATColor.cyan); Text("\(profile.preprocessing.colorMode.rawValue), \(profile.preprocessing.bitDepth)-bit, \(profile.preprocessing.chroma.rawValue)").foregroundStyle(.secondary) }; Spacer(); StatusPill(text: model.isStartingAgent ? "Starting / stopping" : model.isRunning ? "AI running" : profile.activeVersionID == nil ? (model.runUsesRL ? "Ready for RL" : "Training required") : "Ready", color: model.agentIsActiveOrStarting ? ATColor.green : ATColor.violet) }
                     }
                     if model.isLoadingRunContext {
                         OLEDCard {
@@ -1796,7 +1829,9 @@ struct RunView: View {
                             KeyRestrictionGrid(restrictions: Binding(get: { profile.effectiveRestrictions }, set: { value in var changed = profile; changed.restrictions = value; model.saveProfile(changed) }), model: model).disabled(model.isProfileBusy(profile.id))
                         }
                     }
+                    if !model.runUsesRL {
                     HStack { StatusPill(text: model.isTraining ? "Background training remains active" : "Custom panic shortcut armed", color: model.isTraining ? ATColor.cyan : ATColor.coral); Spacer(); if model.agentIsActiveOrStarting { Button(model.isStartingAgent ? "Cancel AI Start & Release Inputs" : "Stop AI & Disable All Hooks") { Task { await model.stopAgent() } }.primaryButton(color: ATColor.coral) } else { Button("Run AI") { Task { await model.startAgent() } }.primaryButton(color: ATColor.green).disabled(profile.activeVersionID == nil || model.trainingProfileID == profile.id || model.recordingIsActiveOrStarting || model.isReplaying) } }
+                    }
                 } else { ContentUnavailableView("No AI profile selected", systemImage: "cpu") }
             }.padding(28)
         }
@@ -2218,7 +2253,7 @@ private struct ThemePreview: View {
 }
 
 private struct HotkeySettingsEditor: View {
-    enum Field { case panic, record, run }
+    enum Field { case panic, record, run, rl }
     @ObservedObject var model: AppModel
     @State private var listening: Field?
     @State private var keyMonitor: Any?
@@ -2228,6 +2263,7 @@ private struct HotkeySettingsEditor: View {
             row("Panic and release everything", field: .panic, binding: model.hotkeys.panic)
             row("Start / stop recording", field: .record, binding: model.hotkeys.record)
             row("Start / stop agent", field: .run, binding: model.hotkeys.run)
+            row("Start / stop and save RL", field: .rl, binding: model.hotkeys.rlSessionToggle)
         }
             .onDisappear { stop() }
     }
@@ -2250,7 +2286,7 @@ private struct HotkeySettingsEditor: View {
     }
     private func commit(_ captured: HotkeyBinding, to field: Field) {
         var settings = model.hotkeys
-        switch field { case .panic: settings.panic = captured; case .record: settings.record = captured; case .run: settings.run = captured }
+        switch field { case .panic: settings.panic = captured; case .record: settings.record = captured; case .run: settings.run = captured; case .rl: settings.rlSessionToggle = captured }
         stop(resume: false)
         model.saveHotkeys(settings)
     }

@@ -1154,7 +1154,7 @@ actor WorkspaceStore {
             // active manifest is constant work and avoids loading every autosave.
             if profile.trainingProgress == nil,
                let activeVersionID = profile.activeVersionID,
-               let active = version(profileID: profile.id, versionID: activeVersionID) {
+               let active = version(profileID: profile.id, versionID: activeVersionID), active.rlSummary == nil {
                 profile.trainingProgress = TrainingProgressSummary(
                     globalStep: active.globalStep,
                     epoch: active.epoch ?? 0,
@@ -1169,7 +1169,7 @@ actor WorkspaceStore {
             // prefer immutable-version timing when available without scanning the
             // full saved-brain list.
             if var progress = profile.trainingProgress {
-                let active = profile.activeVersionID.flatMap { version(profileID: profile.id, versionID: $0) }
+                let active = profile.activeVersionID.flatMap { version(profileID: profile.id, versionID: $0) }.flatMap { $0.rlSummary == nil ? $0 : nil }
                 let checkpoint = checkpointTiming(profileID: profile.id)
                 if progress.trainingDurationSeconds == nil {
                     progress.trainingDurationSeconds = active?.trainingDurationSeconds ?? checkpoint.training
@@ -1223,7 +1223,7 @@ actor WorkspaceStore {
         var reset = profile
         reset.name = reset.name.trimmingCharacters(in: .whitespacesAndNewlines)
         reset.activeVersionID = nil
-        reset.trainingProgress = nil
+        reset.trainingProgress = nil; reset.rlProgress = nil
         let root = profileDirectory(profile.id)
         let profileURL = root.appendingPathComponent("profile.json")
         let previousProfileData = try Data(contentsOf: profileURL)
@@ -1268,8 +1268,97 @@ actor WorkspaceStore {
         profileDirectory(profileID).appendingPathComponent("Versions", isDirectory: true).appendingPathComponent(versionID.uuidString, isDirectory: true)
     }
 
+    private func activateRLVersion(profile: AIProfile, version: ModelVersionManifest, source: URL) throws -> WorkspaceVersionActivation {
+        let state = try JSONDecoder().decode(RLLearningState.self, from: Data(contentsOf: source.appendingPathComponent("state.json")))
+        guard state.format == 1, state.activeVersionID == version.id else {
+            throw AgentTrainerError.storage("This RL version does not contain its matching checkpoint.")
+        }
+        for file in ["trainer.safetensors", "heads.safetensors", "weights.safetensors", "optimizer.safetensors", "collected.plist"] {
+            guard FileManager.default.fileExists(atPath: source.appendingPathComponent(file).path) else {
+                throw AgentTrainerError.storage("The RL checkpoint is missing \(file).")
+            }
+        }
+        let root = profileDirectory(profile.id), checkpoint = root.appendingPathComponent("RLCheckpoint")
+        let incoming = root.appendingPathComponent(".RLActivation.\(UUID().uuidString)")
+        let backup = root.appendingPathComponent(".RLActivation.backup.\(UUID().uuidString)")
+        var installed = false
+        do {
+            try FileManager.default.copyItem(at: source, to: incoming)
+            if FileManager.default.fileExists(atPath: checkpoint.path) { try FileManager.default.moveItem(at: checkpoint, to: backup) }
+            try FileManager.default.moveItem(at: incoming, to: checkpoint); installed = true
+            var updated = profile
+            updated.activeVersionID = version.id; updated.rlTraining = state.configuration; updated.rlProgress = version.rlSummary
+            updated.preprocessing = version.preprocessing; updated.training = version.training; updated.channels = version.channels
+            try saveProfile(updated)
+            try? FileManager.default.removeItem(at: backup)
+            return WorkspaceVersionActivation(profile: updated, version: version, checkpointIsResumable: true)
+        } catch {
+            if installed { try? FileManager.default.removeItem(at: checkpoint) }
+            if FileManager.default.fileExists(atPath: backup.path) { try FileManager.default.moveItem(at: backup, to: checkpoint) }
+            try? FileManager.default.removeItem(at: incoming)
+            throw error
+        }
+    }
+
+    func publishRL(profileID: UUID, version: ModelVersionManifest, staged: URL, keeping: Int) throws -> AIProfile {
+        guard version.rlSummary != nil, version.artifactFileNamesAreSafe, version.contextSchemaIsValid,
+              var profile = listProfiles().first(where: { $0.id == profileID }) else {
+            throw AgentTrainerError.storage("The RL profile or publication is invalid.")
+        }
+        guard version.schemaVersion == ModelContract.schemaVersion,
+              let publicationData = try? Data(contentsOf: staged.appendingPathComponent("publication.json")),
+              (try? decoder.decode(UUID.self, from: publicationData)) == version.id else {
+            throw AgentTrainerError.storage("The RL publication does not match its checkpoint.")
+        }
+        for name in ["weights.safetensors", "trainer.safetensors", "heads.safetensors", "optimizer.safetensors", "state.json", "collected.plist"] {
+            let file = staged.appendingPathComponent(name)
+            guard (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                throw AgentTrainerError.storage("The RL publication is missing \(name).")
+            }
+        }
+        let root = profileDirectory(profileID)
+        let destination = versionDirectory(profileID: profileID, versionID: version.id)
+        let checkpoint = root.appendingPathComponent("RLCheckpoint")
+        let incoming = root.appendingPathComponent(".RLCheckpoint.incoming.\(UUID().uuidString)")
+        let backup = root.appendingPathComponent(".RLCheckpoint.backup.\(UUID().uuidString)")
+        try encoder.encode(version).write(to: staged.appendingPathComponent("manifest.json"), options: .atomic)
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var installed = false
+        do {
+            try FileManager.default.copyItem(at: staged, to: incoming)
+            try FileManager.default.moveItem(at: staged, to: destination)
+            if FileManager.default.fileExists(atPath: checkpoint.path) {
+                try FileManager.default.moveItem(at: checkpoint, to: backup)
+            }
+            try FileManager.default.moveItem(at: incoming, to: checkpoint); installed = true
+            profile.activeVersionID = version.id; profile.rlProgress = version.rlSummary
+            try saveProfile(profile)
+            try? FileManager.default.removeItem(at: backup)
+            _ = try? pruneAutosaveVersions(profile: profile, keeping: keeping)
+            return profile
+        } catch {
+            if installed { try? FileManager.default.removeItem(at: checkpoint) }
+            if FileManager.default.fileExists(atPath: backup.path) {
+                try FileManager.default.moveItem(at: backup, to: checkpoint)
+            }
+            try? FileManager.default.removeItem(at: incoming)
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+
     func checkpointDirectory(profileID: UUID) -> URL {
         profileDirectory(profileID).appendingPathComponent("Checkpoint", isDirectory: true)
+    }
+
+    /// If a process exits between the checkpoint swap and profile publication,
+    /// the immutable active version still owns its last committed resume state.
+    func rlCheckpointDirectory(profile: AIProfile) -> URL {
+        let checkpoint = profileDirectory(profile.id).appendingPathComponent("RLCheckpoint", isDirectory: true)
+        guard let id = profile.activeVersionID, version(profileID: profile.id, versionID: id)?.rlSummary != nil else { return checkpoint }
+        let publication = (try? Data(contentsOf: checkpoint.appendingPathComponent("publication.json")))
+            .flatMap { try? JSONDecoder().decode(UUID.self, from: $0) }
+        return publication == id ? checkpoint : versionDirectory(profileID: profile.id, versionID: id)
     }
 
     func saveVersionManifest(_ manifest: ModelVersionManifest, profileID: UUID) throws {
@@ -1379,6 +1468,7 @@ actor WorkspaceStore {
             throw AgentTrainerError.storage("The selected model version is missing or has an invalid manifest.")
         }
         let source = versionDirectory(profileID: profile.id, versionID: version.id)
+        if version.rlSummary != nil { return try activateRLVersion(profile: profile, version: version, source: source) }
         let sourceWeights = source.appendingPathComponent(version.weightsFile)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: sourceWeights.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
@@ -1411,6 +1501,7 @@ actor WorkspaceStore {
                 try FileManager.default.copyItem(at: source.appendingPathComponent(stateFile), to: candidate.appendingPathComponent("state.json"))
                 try encoder.encode(version.schemaVersion).write(to: candidate.appendingPathComponent("model-schema.json"), options: .atomic)
                 try FileManager.default.copyItem(at: source.appendingPathComponent(randomStateFile), to: candidate.appendingPathComponent("random.safetensors"))
+                try JSONEncoder().encode(Optional(version.id)).write(to: candidate.appendingPathComponent("policy-lineage.json"), options: .atomic)
                 temporary = candidate
             } catch {
                 try? FileManager.default.removeItem(at: candidate)

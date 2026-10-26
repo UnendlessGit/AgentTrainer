@@ -18,6 +18,7 @@ final class AgentRuntime: @unchecked Sendable {
 
     var onState: (@Sendable (InputState) -> Void)?
     var onMetrics: (@Sendable (RuntimeMetrics) -> Void)?
+    var onWillStop: (@Sendable (String?) -> Void)?
     var onStop: (@Sendable (String?) -> Void)?
     var onPreview: (@Sendable (VisionPreviewFrame) -> Void)?
     var onVisualization: (@Sendable (CNNVisualizationFrame) -> Void)?
@@ -30,6 +31,12 @@ final class AgentRuntime: @unchecked Sendable {
     private let inferenceQueue = DispatchQueue(label: "AgentTrainer.Inference", qos: .userInteractive)
     private let actionQueue = DispatchQueue(label: "AgentTrainer.Actions", qos: .userInteractive)
     private let lock = NSLock()
+    private var rlOptions: RLRuntimeOptions?
+    private var visionMask: CGRect?
+    private var rlHeads: RLHeads?
+    private var rlRandom = RLRandom(state: 42)
+    private var rlRevision = 0
+    private var rlActionsEnabled = false
     private var model: AgentPolicy?
     private var visualEncodingFunction: VisualizationFunction?
     private var predictionFunction: VisualizationFunction?
@@ -44,6 +51,7 @@ final class AgentRuntime: @unchecked Sendable {
     private var contextTransitionPending = false
     private var safety = AgentSafetyPolicy()
     private var captureRect = CGRect.zero
+    private var originalRLCaptureRect = CGRect.zero
     private var mode: FrameMode = .newest
     private var mouseMode: MouseControlMode = .absolute
     private var gameCamera = GameCameraSettings()
@@ -65,9 +73,11 @@ final class AgentRuntime: @unchecked Sendable {
         var timestampNanos: UInt64
         var timing: [Float]
         var embedding: MLXArray
+        var revision: Int = 0
     }
     private struct CachedVision: @unchecked Sendable {
         var current: MLXArray
+        var packed: Data
         var past: [TemporalFrame]
         var sourceTime: UInt64
         var publishedAt: Double
@@ -102,6 +112,10 @@ final class AgentRuntime: @unchecked Sendable {
             }
         }
 
+        mutating func replace(_ frame: TemporalFrame) {
+            if let index = storage.firstIndex(where: { $0?.timestampNanos == frame.timestampNanos }) { storage[index] = frame }
+        }
+
         func frame(distanceBack: Int) -> TemporalFrame? {
             guard distanceBack > 0, distanceBack <= count, !storage.isEmpty else { return nil }
             return storage[(oldest + count - distanceBack) % storage.count]
@@ -111,6 +125,8 @@ final class AgentRuntime: @unchecked Sendable {
     private var actionTimer: DispatchSourceTimer?
     private var nextPerceptionTime = 0.0
     private var metrics = RuntimeMetrics()
+    private var headLatencies: [Double] = []
+    private var encodingLatencies: [Double] = []
     private var startedAt = 0.0
     private var stopped = true
     private var targetPID: pid_t?
@@ -134,7 +150,7 @@ final class AgentRuntime: @unchecked Sendable {
         injector.onState = { [weak self] state in self?.onState?(state) }
     }
 
-    func start(profile: AIProfile, version: ModelVersionManifest, allowedKeyCodes: Set<UInt16>, captureSpec: CaptureSpec, captureRect: CGRect, mode: FrameMode, mouseMode: MouseControlMode, gameCamera: GameCameraSettings = GameCameraSettings(), outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions(), contextSelection: [UUID: UUID] = [:], safety: AgentSafetyPolicy, previewFPS: Double = 0, visualizationSettings: CNNVisualizationSettings = CNNVisualizationSettings(), ignoredHotkeys: [HotkeyBinding] = []) async throws {
+    func start(profile: AIProfile, version: ModelVersionManifest, allowedKeyCodes: Set<UInt16>, captureSpec: CaptureSpec, captureRect: CGRect, mode: FrameMode, mouseMode: MouseControlMode, gameCamera: GameCameraSettings = GameCameraSettings(), outputPermissions: RuntimeOutputPermissions = RuntimeOutputPermissions(), contextSelection: [UUID: UUID] = [:], safety: AgentSafetyPolicy, previewFPS: Double = 0, visualizationSettings: CNNVisualizationSettings = CNNVisualizationSettings(), ignoredHotkeys: [HotkeyBinding] = [], rlOptions: RLRuntimeOptions? = nil, visionMask: CGRect? = nil) async throws {
         guard AXIsProcessTrusted() else {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(options)
@@ -190,6 +206,14 @@ final class AgentRuntime: @unchecked Sendable {
         let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: version.id)
         try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
         model.train(false)
+        let rlHeads: RLHeads? = rlOptions.map { options in
+            let heads = RLHeads(width: model.fusionWidth)
+            return heads
+        }
+        if let rlHeads, let rlOptions {
+            try RLWeightTransfer.install(rlOptions.initial.heads, in: rlHeads)
+            try RLWeightTransfer.install(rlOptions.initial.policy, in: model)
+        }
         let temporal = runtimeProfile.training.effectiveTemporalVision
         let hasTemporalMemory = temporal.pastFrameCount > 0
         let hasContext = !contextSchema.isEmpty
@@ -206,16 +230,7 @@ final class AgentRuntime: @unchecked Sendable {
             }
             return [current]
         }
-        let predictionFunction: VisualizationFunction = compile(inputs: [model]) { inputs in
-            let features = model.encodedTemporalFeatures(current: inputs[0],
-                past: hasTemporalMemory ? inputs[1] : nil,
-                controls: hasTemporalMemory ? inputs[2] : nil,
-                currentTiming: inputs[currentTimingIndex],
-                pastTiming: hasTemporalMemory ? inputs[4] : nil)
-            let logits = model.logits(temporalFeatures: features,
-                contextValues: hasContext ? inputs[contextInputIndex] : nil)
-            return [model.activatedPredictions(logits: logits)]
-        }
+        let predictionFunction = RuntimePolicyGraph.make(model: model, heads: rlHeads)
         // Diagnostic graphs are lazy: creating these closures does not execute
         // or materialize an extra tensor. The selected graph first compiles only
         // when its view is enabled and reaches its independently capped rate.
@@ -304,6 +319,9 @@ final class AgentRuntime: @unchecked Sendable {
         let accepted = lock.withLock { () -> Bool in
             guard launchRevision == launchToken, starting, stopped else { return false }
             self.model = model
+            self.rlOptions = rlOptions; self.rlHeads = rlHeads; self.visionMask = rlOptions?.mask ?? visionMask
+            self.rlRandom = rlOptions?.random ?? RLRandom(state: 42)
+            self.rlRevision = rlOptions?.initial.revision ?? 0; self.rlActionsEnabled = rlOptions == nil
             self.visualEncodingFunction = visualEncodingFunction
             self.predictionFunction = predictionFunction
             self.activationVisualizationFunctions = activationVisualizationFunctions
@@ -318,7 +336,7 @@ final class AgentRuntime: @unchecked Sendable {
             self.allowedKeyCodes = runtimeAllowedKeyCodes
             self.shiftUsesKeyboardChannel = (version.trainingDataSchema ?? 0) >= 7
             self.safety = safety
-            self.captureRect = captureRect
+            self.captureRect = captureRect; self.originalRLCaptureRect = captureRect
             self.mode = mode
             self.mouseMode = mouseMode
             self.gameCamera = gameCamera
@@ -334,6 +352,7 @@ final class AgentRuntime: @unchecked Sendable {
             latestFrame = nil; latestFrameHostNanos = 0; lastUsableCaptureFrame = nil
             predictionLatch.reset(); temporalFrames.reset(); cachedVision = nil; actionInferencePending = false; lastUsableFrameSourceNanos = 0
             metrics = RuntimeMetrics(); startedAt = CACurrentMediaTime(); nextPerceptionTime = 0; lastMetricsReportTime = 0; lastFocusCheckTime = 0; stopped = false
+            headLatencies = []; encodingLatencies = []
             // Keep session enablement ordered with live permission changes. A
             // toggle made while model weights are loading must not be replaced
             // by the older settings captured when `start` was first called.
@@ -350,20 +369,25 @@ final class AgentRuntime: @unchecked Sendable {
                 guard let self else { return }
                 let panic = sample.kind == .key && sample.isDown && sample.keyCode == self.safety.panicKeyCode && (sample.modifiers & self.safety.panicModifiers) == self.safety.panicModifiers
                 guard panic || self.safety.stopOnHumanInput else { return }
+                self.suspendRLActions()
                 Task { await self.stop(reason: panic ? "Panic stop" : "Stopped on human input") }
             }
             try safetyMonitor.start()
-            let targetPID = await focusTargetIfNeeded(captureSpec)
+            let rewardTarget = rlOptions.map { CGPoint(x: captureRect.minX + $0.mask.midX * captureRect.width,
+                y: captureRect.minY + $0.mask.midY * captureRect.height) }
+            let targetPID = await focusTargetIfNeeded(captureSpec, rewardTarget: rewardTarget)
+            if rlOptions != nil && targetPID == nil { throw AgentTrainerError.capture("The reward region must belong to an available game or application window.") }
             guard lock.withLock({ !stopped }) else { throw CancellationError() }
             lock.withLock { self.targetPID = targetPID }
             var liveCaptureSpec = captureSpec
             liveCaptureSpec.requestedFPS = runtimeProfile.training.perceptionFPS
             liveCaptureSpec.showsCursor = version.trainingShowsCursor ?? captureSpec.showsCursor
-            try await capture.start(spec: liveCaptureSpec, queueDepth: mode == .newest ? 3 : 8, onFrame: { [weak self] buffer, pts in
+            try await capture.start(spec: liveCaptureSpec, queueDepth: mode == .newest ? 3 : 8, nativeWindowGeometry: rlOptions != nil || visionMask != nil, onFrame: { [weak self] buffer, pts in
                 self?.schedule(buffer, timestampNanos: Self.hostTimeNanos(pts), countThrottledAsDropped: true)
             }, onIdle: { [weak self] pts in
                 self?.receiveIdle(timestamp: pts)
             }, onUnexpectedStop: { [weak self] error in
+                self?.suspendRLActions()
                 Task { await self?.stop(reason: "Capture stopped: \(error.localizedDescription)") }
             })
             guard lock.withLock({ !stopped }) else { _ = try? await capture.stop(); throw CancellationError() }
@@ -381,6 +405,97 @@ final class AgentRuntime: @unchecked Sendable {
             _ = try? await capture.stop()
             injector.disableAndReleaseAll()
             throw error
+        }
+    }
+
+    func moveRLCapture(by offset: CGSize) {
+        lock.withLock {
+            let rect = originalRLCaptureRect.offsetBy(dx: offset.width, dy: offset.height)
+            if rect != captureRect { captureRect = rect; contextRevision &+= 1; predictionLatch.reset() }
+        }
+    }
+
+    func suspendRLActions() {
+        lock.withLock { rlActionsEnabled = false; contextRevision &+= 1; predictionLatch.reset() }
+        injector.disableAndReleaseAll()
+    }
+
+    func beginRLEpisode() async {
+        let revision = lock.withLock { contextRevision }
+        await drain(queue: inferenceQueue)
+        await drain(queue: actionQueue)
+        lock.withLock {
+            guard !stopped, rlOptions != nil, contextRevision == revision else { return }
+            temporalFrames.reset(); cachedVision = nil; predictionLatch.reset()
+            contextRevision &+= 1
+            injector.enable(outputPermissions: outputPermissions)
+            rlActionsEnabled = true
+        }
+    }
+
+    func awaitInitialRLFocus() async throws {
+        guard lock.withLock({ !stopped }) else { throw CancellationError() }
+        guard let pid = lock.withLock({ targetPID }), let app = NSRunningApplication(processIdentifier: pid) else {
+            throw AgentTrainerError.capture("The training application is unavailable.")
+        }
+        await MainActor.run { _ = app.activate(options: [.activateAllWindows]) }
+        for _ in 0..<100 {
+            guard lock.withLock({ !stopped }) else { throw CancellationError() }
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw AgentTrainerError.capture("Activate the training application and start RL using its global shortcut.")
+    }
+
+    func episodeKey(_ key: UInt16?) async throws {
+        guard let key else { return }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            actionQueue.async { [self] in
+                do {
+                    try lock.withLock {
+                        guard !stopped, !rlActionsEnabled, outputPermissions.keyboard, AXIsProcessTrusted() else {
+                            throw AgentTrainerError.permission("Episode keys require keyboard output and Accessibility permission.")
+                        }
+                        if let targetPID, NSWorkspace.shared.frontmostApplication?.processIdentifier != targetPID {
+                            throw AgentTrainerError.model("The target application lost focus before an episode key could be sent.")
+                        }
+                        injector.tapControllerKey(key)
+                    }
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    func rlRandomState() async -> RLRandom {
+        await withCheckedContinuation { continuation in
+            inferenceQueue.async { [self] in continuation.resume(returning: rlRandom) }
+        }
+    }
+
+    func installRLSnapshot(_ snapshot: RLWeightSnapshot) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    guard let model = lock.withLock({ !stopped ? self.model : nil }), let rlHeads else {
+                        throw CancellationError()
+                    }
+                    try RLWeightTransfer.install(snapshot.policy, in: model)
+                    try RLWeightTransfer.install(snapshot.heads, in: rlHeads)
+                    var vision = lock.withLock { cachedVision }
+                    if vision != nil {
+                        let images = VisionPreprocessor.mlxTensor(vision!.packed, batch: 1, spec: model.profile.preprocessing)
+                        let current = model.visualEmbedding(visualFeatures: model.visualActivations(images: images).last!)
+                        MLX.eval(current); vision!.current = current
+                        let refreshed = RLPastEncoder.encode(vision!.past.map(\.packed), model: model)
+                        for i in vision!.past.indices { vision!.past[i].embedding = refreshed[i]; vision!.past[i].revision = snapshot.revision }
+                    }
+                    lock.withLock {
+                        if !stopped { cachedVision = vision; rlRevision = snapshot.revision }
+                    }
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
         }
     }
 
@@ -465,6 +580,8 @@ final class AgentRuntime: @unchecked Sendable {
         case .perform(let value):
             timer = value
         }
+        if let reason { AppLog.write(category: "Runtime", "Stopped execution", details: reason) }
+        onWillStop?(reason)
         timer?.setEventHandler {}
         timer?.cancel()
         // Once no action block can still be executing, release physical input
@@ -484,7 +601,7 @@ final class AgentRuntime: @unchecked Sendable {
         // before a new session can own the pending-decision flag.
         await drain(queue: actionQueue)
         lock.withLock {
-            visualEncodingFunction = nil; cachedVision = nil; actionInferencePending = false; predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; profile = nil; contextSchema = .empty; contextVector.removeAll(keepingCapacity: false); contextRevision &+= 1; contextTransitionPending = false; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
+            visualEncodingFunction = nil; cachedVision = nil; actionInferencePending = false; predictionFunction = nil; activationVisualizationFunctions.removeAll(keepingCapacity: false); channelVisualizationFunction = nil; saliencyVisualizationFunction = nil; saliencyGradientFunction = nil; model = nil; rlHeads = nil; rlOptions = nil; profile = nil; contextSchema = .empty; contextVector.removeAll(keepingCapacity: false); contextRevision &+= 1; contextTransitionPending = false; allowedKeyCodes.removeAll(keepingCapacity: false); shiftUsesKeyboardChannel = false
             latestFrame = nil; latestFrameHostNanos = 0; lastUsableCaptureFrame = nil; temporalFrames.reset(); predictionLatch.reset(); processing = false
             visualizationSettings = CNNVisualizationSettings(); lastVisualizationTime = 0
         }
@@ -562,7 +679,7 @@ final class AgentRuntime: @unchecked Sendable {
         lock.lock()
         guard !stopped, let visualEncodingFunction, let model, let profile else { lock.unlock(); return }
         let temporal = profile.training.effectiveTemporalVision
-        let selectedPriorFrames: [TemporalFrame?] = (0..<temporal.pastFrameCount).map { frame in
+        var selectedPriorFrames: [TemporalFrame?] = (0..<temporal.pastFrameCount).map { frame in
             let distance = temporal.frameSpacing * (temporal.pastFrameCount - frame)
             return temporalFrames.frame(distanceBack: distance)
         }
@@ -577,11 +694,15 @@ final class AgentRuntime: @unchecked Sendable {
         let mouseMode = self.mouseMode
         let contextVector = self.contextVector
         let inferenceContextRevision = contextRevision
+        let inferencePolicyRevision = rlRevision
         let inferencePermissionsRevision = outputPermissionsRevision
         let rect = captureRect
         lock.unlock()
         let began = CACurrentMediaTime()
         do {
+            let stale = selectedPriorFrames.indices.filter { selectedPriorFrames[$0].map { $0.revision != inferencePolicyRevision } ?? false }
+            let refreshed = RLPastEncoder.encode(stale.map { selectedPriorFrames[$0]!.packed }, model: model)
+            for (i, slot) in stale.enumerated() { selectedPriorFrames[slot]!.embedding = refreshed[i]; selectedPriorFrames[slot]!.revision = inferencePolicyRevision }
             let pastSpec = temporal.pastFrameSpec(from: profile.preprocessing)
             let hasTemporalMemory = temporal.pastFrameCount > 0
             let sharesPackedRepresentation = hasTemporalMemory && pastSpec == profile.preprocessing
@@ -590,7 +711,7 @@ final class AgentRuntime: @unchecked Sendable {
                 : [profile.preprocessing]
             // One source mapping and command buffer produces every resolution
             // needed by this perception.
-            let jobs = try preprocessor.submit(buffer, specs: requestedSpecs)
+            let jobs = try preprocessor.submit(buffer, specs: requestedSpecs, mask: visionMask)
             guard let currentJob = jobs.first else {
                 throw AgentTrainerError.model("The live vision pipeline returned no current frame.")
             }
@@ -727,21 +848,27 @@ final class AgentRuntime: @unchecked Sendable {
             }
             let fallbackFrame = hasTemporalMemory ? TemporalFrame(packed: packedPastFrame,
                 controls: zeroControls, timestampNanos: snapshot.timestamp,
-                timing: zeroTiming, embedding: encoded[1]) : nil
+                timing: zeroTiming, embedding: encoded[1], revision: inferencePolicyRevision) : nil
+            for frame in selectedPriorFrames.compactMap({ $0 }) { temporalFrames.replace(frame) }
             let selectedFrames = selectedPriorFrames.compactMap { $0 ?? fallbackFrame }
-            cachedVision = CachedVision(current: encoded[0], past: selectedFrames,
+            cachedVision = CachedVision(current: encoded[0], packed: packed, past: selectedFrames,
                 sourceTime: frameTimestamp, publishedAt: CACurrentMediaTime())
             if hasTemporalMemory {
                 temporalFrames.append(TemporalFrame(packed: packedPastFrame,
                     controls: snapshot.controls, timestampNanos: snapshot.timestamp,
-                    timing: snapshot.features, embedding: encoded[1]),
+                    timing: snapshot.features, embedding: encoded[1], revision: inferencePolicyRevision),
                     capacity: temporal.pastFrameCount * temporal.frameSpacing + 1)
             }
             metrics.frameCount += 1
             let elapsed = max(0.001, CACurrentMediaTime() - startedAt)
             metrics.perceptionFPS = Double(metrics.frameCount) / elapsed
             metrics.latencyMilliseconds = (CACurrentMediaTime() - began) * 1_000
+            encodingLatencies.append(metrics.latencyMilliseconds)
+            if encodingLatencies.count > 512 { encodingLatencies.removeFirst() }
             let now = CACurrentMediaTime()
+            if now - lastMetricsReportTime >= 0.1 {
+                metrics.encodingP95Milliseconds = Self.p95(encodingLatencies); metrics.actionP95Milliseconds = Self.p95(headLatencies)
+            }
             let metricsSnapshot: RuntimeMetrics? = now - lastMetricsReportTime >= 0.1 ? metrics : nil
             if metricsSnapshot != nil { lastMetricsReportTime = now }
             lock.unlock()
@@ -816,7 +943,7 @@ final class AgentRuntime: @unchecked Sendable {
 
     private func actionTick() {
         let admission = lock.withLock { () -> DecisionAdmission in
-            guard !stopped, let profile else { return .idle }
+            guard !stopped, let profile, rlOptions == nil || rlActionsEnabled else { return .idle }
             let maximumAge = max(0.35, 3 / max(0.0001, profile.training.perceptionFPS))
             // This check runs on the action timer, independently of MLX. A
             // queued or stalled head must not keep an old physical hold alive.
@@ -828,6 +955,7 @@ final class AgentRuntime: @unchecked Sendable {
         switch admission {
         case .idle: break
         case .stale:
+            suspendRLActions()
             Task { await stop(reason: "Stopped because action inference stopped producing fresh predictions") }
         case .infer:
             inferenceQueue.async { [weak self] in self?.inferAction() }
@@ -838,7 +966,7 @@ final class AgentRuntime: @unchecked Sendable {
     /// one serial queue; at most one decision and one newest image are pending.
     private func inferAction() {
         let state = lock.withLock { () -> (VisualizationFunction, AIProfile, CachedVision, [Float], UInt64, Int, CGRect)? in
-            guard !stopped, !contextTransitionPending, let predictionFunction, let profile, let cachedVision else { return nil }
+            guard !stopped, rlOptions == nil || rlActionsEnabled, !contextTransitionPending, let predictionFunction, let profile, let cachedVision else { return nil }
             return (predictionFunction, profile, cachedVision, contextVector, contextRevision, outputPermissionsRevision, captureRect)
         }
         guard let (predict, profile, vision, context, revision, permissionsRevision, rect) = state else {
@@ -876,25 +1004,47 @@ final class AgentRuntime: @unchecked Sendable {
                 inputs.append(MLXArray(pastTiming, [1, vision.past.count, TemporalInputContract.valueCount]))
             }
             if !context.isEmpty { inputs.append(MLXArray(context, [1, context.count])) }
-            let output = Device.withDefaultDevice(.gpu) { predict(inputs)[0] }
-            MLX.eval(output)
-            let values = output.asArray(Float.self)
+            let outputs = Device.withDefaultDevice(.gpu) { predict(inputs) }
+            MLX.eval(outputs)
+            rlOptions?.budget?.noteInference(milliseconds: (CACurrentMediaTime() - began) * 1000, actionFPS: profile.training.actionFPS)
+            var values = outputs[0].asArray(Float.self)
+            var decision: RLDecision?
+            if let options = rlOptions, outputs.count == 4 {
+                let sampled = options.distribution.sample(logits: outputs[1].asArray(Float.self),
+                    logStd: outputs[3].asArray(Float.self), random: &rlRandom)
+                guard sampled.logProbability.isFinite, sampled.latent.allSatisfy(\.isFinite), outputs[2].item(Float.self).isFinite else {
+                    throw AgentTrainerError.model("The RL policy produced a non-finite action or value; inputs were stopped safely.")
+                }
+                values = sampled.prediction
+                let currentTiming = inputs[vision.past.isEmpty ? 1 : 3].asArray(Float.self)
+                let pastTiming = vision.past.isEmpty ? [] : inputs[4].asArray(Float.self)
+                decision = RLDecision(observation: RLObservation(current: vision.packed, past: vision.past.map(\.packed),
+                    controls: vision.past.flatMap(\.controls), timing: currentTiming, pastTiming: pastTiming, context: context),
+                    latent: sampled.latent, binary: sampled.binary, logProbability: sampled.logProbability,
+                    value: outputs[2].item(Float.self), timestamp: 0, revision: rlRevision)
+            }
             guard values.count == ActionLayout.count, values.allSatisfy(\.isFinite) else {
                 throw AgentTrainerError.model("The brain produced an invalid prediction, so all outputs were stopped safely.")
             }
             let accepted = lock.withLock { () -> Bool in
-                guard !stopped, !contextTransitionPending, contextRevision == revision,
+                guard !stopped, rlOptions == nil || rlActionsEnabled, !contextTransitionPending, contextRevision == revision,
                       outputPermissionsRevision == permissionsRevision else { return false }
                 predictionLatch.publish(values)
                 metrics.actionInferenceMilliseconds = (CACurrentMediaTime() - began) * 1000
+                headLatencies.append(metrics.actionInferenceMilliseconds)
+                if headLatencies.count > 512 { headLatencies.removeFirst() }
+                if CACurrentMediaTime() - lastMetricsReportTime >= 0.1 {
+                    metrics.actionP95Milliseconds = Self.p95(headLatencies); metrics.encodingP95Milliseconds = Self.p95(encodingLatencies)
+                }
                 metrics.observationAgeMilliseconds = TemporalInputContract.seconds(snapshot.timestamp, since: vision.sourceTime) * 1000
                 return true
             }
             guard accepted else { lock.withLock { actionInferencePending = false }; return }
+            let executedDecision = decision
             actionQueue.async { [weak self] in
                 guard let self else { return }
                 defer { self.lock.withLock { self.actionInferencePending = false } }
-                self.executePrediction(context: revision, permissions: permissionsRevision)
+                self.executePrediction(context: revision, permissions: permissionsRevision, rlDecision: executedDecision)
             }
         } catch {
             lock.withLock { actionInferencePending = false }
@@ -902,9 +1052,9 @@ final class AgentRuntime: @unchecked Sendable {
         }
     }
 
-    private func executePrediction(context expectedContext: UInt64, permissions expectedPermissions: Int) {
+    private func executePrediction(context expectedContext: UInt64, permissions expectedPermissions: Int, rlDecision: RLDecision? = nil) {
         lock.lock()
-        guard !stopped, !contextTransitionPending,
+        guard !stopped, rlOptions == nil || rlActionsEnabled, !contextTransitionPending,
               contextRevision == expectedContext, outputPermissionsRevision == expectedPermissions,
               let latched = predictionLatch.consume(), let profile else { lock.unlock(); return }
         let prediction = latched.values
@@ -923,6 +1073,7 @@ final class AgentRuntime: @unchecked Sendable {
             lastFocusCheckTime = now
             if NSWorkspace.shared.frontmostApplication?.processIdentifier != targetPID {
                 lock.unlock()
+                suspendRLActions()
                 Task { await stop(reason: "Stopped because the target window lost focus") }
                 return
             }
@@ -933,7 +1084,7 @@ final class AgentRuntime: @unchecked Sendable {
         let snapshot: RuntimeMetrics? = now - lastMetricsReportTime >= 0.1 ? metrics : nil
         if snapshot != nil { lastMetricsReportTime = now }
         lock.unlock()
-        injector.execute(
+        let executed = injector.execute(
             prediction,
             profile: profile,
             allowedKeyCodes: allowedKeyCodes,
@@ -944,15 +1095,37 @@ final class AgentRuntime: @unchecked Sendable {
             predictionIsFresh: latched.isFresh,
             shiftUsesKeyboardChannel: shiftUsesKeyboardChannel
         )
+        if executed, var decision = rlDecision {
+            decision.timestamp = injector.lastExecutionTimestamp
+            rlOptions?.onDecision(decision)
+        }
         if let snapshot { onMetrics?(snapshot) }
     }
 
-    private func focusTargetIfNeeded(_ spec: CaptureSpec) async -> pid_t? {
-        guard let id = spec.windowID,
-              let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false),
-              let pid = content.windows.first(where: { $0.windowID == id })?.owningApplication?.processID,
-              let app = NSRunningApplication(processIdentifier: pid) else { return nil }
-        app.activate(options: [.activateAllWindows])
+    private static func p95(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        return values.sorted()[min(values.count - 1, Int(Double(values.count) * 0.95))]
+    }
+
+    private func focusTargetIfNeeded(_ spec: CaptureSpec, rewardTarget: CGPoint? = nil) async -> pid_t? {
+        var pid: pid_t?
+        if let windowID = spec.windowID,
+           let windows = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false).windows {
+            pid = windows.first(where: { $0.windowID == windowID })?.owningApplication?.processID
+        } else if let point = rewardTarget,
+                  let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            for window in windows {
+                guard let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                      let rect = CGRect(dictionaryRepresentation: bounds), rect.contains(point),
+                      let owner = window[kCGWindowOwnerPID as String] as? Int32,
+                      owner != ProcessInfo.processInfo.processIdentifier,
+                      (window[kCGWindowLayer as String] as? Int ?? 1) == 0 else { continue }
+                pid = owner; break
+            }
+        }
+        if let pid, let app = NSRunningApplication(processIdentifier: pid) {
+            await MainActor.run { _ = app.activate(options: [.activateAllWindows]) }
+        }
         return pid
     }
 

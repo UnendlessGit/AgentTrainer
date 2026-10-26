@@ -1,0 +1,141 @@
+{
+  "version": "2.60",
+  "build": 38,
+  "date": "2026-10-26",
+  "hardware": "Apple M3 Max, 36 GiB",
+  "os": "macOS 27.0.1",
+  "regression": {
+    "executed": 224,
+    "skipped": 6,
+    "failures": 0,
+    "seconds": 140.085
+  },
+  "controlledLearning": [
+    {
+      "baseline": 0.5,
+      "score": 1,
+      "seed": 7,
+      "task": "keyboard"
+    },
+    {
+      "baseline": 0.5,
+      "score": 1,
+      "seed": 42,
+      "task": "keyboard"
+    },
+    {
+      "baseline": 0,
+      "score": 1,
+      "seed": 101,
+      "task": "keyboard"
+    },
+    {
+      "baseline": 0.7000818222761154,
+      "score": 0.9916855692863464,
+      "seed": 7,
+      "task": "mouse"
+    },
+    {
+      "baseline": 0.6989768713712692,
+      "score": 0.9935774579644203,
+      "seed": 42,
+      "task": "mouse"
+    },
+    {
+      "baseline": 0.7018484592437744,
+      "score": 0.9968850791454316,
+      "seed": 101,
+      "task": "mouse"
+    }
+  ],
+  "benchmarks": [
+    {
+      "profile": "compact30",
+      "seconds": 60.02328097820282,
+      "actionFPS": 26.655738884679558,
+      "perceptionFPS": 23.33887094267885,
+      "rewardFPS": 23.260628804269775,
+      "headP95Milliseconds": 3.988416661741212,
+      "visionP95Milliseconds": 4.378749996249098,
+      "sampledResidentPeakMB": 376.602624,
+      "updates": 7,
+      "optimizerSteps": 24,
+      "completedEpisodes": 8,
+      "excludedActions": 66,
+      "peakBacklog": 230
+    },
+    {
+      "profile": "compact60",
+      "seconds": 60.07112503051758,
+      "actionFPS": 52.88626881160784,
+      "perceptionFPS": 24.689606459950525,
+      "rewardFPS": 27.042447762813584,
+      "headP95Milliseconds": 4.493208332860377,
+      "visionP95Milliseconds": 5.024458332627546,
+      "sampledResidentPeakMB": 358.596608,
+      "updates": 13,
+      "optimizerSteps": 28,
+      "completedEpisodes": 8,
+      "excludedActions": 1094,
+      "peakBacklog": 512
+    },
+    {
+      "profile": "default30",
+      "seconds": 60.025389075279236,
+      "actionFPS": 26.35088048598122,
+      "perceptionFPS": 23.11157735201236,
+      "rewardFPS": 22.64152919716536,
+      "headP95Milliseconds": 8.980416670965496,
+      "visionP95Milliseconds": 10.79941666830564,
+      "sampledResidentPeakMB": 884.719616,
+      "updates": 4,
+      "optimizerSteps": 2,
+      "completedEpisodes": 8,
+      "excludedActions": 323,
+      "peakBacklog": 291
+    },
+    {
+      "profile": "default60",
+      "seconds": 60.863381028175354,
+      "actionFPS": 53.03038481107922,
+      "perceptionFPS": 24.78287431960565,
+      "rewardFPS": 26.917579252413276,
+      "headP95Milliseconds": 8.55970833072206,
+      "visionP95Milliseconds": 10.831125000549946,
+      "sampledResidentPeakMB": 714.653696,
+      "updates": 10,
+      "optimizerSteps": 15,
+      "completedEpisodes": 8,
+      "excludedActions": 1432,
+      "peakBacklog": 291
+    }
+  ],
+  "selection": {
+    "enterConfirmed": true,
+    "escapeCancelled": true,
+    "nativeDetectionPassed": true,
+    "visibilityRestored": true
+  },
+  "notes": [
+    "Action FPS includes controller reset and inter-episode pauses.",
+    "Reported p95 is the final rolling window, up to 512 inference measurements.",
+    "Resident peak is sampled once per second, not a GPU allocation peak.",
+    "Benchmarks use Balanced PPO defaults; compact vision is 96x64 grayscale, Small architecture, no past frames; default vision is 640x360 color, Balanced architecture, four half-size past frames.",
+    "Only fixture-derived numeric aggregates are published; local screenshots, checkpoints, and raw logs are excluded."
+  ],
+  "postSmokeRegression": {
+    "executed": 224,
+    "skipped": 7,
+    "failures": 0,
+    "seconds": 21.247
+  },
+  "signedInstalledSmoke": {
+    "updates": 4,
+    "status": "Panic stop \u2022 RL progress saved",
+    "completedEpisodeDurations": [
+      4.059347,
+      4.088435875
+    ],
+    "error": ""
+  }
+}

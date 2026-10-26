@@ -1492,8 +1492,12 @@ actor DatasetCacheBuilder {
 
     func cache(for profile: AIProfile, recordings: [RecordingItem], progress: @escaping @Sendable (Double, String) -> Void) async throws -> CachedDataset {
         guard !recordings.isEmpty else { throw AgentTrainerError.noData }
+        let inherited = profile.activeVersionID == nil ? nil : await workspace.version(profileID: profile.id, versionID: profile.activeVersionID!)
+        let preserved = inherited?.effectiveContextSchema.fields.flatMap { field in
+            field.values.map { [ContextAssignment(fieldID: field.id, fieldName: field.name, valueID: $0.id, valueName: $0.name)] }
+        } ?? []
         let contextSchema = try ModelContextSchema.trained(
-            from: recordings.map { $0.manifest.effectiveContextAssignments }
+            from: recordings.map { $0.manifest.effectiveContextAssignments } + preserved
         )
         if preprocessor == nil { preprocessor = try VisionPreprocessor() }
         try await workspace.prepare()

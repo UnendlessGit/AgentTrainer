@@ -21,6 +21,9 @@ final class InputInjector: @unchecked Sendable {
     private var lastStateReportTime = 0.0
     private var lastReportedState = InputState.empty
     private var fullMacRect = CGRect.zero
+    private var firstExecutionPost: UInt64?
+    private var executionReceipt: UInt64 = 0
+    var lastExecutionTimestamp: UInt64 { lock.withLock { executionReceipt } }
     private var decisionTimeline = CausalControlTimeline(origin: DispatchTime.now().uptimeNanoseconds)
     private var perceptionTimeline = CausalControlTimeline(origin: DispatchTime.now().uptimeNanoseconds)
     private var lastPerceptionQuery: UInt64?
@@ -127,11 +130,13 @@ final class InputInjector: @unchecked Sendable {
         onState?(state)
     }
 
-    func execute(_ prediction: [Float], profile: AIProfile, allowedKeyCodes: Set<UInt16>, mouseMode: MouseControlMode, captureRect: CGRect, safety: AgentSafetyPolicy, gameCamera: GameCameraSettings = GameCameraSettings(), predictionIsFresh: Bool = true, shiftUsesKeyboardChannel: Bool = false) {
+    @discardableResult
+    func execute(_ prediction: [Float], profile: AIProfile, allowedKeyCodes: Set<UInt16>, mouseMode: MouseControlMode, captureRect: CGRect, safety: AgentSafetyPolicy, gameCamera: GameCameraSettings = GameCameraSettings(), predictionIsFresh: Bool = true, shiftUsesKeyboardChannel: Bool = false) -> Bool {
         guard prediction.count >= ActionLayout.count,
-              prediction.prefix(ActionLayout.count).allSatisfy(\.isFinite) else { return }
+              prediction.prefix(ActionLayout.count).allSatisfy(\.isFinite) else { return false }
         lock.lock()
-        guard enabled else { lock.unlock(); return }
+        guard enabled else { lock.unlock(); return false }
+        firstExecutionPost = nil
         let channels = profile.channels
         let restrictions = profile.effectiveRestrictions
         let requested = safety.allowFullMac ? fullMacRect : (safety.controlRegion?.cgRect ?? captureRect)
@@ -208,8 +213,31 @@ final class InputInjector: @unchecked Sendable {
         let controlsChanged = state.keys != lastReportedState.keys || state.buttons != lastReportedState.buttons || state.modifiers != lastReportedState.modifiers
         let shouldReport = controlsChanged || now - lastStateReportTime >= 1.0 / 30.0
         if shouldReport { lastStateReportTime = now; lastReportedState = state }
+        executionReceipt = firstExecutionPost ?? monotonicClock()
         lock.unlock()
         if shouldReport { onState?(state) }
+        return true
+    }
+
+    func tapControllerKey(_ code: UInt16) {
+        lock.lock()
+        // Controller keys are never sampled from the policy. Serialize their
+        // complete lifecycle with release and panic operations.
+        let flags: CGEventFlags = switch code {
+        case 56, 60: .maskShift
+        case 59, 62: .maskControl
+        case 58, 61: .maskAlternate
+        case 55, 54: .maskCommand
+        case 57: .maskAlphaShift
+        case 63: .maskSecondaryFn
+        default: []
+        }
+        postKey(code, down: true, flags: flags)
+        heldKeys.insert(code)
+        Thread.sleep(forTimeInterval: 0.04)
+        postKey(code, down: false, flags: [])
+        heldKeys.remove(code)
+        lock.unlock()
     }
 
     func disableAndReleaseAll() {
@@ -297,6 +325,7 @@ final class InputInjector: @unchecked Sendable {
         let isKey = logicalSample != nil || event.type == .keyDown || event.type == .keyUp || event.type == .flagsChanged
         if !isKey { event.flags = CGEventFlags(rawValue: modifiers) }
         let time = monotonicClock()
+        if firstExecutionPost == nil { firstExecutionPost = time }
         event.timestamp = time
         eventSink(event)
         if var sample = logicalSample {

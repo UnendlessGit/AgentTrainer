@@ -1291,6 +1291,7 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
     var contextSchema: ModelContextSchema? = nil
     /// Optional immutable output limits retained when importing older brains.
     var outputCapabilities: ModelOutputCapabilities? = nil
+    var rlSummary: RLSavedSummary? = nil
 
     var effectiveContextSchema: ModelContextSchema { contextSchema ?? .empty }
 
@@ -1311,6 +1312,7 @@ struct ModelVersionManifest: Codable, Hashable, Identifiable, Sendable {
 
 extension ModelVersionManifest {
     private enum CodingKeys: String, CodingKey {
+        case rlSummary
         case schemaVersion, temporalInputVersion, id, name, createdAt, globalStep, trainingLoss, validationLoss
         case preprocessing, channels, training, weightsFile, optimizerFile, trainingStateFile
         case randomStateFile, epoch, isAutosave, demonstratedKeyCodes, relativeMouseScale
@@ -1328,6 +1330,7 @@ extension ModelVersionManifest {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        rlSummary = try container.decodeIfPresent(RLSavedSummary.self, forKey: .rlSummary)
         schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
         temporalInputVersion = try container.decodeIfPresent(Int.self, forKey: .temporalInputVersion)
             ?? (schemaVersion == 7 ? 1 : nil)
@@ -1382,6 +1385,9 @@ struct TrainingProgressSummary: Codable, Hashable, Sendable {
 }
 
 struct AIProfile: Codable, Hashable, Identifiable, Sendable {
+    var rlProgress: RLSavedSummary? = nil
+    var rlTraining: RLConfiguration? = nil
+    var effectiveRL: RLConfiguration { rlTraining ?? RLConfiguration() }
     var schemaVersion = 1
     var id: UUID
     var name: String
@@ -1431,22 +1437,37 @@ struct AIProfile: Codable, Hashable, Identifiable, Sendable {
         )
     }
 
+    func preservingLearning(from current: Self) -> Self {
+        var result = self
+        result.activeVersionID = current.activeVersionID
+        result.trainingProgress = current.trainingProgress
+        result.rlProgress = current.rlProgress
+        return result
+    }
+
+    var learningProgressDescription: String {
+        var parts: [String] = []
+        if let progress = trainingProgress { parts.append("\(progress.globalStep) demo steps • \(progress.epoch) epochs") }
+        if let progress = rlProgress { parts.append("\(progress.updates) RL updates") }
+        return parts.isEmpty ? "Untrained" : parts.joined(separator: " • ")
+    }
+
     /// Uses exact persisted counters when available. Older profiles estimate
     /// consumed samples from optimizer steps and batch size. That estimate is
     /// stable even when recordings or folder selections change after training.
     func trainingDurationSummary(recordings _: [RecordingItem]) -> TrainingDurationSummary {
         let rawActual = trainingProgress?.trainingDurationSeconds ?? 0
-        let actual = rawActual.isFinite ? max(0, rawActual) : 0
+        let actual = (rawActual.isFinite ? max(0, rawActual) : 0) + max(0, rlProgress?.trainingSeconds ?? 0)
         if let exact = trainingProgress?.experienceDurationSeconds {
             let sanitized = exact.isFinite ? max(0, exact) : 0
-            return TrainingDurationSummary(trainingSeconds: actual, experienceSeconds: sanitized, experienceIsEstimated: false)
+            return TrainingDurationSummary(trainingSeconds: actual, experienceSeconds: sanitized + max(0, rlProgress?.experienceSeconds ?? 0), experienceIsEstimated: false)
         }
         let completedSteps = max(0, trainingProgress?.globalStep ?? 0)
         let consumedSamples = Double(completedSteps) * Double(max(1, training.batchSize))
         let actionFPS = training.actionFPS.isFinite ? max(0.0001, training.actionFPS) : 60
         return TrainingDurationSummary(
             trainingSeconds: actual,
-            experienceSeconds: consumedSamples / actionFPS,
+            experienceSeconds: consumedSamples / actionFPS + max(0, rlProgress?.experienceSeconds ?? 0),
             experienceIsEstimated: completedSteps > 0
         )
     }
@@ -1543,6 +1564,8 @@ struct RuntimeMetrics: Sendable {
     var actionFPS = 0.0
     var latencyMilliseconds = 0.0
     var actionInferenceMilliseconds = 0.0
+    var actionP95Milliseconds = 0.0
+    var encodingP95Milliseconds = 0.0
     var observationAgeMilliseconds = 0.0
     var frameCount = 0
     var actionCount = 0
@@ -1604,6 +1627,7 @@ struct HotkeySettings: Codable, Hashable, Sendable {
     var panic = HotkeyBinding.panic
     var record = HotkeyBinding.record
     var run = HotkeyBinding.run
+    var rlSessionToggle = HotkeyBinding(keyCode: 37, carbonModifiers: UInt32(1 << 12 | 1 << 11 | 1 << 8))
 
     init(
         panic: HotkeyBinding = .panic,
@@ -1615,8 +1639,21 @@ struct HotkeySettings: Codable, Hashable, Sendable {
         self.run = run
     }
 
+    func preservingExistingShortcuts() -> Self {
+        guard Set([panic, record, run]).count == 3 else { return Self() }
+        var value = self
+        if [panic, record, run].contains(value.rlSessionToggle) {
+            let modifiers = HotkeySettings().rlSessionToggle.carbonModifiers
+            for code: UInt32 in [37, 17, 5, 46, 38, 40, 41] {
+                let candidate = HotkeyBinding(keyCode: code, carbonModifiers: modifiers)
+                if ![panic, record, run].contains(candidate) { value.rlSessionToggle = candidate; break }
+            }
+        }
+        return value
+    }
+
     private enum CodingKeys: String, CodingKey {
-        case panic, record, run
+        case panic, record, run, rlSessionToggle
     }
 
     init(from decoder: Decoder) throws {
@@ -1624,6 +1661,7 @@ struct HotkeySettings: Codable, Hashable, Sendable {
         panic = try container.decodeIfPresent(HotkeyBinding.self, forKey: .panic) ?? .panic
         record = try container.decodeIfPresent(HotkeyBinding.self, forKey: .record) ?? .record
         run = try container.decodeIfPresent(HotkeyBinding.self, forKey: .run) ?? .run
+        rlSessionToggle = try container.decodeIfPresent(HotkeyBinding.self, forKey: .rlSessionToggle) ?? HotkeySettings().rlSessionToggle
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1631,6 +1669,7 @@ struct HotkeySettings: Codable, Hashable, Sendable {
         try container.encode(panic, forKey: .panic)
         try container.encode(record, forKey: .record)
         try container.encode(run, forKey: .run)
+        try container.encode(rlSessionToggle, forKey: .rlSessionToggle)
     }
 }
 

@@ -363,6 +363,16 @@ final class TrainingEngine: @unchecked Sendable {
            state.samplingStrategy != desiredSamplingStrategy {
             state.samplingStrategy = desiredSamplingStrategy
         }
+        if let inherited = restore.baselineVersion?.outputCapabilities {
+            var caps = state.outputCapabilities ?? ModelOutputCapabilities()
+            caps.allowedKeyCodes.formUnion(inherited.allowedKeyCodes)
+            caps.allowedMouseButtons.formUnion(inherited.allowedMouseButtons)
+            caps.allowsAbsoluteMouseMovement = inherited.allowsAbsoluteMouseMovement || caps.allowsAbsoluteMouseMovement
+            caps.allowsRelativeMouseMovement = inherited.allowsRelativeMouseMovement || caps.allowsRelativeMouseMovement
+            caps.allowsScroll = inherited.allowsScroll || caps.allowsScroll
+            state.outputCapabilities = caps
+            state.demonstratedKeyCodes?.formUnion(inherited.allowedKeyCodes)
+        }
         state.recommendedMouseMode = recommendedMouseMode
         let cursorDurations = recordings.reduce(into: (shown: 0.0, total: 0.0)) { result, recording in
             let start = max(0, min(recording.manifest.duration, recording.manifest.trimStart))
@@ -1791,6 +1801,8 @@ final class TrainingEngine: @unchecked Sendable {
             }
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(state).write(to: temporary.appendingPathComponent("state.json"), options: .atomic)
+            let lineage = try (try? Data(contentsOf: destination.appendingPathComponent("policy-lineage.json"))) ?? encoder.encode(profile.activeVersionID)
+            try lineage.write(to: temporary.appendingPathComponent("policy-lineage.json"), options: .atomic)
             try encoder.encode(ModelContract.schemaVersion).write(to: temporary.appendingPathComponent("model-schema.json"), options: .atomic)
             if FileManager.default.fileExists(atPath: destination.path) {
                 let backupName = ".Checkpoint.backup.\(UUID().uuidString)"
@@ -1877,6 +1889,7 @@ final class TrainingEngine: @unchecked Sendable {
         // Save the active reference before pruning so cleanup can never remove
         // the version that was just published.
         try await WorkspaceStore.shared.saveProfile(updated)
+        try JSONEncoder().encode(Optional(version.id)).write(to: checkpoint.appendingPathComponent("policy-lineage.json"), options: .atomic)
         let removed = try await WorkspaceStore.shared.pruneAutosaveVersions(profile: updated, keeping: 10)
         let savedBrainCount = await WorkspaceStore.shared.listVersions(profileID: profile.id).count
         updated.trainingProgress = TrainingProgressSummary(
@@ -1907,7 +1920,11 @@ final class TrainingEngine: @unchecked Sendable {
     ) async throws -> CheckpointRestore {
         let directory = await WorkspaceStore.shared.checkpointDirectory(profileID: profile.id)
         let stateURL = directory.appendingPathComponent("state.json")
-        if FileManager.default.fileExists(atPath: stateURL.path) {
+        let activeVersion = profile.activeVersionID == nil ? nil : await WorkspaceStore.shared.version(profileID: profile.id, versionID: profile.activeVersionID!)
+        let lineageURL = directory.appendingPathComponent("policy-lineage.json")
+        let lineage = (try? Data(contentsOf: lineageURL)).flatMap { try? JSONDecoder().decode(UUID?.self, from: $0) }
+        let lineageMatches = activeVersion?.rlSummary == nil && (lineage == nil || lineage == profile.activeVersionID)
+        if lineageMatches, FileManager.default.fileExists(atPath: stateURL.path) {
             let restored = try JSONDecoder().decode(CheckpointState.self, from: Data(contentsOf: stateURL))
             let recordingOrderMatches = restored.recordingOrder.map { $0 == expectedRecordingOrder } ?? true
             let samplingStrategyIsKnown = restored.samplingStrategy == nil
@@ -1950,14 +1967,14 @@ final class TrainingEngine: @unchecked Sendable {
            version.schemaVersion == ModelContract.schemaVersion,
            version.preprocessing == profile.preprocessing,
            version.training.architecture.weightLayout == profile.training.architecture.weightLayout,
-           version.effectiveContextSchema.hasSameLayout(as: expectedContextSchema) {
+           version.training.effectiveTemporalVision == profile.training.effectiveTemporalVision {
             let versionDirectory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: versionID)
-            try model.loadWeights(from: versionDirectory.appendingPathComponent(version.weightsFile))
+            try model.loadCompatibleWeights(from: versionDirectory.appendingPathComponent(version.weightsFile), sourceContext: version.effectiveContextSchema)
             state.epoch = max(0, version.epoch ?? 0)
             state.batchOffset = 0
-            state.globalStep = max(0, version.globalStep)
-            state.elapsed = max(0, version.trainingDurationSeconds ?? profile.trainingProgress?.trainingDurationSeconds ?? 0)
-            state.experienceSeconds = version.experienceDurationSeconds ?? profile.trainingProgress?.experienceDurationSeconds
+            state.globalStep = max(0, version.rlSummary == nil ? version.globalStep : (profile.trainingProgress?.globalStep ?? 0))
+            state.elapsed = max(0, version.rlSummary == nil ? (version.trainingDurationSeconds ?? profile.trainingProgress?.trainingDurationSeconds ?? 0) : (profile.trainingProgress?.trainingDurationSeconds ?? 0))
+            state.experienceSeconds = version.rlSummary == nil ? (version.experienceDurationSeconds ?? profile.trainingProgress?.experienceDurationSeconds) : profile.trainingProgress?.experienceDurationSeconds
             state.lossHistory = [version.trainingLoss]
             state.epochLossHistory = [version.trainingLoss]
             state.validationHistory = version.validationLoss.map { [$0] } ?? []
@@ -1973,6 +1990,9 @@ final class TrainingEngine: @unchecked Sendable {
                 return CheckpointRestore(status: "Loaded the selected best brain; optimizer restarted safely", captureValidationBaseline: true, baselineDemonstratedKeyCodes: version.demonstratedKeyCodes, baselineVersion: version, isExactResume: false)
             }
             return CheckpointRestore(status: "Loaded the active brain for fine-tuning; optimizer restarted safely", captureValidationBaseline: true, baselineDemonstratedKeyCodes: version.demonstratedKeyCodes, baselineVersion: version, isExactResume: false)
+        }
+        if profile.activeVersionID != nil {
+            throw AgentTrainerError.model("The selected brain is incompatible with these inputs. Its weights were preserved; duplicate the profile before changing architecture or vision.")
         }
         return CheckpointRestore(status: "Compiling fused MLX training graph on Apple GPU", captureValidationBaseline: false, baselineDemonstratedKeyCodes: nil, baselineVersion: nil, isExactResume: false)
     }

@@ -1,6 +1,6 @@
 # AgentTrainer architecture
 
-AgentTrainer 2.52 (build 37) is a local macOS demonstration-recording, behavioral-cloning, and input-execution app. This reference describes the implementation in this checkout.
+AgentTrainer 2.60 (build 38) is a local macOS demonstration-recording, behavioral-cloning, live reinforcement-learning, and input-execution app. This reference describes the implementation in this checkout.
 
 ## System flow
 
@@ -13,6 +13,10 @@ Demonstrations combine screen video with timestamped physical inputs. Dataset co
 | [Recording and storage](docs/recording-and-storage.md) | Capture, HEVC encoding, binary input format, imports/exports, presets, and workspace relocation |
 | [Model and training](docs/model-and-training.md) | Vision, cache files, action/timing layouts, Policy v9, losses, optimization, checkpoints, and compatibility |
 | [Runtime](docs/runtime.md) | Perception/action scheduling, output filtering, executed-control feedback, stopping, UI, and updater |
+
+## Reinforcement learning
+
+The [RL reference](docs/reinforcement-learning.md) describes native reward OCR, the episode state machine, timestamped executed-action intervals, hybrid PPO, independent actor/learner ownership, checkpoints, and bounded compute. Policy v9 weights and dataset schema 15 are retained. RL state is a separate versioned sidecar, and training-mode switches use active-policy lineage rather than restoring an unrelated optimizer.
 
 ## Components and state
 

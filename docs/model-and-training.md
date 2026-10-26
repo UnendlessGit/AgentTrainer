@@ -2,7 +2,7 @@
 
 Back to [architecture overview](../ARCHITECTURE.md).
 
-Vision preprocessing, dataset formats, explicit timing, Policy v9, and saved training state in AgentTrainer 2.52. The live execution path is described in [Runtime](runtime.md).
+Vision preprocessing, dataset formats, explicit timing, Policy v9, and saved training state in AgentTrainer 2.60. The live execution path is described in [Runtime](runtime.md).
 
 ## Vision and dataset construction
 
@@ -138,3 +138,15 @@ Saved versions snapshot architecture, vision, precision, channels, cursor visibi
 The learned-layout comparison normalizes dropout out of the architecture. A dropout-only edit can retain compatible brain weights, while its changed stochastic objective starts a fresh optimizer sequence. Ordered categorical IDs and other learned-layout settings participate in compatibility checks.
 
 The current migration archives incompatible versions/checkpoints instead of converting v7/v8 weights into v9. It retains recordings, profile architecture/temporal settings, and compatible schema-15 caches. Weight loading checks format metadata as well as parameter shapes, distinguishing same-shaped weights with different policy semantics. Older removed-feature settings are ignored on decode and omitted when saved.
+
+## Live reinforcement learning
+
+PPO reuses Policy v9's encoder, temporal network, and action heads. A separate Float32 critic and learned exploration parameters do not change the standalone policy weight layout. The learner re-encodes masked original pixels and causal controls/timing rather than differentiating stale inference embeddings. Dropout and demonstration-only objectives are disabled for PPO likelihood consistency; those heads remain available for later demonstration training.
+
+Binary outputs use a masked Bernoulli distribution with explicit exploration; mouse values and movement intent use Gaussian latent samples followed by the existing deterministic decoder. PPO retains the latent samples and their exact behavior probabilities. Short cumulative reward intervals can contain multiple executed actions; their joint trajectory likelihood and elapsed duration are retained. RL does not invent which individual missed frame earned a cumulative delta.
+
+Compiled microbatches combine independent intervals without mixing their likelihoods, and gradients accumulate to the configured optimizer minibatch. Probability/advantage/value arithmetic and master weights/moments use Float32. KL stopping and finite-value checks precede optimizer updates. The actor receives owned weight buffers, refreshes selected historical embeddings by policy revision, and retains bounded raw history.
+
+Demonstration checkpoints carry active-policy lineage. A method switch loads the active compatible brain and restarts stale optimizer state, preserving previous artifacts. Newly introduced context dimensions widen input projections with zero-initialized columns while mapping existing context IDs. RL and demonstration timing counters remain separately attributable in profile progress.
+
+See [Reinforcement learning](reinforcement-learning.md) for the full environment and persistence contract.

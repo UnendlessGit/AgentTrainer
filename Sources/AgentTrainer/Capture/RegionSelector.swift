@@ -5,14 +5,16 @@ import Foundation
 final class RegionSelector {
     private var panel: RegionPanel?
 
-    func select(on sourceFrame: CGRect, completion: @escaping (CGRect?) -> Void) {
+    func select(on sourceFrame: CGRect, confirmWithEnter: Bool = false, background: CGImage? = nil, completion: @escaping (CGRect?) -> Void) {
         panel?.close()
-        let panel = RegionPanel(contentRect: sourceFrame, styleMask: [.borderless], backing: .buffered, defer: false)
+        let appKitFrame = CGRect(x: sourceFrame.minX, y: (NSScreen.screens.first?.frame.height ?? sourceFrame.maxY) - sourceFrame.maxY, width: sourceFrame.width, height: sourceFrame.height)
+        let panel = RegionPanel(contentRect: appKitFrame, styleMask: [.borderless], backing: .buffered, defer: false)
         panel.level = .screenSaver
         panel.isOpaque = false
         panel.backgroundColor = NSColor.black.withAlphaComponent(0.18)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         let selector = RegionSelectionView(frame: CGRect(origin: .zero, size: sourceFrame.size))
+        selector.confirmWithEnter = confirmWithEnter; selector.background = background
         selector.onComplete = { [weak self, weak panel] local in
             panel?.orderOut(nil); panel?.close(); self?.panel = nil
             guard let local else { completion(nil); return }
@@ -22,6 +24,7 @@ final class RegionSelector {
         panel.contentView = selector
         self.panel = panel
         panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(selector)
         NSApp.activate(ignoringOtherApps: true)
     }
 }
@@ -31,6 +34,8 @@ private final class RegionPanel: NSPanel {
 }
 
 private final class RegionSelectionView: NSView {
+    var confirmWithEnter = false
+    var background: CGImage?
     var onComplete: ((CGRect?) -> Void)?
     private var start: CGPoint?
     private var selection = CGRect.zero
@@ -38,13 +43,14 @@ private final class RegionSelectionView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func mouseDown(with event: NSEvent) { let point = convert(event.locationInWindow, from: nil); start = point; selection = CGRect(origin: point, size: .zero); needsDisplay = true }
     override func mouseDragged(with event: NSEvent) { guard let start else { return }; selection = normalized(start, convert(event.locationInWindow, from: nil)); needsDisplay = true }
-    override func mouseUp(with event: NSEvent) { guard let start else { onComplete?(nil); return }; selection = normalized(start, convert(event.locationInWindow, from: nil)); onComplete?(selection.width >= 8 && selection.height >= 8 ? selection : nil) }
-    override func keyDown(with event: NSEvent) { if event.keyCode == 53 { onComplete?(nil) } else { super.keyDown(with: event) } }
+    override func mouseUp(with event: NSEvent) { guard let start else { onComplete?(nil); return }; selection = normalized(start, convert(event.locationInWindow, from: nil)); if !confirmWithEnter { onComplete?(selection.width >= 8 && selection.height >= 8 ? selection : nil) }; needsDisplay = true }
+    override func keyDown(with event: NSEvent) { if event.keyCode == 53 { onComplete?(nil) } else if event.keyCode == 36 || event.keyCode == 76 { if selection.width >= 8 && selection.height >= 8 { onComplete?(selection) } } else { super.keyDown(with: event) } }
 
     override func draw(_ dirtyRect: NSRect) {
+        if let background { NSImage(cgImage: background, size: bounds.size).draw(in: bounds) }
         NSColor.black.withAlphaComponent(0.25).setFill(); bounds.fill()
         guard selection.width > 0, selection.height > 0 else {
-            let text = "Drag to select the exact screen region • Esc to cancel"
+            let text = confirmWithEnter ? "Drag to select reward text • Enter to confirm • Esc to cancel" : "Drag to select the exact screen region • Esc to cancel"
             text.draw(at: CGPoint(x: bounds.midX - 170, y: bounds.midY), withAttributes: [.foregroundColor: NSColor.white, .font: NSFont.systemFont(ofSize: 15, weight: .semibold)])
             return
         }

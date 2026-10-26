@@ -107,7 +107,7 @@ final class VisionPreprocessor: @unchecked Sendable {
     /// command buffer. Training caches always need the current image and, when
     /// temporal memory is enabled, a reduced past image; sharing setup removes
     /// duplicate CVMetalTexture creation and command submission per perception.
-    func submit(_ pixelBuffer: CVPixelBuffer, specs requestedSpecs: [PreprocessingSpec]) throws -> [PendingPackedFrame] {
+    func submit(_ pixelBuffer: CVPixelBuffer, specs requestedSpecs: [PreprocessingSpec], mask: CGRect? = nil) throws -> [PendingPackedFrame] {
         guard !requestedSpecs.isEmpty else { return [] }
         let specs = try requestedSpecs.map { try $0.validated() }
         lock.lock()
@@ -168,7 +168,9 @@ final class VisionPreprocessor: @unchecked Sendable {
                 bitDepth: UInt32(spec.bitDepth), mode: spec.colorMode == .grayscale ? 0 : 1,
                 chroma: UInt32(spec.chroma == .yuv420 ? 0 : spec.chroma == .yuv422 ? 1 : 2),
                 resize: UInt32(spec.resizePolicy == .fit ? 0 : spec.resizePolicy == .fill ? 1 : 2),
-                sourceFormat: sourceFormat, sourceMatrix: sourceMatrix
+                sourceFormat: sourceFormat, sourceMatrix: sourceMatrix,
+                maskX: Float(mask?.minX ?? -2), maskY: Float(mask?.minY ?? -2),
+                maskWidth: Float(mask?.width ?? 0), maskHeight: Float(mask?.height ?? 0)
             )
             encoder.setComputePipelineState(pipeline)
             encoder.setTexture(lumaTexture, index: 0)
@@ -358,12 +360,16 @@ final class VisionPreprocessor: @unchecked Sendable {
         var resize: UInt32
         var sourceFormat: UInt32
         var sourceMatrix: UInt32
+        var maskX: Float
+        var maskY: Float
+        var maskWidth: Float
+        var maskHeight: Float
     }
 
     private static let kernelSource = #"""
     #include <metal_stdlib>
     using namespace metal;
-    struct Params { uint sw, sh, ow, oh, bits, mode, chroma, resize, sourceFormat, sourceMatrix; };
+    struct Params { uint sw, sh, ow, oh, bits, mode, chroma, resize, sourceFormat, sourceMatrix; float mx, my, mw, mh; };
 
     kernel void packVision(texture2d<float, access::sample> lumaInput [[texture(0)]],
                            texture2d<float, access::sample> chromaInput [[texture(1)]],
@@ -389,6 +395,11 @@ final class VisionPreprocessor: @unchecked Sendable {
                 uv.x = (uv.x - (1.0-used)*0.5) / used;
             }
         }
+        // Expand by the sampling footprint so bilinear/chroma taps cannot leak hidden pixels.
+        float2 guardBand = float2(2.0) / srcSize;
+        outside = outside || (p.mw > 0 && p.mh > 0 &&
+            uv.x >= p.mx - guardBand.x && uv.x <= p.mx + p.mw + guardBand.x &&
+            uv.y >= p.my - guardBand.y && uv.y <= p.my + p.mh + guardBand.y);
         float3 rgb;
         if (outside) {
             rgb = float3(0.0);

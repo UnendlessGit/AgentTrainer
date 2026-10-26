@@ -2,7 +2,7 @@
 
 Back to [architecture overview](../ARCHITECTURE.md).
 
-Live inference, input execution, UI behavior, and updates in AgentTrainer 2.52. Timing features and policy decoding are described in [Model and training](model-and-training.md#explicit-timing).
+Live inference, input execution, UI behavior, and updates in AgentTrainer 2.60. Timing features and policy decoding are described in [Model and training](model-and-training.md#explicit-timing).
 
 ## Runtime execution
 
@@ -21,3 +21,11 @@ The prediction latch retains held-state actions between fresh predictions while 
 The SwiftUI interface uses shared appearance settings, a custom top bar/sidebar, and reusable context controls. Decorative motion responds to Reduce Motion, user settings, and app activation. Charts have bounded histories; sizing displays use `NeuralInputSizing` and `ModelSizing`. Context catalog renames update recording snapshots; deletion removes matching assignments after UI confirmation, independently of saved-brain vocabularies.
 
 `GitHubReleaseUpdater` requests releases from the configured GitHub repository, parses stable semantic versions, and offers newer versions. Downloads use HTTPS, approved hosts, and declared/observed size limits. Installation verifies the named DMG's SHA-256 entry, disk image, app bundle identifier/version, strict code signature, and designated requirement equality with the installed app. A helper acknowledges readiness before the app quits, then replaces the app using incoming/rollback copies on the target volume. Failed acknowledgement terminates the helper.
+
+## RL execution
+
+Run remains deterministic. RL Training samples a hybrid policy while retaining execution receipts on the HID queue. Its thread-safe inbox aligns action timestamps with capture timestamps, independently of main-actor callback order and OCR completion time. The controller blocks AI output during reset/finalization, sends reserved episode keys, and acknowledges fresh zero reward before resuming.
+
+A separate native-resolution capture reads both reward fields. Cached unchanged pixels and calibrated numeric crops reduce OCR cost; ambiguous recognition falls back to accurate Vision recognition. Invalid readings never become zero. Source-local geometry follows window movement; source loss, resize, or scale changes stop safely. Reward masking happens in the Metal preprocessing shader before resize sampling, with a sampling-footprint guard band.
+
+Panic releases controls before capture, GPU, or checkpoint drains. Live RL enforces physical-input/focus protection and stops/saves on distribution-invalidating output-permission changes. Normal Run retains its prior safety controls and applies the configured reward mask for an RL brain on its matching source.
