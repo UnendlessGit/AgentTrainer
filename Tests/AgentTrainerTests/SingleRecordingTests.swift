@@ -44,15 +44,23 @@ final class SingleRecordingTests: XCTestCase {
                 feedbackMode: .allControls, capabilities: version.outputCapabilities)
             try encoder.encode(reports).write(to: workspace.appendingPathComponent("single-recording-feedback.json"), options: .atomic)
         }
-        let recording = try XCTUnwrap(recordings.max { $0.manifest.duration < $1.manifest.duration })
+        let recording: RecordingItem
+        if let requested = ProcessInfo.processInfo.environment["AGENTTRAINER_MEMORY_RECORDING_ID"] {
+            guard let id = UUID(uuidString: requested), let selected = recordings.first(where: { $0.id == id }) else {
+                throw AgentTrainerError.storage("The explicitly selected real memorization recording is unavailable.")
+            }
+            recording = selected
+        } else {
+            recording = try XCTUnwrap(recordings.max { $0.manifest.duration < $1.manifest.duration })
+        }
         let arm = ProcessInfo.processInfo.environment["AGENTTRAINER_MEMORY_ARM"] ?? "baseline"
-        let fit = ["fit", "phase", "dense", "grounded", "grounded-diverse"].contains(arm)
-        let idSuffix = arm == "grounded-diverse" ? "2526" : arm == "grounded" ? "2525" : arm == "dense" ? "2524" : arm == "phase" ? "2523" : fit ? "2522" : arm == "master" ? "2521" : "2520"
+        let fit = ["fit", "phase", "dense", "grounded", "grounded-diverse", "grounded-visual"].contains(arm)
+        let idSuffix = arm == "grounded-visual" ? "2527" : arm == "grounded-diverse" ? "2526" : arm == "grounded" ? "2525" : arm == "dense" ? "2524" : arm == "phase" ? "2523" : fit ? "2522" : arm == "master" ? "2521" : "2520"
         var profile = AIProfile.fresh(name: fit ? "Reborn • deterministic fitting diagnostic" : arm == "master" ? "Reborn • Float32 accumulation diagnostic" : "Reborn • single recording diagnostic")
         profile.id = UUID(uuidString: "00000000-0000-0000-0000-00000000\(idSuffix)")!
         profile.preprocessing = reference.preprocessing; profile.channels = reference.channels
         profile.restrictions = reference.restrictions; profile.training = reference.training
-        profile.training.movementHistoryMode = .bounded
+        profile.training.movementHistoryMode = arm == "grounded-visual" ? .visualOnly : .bounded
         profile.training.epochs = 20; profile.training.maximumSteps = 0
         profile.training.perceptionFPS = 60; profile.training.actionFPS = 60
         profile.training.binaryFocalGamma = 0; profile.training.validationSplit = 0
@@ -62,7 +70,7 @@ final class SingleRecordingTests: XCTestCase {
             profile.training.precision = .float32
             profile.training.learningRate = 0.001
             profile.training.cosineCycleEpochs = 20
-            if ["dense", "grounded", "grounded-diverse"].contains(arm) { profile.training.batchSize = 4 }
+            if ["dense", "grounded", "grounded-diverse", "grounded-visual"].contains(arm) { profile.training.batchSize = 4 }
         }
         var augmentation = profile.training.effectiveVisualAugmentation; augmentation.enabled = false
         profile.training.visualAugmentation = augmentation
@@ -80,7 +88,7 @@ final class SingleRecordingTests: XCTestCase {
         let completedEpochs = state?["epoch"] as? Int ?? 0
         guard completedEpochs <= 20 else { throw AgentTrainerError.model("Memorization run exceeds 20 epochs.") }
         if completedEpochs < 20 {
-            let engine = TrainingEngine(diagnosticDeterministicFit: fit, diagnosticDiverseSampling: arm == "grounded-diverse")
+            let engine = TrainingEngine(diagnosticDeterministicFit: fit, diagnosticDiverseSampling: ["grounded-diverse", "grounded-visual"].contains(arm))
             let progress = SingleRecordingProgress()
             let completion: TrainingCompletion = try await withCheckedThrowingContinuation { continuation in
                 engine.start(profile: profile, recordings: [recording],
@@ -107,7 +115,7 @@ final class SingleRecordingTests: XCTestCase {
                 maskControlHistoryForDiagnosis: diagnostic == "control-masked")
         }
         try encoder.encode(reports).write(to: workspace.appendingPathComponent("single-recording-feedback.json"), options: .atomic)
-        if arm == "grounded-diverse" {
+        if ["grounded-diverse", "grounded-visual"].contains(arm) {
             let posted = try XCTUnwrap(reports["memorized-production"])
             XCTAssertGreaterThanOrEqual(posted.movementRecall, 0.8)
             XCTAssertLessThanOrEqual(posted.idlePostRate, 0.1)

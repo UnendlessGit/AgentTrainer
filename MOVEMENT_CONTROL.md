@@ -45,6 +45,10 @@ The final smooth-confidence decoder was reevaluated on the same completed weight
 
 The evaluator uses actual integer events posted through the production injector, a private event sink, the prediction latch, and causal current/historical timelines. No events reach global HID. Recorded video cannot react to generated actions. Memorizing the clip demonstrates fitting and feedback behavior, not generalization or gameplay success.
 
+## Initial live confirmation
+
+The user tested the retained-history memorization brain in the matching Reborn trial. They reported substantially better control, good mouse movement for the small training set, and keys pressed at the right times. The brain still did not approach completing the trial; that was outside this diagnostic's goal. This is positive live evidence for the control correction, not proof of generalization or proof that additional epochs would solve the remaining errors. A matched single-recording visual-movement arm also completed 20 epochs and 8,100 updates, using the same real clip, preprocessing, seed and optimizer settings. It had 81.1% motion recall, 37.0% idle posting and MAE 1.850 under posted-control feedback, failing the diagnostic idle/key gates. It is a comparison brain, not an accepted correction. The live movement-mode A/B comparison remains pending before selecting a winner.
+
 ## Broader comparison
 
 The new frozen selection contains 46 real recordings: the original 39, an additional 3.59-second Reborn recording saved before the check, and the six camera-check recordings. Total duration is 1,066.245 seconds, with 63,999 action rows and 9,605 whole-recording held-out rows. Both movement modes use the same architecture, initialization seed, sampler, optimizer, split, 60/60 FPS, 128×128 vision, focal gamma 0 and exactly 20 epochs / 34,000 updates. Existing profiles and recordings are preserved. Completed arms evaluate only on reruns.

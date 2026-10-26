@@ -1,6 +1,6 @@
 # AgentTrainer 2.52 (build 37) — diagnostic candidate
 
-This candidate is not published. Live Reborn acceptance is required before calling the camera regression fixed or choosing a movement-history winner. The prior 2.51 candidates were rejected in actual play.
+This candidate is not published. The retained-history single-trial diagnostic received positive live Reborn feedback for mouse movement and key timing. A matching visual-movement comparison is still pending before choosing a movement-history winner. The prior 2.51 candidates were rejected in actual play.
 
 ## Changes
 
