@@ -4,7 +4,7 @@ AgentTrainer is a local-first Apple-silicon macOS app for recording demonstratio
 
 Recordings, models, settings, and diagnostics stay on the Mac. Network use is limited to the public GitHub Releases check. AgentTrainer does not upload training data or telemetry.
 
-**2.52 is a diagnostic candidate awaiting live Reborn acceptance.** The latest published release is still 2.50. The previous 2.51 comparison was rejected in actual play. See [movement-control findings](MOVEMENT_CONTROL.md) for verified results and remaining limitations.
+**2.52 is a diagnostic candidate with positive live Reborn feedback.** The retained-history brain was preferred over the matching visual-movement comparator for both keys and camera control; trial completion and broader generalization remain unproven. The latest published release is still 2.50. The previous 2.51 comparison was rejected in actual play. See [movement-control findings](MOVEMENT_CONTROL.md) for verified results and remaining limitations.
 
 Download the published signed macOS installer from the [latest GitHub Release](https://github.com/UnendlessGit/AgentTrainer/releases/latest). Version 2.52 preserves the app's signing identity across rebuilds and updates. On this Mac, updates signed with the same identity should retain existing privacy permissions. A new Mac still needs permissions granted once; building from source requires your own signing key.
 
