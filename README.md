@@ -1,10 +1,12 @@
-# AgentTrainer 2.51
+# AgentTrainer 2.52
 
 AgentTrainer is a local-first Apple-silicon macOS app for recording demonstrations, training behavioral cloning policies with MLX, and running those policies with explicit safety controls.
 
 Recordings, models, settings, and diagnostics stay on the Mac. Network use is limited to the public GitHub Releases check. AgentTrainer does not upload training data or telemetry.
 
-Download the signed macOS installer from the [latest GitHub Release](https://github.com/UnendlessGit/AgentTrainer/releases/latest). Version 2.51 preserves the app's signing identity across rebuilds and updates. On this Mac, updates signed with the same identity should retain existing privacy permissions. A new Mac still needs permissions granted once; building from source requires your own signing key.
+**2.52 is a diagnostic candidate awaiting live Reborn acceptance.** The latest published release is still 2.50. The previous 2.51 comparison was rejected in actual play. See [movement-control findings](MOVEMENT_CONTROL.md) for verified results and remaining limitations.
+
+Download the published signed macOS installer from the [latest GitHub Release](https://github.com/UnendlessGit/AgentTrainer/releases/latest). Version 2.52 preserves the app's signing identity across rebuilds and updates. On this Mac, updates signed with the same identity should retain existing privacy permissions. A new Mac still needs permissions granted once; building from source requires your own signing key.
 
 ## Requirements
 
@@ -32,7 +34,7 @@ The capture-source picker refreshes while Record or Run is visible, and reacts i
 
 ## Compatibility
 
-Version 2.51 introduces Policy v8 (model schema 8). Existing recordings and schema-15 training caches remain compatible. Incompatible brains and checkpoints are preserved in the managed archive; profiles keep their architecture and temporal settings, and require retraining from their recordings. There is no exact v7-to-v8 optimizer resume or weight conversion. Exact pause/resume remains available within v8.
+Version 2.52 introduces Policy v9 (model schema 9). Existing recordings and schema-15 training caches remain compatible. Weight-format metadata is checked even when an older brain has matching tensor shapes. Incompatible brains and checkpoints are preserved in the managed archive; profiles keep their architecture and temporal settings, and require retraining from their recordings. There is no exact v7/v8-to-v9 optimizer resume or weight conversion. BF16/FP16 training now preserves small updates using Float32 master weights, including exact residuals in checkpoints. Exact pause/resume remains available within v9.
 
 Older DAgger/reinforcement-learning settings remain inactive. Saved supervision boundaries still allow earlier frames and held-control history as context while excluding earlier actions from labels. Training uses whole-recording held-out splits and equal recording emphasis.
 
@@ -54,7 +56,7 @@ Context is a generic user-defined categorical system. AgentTrainer does not ship
 - Training snapshots only fields and values actually observed in the AI's selected recordings. Each value occupies one stable categorical input; a missing field is an all-zero segment rather than an invented hidden category.
 - Run loads the immutable vocabulary from the selected brain. Every trained field appears blank so the current operating context can be chosen, and changes take effect on the next perception after stale temporal/action state is released. A brain trained without context shows no context controls.
 
-Context-free Policy-v8 brains omit the categorical tensor. Adding or changing trained categorical IDs changes the learned contract; renaming display labels does not.
+Context-free Policy-v9 brains omit the categorical tensor. Adding or changing trained categorical IDs changes the learned contract; renaming display labels does not.
 
 ## Temporal vision
 
@@ -69,7 +71,7 @@ The default context is four past frames, two perception intervals apart, at half
 
 ## Explicit temporal inputs
 
-Policy v8 receives elapsed time on every action decision, even when Past frames is `0`. Each supported key, modifier, and mouse button has held state, continuous hold age, press/release recency, last completed hold duration, interval edge counts, and held-time fraction. Mouse movement and scrolling include displacement, sample counts, first/last sample timing, observed spans, and real-time rates.
+Policy v9 receives elapsed time on every action decision, even when Past frames is `0`. Each supported key, modifier, and mouse button has held state, continuous hold age, press/release recency, last completed hold duration, interval edge counts, and held-time fraction. Mouse movement and scrolling include displacement, sample counts, first/last sample timing, observed spans, and real-time rates.
 
 Current and historical inputs also carry observation intervals, source-frame age, historical age/separation, and validity indicators. Unknown startup hold durations and missing history remain explicitly unknown. Nanosecond clocks are subtracted before conversion to Float32; short linear and longer logarithmic encodings preserve both taps and long holds. Event spans describe observed samples, not an inferred duration of physical device motion.
 
@@ -79,7 +81,7 @@ The earlier Policy-v7 matched Blade Ball experiment used all 145 recordings, who
 
 ## Mouse movement and stopping
 
-The movement-memory setting is saved with each trained brain. **Bounded movement history** retains recent executed movement through a limited, time-normalized history path. **Visual timing only** predicts mouse movement without feeding previous cursor, movement, or scroll values into its motor path. Both preserve real visual history, discrete-control timing, and observation clocks; the keyboard/button path still receives complete control history.
+The movement-memory setting is saved with each trained brain. **Bounded movement history** retains recent executed movement through a limited, time-normalized history path. **Visual timing only** predicts mouse movement without feeding previous cursor, movement, or scroll values into its motor path. Both ground camera direction and stopping in real visual history and observation clocks. Complete key/button/control timing remains available through a bounded correction to visually grounded binary actions, so a generated hold cannot freely dictate the next hold. The same real recorded actions separately supervise the visual base during training.
 
 Relative movement has separate learned per-axis activity decisions. They allow an exact stop rather than repeatedly posting a small regression residual. The bounded path cannot change these decisions, its own attention weights, or the independent base movement prediction. This limits direct feedback amplification; it does not guarantee stability of an arbitrary game or eliminate the need for representative demonstrations.
 
@@ -93,7 +95,7 @@ The AI editor independently configures three training-only features. None delays
 - **Future Action Prediction** predicts up to four configurable action horizons. Near horizons receive more weight, teaching intent and smoother continuation while the immediate head remains the sole runtime output.
 - **Future State Prediction** predicts an action-conditioned change in the learned visual state. It uses stopped-gradient latent targets and never generates future images; repeated future observations are deduplicated before encoding.
 
-The auxiliary heads have a fixed Policy-v8 layout, so these settings can warm-start compatible v8 brain weights. Conservative default loss weights passed a matched-update causal held-out test with no more than 1% immediate-policy loss drift while both auxiliary objectives improved.
+The auxiliary heads have a fixed Policy-v9 layout, so these settings can warm-start compatible v9 brain weights. The release benchmark checks the full objective, including visual-base supervision, augmentation, and both predictive heads, against its unchanged quality and overhead gates.
 
 ## Safety
 
@@ -124,7 +126,7 @@ Run the opt-in release benchmark for a compact fixture, the default vision/model
 ./benchmark.sh
 ```
 
-The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, cached action-head p50/p95 latency, and learning-quality deltas against the pre-optimization graph. It also executes the complete Policy-v8 objective—including independent per-sample augmentation and both predictive heads—and reports its overhead, memory, and thermal state. Default and temporal-stress runs report sustained windows for both the optimized core path and the full Policy-v8 objective. Low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
+The benchmark reports end-to-end optimizer-step throughput, held-out evaluation throughput, inference throughput, cached action-head p50/p95 latency, and learning-quality deltas against the pre-optimization graph. It also executes the complete Policy-v9 objective—including visual-base supervision, independent per-sample augmentation and both predictive heads—and reports its overhead, memory, and thermal state. Default and temporal-stress runs report sustained windows for both the optimized core path and the full Policy-v9 objective. Low-bit numerical trajectories may differ while the objective and every training label remain unchanged. Results are hardware-specific, so compare repeated warm runs on the same idle Mac.
 
 Run the optional local Blade Ball timing experiment (requires the existing 145-recording folder):
 
@@ -140,7 +142,7 @@ Run the local real-Reborn mouse-feedback comparison (requires the 39-recording f
 ./benchmark-mouse.sh
 ```
 
-It uses ignored `work/mouse-comparison-v8`, trains each candidate for exactly 20 epochs, and evaluates completed candidates without further training. No global input is posted. See [MOVEMENT_CONTROL.md](MOVEMENT_CONTROL.md) for the feedback method and its limits.
+It uses ignored `work/mouse-comparison-v9`, trains each candidate for exactly 20 epochs, and evaluates completed candidates without further training. No global input is posted. See [MOVEMENT_CONTROL.md](MOVEMENT_CONTROL.md) for the feedback method and its limits.
 
 Build, sign, package, and install:
 
@@ -163,7 +165,7 @@ Mono variants for the app bundle and the icon shown inside AgentTrainer.
 
 The build assembles and verifies a complete signed bundle before transactionally replacing that path. AgentTrainer must be quit first. Distribution artifacts are written to the ignored `outputs` folder:
 
-- `AgentTrainer-2.51.dmg`
+- `AgentTrainer-2.52.dmg`
 - `AgentTrainer-Source.zip`
 - `SHA256SUMS.txt`
 

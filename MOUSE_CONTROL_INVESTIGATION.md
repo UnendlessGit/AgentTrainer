@@ -1,5 +1,7 @@
 # Mouse / game-camera regression investigation
 
+This document preserves the original investigation and measurements. Current Policy v9 work and live acceptance status are documented in [MOVEMENT_CONTROL.md](MOVEMENT_CONTROL.md).
+
 Investigation date: 2026-10-25. Application/source: AgentTrainer 2.50, commit `2c430af`.
 
 ## Finding

@@ -5,9 +5,10 @@ import MLXNN
 @testable import AgentTrainer
 
 /// Executes the policy and production injector against real recorded visual
-/// observations. Only mouse feedback is closed; other controls come from the
-/// actual demonstration. No generated actions become training targets.
+/// observations. Can close mouse or all posted controls, or retain recorded
+/// history for a pipeline parity check. No generated action is a training target.
 enum MouseFeedbackEvaluation {
+    enum FeedbackMode: Equatable { case mouseOnly, allControls, recordedControls }
     private struct Frame {
         let current: MLXArray
         let reduced: MLXArray
@@ -18,7 +19,14 @@ enum MouseFeedbackEvaluation {
     }
 
     static func evaluate(_ model: AgentPolicy, dataset: CachedDataset, rows: [Int], profile: AIProfile,
-                         recordings: [RecordingItem], perceptionStride: Int = 1) throws -> MouseFeedbackMetrics {
+                         recordings: [RecordingItem], perceptionStride: Int = 1,
+                         feedbackMode: FeedbackMode = .mouseOnly,
+                         capabilities: ModelOutputCapabilities? = nil,
+                         bypassMovementActivityForDiagnosis: Bool = false,
+                         maskControlHistoryForDiagnosis: Bool = false) throws -> MouseFeedbackMetrics {
+        guard feedbackMode == .mouseOnly || capabilities != nil else {
+            throw AgentTrainerError.model("Full-control evaluation requires immutable output capabilities.")
+        }
         var score = MouseFeedbackMetrics()
         let count = profile.training.effectiveTemporalVision.pastFrameCount
         let spacing = profile.training.effectiveTemporalVision.frameSpacing
@@ -27,17 +35,31 @@ enum MouseFeedbackEvaluation {
         let head = compile(inputs: [model]) { arrays in
             let features = model.encodedTemporalFeatures(current: arrays[0], past: arrays[1], controls: arrays[2],
                 currentTiming: arrays[3], pastTiming: arrays[4])
-            return [model.activatedPredictions(logits: model.logits(temporalFeatures: features,
-                contextValues: model.contextSchema.isEmpty ? nil : arrays[5]))]
+            let logits = model.logits(temporalFeatures: features,
+                contextValues: model.contextSchema.isEmpty ? nil : arrays[5])
+            let prediction = model.activatedPredictions(logits: logits)
+            if bypassMovementActivityForDiagnosis {
+                return [concatenated([prediction[.ellipsis, 0..<2], tanh(logits[.ellipsis, 2..<4]),
+                    prediction[.ellipsis, 4...]], axis: -1)]
+            }
+            return [prediction]
         }
         let sink = MouseEventSink()
         let injector = InputInjector(eventSink: { sink.post($0) }, cursorWarp: { _ in },
             monotonicClock: { sink.now }, associateCursor: {})
+        injector.onState = { sink.accept($0) }
         defer { injector.disableAndReleaseAll() }
         var execution = profile
-        execution.channels.mouseMovement = true
-        execution.channels.buttons = false; execution.channels.scroll = false
-        execution.channels.keyboard = false; execution.channels.modifiers = false
+        if feedbackMode != .mouseOnly, let capabilities {
+            execution.channels = capabilities.restricting(execution.channels, mouseMode: .relative)
+            execution.restrictions = capabilities.restricting(execution.effectiveRestrictions)
+        } else {
+            execution.channels.mouseMovement = true
+            execution.channels.buttons = false; execution.channels.scroll = false
+            execution.channels.keyboard = false; execution.channels.modifiers = false
+        }
+        let allowedKeys = feedbackMode != .mouseOnly ? capabilities?.allowedKeyCodes ?? [] : []
+        let keyboardEnabled = feedbackMode != .mouseOnly
         var camera = GameCameraSettings(); camera.recenterCursor = false
         let rect = CGRect(x: 0, y: 0, width: 100, height: 100)
         var recordingID: UUID?
@@ -73,7 +95,7 @@ enum MouseFeedbackEvaluation {
                         injector.disableAndReleaseAll()
                         nativeOffset = sink.now + 1_000_000_000
                         sink.setTime(nativeOffset + query)
-                        injector.enable(outputPermissions: RuntimeOutputPermissions(cursorMovement: true, keyboard: false))
+                        injector.enable(outputPermissions: RuntimeOutputPermissions(cursorMovement: true, keyboard: keyboardEnabled))
                         recordingID = item.id
                         events = try InputEventReader.mapped(url: item.directory.appendingPathComponent(item.manifest.eventFile))
                         eventIndex = 0
@@ -101,8 +123,13 @@ enum MouseFeedbackEvaluation {
                             frameTime: item.manifest.hostStartNanos + source,
                             perceptionInterval: lastPerception.map { TemporalInputContract.seconds(query, since: $0) }, rect: item.manifest.globalRect.cgRect)
                         var controls = teacherPerception!.controlValues(rect: item.manifest.globalRect.cgRect)
-                        replaceMouse(in: &timing, from: native.features)
-                        for i in 0..<4 { controls[i] = native.controls[i] }
+                        if feedbackMode == .allControls {
+                            timing.replaceSubrange(16..., with: native.features[16...])
+                            controls = native.controls
+                        } else if feedbackMode == .mouseOnly {
+                            replaceMouse(in: &timing, from: native.features)
+                            for i in 0..<4 { controls[i] = native.controls[i] }
+                        }
                         controls.withUnsafeMutableBufferPointer {
                             ActionLayout.sanitizeTrainingRows($0, rowCount: 1, channels: profile.channels, restrictions: profile.effectiveRestrictions)
                         }
@@ -119,7 +146,9 @@ enum MouseFeedbackEvaluation {
                         perceptionInterval: lastPerception.map { _ in 1 / profile.training.perceptionFPS * Double(perceptionStride) },
                         rect: item.manifest.globalRect.cgRect)
                     teacherDecision!.endInterval(at: teacherTime)
-                    replaceMouse(in: &timing, from: native.features)
+                    if feedbackMode == .allControls {
+                        timing.replaceSubrange(16..., with: native.features[16...])
+                    } else if feedbackMode == .mouseOnly { replaceMouse(in: &timing, from: native.features) }
                     sanitize(&timing, profile: profile)
                     var pastTiming: [Float] = []
                     for (slot, frame) in vision.past.enumerated() {
@@ -134,7 +163,16 @@ enum MouseFeedbackEvaluation {
                         pastTiming += values
                     }
                     let past = stacked(vision.past.map { ($0?.reduced ?? vision.fallback)[0] }, axis: 0).expandedDimensions(axis: 0)
-                    let controls = vision.past.flatMap { $0?.controls ?? [Float](repeating: 0, count: ActionLayout.count) }
+                    var controls = vision.past.flatMap { $0?.controls ?? [Float](repeating: 0, count: ActionLayout.count) }
+                    if maskControlHistoryForDiagnosis {
+                        for index in 16..<timing.count { timing[index] = 0 }
+                        for row in 0..<count {
+                            for index in 16..<TemporalInputContract.valueCount {
+                                pastTiming[row * TemporalInputContract.valueCount + index] = 0
+                            }
+                        }
+                        controls = [Float](repeating: 0, count: controls.count)
+                    }
                     var arrays = [vision.current, past, MLXArray(controls, [1, count, ActionLayout.count]),
                         MLXArray(timing, [1, timing.count]), MLXArray(pastTiming, [1, count, TemporalInputContract.valueCount])]
                     if !model.contextSchema.isEmpty {
@@ -150,10 +188,14 @@ enum MouseFeedbackEvaluation {
                     latch.publish(prediction, at: Double(nativeOffset + query) / 1e9)
                     let action = latch.consume()!
                     sink.clearMovement(); sink.setTime(nativeOffset + query + 1_000_000)
-                    injector.execute(action.values, profile: execution, allowedKeyCodes: [], mouseMode: .relative,
-                        captureRect: rect, safety: AgentSafetyPolicy(), gameCamera: camera, predictionIsFresh: action.isFresh)
+                    injector.execute(action.values, profile: execution, allowedKeyCodes: allowedKeys, mouseMode: .relative,
+                        captureRect: rect, safety: AgentSafetyPolicy(), gameCamera: camera,
+                        predictionIsFresh: action.isFresh, shiftUsesKeyboardChannel: true)
                     let posted = sink.movement
                     score.consume(posted: posted, target: dataset.action(at: index), latency: latency)
+                    if feedbackMode != .mouseOnly {
+                        score.consumeKeys(state: sink.state, target: dataset.action(at: index), allowedKeys: allowedKeys)
+                    }
                     sessionRow += 1
                 }
             }
@@ -178,6 +220,9 @@ private final class MouseEventSink: @unchecked Sendable {
     private let lock = NSLock()
     private var time: UInt64 = 1_000_000_000
     private var x = 0.0, y = 0.0
+    private var controlState = InputState.empty
+    var state: InputState { lock.withLock { controlState } }
+    func accept(_ state: InputState) { lock.withLock { controlState = state } }
     var now: UInt64 { lock.withLock { time } }
     var movement: (Double, Double) { lock.withLock { (x, y) } }
     func setTime(_ value: UInt64) { lock.withLock { time = value } }
@@ -202,10 +247,25 @@ struct MouseFeedbackMetrics: Encodable {
     private var reverseSigns = [Double](repeating: 0, count: 2)
     private var reverseLags: [Int] = [], missedReversals = 0
     private var latencies: [Double] = []
+    private(set) var keyScores: [UInt16: FeedbackKeyMetrics] = [:]
+    mutating func consumeKeys(state: InputState, target: [Float], allowedKeys: Set<UInt16>) {
+        for code in allowedKeys where !ActionLayout.allModifierKeyCodes.contains(code) {
+            keyScores[code, default: FeedbackKeyMetrics()].consume(
+                actual: state.keys.contains(code), target: target[14 + Int(code)] >= 0.5)
+        }
+        let families: [Set<UInt16>] = [[56, 60], [59, 62], [58, 61], [54, 55]]
+        let primary: [UInt16] = [56, 59, 58, 55]
+        let masks: [CGEventFlags] = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
+        for i in families.indices where !allowedKeys.isDisjoint(with: families[i]) {
+            keyScores[primary[i], default: FeedbackKeyMetrics()].consume(
+                actual: state.modifiers & masks[i].rawValue != 0, target: target[142 + i] >= 0.5)
+        }
+    }
     var feedbackRawMAE: Double { error / Double(max(1, rows)) }
     var idlePostRate: Double { Double(idlePosts) / Double(max(1, idle)) }
     var movementRecall: Double { Double(activePosts) / Double(max(1, active)) }
     mutating func recordingBoundary() {
+        for code in keyScores.keys { keyScores[code]?.recordingBoundary() }
         lastTarget = [0, 0]; stopAges = [nil, nil]; reverseAges = [nil, nil]; reverseSigns = [0, 0]
     }
     mutating func consume(posted: (Double, Double), target: [Float], latency: Double) {
@@ -241,10 +301,11 @@ struct MouseFeedbackMetrics: Encodable {
     private enum CodingKeys: String, CodingKey {
         case rows, idle, idlePosts, active, activePosts, feedbackRawMAE, idlePostRate, movementRecall,
              directionAccuracy, magnitude, signedX, signedY, stopMatches, missedStops, stopP95Ticks,
-             reversalMatches, missedReversals, reversalP95Ticks, headP50Milliseconds, headP95Milliseconds
+             reversalMatches, missedReversals, reversalP95Ticks, headP50Milliseconds, headP95Milliseconds, keyScores
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(Dictionary(uniqueKeysWithValues: keyScores.map { (String($0.key), $0.value) }), forKey: .keyScores)
         try c.encode(rows, forKey: .rows); try c.encode(idle, forKey: .idle); try c.encode(idlePosts, forKey: .idlePosts)
         try c.encode(active, forKey: .active); try c.encode(activePosts, forKey: .activePosts)
         try c.encode(feedbackRawMAE, forKey: .feedbackRawMAE); try c.encode(idlePostRate, forKey: .idlePostRate)
@@ -261,5 +322,27 @@ struct MouseFeedbackMetrics: Encodable {
             try c.encode(a[a.count / 2], forKey: .headP50Milliseconds)
             try c.encode(a[Int(Double(a.count - 1) * 0.95)], forKey: .headP95Milliseconds)
         }
+    }
+}
+
+
+struct FeedbackKeyMetrics: Encodable {
+    var truePositives = 0, falsePositives = 0, falseNegatives = 0, trueNegatives = 0
+    var maximumPostedHoldTicks = 0, maximumTargetHoldTicks = 0
+    private var postedHold = 0, targetHold = 0
+    mutating func consume(actual: Bool, target: Bool) {
+        if actual && target { truePositives += 1 }
+        else if actual { falsePositives += 1 }
+        else if target { falseNegatives += 1 }
+        else { trueNegatives += 1 }
+        postedHold = actual ? postedHold + 1 : 0
+        targetHold = target ? targetHold + 1 : 0
+        maximumPostedHoldTicks = max(maximumPostedHoldTicks, postedHold)
+        maximumTargetHoldTicks = max(maximumTargetHoldTicks, targetHold)
+    }
+    mutating func recordingBoundary() { postedHold = 0; targetHold = 0 }
+    private enum CodingKeys: String, CodingKey {
+        case truePositives, falsePositives, falseNegatives, trueNegatives,
+             maximumPostedHoldTicks, maximumTargetHoldTicks
     }
 }

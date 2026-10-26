@@ -1,79 +1,66 @@
-# AgentTrainer 2.51 movement control
+# AgentTrainer 2.52 movement-control investigation
 
-Policy v8 corrects a reproduced Policy-v7 mouse feedback regression. The earlier diagnosis and frozen-brain measurements are in [MOUSE_CONTROL_INVESTIGATION.md](MOUSE_CONTROL_INVESTIGATION.md). Timing inputs remain explicit; removing all timing from an existing v7 brain is not a supported correction.
+**Status: diagnostic candidate, not an accepted live fix.** The 2.51 candidates were rejected by the user in Reborn: persistent W/Space/other keys and little camera movement, including on a recorded trial. The latest published release remains 2.50. Neither an offline loss nor recorded-video replay establishes improved gameplay.
 
-## Inputs and architecture
+## Reproduced failures
 
-The recordings, dataset schema 15, and 2,190-value `TemporalInputContract` are unchanged. A decision still receives real images, paired trailing controls, hold/edge durations, movement/scroll samples and rates, elapsed intervals, frame age, and validity. Runtime feedback comes from events actually posted after output restrictions and integer rounding.
+Policy v7 received its own current timing/control state without a constraint on its influence. Frozen-brain probes reproduced mouse feedback amplification. Policy v8 bounded the continuous mouse prior but still let generated keys influence camera confidence and unrestricted held-state copying influence binary outputs. The initial mouse-only replay concealed this problem by supplying demonstrated keys. Full posted-control feedback reproduced Space holds lasting tens of seconds.
 
-Policy v8 reuses the same CNN embeddings in two policy streams. They share recurrent and fusion weights; they are evaluated together along the batch dimension, rather than duplicating the encoder or parameter set.
+A single-video experiment was essential: good predictions using recorded controls collapsed with the model's own controls, even on the same real visual sequence. A second issue appeared in fitting: small augmentation-off locality batches mostly contained neighboring frames from one action. Diverse batches of the same frames substantially improved the visual base without adding or changing targets.
 
-- The decision stream receives complete control/timing history and produces keyboard, modifier, button, and predictive-state outputs.
-- The motor base stream retains visual history, categorical context, discrete controls and their timing, observation clocks, and validity. It zeros cursor position plus movement/scroll control and timing fields. Absolute cursor, scroll, relative base movement, and relative movement activity come from this stream.
-- Bounded mode reintroduces previous relative movement through a separate constrained path. Visual timing only mode omits this path. Both choices have identical parameter shapes and are immutable in the saved brain.
+## Policy v9
 
-For each axis and history window, let `d` be the normalized signed displacement recovered from the Float32 rate encoding, `Δt` its actual interval, `h` the nominal action interval, and `s` runtime camera sensitivity. The retained value is
+Recordings, cache schema 15, the 2,190-value timing vocabulary and 146 executable actions are unchanged. Timing remains available with current-only vision. GRU/LSTM, all supported precisions and categorical context remain supported.
 
-```
-v = clip(d × min(1, h / Δt) / s, −1, 1)
-prior = 0.4 × sigmoid(gain(motor)) × Σ softmax(attention(motor)) × v
-relative = clip(tanh(base(motor)) + prior, −0.9999, 0.9999)
-```
+The shared CNN encodes each real image independently. Two policy streams share recurrent/fusion weights and run together along the batch dimension:
 
-Invalid windows contribute zero. The current window and every selected historical observation have independent validity. Long windows become a rate-equivalent action step; short windows are never magnified. Sensitivity is removed before reuse, so increasing the external sensitivity does not increase the direct history loop gain. All decoding and mixture arithmetic uses Float32 before casting to model precision.
+- Complete context receives all causal controls, held/edge durations, motion samples/rates, clocks and validity.
+- The grounded stream receives real visual history, categorical context and observation clocks/validity. Endogenous controls and their timing derivatives are zeroed in this stream.
 
-Attention and gain cannot read the movement being reused. Consequently, the direct movement-history path has continuous gain below 0.4 for fixed visual/discrete/clock context. Its convex mixture cannot amplify an input perturbation. This is a bound on one feedback path, not a stability proof for an interactive game, generated keyboard/button feedback, or arbitrary visual dynamics. With a zero base at 1× sensitivity, the maximum gain also avoids retaining a one-pixel command solely through rounding. There is no runtime smoothing queue to delay a reversal.
+For binary heads, the final logit is `base + tanh(context - base)`, computed in Float32 before casting. Timing can resolve an uncertain visual decision; its correction is bounded by one logit. The same real targets also supervise the grounded base with weight 0.5 during training. This adds no CNN/recurrent pass or learned parameters at inference.
 
-Two extra internal logits classify whether X and Y should move. A nonpositive activity logit makes that axis exactly zero. The activity decision is independent of continuous feedback, so a previous turn cannot enable its own next turn. Activity labels come directly from real forward-interval targets at the default posting threshold (`abs(delta) >= 0.5` raw pixels). Per-axis positive weights use the training split only, capped at 8. The activity BCE contributes 0.25 within the movement loss; displacement regression remains active. An early unweighted prototype suppressed useful movement and was rejected.
+Absolute cursor, relative movement base, scroll, and movement activity use the grounded stream. Generated keys cannot directly suppress camera confidence. Bounded mode retains the existing motion-independent convex history mixture with gain below 0.4, actual interval normalization, and sensitivity compensation. Visual timing only omits that prior. Movement history cannot enable its own stopping/activity gate. Both choices preserve complete temporal evidence in the context stream. There is no delayed smoothing queue or arbitrary sub-tick HID scheduler; at 60 Hz execution remains about 16.7 ms.
 
-The physical action vocabulary remains 146 values. Internal immediate logits have 148 values, as do each of the four future-action horizons. Saliency selectors, sizing estimates, precision conversion, strict weight loading, checkpoint signatures, and context fusion follow this layout. GRU/LSTM and current-only vision remain supported. All control-derived timing and the bounded path share the existing per-sample control-dropout mask; clocks and validity remain visible.
+Per-axis movement confidence interpolates smoothly through uncertain logits: `u = clip((logit + 1) / 2, 0, 1)`, `gain = u² × (3 − 2u)`. Logits at or below −1 stop exactly; logits at or above 1 preserve full predicted movement. This avoids magnifying small encoder/precision differences near zero into a full-size camera command. The raw regression targets and confidence labels remain real recorded actions.
 
-## Validation and real-data comparison
+These constraints bound individual feedback paths. They are not a proof of game stability or a substitute for learning appropriate actions from images.
 
-Learning uses only the user's real Reborn demonstrations: 39 recordings, about 965 seconds, 115,198 nonzero movement samples. No synthetic mouse trajectories or generated-action labels are used. Small algebra/event fixtures test contracts only and are never training examples. Generic hardware benchmarks test tensor-path equivalence rather than mouse learning.
+## Real single-recording fitting
 
-`./benchmark-mouse.sh` uses an isolated ignored workspace, freezes the v7 reference before migration, and trains bounded-history and visual-only candidates with identical architecture, initialization seed, recording order, whole-recording split, sampler, and optimizer. Both use all 39 recordings, 60 Perception FPS, 60 Action FPS, 128×128 color vision, BFloat16, binary focal gamma 0, four past frames, and exactly 20 epochs / 30,820 updates per arm. Automatic repetition is absent and the step cap is zero. Completed arms are evaluation-only on reruns.
+All arms used one real 26.98-second recording (1,619 action rows), 60/60 FPS, 128×128 vision, focal gamma 0, no augmentation/auxiliary losses, and exactly 20 epochs. The dense fitting arms used Float32, batch 4, no stochastic regularization and 8,100 optimizer updates. No generated mouse trajectories became targets.
 
-The feedback evaluator uses real recorded video through the native encoder, cached visual context, `RuntimePredictionLatch`, and the production `InputInjector` with a private `CGEvent` sink. It closes both current and historical mouse feedback using the integer deltas actually posted; other controls retain demonstrated context. It separately exercises perception every one, two, or four action ticks, with fresh action clocks and source-frame age between observations. No events reach the global HID stream.
+The following investigation measurements preceded the smooth-confidence correction:
 
-Scores include raw-pixel error after posting, useful-movement recall, idle movement, signed/cumulative drift, direction, stopping/reversal lag with missed-event counts, and action-head latency. The frozen v7 brain had different original training/split provenance; comparisons against it demonstrate reproduced feedback behavior, not matched training superiority. Comparisons between the two v8 arms are matched.
-
-**Recorded video cannot react to generated actions.** This experiment measures feedback robustness against real visual sequences and cannot establish actual gameplay improvement. A real Reborn A/B check is required before selecting the live winner. Recording-feedback measurements appear below; the live comparison remains a separate acceptance step.
-
-## Measured recording-feedback results
-
-All **8,639 held-out action rows** are evaluated as complete recording sequences. Training uses 57,928 total rows, recording-level held-out splits, seed 42, and the same initial tensor values for both v8 modes. Each arm completed 20 epochs; the app's existing held-out loss selector chose its epoch-3 brain for Run. The frozen v7 reference is an earlier epoch-29 brain, not a matched 20-epoch training arm.
-
-At 60 perception / 60 action FPS:
-
-| Metric | Frozen v7 reference | Visual timing only | Bounded history |
+| Posted-control result | Earlier v8 dense fit | v9, local batches | v9, diverse batches |
 | --- | ---: | ---: | ---: |
-| Raw-pixel MAE / axis / tick | 5.255 | 2.043 | 2.182 |
-| Movement recall | 100.0% | 79.5% | 76.4% |
-| Idle rows posting movement | 100.0% | 56.3% | 53.0% |
-| Active-axis direction accuracy | 57.2% | 43.9% | 42.4% |
-| Matched stops | 112 | 609 | 618 |
-| Missed stops before target resumes | 1198 | 706 | 697 |
-| Matched-stop p95 lag, ticks | 36 | 8 | 9 |
+| Movement recall | 4.6% | 73.8% | 84.4% |
+| Idle rows posting movement | 5.7% | 48.9% | 6.1% |
+| Raw-pixel MAE / axis / tick | 1.744 | 1.880 | 1.271 |
+| Longest W hold | 26.92 s | 26.98 s | 10.55 s |
+| Longest Space hold | 0 s | 9.82 s | 1.10 s |
 
-Both corrections reduce error and runaway movement, while useful movement recall remains above 76%. Neither is perfect: roughly half of demonstrated idle rows still post movement, and direction accuracy is lower than the reference. Stop-lag percentiles describe matched events only; missed stops remain failures and are reported alongside them. Only seven immediate sign reversals occur in these held-out sequences, too few for a strong reversal claim.
+The real recording's longest W and Space intervals are 10.55 and 1.10 seconds. The diverse v9 run had W FP/FN 7/2, Space 9/1, S 4/0, and D 0/0 action ticks. Recorded-history keyboard precision/recall were about 99.2%/99.9%. The inference-only all-control-masked ablation had mouse MAE 1.324 versus 1.271 with retained history. This ablation changes inputs, never the real targets; it does not replace the matched movement-mode comparison.
 
-At 30/60 FPS, visual-only and bounded MAE are **2.028 / 2.174** pixels; at 15/60 FPS they are **2.049 / 2.207**. The reference worsens to **5.397 / 5.832**. Cached policy-head p95 measurements range **1.58–4.23 ms** across corrected arms/cadences on this Mac, excluding capture, CNN, queueing, and HID delivery. These are measurements, not an end-to-end 60-FPS guarantee.
+The final smooth-confidence decoder was reevaluated on the same completed weights, without additional training. It achieved **86.1% movement recall, 7.4% idle posting, and 1.265 raw-pixel MAE**. W/Space/S/D counts and holds above stayed unchanged; Shift had no extra or missed ticks and matched its 1.167-second maximum. The masked-control ablation had 84.0% motion recall and MAE 1.321. The candidate remains a single-trial diagnostic, not a general gameplay claim.
 
-Bounded history has fewer idle false moves; visual-only has lower displacement error and greater useful-movement recall. These replay results do not settle the user's live Reborn preference. **Live result: both candidates were rejected.** On an unseen parkour trial with the same camera mode, the user observed persistent W/other-key/Space holds and little camera movement; the visual-only candidate moved slowly in short bursts. A follow-up on a recorded trial was somewhat better but still poor, with very similar behavior from both candidates. Neither meets the requested live-control quality. The replay improvement is insufficient for acceptance, and this candidate release has not been published.
+The evaluator uses actual integer events posted through the production injector, a private event sink, the prediction latch, and causal current/historical timelines. No events reach global HID. Recorded video cannot react to generated actions. Memorizing the clip demonstrates fitting and feedback behavior, not generalization or gameplay success.
 
-The initial replay test closed only mouse feedback while supplying demonstrated discrete controls. It therefore did not test the full live key/button feedback distribution. An expanded diagnostic closes every actual posted control and compares saved best/final checkpoints. Activity bypass and control masking in that diagnostic are inference ablations only, never synthetic training labels. Further development uses additional real recordings and another live acceptance check.
+## Broader comparison
 
-## Migration and execution limits
+The new frozen selection contains 46 real recordings: the original 39, an additional 3.59-second Reborn recording saved before the check, and the six camera-check recordings. Total duration is 1,066.245 seconds, with 63,999 action rows and 9,605 whole-recording held-out rows. Both movement modes use the same architecture, initialization seed, sampler, optimizer, split, 60/60 FPS, 128×128 vision, focal gamma 0 and exactly 20 epochs / 34,000 updates. Existing profiles and recordings are preserved. Completed arms evaluate only on reruns.
 
-Model schema 8 / `AgentTrainer.Policy.v8` requires retraining. Incompatible v7 brains and checkpoints are archived, never converted or silently partially loaded. Recordings, profile architecture, temporal settings, and compatible schema-15 caches remain intact. Exact pause/resume is supported only within the matching v8 checkpoint contract.
+Before the smooth-confidence correction, the visual-movement arm failed the useful-movement recall gate. Its teacher-loss-selected epoch-1 brain had 50.9% motion recall, 40.7% idle posting and a 7.68-second maximum Space hold. The final checkpoint released Space much better (maximum 1.02 seconds) but still had only 65.3% motion recall and 52.3% idle posting. These are failed acceptance results, not an improvement claim. The retained-history arm also failed: its selected brain had 56.1% motion recall, 43.6% idle posting and an 11.65-second maximum Space hold; the final checkpoint had 67.0% recall, 54.2% idle posting and a 1.30-second maximum Space hold. Both final checkpoints reduce the prolonged Space failure, but neither meets the broader movement gate. No full-data live winner has been chosen. The next controlled live check uses the successful single-recording fitting brain.
 
-Only keys/buttons with actual positive training targets enter immutable output capabilities. This uses positive counts, not positive-loss weights (a never-pressed button can have weight one). Validation reports per-axis activity recall and idle false moves at the same half-pixel rounding boundary used by execution at default 1× sensitivity. Nondefault sensitivity changes the posting threshold.
+The previous v8 comparison used 39 recordings and mouse-only feedback. Its improved replay errors did not transfer to live Reborn; the user rejected both candidates on an unseen and a recorded trial. Do not reuse that comparison as live acceptance evidence.
 
-Run settings are captured at startup; live output permissions still act immediately. Each movement is consumed once, action/perception queues remain bounded and serialized, and panic, takeover, context invalidation, stale-observation stopping, and release ordering retain their existing contracts. At 60 Action FPS the execution interval remains about 16.7 ms; no arbitrary sub-tick HID scheduling is added.
+## Training and compatibility repairs
 
-## Release validation
+AdamW now retains Float32 master weights, preserving updates smaller than a BF16 weight's rounding step. All master weights, moments, scheduler and RNG state survive exact same-contract resume. Fresh warm starts reseed masters after loading selected weights. Legacy optimizer containers explicitly preserve their original arithmetic; model-generation migration still requires retraining.
 
-The functional suite passed **188 tests with four opt-in workflows skipped**; the real-recording comparison and release hardware benchmark were run separately. Compact, default, and 16-frame Float32 stress benchmarks passed the existing equivalence, quality, auxiliary-overhead, sustained-throughput, memory, and thermal gates without relaxed thresholds. Cached action-head p95 was **2.07 / 2.91 / 4.88 ms**. The default full-objective sustained throughput retained 102.9% of its first window; stress retained 100.3%. These hardware figures are local measurements and exclude capture, image encoding, scheduling, and HID delivery.
+Disabled augmentation bypasses transforms entirely, fixing shape errors between independently deduplicated images and per-action rows. Small batches use the established diverse salience ordering; sampling remains separate from deterministic CNN reuse. Global gradient norms accumulate in Float32 to avoid FP16 overflow.
 
-Migration tests verify archived v7 weights remain recoverable and compatible schema-15 pixel caches survive. Signing regression checks and shell syntax checks pass. Final installation/package identity and live Reborn acceptance remain separate release checks.
+Policy v9 validates weight-format metadata, including same-shaped v8 weights. Older brains/checkpoints are archived and compatible schema-15 caches retained. The signing identity and recording bytes are unchanged. Installation, final test/benchmark results, and live acceptance must be verified before publication.
+
+## Candidate validation
+
+Compact, default and 16-frame stress hardware benchmarks passed the unchanged equivalence, 1% quality-drift, overhead, memory and sustained-throughput gates. Canonical, reused and augmented training references all include the visual-base loss. Cached policy-head p95 was 0.85 / 0.90 / 2.42 ms on this Mac; these figures exclude capture, CNN encoding, queueing and HID delivery. Full-objective throughput retention was 100.1% for default and 104.2% for stress, with nominal thermal state and bounded cache memory. The functional suite passed 199 tests with six opt-in workflows skipped; the real single-recording workflow and hardware benchmarks were run separately. Signed installation/package verification is recorded with candidate validation; actual Reborn acceptance remains pending.

@@ -1,5 +1,7 @@
 # Policy v7 temporal input and validation record
 
+This document preserves the original investigation and measurements. Current Policy v9 work and live acceptance status are documented in [MOVEMENT_CONTROL.md](MOVEMENT_CONTROL.md).
+
 This documents the historical 2.50 / Policy-v7 release. Current mouse feedback corrections and Policy-v8 contracts are in [MOVEMENT_CONTROL.md](MOVEMENT_CONTROL.md).
 
 AgentTrainer 2.50 (build 35) uses model schema 7, `AgentTrainer.Policy.v7`, dataset schema 15, and `TemporalInputContract.version = 1`. This document records the source audit, contracts, and local offline evaluation. It contains aggregate results, never recording contents or private model artifacts.

@@ -5343,6 +5343,11 @@ final class DomainTests: XCTestCase {
         profile.training.batchSize = 4
         profile.training.epochs = 1
         profile.training.validationSplit = 0.5
+        // Exercise the deduplicated augmentation-off path with different
+        // image/action row counts through training, exact resume, and inference.
+        var augmentation = profile.training.effectiveVisualAugmentation
+        augmentation.enabled = false
+        profile.training.visualAugmentation = augmentation
         profile.training.checkpointInterval = 1
         var recordings: [RecordingItem] = []
         for index in 0..<2 {

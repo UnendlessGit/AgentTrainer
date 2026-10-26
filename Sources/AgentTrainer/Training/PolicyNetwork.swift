@@ -16,8 +16,11 @@ final class AgentPolicy: Module, @unchecked Sendable {
     let contextSchema: ModelContextSchema
     let dtype: DType
     private let legacyMovementFeedback: Bool
+    private let legacyControlFeedback: Bool
     private let _movementSensitivity: Float
     static let maximumHistoryGain: Float = 0.4
+    static let maximumControlLogitCorrection: Float = 1
+    static let visualActionLossWeight: Float = 0.5
     // Leading underscore deliberately keeps this deterministic tensor out of
     // MLX Module reflection. It is an input buffer, not a learned parameter;
     // putting it in AdamW would waste two Float32 moment arrays and allow
@@ -54,8 +57,9 @@ final class AgentPolicy: Module, @unchecked Sendable {
     @ModuleInfo var movementHistoryGain: Linear
     @ModuleInfo var dropout: Dropout
 
-    init(profile: AIProfile, contextSchema: ModelContextSchema = .empty, legacyMovementFeedback: Bool = false, movementSensitivity: Double = 1) {
+    init(profile: AIProfile, contextSchema: ModelContextSchema = .empty, legacyMovementFeedback: Bool = false, legacyControlFeedback: Bool = false, movementSensitivity: Double = 1) {
         self.legacyMovementFeedback = legacyMovementFeedback
+        self.legacyControlFeedback = legacyControlFeedback || legacyMovementFeedback
         _movementSensitivity = Float(movementSensitivity.isFinite ? min(100, max(0.01, movementSensitivity)) : 1)
         self.profile = profile
         self.contextSchema = contextSchema
@@ -692,8 +696,8 @@ final class AgentPolicy: Module, @unchecked Sendable {
             timing = timing.take(sampleToVision, axis: 0)
         }
         // Both streams reuse the CNN and learned recurrent/fusion weights.
-        // Only the motor stream excludes cursor/movement/scroll history, so
-        // its own continuous commands cannot become evidence for another turn.
+        // The grounded stream excludes endogenous control feedback. Full timing
+        // still informs a bounded correction to visually grounded controls.
         let fullSteps = concatenated([pastEmbedding, controls,
             timingEmbedding(timing, batch: batch, keep: controlKeep)], axis: -1)
         let motorSteps = concatenated([pastEmbedding, motorControls(controls),
@@ -739,12 +743,16 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return history.asType(dtype)
     }
 
-    /// Preserve discrete held/edge durations and observation clocks. Full
-    /// motion timing remains available to decision/predictive learning. Motor
-    /// base and stopping confidence are independent of continuous feedback;
-    /// the explicit bounded history path is the only motion reuse.
+    /// The grounded stream retains all observation clocks and historical
+    /// images. Endogenous controls cannot suppress camera confidence or become
+    /// its own evidence for continued turning. Full timing remains available
+    /// in the context stream, whose binary correction is explicitly bounded.
     private func motorTiming(_ values: MLXArray?) -> MLXArray? {
         guard let values, !legacyMovementFeedback else { return values }
+        if !legacyControlFeedback {
+            return concatenated([values[.ellipsis, 0..<16],
+                MLXArray.zeros(like: values[.ellipsis, 16...])], axis: -1)
+        }
         return concatenated([values[.ellipsis, 0..<16],
             MLXArray.zeros(like: values[.ellipsis, 16..<18]),
             values[.ellipsis, 18..<TemporalInputContract.motionOffset],
@@ -753,6 +761,7 @@ final class AgentPolicy: Module, @unchecked Sendable {
 
     private func motorControls(_ values: MLXArray) -> MLXArray {
         guard !legacyMovementFeedback else { return values }
+        if !legacyControlFeedback { return MLXArray.zeros(like: values) }
         return concatenated([MLXArray.zeros(like: values[.ellipsis, 0..<4]),
             values[.ellipsis, 4..<12], MLXArray.zeros(like: values[.ellipsis, 12..<14]),
             values[.ellipsis, 14...]], axis: -1)
@@ -838,11 +847,60 @@ final class AgentPolicy: Module, @unchecked Sendable {
         return (0.5 * log((1 + combined) / (1 - combined))).asType(dtype)
     }
 
+    /// History can resolve an ambiguous visual decision but cannot overturn a
+    /// confident one by copying a held state. Accumulate the correction in
+    /// Float32, including for FP16/BF16 models.
+    func boundedControlLogits(base: MLXArray, context: MLXArray) -> MLXArray {
+        if legacyControlFeedback { return context }
+        let base = base.asType(.float32)
+        return (base + Self.maximumControlLogitCorrection * tanh(context.asType(.float32) - base)).asType(dtype)
+    }
+
+    func visualActionLogits(fusedFeatures fused: MLXArray) -> MLXArray {
+        let base = motorFeatures(fused)
+        return concatenated([absoluteMouseHead(base), relativeMouseHead(base), buttonHead(base),
+            scrollHead(base), keyboardHead(base), modifierHead(base), movementIntentHead(base)], axis: -1)
+    }
+
+    /// The same real action labels supervise the visual/clock base. This is a
+    /// training-only cost; it adds no CNN or recurrent pass and no new targets.
+    func visualActionLoss(fusedFeatures: MLXArray, targets: MLXArray, positiveWeights: MLXArray?,
+                          previousTargets: MLXArray?, sampleWeights: MLXArray?) -> MLXArray {
+        guard !legacyControlFeedback else { return MLXArray(0, dtype: dtype) }
+        return loss(logits: visualActionLogits(fusedFeatures: fusedFeatures), targets: targets,
+            positiveWeights: positiveWeights, previousTargets: previousTargets, sampleWeights: sampleWeights)
+    }
+
+    /// The complete immediate training objective, shared by canonical and
+    /// optimized benchmark paths. Validation still reports executed-head loss
+    /// separately, as does TrainingEngine's per-term telemetry.
+    func trainingActionLoss(fusedFeatures: MLXArray, targets: MLXArray,
+                            positiveWeights: MLXArray? = nil, previousTargets: MLXArray? = nil,
+                            sampleWeights: MLXArray? = nil) -> MLXArray {
+        loss(logits: logits(fusedFeatures: fusedFeatures), targets: targets,
+            positiveWeights: positiveWeights, previousTargets: previousTargets, sampleWeights: sampleWeights)
+            + Self.visualActionLossWeight * visualActionLoss(fusedFeatures: fusedFeatures, targets: targets,
+                positiveWeights: positiveWeights, previousTargets: previousTargets, sampleWeights: sampleWeights)
+    }
+
+    func trainingActionLoss(currentImages: MLXArray, pastImages: MLXArray, pastControls: MLXArray,
+                            targets: MLXArray, positiveWeights: MLXArray? = nil,
+                            previousTargets: MLXArray? = nil, currentTiming: MLXArray? = nil,
+                            pastTiming: MLXArray? = nil) -> MLXArray {
+        let features = temporalFeatures(currentImages: currentImages, pastImages: pastImages,
+            pastControls: pastControls, currentTiming: currentTiming, pastTiming: pastTiming)
+        return trainingActionLoss(fusedFeatures: fusedFeatures(temporalFeatures: features), targets: targets,
+            positiveWeights: positiveWeights, previousTargets: previousTargets)
+    }
+
     func logits(fusedFeatures fused: MLXArray) -> MLXArray {
         let decision = decisionFeatures(fused), motor = motorFeatures(fused)
         return concatenated([
-            absoluteMouseHead(motor), relativeLogits(relativeMouseHead(motor), fused: fused), buttonHead(decision),
-            scrollHead(motor), keyboardHead(decision), modifierHead(decision), movementIntentHead(motor)
+            absoluteMouseHead(motor), relativeLogits(relativeMouseHead(motor), fused: fused),
+            boundedControlLogits(base: buttonHead(motor), context: buttonHead(decision)),
+            scrollHead(motor),
+            boundedControlLogits(base: keyboardHead(motor), context: keyboardHead(decision)),
+            boundedControlLogits(base: modifierHead(motor), context: modifierHead(decision)), movementIntentHead(motor)
         ], axis: -1)
     }
 
@@ -870,8 +928,9 @@ final class AgentPolicy: Module, @unchecked Sendable {
         let decision = raw[0..<batch], motor = raw[batch..<(2 * batch)]
         let intent = futureMovementIntentHead(motorFeatures(fusedFeatures)).reshaped([batch,
             FutureActionPredictionConfiguration.maximumHorizonCount, 2])
-        return concatenated([motor[.ellipsis, 0..<2], relativeLogits(motor[.ellipsis, 2..<4], fused: fusedFeatures), decision[.ellipsis, 4..<12],
-            motor[.ellipsis, 12..<14], decision[.ellipsis, 14...], intent], axis: -1)
+        return concatenated([motor[.ellipsis, 0..<2], relativeLogits(motor[.ellipsis, 2..<4], fused: fusedFeatures),
+            boundedControlLogits(base: motor[.ellipsis, 4..<12], context: decision[.ellipsis, 4..<12]),
+            motor[.ellipsis, 12..<14], boundedControlLogits(base: motor[.ellipsis, 14...], context: decision[.ellipsis, 14...]), intent], axis: -1)
     }
 
     func futureStateDelta(
@@ -939,7 +998,14 @@ final class AgentPolicy: Module, @unchecked Sendable {
         guard !legacyMovementFeedback, logits.dim(-1) == PolicyLogitsLayout.count else {
             return MLXArray.ones(like: logits[.ellipsis, ActionLayout.relativeMouse])
         }
-        return (logits[.ellipsis, PolicyLogitsLayout.movementIntent] .> 0).asType(dtype)
+        let intent = logits[.ellipsis, PolicyLogitsLayout.movementIntent]
+        if legacyControlFeedback { return (intent .> 0).asType(dtype) }
+        // A hard zero/one switch magnifies tiny low-precision encoder changes
+        // into a full-size camera command. Interpolate uncertain evidence;
+        // confident stops (<= -1) remain exact zero and turns (>= 1) retain
+        // their full magnitude. This adds no queue or delay to a reversal.
+        let confidence = clip(0.5 + 0.5 * intent.asType(.float32), min: 0, max: 1)
+        return (confidence * confidence * (3 - 2 * confidence)).asType(dtype)
     }
 
     func predictions(
@@ -1244,11 +1310,17 @@ final class AgentPolicy: Module, @unchecked Sendable {
     }
 
     func saveWeights(to url: URL) throws {
+        guard !legacyControlFeedback else { throw AgentTrainerError.model("A diagnostic legacy policy cannot publish current-format weights.") }
         try MLX.save(arrays: Dictionary(uniqueKeysWithValues: parameters().flattened()), metadata: ["format": ModelContract.weightFormat], url: url)
     }
 
     func loadWeights(from url: URL) throws {
-        let arrays = try MLX.loadArrays(url: url)
+        let (arrays, metadata) = try MLX.loadArraysAndMetadata(url: url)
+        let expectedFormat = legacyMovementFeedback ? "AgentTrainer.Policy.v7"
+            : legacyControlFeedback ? "AgentTrainer.Policy.v8" : ModelContract.weightFormat
+        guard metadata["format"] == expectedFormat else {
+            throw AgentTrainerError.model("These weights use an incompatible policy contract. Retrain from the preserved recordings.")
+        }
         try update(parameters: ModuleParameters.unflattened(arrays), verify: .all)
     }
 }
@@ -1267,6 +1339,8 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     private var learningRateScaleArray = MLXArray(1, dtype: .float32)
     private var firstMoments: [String: MLXArray] = [:]
     private var secondMoments: [String: MLXArray] = [:]
+    private var masterWeights: [String: MLXArray] = [:]
+    private(set) var usesMasterWeights: Bool
     private var parameterNames: [String] = []
 
     var step: Int { MLX.eval(stepArray); return Int(stepArray.item(Float.self).rounded()) }
@@ -1281,8 +1355,10 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         warmupSteps: Int = 500,
         schedule: LearningRateSchedule = .adaptiveCosine,
         cycleSteps: Int = 4_000,
-        minimumLearningRateRatio: Float = 0.05
+        minimumLearningRateRatio: Float = 0.05,
+        usesMasterWeights: Bool = true
     ) {
+        self.usesMasterWeights = usesMasterWeights
         self.learningRate = learningRate
         self.weightDecay = weightDecay
         self.warmupSteps = max(1, warmupSteps)
@@ -1300,7 +1376,18 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
             let value = parameter.asType(.float32)
             firstMoments[name] = MLXArray.zeros(like: value)
             secondMoments[name] = MLXArray.zeros(like: value)
+            if usesMasterWeights { masterWeights[name] = value }
         }
+    }
+
+    /// Warm-start weights can be loaded after moment allocation. Seed the new
+    /// accumulator from those selected weights before tracing the first update.
+    func synchronizeInitialParameters(model: Module) {
+        precondition(step == 0, "Only a fresh optimizer may reseed master weights.")
+        guard usesMasterWeights else { return }
+        masterWeights = Dictionary(uniqueKeysWithValues: model.parameters().flattened().map {
+            ($0.0, $0.1.asType(.float32))
+        })
     }
 
     func update(
@@ -1356,7 +1443,7 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         var updated: [(String, MLXArray)] = []
         for (name, parameter) in model.parameters().flattened() {
             guard let gradient = gradientMap[name] else { updated.append((name, parameter)); continue }
-            let p = parameter.asType(.float32)
+            let p = masterWeights[name] ?? parameter.asType(.float32)
             let clipped = clipping.map {
                 which($0.condition, gradient, gradient * $0.normalizer)
             } ?? gradient
@@ -1366,7 +1453,9 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
             firstMoments[name] = m
             secondMoments[name] = v
             let update = (m / correction1) / (sqrt(v / correction2) + epsilon)
-            updated.append((name, (p * decayScale - scheduledLearningRate * update).asType(targetType)))
+            let next = p * decayScale - scheduledLearningRate * update
+            if usesMasterWeights { masterWeights[name] = next }
+            updated.append((name, next.asType(targetType)))
         }
         model.update(parameters: ModuleParameters.unflattened(updated))
     }
@@ -1374,7 +1463,7 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     /// Mirrors MLXOptimizers' canonical global norm calculation, but returns
     /// only its shared scalar, avoiding a temporary clipped parameter tree.
     static func globalGradientNorm(_ gradients: ModuleParameters) -> MLXArray {
-        sqrt(gradients.reduce(MLXArray(0)) { $0 + $1.square().sum() })
+        sqrt(gradients.reduce(MLXArray(Float(0))) { $0 + $1.asType(.float32).square().sum() })
     }
 
     func save(to url: URL) throws {
@@ -1382,9 +1471,12 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         var arrays: [String: MLXArray] = [:]
         for (key, value) in firstMoments { arrays["m.\(key)"] = value }
         for (key, value) in secondMoments { arrays["v.\(key)"] = value }
+        for (key, value) in masterWeights { arrays["master.\(key)"] = value }
         try MLX.save(
             arrays: arrays,
             metadata: [
+                "optimizerFormat": "AgentTrainer.AdamW.v2",
+                "usesMasterWeights": String(usesMasterWeights),
                 "step": String(step),
                 "learningRate": String(learningRate),
                 "weightDecay": String(weightDecay),
@@ -1403,7 +1495,7 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
     }
 
     func innerState() -> [MLXArray] {
-        [stepArray, learningRateScaleArray] + parameterNames.flatMap { name in [firstMoments[name], secondMoments[name]].compactMap { $0 } }
+        [stepArray, learningRateScaleArray] + parameterNames.flatMap { name in [firstMoments[name], secondMoments[name], masterWeights[name]].compactMap { $0 } }
     }
 
     /// Reduces the cosine envelope after a measured plateau. The mutable scalar
@@ -1446,11 +1538,28 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         let loaded = try MLX.loadArraysAndMetadata(url: url)
         let restoredFirst = Dictionary(uniqueKeysWithValues: loaded.0.compactMap { key, value in key.hasPrefix("m.") ? (String(key.dropFirst(2)), value) : nil })
         let restoredSecond = Dictionary(uniqueKeysWithValues: loaded.0.compactMap { key, value in key.hasPrefix("v.") ? (String(key.dropFirst(2)), value) : nil })
+        let restoredMaster = Dictionary(uniqueKeysWithValues: loaded.0.compactMap { key, value in
+            key.hasPrefix("master.") ? (String(key.dropFirst(7)), value) : nil
+        })
+        if let format = loaded.1["optimizerFormat"], format != "AgentTrainer.AdamW.v2" {
+            throw AgentTrainerError.model("The optimizer checkpoint uses an unsupported format.")
+        }
+        let restoredUsesMaster: Bool
+        if let flag = loaded.1["usesMasterWeights"] {
+            guard let parsed = Bool(flag) else { throw AgentTrainerError.model("Invalid master-weight metadata.") }
+            restoredUsesMaster = parsed
+        } else {
+            // Preserve the exact rounded-update trajectory of older checkpoints.
+            restoredUsesMaster = false
+        }
         let restoredNames = Set(restoredFirst.keys)
         let expectedNames = Set(parameterNames)
         let expectedShapes = firstMoments.mapValues(\.shape)
         guard !restoredNames.isEmpty,
               restoredNames == Set(restoredSecond.keys),
+              restoredUsesMaster ? Set(restoredMaster.keys) == restoredNames : restoredMaster.isEmpty,
+              restoredNames.allSatisfy({ !restoredUsesMaster ||
+                  (restoredMaster[$0]?.shape == restoredFirst[$0]?.shape && restoredMaster[$0]?.dtype == .float32) }),
               expectedNames.isEmpty || restoredNames == expectedNames,
               restoredNames.allSatisfy({
                   restoredFirst[$0]?.shape == restoredSecond[$0]?.shape
@@ -1460,6 +1569,8 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         }
         firstMoments = restoredFirst
         secondMoments = restoredSecond
+        masterWeights = restoredMaster
+        usesMasterWeights = restoredUsesMaster
         parameterNames = restoredNames.sorted()
         guard let restoredStep = loaded.1["step"].flatMap(Int.init), restoredStep >= 0,
               let restoredLearningRate = loaded.1["learningRate"].flatMap(Float.init),

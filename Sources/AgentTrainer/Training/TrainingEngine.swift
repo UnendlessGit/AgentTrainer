@@ -67,8 +67,16 @@ final class TrainingEngine: @unchecked Sendable {
 
     private let lock = NSLock()
     private let ablateActionTiming: Bool
+    /// Isolated fitting-capacity probe: match deterministic inference while
+    /// still taking gradients. Production training retains all regularization.
+    private let diagnosticDeterministicFit: Bool
+    private let diagnosticDiverseSampling: Bool
 
-    init(ablateActionTiming: Bool = false) { self.ablateActionTiming = ablateActionTiming }
+    init(ablateActionTiming: Bool = false, diagnosticDeterministicFit: Bool = false, diagnosticDiverseSampling: Bool = false) {
+        self.ablateActionTiming = ablateActionTiming
+        self.diagnosticDeterministicFit = diagnosticDeterministicFit
+        self.diagnosticDiverseSampling = diagnosticDiverseSampling
+    }
     private var task: Task<Void, Never>?
     private var pauseRequested = false
     private var stopRequested = false
@@ -191,7 +199,11 @@ final class TrainingEngine: @unchecked Sendable {
         // rows before the CNN so each gets an independent visual domain.
         let reusesTrainingVisionFeatures = reusesVisionFeatures
             && !usesPerSampleVisualAugmentation
-        let desiredSamplingStrategy = reusesTrainingVisionFeatures
+        // A tiny locality batch can contain only neighboring frames from one
+        // action. Real single-video fitting reproduced severe visual underfit
+        // with four-row local batches. Keep deterministic CNN reuse independent
+        // of sampling; small batches use the established diverse ordering.
+        let desiredSamplingStrategy = reusesTrainingVisionFeatures && batchSize >= 16 && !diagnosticDiverseSampling
             ? TrainingSamplingContract.localityGroupedVision
             : TrainingSamplingContract.salienceBalanced
         // Salience depends only on immutable cached targets and profile output
@@ -240,7 +252,7 @@ final class TrainingEngine: @unchecked Sendable {
         }()
 
         let model = AgentPolicy(profile: profile, contextSchema: contextSchema)
-        model.train(true)
+        model.train(!diagnosticDeterministicFit)
         let optimizer = ResumableAdamW(
             learningRate: Float(profile.training.learningRate),
             weightDecay: Float(profile.training.weightDecay),
@@ -293,6 +305,8 @@ final class TrainingEngine: @unchecked Sendable {
             expectedContextSchema: contextSchema,
             state: &state
         )
+        if !restore.isExactResume { optimizer.synchronizeInitialParameters(model: model) }
+
         state.contextSchema = contextSchema.isEmpty ? nil : contextSchema
         let validationStep = compile(inputs: [model]) { (arrays: [MLXArray]) -> [MLXArray] in
             // Keep packed-frame expansion, the shared forward pass, loss, and activation
@@ -439,22 +453,24 @@ final class TrainingEngine: @unchecked Sendable {
                 includeAuxiliaries: true
             )
             let sampleCount = batch.targets.dim(0)
-            let augmentation = model.sampleVisualAugmentation(batchSize: sampleCount)
-            let currentImages = model.augmentedVision(
-                batch.currentImages,
-                parameters: augmentation
-            )
-            let pastImages = model.augmentedPastVision(
-                batch.pastImages,
-                parameters: augmentation
-            )
+            // Without augmentation, current/past/future image rows may be
+            // deduplicated independently of the action-row count. Bypass the
+            // transform entirely; a per-label identity tensor cannot broadcast
+            // across those distinct image batches (and its clamp is not identity).
+            let augmentation = usesPerSampleVisualAugmentation
+                ? model.sampleVisualAugmentation(batchSize: sampleCount) : nil
+            let currentImages = augmentation.map {
+                model.augmentedVision(batch.currentImages, parameters: $0)
+            } ?? batch.currentImages
+            let pastImages = augmentation.map {
+                model.augmentedPastVision(batch.pastImages, parameters: $0)
+            } ?? batch.pastImages
             let sampleFutureImages = usesPerSampleVisualAugmentation
                 ? batch.futureStateImages.take(batch.sampleToFutureState, axis: 0)
                 : batch.futureStateImages
-            let futureStateImages = model.augmentedVision(
-                sampleFutureImages,
-                parameters: augmentation
-            )
+            let futureStateImages = augmentation.map {
+                model.augmentedVision(sampleFutureImages, parameters: $0)
+            } ?? sampleFutureImages
             var gradientInputs = [
                 currentImages,
                 pastImages,
@@ -529,10 +545,15 @@ final class TrainingEngine: @unchecked Sendable {
                     masks: arrays[futureStateMaskIndex],
                     trainingSampleWeights: arrays[sampleWeightIndex]
                 )
+                let visualActionLoss = model.visualActionLoss(
+                    fusedFeatures: fusedFeatures, targets: arrays[targetIndex], positiveWeights: classWeights,
+                    previousTargets: arrays[previousIndex], sampleWeights: arrays[sampleWeightIndex]
+                )
                 let totalLoss = immediateLoss
+                    + AgentPolicy.visualActionLossWeight * visualActionLoss
                     + Float(profile.training.effectiveFutureActionPrediction.lossWeight) * futureActionLoss
                     + Float(profile.training.effectiveFutureStatePrediction.lossWeight) * futureStateLoss
-                return [totalLoss, immediateLoss, futureActionLoss, futureStateLoss]
+                return [totalLoss, immediateLoss, futureActionLoss, futureStateLoss, visualActionLoss]
             }(model, gradientInputs)
             optimizer.update(
                 model: model,
@@ -686,6 +707,7 @@ final class TrainingEngine: @unchecked Sendable {
                 let result: (
                     loss: Double,
                     immediateActionLoss: Double,
+                    visualActionLoss: Double,
                     futureActionLoss: Double,
                     futureStateLoss: Double,
                     next: (arrays: [MLXArray], preparation: Double)?
@@ -721,13 +743,14 @@ final class TrainingEngine: @unchecked Sendable {
                     return (
                         Double(lossArray.item(Float.self)),
                         Double(stepOutputs[1].item(Float.self)),
+                        Double(stepOutputs[4].item(Float.self)),
                         Double(stepOutputs[2].item(Float.self)),
                         Double(stepOutputs[3].item(Float.self)),
                         next
                     )
                 }
                 let loss = result.loss
-                guard loss.isFinite, result.immediateActionLoss.isFinite,
+                guard loss.isFinite, result.immediateActionLoss.isFinite, result.visualActionLoss.isFinite,
                       result.futureActionLoss.isFinite,
                       result.futureStateLoss.isFinite else {
                     throw AgentTrainerError.model("Training became numerically unstable before this step could be saved. Lower the learning rate or reset this brain's learning state.")
@@ -774,6 +797,7 @@ final class TrainingEngine: @unchecked Sendable {
                         autosavesPublished: autosavesPublished,
                         trainingLoss: loss,
                         immediateActionLoss: result.immediateActionLoss,
+                        visualActionLoss: result.visualActionLoss,
                         futureActionLoss: result.futureActionLoss,
                         futureStateLoss: result.futureStateLoss,
                         epochTrainingLoss: epochSampleCount > 0 ? epochWeightedLoss / Double(epochSampleCount) : nil,
@@ -1307,7 +1331,7 @@ final class TrainingEngine: @unchecked Sendable {
         reusesVisionFeatures: Bool
     ) throws -> ValidationEvaluation {
         model.train(false)
-        defer { model.train(true) }
+        defer { model.train(!diagnosticDeterministicFit) }
         var weightedLoss = 0.0
         var evaluated = 0
         var report = ValidationAccumulator(
@@ -1714,6 +1738,7 @@ final class TrainingEngine: @unchecked Sendable {
 
     private func profileSignature(_ profile: AIProfile, recordings: [RecordingItem]) throws -> String {
         struct TrainingIdentity: Encodable {
+            let modelSchema: Int
             let trainingDataSchema: Int
             let ablateActionTiming: Bool
             let preprocessing: PreprocessingSpec
@@ -1722,6 +1747,12 @@ final class TrainingEngine: @unchecked Sendable {
             let recordings: [RecordingTrainingIdentity]
             let folderIDs: [UUID]
             let restrictions: ActionRestrictions
+            // Optional preserves exact signatures for the unchanged augmented
+            // path. Disabled augmentation now bypasses a formerly nonidentity
+            // transform, requiring a fresh optimizer rather than a false resume.
+            let unaugmentedInputContract: Int?
+            let diagnosticDeterministicFit: Bool?
+            let diagnosticDiverseSampling: Bool?
         }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         var resumeCompatibleTraining = profile.training
@@ -1736,7 +1767,7 @@ final class TrainingEngine: @unchecked Sendable {
         let recordingIdentities = try recordings
             .map { try RecordingTrainingIdentity(recording: $0) }
             .sorted { $0.id.uuidString < $1.id.uuidString }
-        let identity = TrainingIdentity(trainingDataSchema: TrainingDataContract.schemaVersion, ablateActionTiming: ablateActionTiming, preprocessing: profile.preprocessing, channels: normalizedChannels, training: resumeCompatibleTraining, recordings: recordingIdentities, folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString }, restrictions: profile.effectiveRestrictions)
+        let identity = TrainingIdentity(modelSchema: ModelContract.schemaVersion, trainingDataSchema: TrainingDataContract.schemaVersion, ablateActionTiming: ablateActionTiming, preprocessing: profile.preprocessing, channels: normalizedChannels, training: resumeCompatibleTraining, recordings: recordingIdentities, folderIDs: profile.effectiveFolderIDs.sorted { $0.uuidString < $1.uuidString }, restrictions: profile.effectiveRestrictions, unaugmentedInputContract: profile.training.effectiveVisualAugmentation.enabled && profile.training.effectiveVisualAugmentation.probability > 0 ? nil : 1, diagnosticDeterministicFit: diagnosticDeterministicFit ? true : nil, diagnosticDiverseSampling: diagnosticDiverseSampling ? true : nil)
         return SHA256.hash(data: try encoder.encode(identity)).map { String(format: "%02x", $0) }.joined()
     }
 

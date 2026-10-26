@@ -326,7 +326,7 @@ final class TrainingPerformanceTests: XCTestCase {
             ) -> @Sendable ([MLXArray]) -> [MLXArray] {
                 compile(inputs: [model, optimizer], outputs: [model, optimizer]) { arrays in
                     let result = valueAndGrad(model: model) { model, inputs in
-                        [model.loss(
+                        [model.trainingActionLoss(
                             currentImages: inputs[0],
                             pastImages: inputs[1],
                             pastControls: inputs[2],
@@ -361,7 +361,7 @@ final class TrainingPerformanceTests: XCTestCase {
                         actions[0..., 1, 0...], arrays[4], arrays[5]
                     ]
                     let result = valueAndGrad(model: model) { model, values in
-                        [model.loss(
+                        [model.trainingActionLoss(
                             currentImages: values[0],
                             pastImages: values[1],
                             pastControls: values[2],
@@ -404,9 +404,9 @@ final class TrainingPerformanceTests: XCTestCase {
                             sampleToVision: arrays[4],
                             currentTiming: values[3], pastTiming: values[4]
                         )
-                        let logits = model.logits(temporalFeatures: uniqueTemporal)
-                        return [model.loss(
-                            logits: logits,
+                        let fused = model.fusedFeatures(temporalFeatures: uniqueTemporal)
+                        return [model.trainingActionLoss(
+                            fusedFeatures: fused,
                             targets: targets,
                             positiveWeights: positiveWeights,
                             previousTargets: previousTargets
@@ -839,13 +839,16 @@ final class TrainingPerformanceTests: XCTestCase {
                         pastControls: values[2],
                         currentTiming: values[3], pastTiming: values[4]
                     )
-                    return [candidate.loss(
-                        logits: candidate.logits(temporalFeatures: temporalFeatures),
-                        targets: actions[0..., 0, 0...],
-                        positiveWeights: positiveWeights,
-                        previousTargets: actions[0..., 1, 0...],
-                        sampleWeights: arrays[6]
-                    )]
+                    let fused = candidate.fusedFeatures(temporalFeatures: temporalFeatures)
+                    let immediate = candidate.loss(
+                        logits: candidate.logits(fusedFeatures: fused),
+                        targets: actions[0..., 0, 0...], positiveWeights: positiveWeights,
+                        previousTargets: actions[0..., 1, 0...], sampleWeights: arrays[6]
+                    )
+                    let visual = candidate.visualActionLoss(fusedFeatures: fused,
+                        targets: actions[0..., 0, 0...], positiveWeights: positiveWeights,
+                        previousTargets: actions[0..., 1, 0...], sampleWeights: arrays[6])
+                    return [immediate + AgentPolicy.visualActionLossWeight * visual]
                 }(augmentedImmediateModel, [current, past, arrays[2], arrays[12], arrays[13]])
                 augmentedImmediateOptimizer.update(
                     model: augmentedImmediateModel,
@@ -932,7 +935,11 @@ final class TrainingPerformanceTests: XCTestCase {
                     let futureStateWeight = Float(
                         profile.training.effectiveFutureStatePrediction.lossWeight
                     )
+                    let visual = candidate.visualActionLoss(fusedFeatures: fused,
+                        targets: actions[0..., 0, 0...], positiveWeights: positiveWeights,
+                        previousTargets: actions[0..., 1, 0...], sampleWeights: arrays[6])
                     let total = immediate
+                        + AgentPolicy.visualActionLossWeight * visual
                         + futureActionWeight * futureAction
                         + futureStateWeight * futureState
                     return [total]
@@ -993,7 +1000,7 @@ final class TrainingPerformanceTests: XCTestCase {
                 withRandomState(auxiliaryRandomState) { auxiliaryStep(arrays) }
             }
             runSustainedBenchmark(
-                path: "policy-v8-full",
+                path: "policy-v9-full",
                 steps: sustainedSteps,
                 step: auxiliarySustainedStep,
                 inputs: auxiliaryInputs,

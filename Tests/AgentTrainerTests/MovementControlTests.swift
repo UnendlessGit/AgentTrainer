@@ -95,12 +95,27 @@ final class MovementControlTests: XCTestCase {
         let model = AgentPolicy(profile: p)
         var values = [Float](repeating: 0, count: PolicyLogitsLayout.count)
         values[2] = 1; values[3] = -1
-        values[146] = 0; values[147] = 1
+        values[146] = -1; values[147] = 1
         let prediction = model.activatedPredictions(logits: MLXArray(values, [1, values.count]))
         MLX.eval(prediction)
         XCTAssertEqual(prediction.shape, [1, 146])
         XCTAssertEqual(prediction[0, 2].item(Float.self), 0)
         XCTAssertLessThan(prediction[0, 3].item(Float.self), -0.5)
+    }
+
+    func testUncertainActivityDoesNotCreateAnOnOffCameraDiscontinuity() {
+        let model = AgentPolicy(profile: profile(.bounded))
+        var a = [Float](repeating: 0, count: PolicyLogitsLayout.count)
+        a[2] = 0.2; a[146] = -0.001
+        var b = a; b[146] = 0.001
+        let before = model.activatedPredictions(logits: MLXArray(a, [1, a.count]))
+        let after = model.activatedPredictions(logits: MLXArray(b, [1, b.count]))
+        MLX.eval(before, after)
+        XCTAssertGreaterThan(before[0, 2].item(Float.self), 0)
+        XCTAssertLessThan(abs(after[0, 2] - before[0, 2]).item(Float.self), 0.001)
+        a[146] = -2
+        let stopped = model.activatedPredictions(logits: MLXArray(a, [1, a.count]))
+        XCTAssertEqual(stopped[0, 2].item(Float.self), 0)
     }
 
     func testIdleValidationCountsTheSameHalfPixelBoundaryAsExecution() {

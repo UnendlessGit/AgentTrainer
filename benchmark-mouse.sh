@@ -39,7 +39,7 @@ cp "$METALLIB" "$TEST_BUNDLE/Contents/MacOS/mlx.metallib"
 # Both candidates use the same real recordings, split, architecture, initial
 # seed, and optimizer. Each stops at exactly 20 epochs. Completed arms only
 # evaluate on reruns; neither arm can change an existing user brain.
-export AGENTTRAINER_WORKSPACE_ROOT="$ROOT/work/mouse-comparison-v8"
+export AGENTTRAINER_WORKSPACE_ROOT="$ROOT/work/mouse-comparison-v9"
 export AGENTTRAINER_MOUSE_CORRECTION=1
 benchmark_status=0
 for history_mode in visual bounded; do

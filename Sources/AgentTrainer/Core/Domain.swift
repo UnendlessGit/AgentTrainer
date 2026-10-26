@@ -549,10 +549,10 @@ enum MovementHistoryMode: String, Codable, CaseIterable, Identifiable, Sendable 
 }
 
 enum ModelContract {
-    /// Version 8 separates movement from endogenous motion history and learns
-    /// per-axis movement intent. Older brains are retained in the archive.
-    static let schemaVersion = 8
-    static let weightFormat = "AgentTrainer.Policy.v8"
+    /// Version 9 grounds actions in vision and bounds endogenous control
+    /// feedback while retaining explicit timing and movement history. Older brains are retained in the archive.
+    static let schemaVersion = 9
+    static let weightFormat = "AgentTrainer.Policy.v9"
 }
 
 /// Physical actions retain their 146-value layout. Confidence logits are
@@ -1509,6 +1509,7 @@ struct TrainingMetrics: Sendable {
     var autosavesPublished = 0
     var trainingLoss = 0.0
     var immediateActionLoss = 0.0
+    var visualActionLoss = 0.0
     var futureActionLoss = 0.0
     var futureStateLoss = 0.0
     var epochTrainingLoss: Double?
@@ -1713,7 +1714,7 @@ enum ModelSizing {
         total = add(total, multiply(add(Int64(fusionInput), 1), Int64(PolicyLogitsLayout.count)))
         let historySlots = 1 + profile.training.effectiveTemporalVision.pastFrameCount
         total = add(total, multiply(add(Int64(fusionInput), 1), Int64(2 * historySlots + 2)))
-        // Policy v8 keeps fixed auxiliary layouts even when their losses are
+        // Policy v9 keeps fixed auxiliary layouts even when their losses are
         // disabled, allowing configuration changes to warm-start the same brain.
         total = add(total, multiply(
             add(Int64(fusionInput), 1),
@@ -1727,7 +1728,8 @@ enum ModelSizing {
     }
 
     /// Conservative peak budget for compiled forward/backward training. AdamW
-    /// keeps two Float32 moments in addition to parameters and gradients, while
+    /// keeps Float32 master weights and two moments alongside parameters and
+    /// gradients, while
     /// activations and compiler temporaries multiply the nominal batch input.
     /// This is a safety bound, not a reported MLX memory measurement.
     static func estimatedTrainingWorkingSet(
@@ -1736,7 +1738,7 @@ enum ModelSizing {
     ) -> Int64 {
         let parameters = multiply(
             parameterCount(profile, contextSchema: contextSchema),
-            24
+            28
         )
         let batch = multiply(
             NeuralInputSizing.summary(for: profile, contextSchema: contextSchema)

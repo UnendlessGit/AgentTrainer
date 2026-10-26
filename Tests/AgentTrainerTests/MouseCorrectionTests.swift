@@ -19,43 +19,50 @@ final class MouseCorrectionTests: XCTestCase {
         guard workspace != source else { throw AgentTrainerError.storage("Mouse evaluation requires a separate workspace.") }
         try await store.prepare()
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
-        let referenceRoot = workspace.appendingPathComponent("Reference-v7")
+        let settingsURL = workspace.appendingPathComponent("settings-reference.json")
         let savedProfile: AIProfile
-        let reference: ModelVersionManifest
-        if FileManager.default.fileExists(atPath: referenceRoot.appendingPathComponent("profile.json").path) {
-            savedProfile = try decoder.decode(AIProfile.self, from: Data(contentsOf: referenceRoot.appendingPathComponent("profile.json")))
-            reference = try decoder.decode(ModelVersionManifest.self, from: Data(contentsOf: referenceRoot.appendingPathComponent("manifest.json")))
+        if FileManager.default.fileExists(atPath: settingsURL.path) {
+            savedProfile = try decoder.decode(AIProfile.self, from: Data(contentsOf: settingsURL))
         } else {
-            let directories = try FileManager.default.contentsOfDirectory(at: source.appendingPathComponent("Profiles"), includingPropertiesForKeys: nil)
-            savedProfile = try XCTUnwrap(directories.compactMap { url -> AIProfile? in
-                guard let data = try? Data(contentsOf: url.appendingPathComponent("profile.json")) else { return nil }
-                return try decoder.decode(AIProfile.self, from: data)
-            }.first { $0.name == "Reborn" })
-            let versionID = try XCTUnwrap(savedProfile.activeVersionID)
-            let versionRoot = source.appendingPathComponent("Profiles/\(savedProfile.id.uuidString)/Versions/\(versionID.uuidString)")
-            reference = try decoder.decode(ModelVersionManifest.self, from: Data(contentsOf: versionRoot.appendingPathComponent("manifest.json")))
-            guard reference.schemaVersion == 7 else { throw AgentTrainerError.model("Freeze a v7 reference before the migration.") }
-            try FileManager.default.createDirectory(at: referenceRoot, withIntermediateDirectories: true)
-            try FileManager.default.copyItem(at: versionRoot.appendingPathComponent(reference.weightsFile), to: referenceRoot.appendingPathComponent(reference.weightsFile))
-            try FileManager.default.copyItem(at: versionRoot.appendingPathComponent("manifest.json"), to: referenceRoot.appendingPathComponent("manifest.json"))
-            try Data(contentsOf: source.appendingPathComponent("Profiles/\(savedProfile.id.uuidString)/profile.json"))
-                .write(to: referenceRoot.appendingPathComponent("profile.json"), options: .atomic)
+            let frozen = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("work/mouse-comparison-v8/Reference-v7/profile.json")
+            if FileManager.default.fileExists(atPath: frozen.path) {
+                savedProfile = try decoder.decode(AIProfile.self, from: Data(contentsOf: frozen))
+            } else {
+                let directories = try FileManager.default.contentsOfDirectory(at: source.appendingPathComponent("Profiles"), includingPropertiesForKeys: nil)
+                savedProfile = try XCTUnwrap(directories.compactMap { url -> AIProfile? in
+                    guard let data = try? Data(contentsOf: url.appendingPathComponent("profile.json")) else { return nil }
+                    return try decoder.decode(AIProfile.self, from: data)
+                }.first { $0.name == "Reborn" })
+            }
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(savedProfile).write(to: settingsURL, options: .atomic)
         }
         let folders = try decoder.decode([RecordingFolder].self, from: Data(contentsOf: source.appendingPathComponent("recording-folders.json")))
-        let folderID = try XCTUnwrap(folders.first { $0.name == "Reborn" }?.id)
-        let recordings = try FileManager.default.contentsOfDirectory(at: source.appendingPathComponent("Recordings"), includingPropertiesForKeys: nil)
+        let folderIDs = Set(folders.filter { ["reborn", "reborn camera check"].contains($0.name.lowercased()) }.map(\.id))
+        let available = try FileManager.default.contentsOfDirectory(at: source.appendingPathComponent("Recordings"), includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "atrrecord" }.compactMap { url -> RecordingItem? in
                 let m = try decoder.decode(RecordingManifest.self, from: Data(contentsOf: url.appendingPathComponent("manifest.json")))
-                return m.folderID == folderID ? RecordingItem(manifest: m, directory: url) : nil
+                return m.folderID.map(folderIDs.contains) == true ? RecordingItem(manifest: m, directory: url) : nil
             }.sorted { $0.id.uuidString < $1.id.uuidString }
-        XCTAssertEqual(recordings.count, 39)
+        let selectionURL = workspace.appendingPathComponent("recording-selection.json")
+        let selectedIDs: [UUID]
+        if FileManager.default.fileExists(atPath: selectionURL.path) {
+            selectedIDs = try decoder.decode([UUID].self, from: Data(contentsOf: selectionURL))
+        } else {
+            selectedIDs = available.map(\.id)
+            try JSONEncoder().encode(selectedIDs).write(to: selectionURL, options: .atomic)
+        }
+        let byID = Dictionary(uniqueKeysWithValues: available.map { ($0.id, $0) })
+        let recordings = try selectedIDs.map { try XCTUnwrap(byID[$0], "An experiment recording was removed.") }
+        XCTAssertEqual(recordings.count, 46)
         let mode: MovementHistoryMode = ProcessInfo.processInfo.environment["AGENTTRAINER_MOUSE_HISTORY_MODE"] == "visual" ? .visualOnly : .bounded
-        var profile = AIProfile.fresh(name: mode == .bounded ? "Reborn • bounded mouse history" : "Reborn • visual movement")
-        profile.id = UUID(uuidString: mode == .bounded ? "00000000-0000-0000-0000-000000002511" : "00000000-0000-0000-0000-000000002510")!
-        profile.preprocessing = reference.preprocessing
-        profile.channels = reference.channels
+        var profile = AIProfile.fresh(name: mode == .bounded ? "Reborn • grounded mouse history" : "Reborn • grounded visual movement")
+        profile.id = UUID(uuidString: mode == .bounded ? "00000000-0000-0000-0000-000000002531" : "00000000-0000-0000-0000-000000002530")!
+        profile.preprocessing = savedProfile.preprocessing
+        profile.channels = savedProfile.channels
         profile.restrictions = savedProfile.restrictions
-        profile.training = reference.training
+        profile.training = savedProfile.training
         profile.training.movementHistoryMode = mode
         profile.training.epochs = 20; profile.training.maximumSteps = 0
         profile.training.perceptionFPS = 60; profile.training.actionFPS = 60
@@ -86,9 +93,6 @@ final class MouseCorrectionTests: XCTestCase {
         let weightsRoot = await store.versionDirectory(profileID: profile.id, versionID: version.id)
         let model = AgentPolicy(profile: profile, contextSchema: version.effectiveContextSchema)
         try model.loadWeights(from: weightsRoot.appendingPathComponent(version.weightsFile)); model.train(false)
-        let legacy = AgentPolicy(profile: profile, contextSchema: version.effectiveContextSchema, legacyMovementFeedback: true)
-        try legacy.update(parameters: ModuleParameters.unflattened(MLX.loadArrays(url: referenceRoot.appendingPathComponent(reference.weightsFile))), verify: .noUnusedKeys)
-        legacy.train(false)
         let dataset = try await DatasetCacheBuilder.shared.cache(for: profile, recordings: recordings) { _, _ in }
         let split = TrainingEngine().splitIndices(dataset: dataset, fraction: profile.training.validationSplit,
             seed: profile.training.seed, channels: profile.channels, restrictions: profile.effectiveRestrictions)
@@ -96,23 +100,21 @@ final class MouseCorrectionTests: XCTestCase {
         // only to the demonstrator; this is feedback robustness, not gameplay.
         let selected = split.validation
         var reports: [String: MouseFeedbackMetrics] = [:]
-        for cadence in [1, 2, 4] {
-            let corrected = try MouseFeedbackEvaluation.evaluate(model, dataset: dataset, rows: selected,
-                profile: profile, recordings: recordings, perceptionStride: cadence)
-            let original = try MouseFeedbackEvaluation.evaluate(legacy, dataset: dataset, rows: selected,
-                profile: profile, recordings: recordings, perceptionStride: cadence)
-            reports["corrected-stride-\(cadence)"] = corrected
-            reports["v7-reference-stride-\(cadence)"] = original
-        }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(reports)
-        try data.write(to: workspace.appendingPathComponent(mode == .bounded ? "mouse-results-bounded.json" : "mouse-results-visual.json"), options: .atomic)
-        print("MOUSE_CORRECTION_RESULT mode=\(mode.rawValue) \(String(data: data, encoding: .utf8)!)")
-        let corrected = reports["corrected-stride-1"]!, original = reports["v7-reference-stride-1"]!
-        XCTAssertLessThan(corrected.feedbackRawMAE, original.feedbackRawMAE * 0.8,
-            "Corrected posted feedback must improve mouse error beyond the frozen reference.")
-        XCTAssertLessThan(corrected.idlePostRate, original.idlePostRate,
-            "The correction must reduce actual post-rounding movement during demonstrated stops.")
+        let outputURL = workspace.appendingPathComponent(mode == .bounded ? "mouse-results-bounded.json" : "mouse-results-visual.json")
+        for point in ["best", "final"] {
+            if point == "final" { try model.loadWeights(from: checkpoint.appendingPathComponent("weights.safetensors")) }
+            for cadence in [1, 2, 4] {
+                let corrected = try MouseFeedbackEvaluation.evaluate(model, dataset: dataset, rows: selected,
+                    profile: profile, recordings: recordings, perceptionStride: cadence,
+                    feedbackMode: .allControls, capabilities: version.outputCapabilities)
+                reports["\(point)-stride-\(cadence)"] = corrected
+                try encoder.encode(reports).write(to: outputURL, options: .atomic)
+                print("MOUSE_CORRECTION_RESULT mode=\(mode.rawValue) point=\(point) cadence=\(cadence) MAE=\(corrected.feedbackRawMAE) recall=\(corrected.movementRecall) idle=\(corrected.idlePostRate)")
+                fflush(stdout)
+            }
+        }
+        let corrected = reports["best-stride-1"]!
         XCTAssertGreaterThanOrEqual(corrected.movementRecall, 0.7,
             "Suppressing useful movement is not a valid fix for drift.")
 

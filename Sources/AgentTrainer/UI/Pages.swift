@@ -375,7 +375,7 @@ private struct ProfileEditor: View {
                                 )) {
                                     ForEach(MovementHistoryMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
                                 }
-                                InfoTip("Bounded history retains previous movement with limited feedback and learned stopping. Visual timing only omits movement feedback from mouse prediction. This setting applies when training; each saved brain keeps its own choice.")
+                                InfoTip("Bounded history retains previous executed movement with limited feedback. Visual timing only omits previous movement from mouse prediction. Both use visual history for camera direction and stopping, with limited control-history corrections for keys and buttons. This setting applies when training; each saved brain keeps its own choice.")
                             }
                             let pastSpec = temporal.pastFrameSpec(from: draft.preprocessing)
                             HStack(spacing: 10) {
@@ -1386,6 +1386,8 @@ struct TrainingView: View {
                 }
                 HStack(spacing: 12) {
                     MetricCard(title: "Immediate action loss", value: lossText(model.trainingMetrics.immediateActionLoss), symbol: "bolt.horizontal.fill", color: ATColor.green)
+                    MetricCard(title: "Visual action loss", value: lossText(model.trainingMetrics.visualActionLoss), symbol: "eye.fill", color: ATColor.coral)
+                        .help("Trains actions from visual history and observation timing. The total objective includes this loss at weight 0.5.")
                     MetricCard(title: "Future action loss", value: lossText(model.trainingMetrics.futureActionLoss), symbol: "arrow.right.to.line.compact", color: ATColor.violet)
                     MetricCard(title: "Future state loss", value: lossText(model.trainingMetrics.futureStateLoss), symbol: "point.3.connected.trianglepath.dotted", color: ATColor.cyan)
                     MetricCard(title: "Total objective", value: lossText(model.trainingMetrics.trainingLoss), symbol: "sum", color: ATColor.amber)
