@@ -278,7 +278,7 @@ struct ModelContextSchema: Codable, Hashable, Sendable {
         guard catalog.fields.allSatisfy({ !$0.values.isEmpty }),
               inputValueCount <= Self.maximumInputValues else {
             throw AgentTrainerError.invalidConfiguration(
-                "A trained context schema requires at least one observed value per field and at most \(Self.maximumInputValues.formatted()) total values."
+                "A trained context schema requires at least one observed value per field and at most \(Self.maximumInputValues.formatted(.number.locale(AppNumberFormat.locale))) total values."
             )
         }
         return Self(fields: catalog.fields)
@@ -1493,7 +1493,7 @@ enum TrainingDurationFormatter {
     }
 
     private static func formatted(_ value: Double) -> String {
-        value.formatted(.number.precision(.fractionLength(value < 10 ? 2 : 1)))
+        value.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(value < 10 ? 2 : 1)))
     }
 }
 

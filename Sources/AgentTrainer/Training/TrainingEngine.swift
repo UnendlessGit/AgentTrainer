@@ -831,7 +831,7 @@ final class TrainingEngine: @unchecked Sendable {
                         mlxPeakMemory: memory.peakMemory
                     )
                     let visionStatus = reusesTrainingVisionFeatures
-                        ? " • shared temporal work \(observationReuseRatio.formatted(.number.precision(.fractionLength(2))))×"
+                        ? " • shared temporal work \(observationReuseRatio.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(2))))×"
                         : usesPerSampleVisualAugmentation ? " • independent sample augmentation" : ""
                     let performanceLimit = performance.limitingStatus(
                         memory: memory,
@@ -844,9 +844,9 @@ final class TrainingEngine: @unchecked Sendable {
                                 .warning,
                                 category: "Training",
                                 performanceLimit,
-                                details: "throughput retention \((100 * performance.throughputRetention).formatted(.number.precision(.fractionLength(1))))%; "
-                                    + "step \(performance.stepMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms; "
-                                    + "input \(performance.preparationMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms; "
+                                details: "throughput retention \((100 * performance.throughputRetention).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))))%; "
+                                    + "step \(performance.stepMilliseconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1)))) ms; "
+                                    + "input \(performance.preparationMilliseconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1)))) ms; "
                                     + "thermal \(thermalState.rawValue)"
                             )
                         }
@@ -1455,7 +1455,7 @@ final class TrainingEngine: @unchecked Sendable {
         let nextScale = optimizer.reduceLearningRate()
         if nextScale < previousScale - 0.000_001 {
             state.schedulerReductions = (state.schedulerReductions ?? 0) + 1
-            return "Plateau detected • learning-rate envelope reduced to \(nextScale.formatted(.number.precision(.fractionLength(4))))×; cosine exploration continues"
+            return "Plateau detected • learning-rate envelope reduced to \(nextScale.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(4))))×; cosine exploration continues"
         }
         return "Plateau detected • learning-rate floor reached; cosine restarts remain active"
     }

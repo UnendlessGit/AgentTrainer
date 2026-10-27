@@ -185,7 +185,7 @@ private struct InputHUDView: View {
             if let rl = model.rlMetrics {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack { Text("PPO • EPISODE \(rl.episode)").font(.system(size: 10, weight: .bold)); Spacer(); Text(String(format: "%.1fs", rl.remaining)).font(.system(size: 10, design: .monospaced)) }
-                    HStack { Text("Reward \(rl.episodeReward.formatted())"); Spacer(); Text("Best \(rl.best?.formatted() ?? "—")") }.font(.system(size: 10, design: .monospaced))
+                    HStack { Text("Reward \(rl.episodeReward.formatted(.number.locale(AppNumberFormat.locale)))"); Spacer(); Text("Best \(rl.best?.formatted(.number.locale(AppNumberFormat.locale)) ?? "—")") }.font(.system(size: 10, design: .monospaced))
                     Text(rl.status).font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
                 }.foregroundStyle(.green)
             }

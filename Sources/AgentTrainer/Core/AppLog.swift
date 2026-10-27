@@ -92,7 +92,7 @@ final class AppLogStore: ObservableObject {
         Generated: \(Date().formatted(.iso8601))
         macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)
         Hardware: \(Self.hardwareName())
-        Memory: \(ByteCountFormatter.string(fromByteCount: Int64(ProcessInfo.processInfo.physicalMemory), countStyle: .memory))
+        Memory: \(AppNumberFormat.bytes(Int64(ProcessInfo.processInfo.physicalMemory), style: .memory))
         State: \(appState)
 
         Recent log

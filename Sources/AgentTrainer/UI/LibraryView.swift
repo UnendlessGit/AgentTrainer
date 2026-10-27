@@ -234,10 +234,10 @@ struct LibraryView: View {
                         TextField("Recording name", text: $renameText).font(.title3.bold()).textFieldStyle(.plain)
                             .onSubmit { Task { await model.renameRecording(item, name: renameText) } }
                         HStack { StatusPill(text: durationString(effectiveDuration(item)), color: ATColor.cyan); StatusPill(text: "\(item.manifest.pixelWidth)×\(item.manifest.pixelHeight)", color: ATColor.violet); StatusPill(text: "\(Int(item.manifest.deliveredFPS.rounded())) FPS", color: ATColor.green) }
-                        HStack { StatusPill(text: "\(item.manifest.encodedFrameCount.formatted()) frames", color: ATColor.amber); if let dropped = item.manifest.droppedFrameCount, dropped > 0 { StatusPill(text: "\(dropped) dropped", color: ATColor.coral) }; StatusPill(text: storageString(item.storageBytes), color: ATColor.violet); Spacer() }
+                        HStack { StatusPill(text: "\(item.manifest.encodedFrameCount.formatted(.number.locale(AppNumberFormat.locale))) frames", color: ATColor.amber); if let dropped = item.manifest.droppedFrameCount, dropped > 0 { StatusPill(text: "\(dropped) dropped", color: ATColor.coral) }; StatusPill(text: storageString(item.storageBytes), color: ATColor.violet); Spacer() }
                         HStack { Label("\(item.manifest.eventCount) inputs", systemImage: "cursorarrow.click.2"); Spacer(); Label(item.manifest.capture.kind.rawValue, systemImage: "viewfinder") }.font(.caption).foregroundStyle(.secondary)
                         if item.manifest.trimStart > 0 || (item.manifest.trimEnd ?? item.manifest.duration) < item.manifest.duration {
-                            Label("Uses \(item.manifest.trimStart.formatted(.number.precision(.fractionLength(2))))s – \((item.manifest.trimEnd ?? item.manifest.duration).formatted(.number.precision(.fractionLength(2))))s", systemImage: "scissors").font(.caption).foregroundStyle(ATColor.amber)
+                            Label("Uses \(item.manifest.trimStart.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(2))))s – \((item.manifest.trimEnd ?? item.manifest.duration).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(2))))s", systemImage: "scissors").font(.caption).foregroundStyle(ATColor.amber)
                         }
                         Divider()
                         HStack {
@@ -261,7 +261,7 @@ struct LibraryView: View {
                                 StatusPill(text: summary.mouse.isGameCamera ? "Game camera detected" : "Moving cursor detected", color: summary.mouse.isGameCamera ? ATColor.green : ATColor.cyan)
                                 StatusPill(text: summary.mouse.positionsAreValid ? "Positions valid" : "\(summary.mouse.outOfCaptureBoundsCount) invalid positions", color: summary.mouse.positionsAreValid ? ATColor.green : ATColor.coral)
                             }
-                            Text("Raw delta active on \((summary.mouse.nonzeroDeltaFraction * 100).formatted(.number.precision(.fractionLength(1))))% of move samples • mean active |Δ| \(summary.mouse.meanActiveDeltaMagnitude.formatted(.number.precision(.fractionLength(2)))) px • max \(summary.mouse.maximumDeltaMagnitude.formatted(.number.precision(.fractionLength(1)))) px")
+                            Text("Raw delta active on \((summary.mouse.nonzeroDeltaFraction * 100).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))))% of move samples • mean active |Δ| \(summary.mouse.meanActiveDeltaMagnitude.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(2)))) px • max \(summary.mouse.maximumDeltaMagnitude.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1)))) px")
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
                         Button {
@@ -326,7 +326,7 @@ struct LibraryView: View {
                             .font(.title2).foregroundStyle(ATColor.cyan)
                         VStack(alignment: .leading, spacing: 2) {
                             Text("\(items.count) recordings selected").font(.title3.bold())
-                            Text("\(durationString(totalDuration)) usable • \(metrics.frameCount.formatted()) frames • \(storageString(metrics.storageBytes)) • \(items.reduce(0) { $0 + $1.manifest.eventCount }.formatted()) input events")
+                            Text("\(durationString(totalDuration)) usable • \(metrics.frameCount.formatted(.number.locale(AppNumberFormat.locale))) frames • \(storageString(metrics.storageBytes)) • \(items.reduce(0) { $0 + $1.manifest.eventCount }.formatted(.number.locale(AppNumberFormat.locale))) input events")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
@@ -467,7 +467,7 @@ struct LibraryView: View {
     private func durationString(_ seconds: Double) -> String { let value = Int(ceil(seconds)); return String(format: "%d:%02d", value / 60, value % 60) }
     private func storageString(_ bytes: Int64) -> String { RecordingMetricFormatter.storage(bytes) }
     private func folderMetricSummary(_ metrics: RecordingCollectionMetrics) -> String {
-        "\(metrics.recordingCount.formatted()) recording\(metrics.recordingCount == 1 ? "" : "s") • \(metrics.frameCount.formatted()) frames • \(storageString(metrics.storageBytes)) • \(metrics.durationSeconds.formatted(.number.precision(.fractionLength(1)))) seconds"
+        "\(metrics.recordingCount.formatted(.number.locale(AppNumberFormat.locale))) recording\(metrics.recordingCount == 1 ? "" : "s") • \(metrics.frameCount.formatted(.number.locale(AppNumberFormat.locale))) frames • \(storageString(metrics.storageBytes)) • \(metrics.durationSeconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1)))) seconds"
     }
     private func eventLabel(_ event: InputSample) -> String { switch event.kind { case .key: "\(KeyNames.name(for: event.keyCode)) \(event.isDown ? "down" : "up")"; case .mouseButton: "Mouse \(Int(event.button) + 1) \(event.isDown ? "down" : "up")"; case .mouseMove: "Mouse Δ\(Int(event.deltaX)), \(Int(event.deltaY))"; case .scroll: "Scroll \(Int(event.scrollY))"; case .flags: "Modifiers" } }
     private func eventTime(_ event: InputSample, manifest: RecordingManifest) -> String { guard event.timestampNanos >= manifest.hostStartNanos else { return "—" }; return String(format: "%.3fs", Double(event.timestampNanos - manifest.hostStartNanos) / 1e9) }
@@ -492,7 +492,7 @@ private struct LibraryRecordingRow: View {
                     Label("\(item.manifest.pixelWidth)×\(item.manifest.pixelHeight)", systemImage: "rectangle.inset.filled")
                 }.font(.caption2).foregroundStyle(.secondary)
                 HStack(spacing: 10) {
-                    Label("\(item.manifest.encodedFrameCount.formatted()) frames", systemImage: "film.stack")
+                    Label("\(item.manifest.encodedFrameCount.formatted(.number.locale(AppNumberFormat.locale))) frames", systemImage: "film.stack")
                     Label(RecordingMetricFormatter.storage(item.storageBytes), systemImage: "internaldrive")
                     Label("\(item.manifest.eventCount)", systemImage: "cursorarrow.click.2")
                 }.font(.caption2).foregroundStyle(.secondary)

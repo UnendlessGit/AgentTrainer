@@ -572,7 +572,7 @@ final class AppModel: ObservableObject {
             AppLog.write(
                 category: "Recording",
                 "Recording started",
-                details: "\(spec.kind.rawValue), \(recordingWidth)×\(recordingHeight) output from \(Int(captureRect.width))×\(Int(captureRect.height)) at \(captureFPS.formatted()) FPS"
+                details: "\(spec.kind.rawValue), \(recordingWidth)×\(recordingHeight) output from \(Int(captureRect.width))×\(Int(captureRect.height)) at \(captureFPS.formatted(.number.locale(AppNumberFormat.locale))) FPS"
             )
         } catch {
             _ = try? await capture.stop()
@@ -615,8 +615,8 @@ final class AppModel: ObservableObject {
             await createThumbnail(for: directory.appendingPathComponent("capture.mov"), at: max(0, min(duration * 0.25, 2)), destination: directory.appendingPathComponent("thumbnail.jpg"))
             activityStatus = "Recording saved"
             let videoBytes = (try? directory.appendingPathComponent("capture.mov").resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
-            let size = ByteCountFormatter.string(fromByteCount: videoBytes, countStyle: .file)
-            AppLog.write(category: "Recording", "Recording saved", details: "\(result.frameCount) frames, \(eventCount) input events, \(result.width)×\(result.height), \(duration.formatted(.number.precision(.fractionLength(2)))) seconds, \(size)")
+            let size = AppNumberFormat.bytes(videoBytes, style: .file)
+            AppLog.write(category: "Recording", "Recording saved", details: "\(result.frameCount) frames, \(eventCount) input events, \(result.width)×\(result.height), \(duration.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(2)))) seconds, \(size)")
             if result.droppedFrameCount > 0 {
                 AppLog.write(.warning, category: "Recording", "Skipped unusable or backpressured capture frames", details: "\(result.droppedFrameCount) frames; input timing and the remaining HEVC timeline were preserved")
             }

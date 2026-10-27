@@ -30,9 +30,9 @@ struct RLSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     if !profile.effectiveRL.advanced {
                         VStack(alignment: .leading, spacing: 8) {
-                            HStack { Text("Exploration").font(.caption); Slider(value: settings.binaryExploration, in: 0...0.2); Text(profile.effectiveRL.binaryExploration.formatted(.percent.precision(.fractionLength(0)))).font(.caption.monospacedDigit()) }
+                            HStack { Text("Exploration").font(.caption); Slider(value: settings.binaryExploration, in: 0...0.2); Text(profile.effectiveRL.binaryExploration.formatted(.percent.locale(AppNumberFormat.locale).precision(.fractionLength(0)))).font(.caption.monospacedDigit()) }
                             if profile.effectiveRL.mouseMovement || profile.effectiveRL.scroll {
-                                HStack { Text("Mouse variation").font(.caption); Slider(value: settings.explorationScale, in: 0.05...2.5); Text(profile.effectiveRL.explorationScale.formatted(.number.precision(.fractionLength(2))) + "×").font(.caption.monospacedDigit()) }
+                                HStack { Text("Mouse variation").font(.caption); Slider(value: settings.explorationScale, in: 0.05...2.5); Text(profile.effectiveRL.explorationScale.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(2))) + "×").font(.caption.monospacedDigit()) }
                             }
                             HStack {
                                 Text("Learning stability").font(.caption)
@@ -114,7 +114,7 @@ struct RLSettingsView: View {
                     RLNumber("Gradient limit", value: settings.maximumGradientNorm, help: "0.01–100. Clips the global gradient norm before applying an update.")
                     RLNumber("Weight decay", value: settings.weightDecay, help: "0–1. AdamW regularization; zero is the default for PPO.")
                 }
-                HStack { Text("Random seed").font(.caption).foregroundStyle(.secondary); TextField("Seed", value: settings.seed, format: .number).textFieldStyle(.roundedBorder); InfoTip("Saved random state makes pause/resume reproducible. A changed seed starts a new optimizer sequence without clearing learned weights.") }
+                HStack { Text("Random seed").font(.caption).foregroundStyle(.secondary); TextField("Seed", value: settings.seed, format: .number.locale(AppNumberFormat.locale).grouping(.never)).textFieldStyle(.roundedBorder); InfoTip("Saved random state makes pause/resume reproducible. A changed seed starts a new optimizer sequence without clearing learned weights.") }
                 Divider(); Text("Exploration and reward scaling").font(.subheadline.bold())
                 HStack {
                     RLNumber("Binary exploration", value: settings.binaryExploration, help: "0–0.5. Mixes a small random probability into allowed key/button choices, including previously rare actions.")
@@ -145,7 +145,7 @@ private struct RLNumber: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 4) { Text(title); InfoTip(help) }.font(.caption).foregroundStyle(.secondary)
-            TextField(title, value: $value, format: .number).textFieldStyle(.roundedBorder)
+            DecimalTextField(title, value: $value).textFieldStyle(.roundedBorder)
         }.frame(maxWidth: .infinity)
     }
 }
@@ -158,7 +158,7 @@ private struct RLInteger: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 4) { Text(title); InfoTip(help) }.font(.caption).foregroundStyle(.secondary)
-            TextField(title, value: $value, format: .number).textFieldStyle(.roundedBorder)
+            TextField(title, value: $value, format: .number.locale(AppNumberFormat.locale).grouping(.never)).textFieldStyle(.roundedBorder)
         }.frame(maxWidth: .infinity)
     }
 }
@@ -243,9 +243,9 @@ struct RLRewardSetup: View {
                     Image(nsImage: NSImage(cgImage: preview.image, size: NSSize(width: preview.image.width, height: preview.image.height))).resizable().interpolation(.none).scaledToFit()
                         .frame(maxWidth: .infinity, maxHeight: 160).background(.black).clipShape(RoundedRectangle(cornerRadius: 10))
                     HStack {
-                        LabeledContent("Reward", value: preview.reading.map { $0.reward.formatted() } ?? "—")
-                        LabeledContent("Episode length", value: preview.reading.map { $0.episodeLength.formatted() + " s" } ?? "—")
-                        Text(preview.framesPerSecond.formatted(.number.precision(.fractionLength(1))) + " reads/s").font(.caption.monospacedDigit())
+                        LabeledContent("Reward", value: preview.reading.map { $0.reward.formatted(.number.locale(AppNumberFormat.locale)) } ?? "—")
+                        LabeledContent("Episode length", value: preview.reading.map { $0.episodeLength.formatted(.number.locale(AppNumberFormat.locale)) + " s" } ?? "—")
+                        Text(preview.framesPerSecond.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))) + " reads/s").font(.caption.monospacedDigit())
                     }
                 }
                 if let confidence = model.rewardPreview?.reading?.confidence {
@@ -268,11 +268,11 @@ struct RLDashboard: View {
                     HStack { Label("Live reinforcement learning", systemImage: "chart.xyaxis.line").font(.headline).foregroundStyle(ATColor.green); Spacer(); StatusPill(text: "PPO", color: ATColor.violet) }
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 180))], alignment: .leading, spacing: 16) {
                         metric("Current episode", "\(m.episode)")
-                        metric("Episode reward", m.episodeReward.formatted())
-                        metric("Best reward", m.best?.formatted() ?? "—")
-                        metric("Average • last 100", m.average?.formatted() ?? "—")
+                        metric("Episode reward", m.episodeReward.formatted(.number.locale(AppNumberFormat.locale)))
+                        metric("Best reward", m.best?.formatted(.number.locale(AppNumberFormat.locale)) ?? "—")
+                        metric("Average • last 100", m.average?.formatted(.number.locale(AppNumberFormat.locale)) ?? "—")
                         metric("Total episodes", "\(m.totalEpisodes)")
-                        metric("Time remaining", m.remaining.formatted(.number.precision(.fractionLength(1))) + " s")
+                        metric("Time remaining", m.remaining.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))) + " s")
                         metric("Training time", TrainingDurationFormatter.string(seconds: m.trainingSeconds))
                         metric(m.legacyUpdateAttempts > 0 ? "Applied updates since upgrade" : "Applied learning",
                             "\(max(0, m.updates - m.legacyUpdateAttempts)) updates • \(m.optimizerSteps) total steps")
@@ -306,6 +306,7 @@ struct RLDashboard: View {
                                 .foregroundStyle(by: .value("Series", "Interrupted")).symbol(.cross)
                         }
                     }.chartForegroundStyleScale(["Episode reward": ATColor.green, "Average • last 20": ATColor.cyan, "Interrupted": ATColor.amber])
+                        .environment(\.locale, AppNumberFormat.locale)
                         .frame(height: 190).chartXAxisLabel("Episode").chartYAxisLabel("Reward")
                     HStack {
                         if model.isRLTraining {

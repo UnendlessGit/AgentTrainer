@@ -59,6 +59,6 @@ enum MLXMemoryLifecycle {
     }
 
     private static func formatted(_ bytes: Int) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)
+        AppNumberFormat.bytes(Int64(bytes), style: .memory)
     }
 }

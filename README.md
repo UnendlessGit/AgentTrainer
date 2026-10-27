@@ -1,6 +1,6 @@
 # AgentTrainer
 
-AgentTrainer is an Apple-silicon macOS app that records screen and input demonstrations, trains behavioral cloning and live reinforcement learning policies locally with MLX, and runs those policies through macOS keyboard and mouse events. This checkout identifies the app as **2.61, build 39**.
+AgentTrainer is an Apple-silicon macOS app that records screen and input demonstrations, trains behavioral cloning and live reinforcement learning policies locally with MLX, and runs those policies through macOS keyboard and mouse events. This checkout identifies the app as **2.62, build 40**.
 
 Recordings, datasets, model weights, and diagnostics are stored locally. The app's networking is used for checking and downloading public GitHub releases; it does not upload training data or telemetry. Published installers are available from [GitHub Releases](https://github.com/UnendlessGit/AgentTrainer/releases).
 
@@ -20,6 +20,8 @@ Recordings, datasets, model weights, and diagnostics are stored locally. The app
 5. In Run, select a trained brain, capture source, cursor mode, output permissions, and any context values. Panic Stop releases held controls; the optional human-input stop also ends a run when physical input is detected.
 
 The Record and Run source lists refresh while their pickers are visible and the app is active and idle. Application/display changes also trigger refreshes under those conditions.
+
+Technical numbers use `.` as the decimal separator on every Mac, regardless of regional settings. Enter decimal points in numeric fields; commas separate values in lists such as future-action prediction horizons. Small learning rates retain their precision when edited.
 
 ## Live reinforcement learning
 
@@ -76,7 +78,7 @@ The current formats are recording manifest schema 4, event format `ATREVT01` ver
 
 ## Build and signing
 
-`./build.sh` builds, signs, installs, and packages the app. Its default installation path is `/Applications/AgentTrainer.app`; `APP_PATH` selects another location. The script exits if AgentTrainer is running. Its outputs are `outputs/AgentTrainer-2.61.dmg`, `outputs/AgentTrainer-Source.zip`, and `outputs/SHA256SUMS.txt`.
+`./build.sh` builds, signs, installs, and packages the app. Its default installation path is `/Applications/AgentTrainer.app`; `APP_PATH` selects another location. The script exits if AgentTrainer is running. Its outputs are `outputs/AgentTrainer-2.62.dmg`, `outputs/AgentTrainer-Source.zip`, and `outputs/SHA256SUMS.txt`.
 
 Certificate signing is configured by `scripts/signing.sh`. It resolves usable certificate fingerprints and saves the certificate/permission-identity pin outside the checkout in `~/Library/Application Support/AgentTrainer/BuildSigning`. For a pinned installation, a missing key or mismatched designated requirement stops replacement. Matching signing identity lets macOS recognize app updates and retain privacy grants; a new Mac still needs its own permissions.
 

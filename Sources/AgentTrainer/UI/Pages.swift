@@ -11,8 +11,8 @@ struct HomeView: View {
                 HStack(spacing: 14) {
                     MetricCard(title: "Recordings", value: "\(model.recordings.count)", symbol: "record.circle", color: ATColor.coral)
                     MetricCard(title: "AI profiles", value: "\(model.profiles.count)", symbol: "cpu", color: ATColor.violet)
-                    MetricCard(title: "Local storage", value: ByteCountFormatter.string(fromByteCount: model.storageBytes, countStyle: .file), symbol: "internaldrive", color: ATColor.amber)
-                    MetricCard(title: "MLX memory", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .memory), symbol: "memorychip", color: ATColor.green)
+                    MetricCard(title: "Local storage", value: AppNumberFormat.bytes(model.storageBytes, style: .file), symbol: "internaldrive", color: ATColor.amber)
+                    MetricCard(title: "MLX memory", value: AppNumberFormat.bytes(Int64(Memory.activeMemory), style: .memory), symbol: "memorychip", color: ATColor.green)
                 }
                 OLEDCard {
                     HStack(spacing: 20) {
@@ -257,7 +257,7 @@ struct RecordView: View {
 }
 
 private struct InputCapability: View { let text: String; let symbol: String; init(_ text: String, _ symbol: String) { self.text = text; self.symbol = symbol }; var body: some View { Label(text, systemImage: symbol).foregroundStyle(.secondary) } }
-private struct LabeledNumber: View { let title: String; @Binding var value: Double; init(_ title: String, value: Binding<Double>) { self.title = title; _value = value }; var body: some View { VStack(alignment: .leading, spacing: 5) { Text(title).font(.caption).foregroundStyle(.secondary); TextField(title, value: $value, format: .number).textFieldStyle(.roundedBorder).frame(minWidth: 82) } } }
+private struct LabeledNumber: View { let title: String; @Binding var value: Double; init(_ title: String, value: Binding<Double>) { self.title = title; _value = value }; var body: some View { VStack(alignment: .leading, spacing: 5) { Text(title).font(.caption).foregroundStyle(.secondary); DecimalTextField(title, value: $value).textFieldStyle(.roundedBorder).frame(minWidth: 82) } } }
 
 struct ModelsView: View {
     @ObservedObject var model: AppModel
@@ -390,7 +390,7 @@ private struct ProfileEditor: View {
                                         .font(.caption).foregroundStyle(.secondary)
                                 } else {
                                     StatusPill(text: "Past \(pastSpec.width) × \(pastSpec.height)", color: ATColor.cyan)
-                                    Text("nominally every \(temporal.spacingSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.precision(.fractionLength(3))))s • \(temporal.lookbackSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.precision(.fractionLength(3))))s total lookback")
+                                    Text("nominally every \(temporal.spacingSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(3))))s • \(temporal.lookbackSeconds(perceptionFPS: draft.training.perceptionFPS).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(3))))s total lookback")
                                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                                 }
                                 Spacer()
@@ -412,7 +412,7 @@ private struct ProfileEditor: View {
                         }
                         HStack { InfoTip("The shared encoder sees the current frame and each real reduced-resolution past frame with screen coordinates. The temporal encoder then reads every past visual embedding together with the controls tied to that frame."); Spacer() }
                         HStack { IntArrayField("Conv channels", values: $draft.training.architecture.convolutionChannels); IntArrayField("Kernels", values: $draft.training.architecture.kernelSizes); IntArrayField("Strides", values: $draft.training.architecture.strides); IntArrayField("Fusion widths", values: $draft.training.architecture.fusionWidths) }
-                        HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs. Changing it keeps existing brain weights and starts a fresh optimizer sequence when training resumes."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft, contextSchema: selectedContextSchema).formatted())").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
+                        HStack { DoubleField("Dropout", value: $draft.training.architecture.dropout, help: "Randomly hides a small share of features during training to reduce memorization. It is disabled while the AI runs. Changing it keeps existing brain weights and starts a fresh optimizer sequence when training resumes."); Spacer(); Text("Estimated parameters: \(ModelSizing.parameterCount(draft, contextSchema: selectedContextSchema).formatted(.number.locale(AppNumberFormat.locale)))").font(.caption.monospacedDigit()).foregroundStyle(ATColor.cyan) }
                     }
                 }
                 }
@@ -523,7 +523,7 @@ private struct ProfileEditor: View {
                         } else {
                             ForEach(model.versions) { version in
                                 HStack {
-                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned/allowed keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
+                                    VStack(alignment: .leading) { HStack { Text(version.name).font(.subheadline.bold()); if draft.activeVersionID == version.id { StatusPill(text: "Active", color: ATColor.green) } }; Text("\(version.globalStep) steps • \(version.epoch ?? 0) epochs • train \(version.trainingLoss.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(4))))\(version.validationLoss.map { " • validation \($0.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(4))))" } ?? "")\(version.validationReport?.binary.map { " • F1 \((100 * $0.f1).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))))% over \(version.validationReport?.sampleCount ?? 0) samples" } ?? "") • \(version.demonstratedKeyCodes.map { "\($0.count) learned/allowed keys" } ?? "legacy key set derived at run") • \(version.createdAt.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
                                     Spacer(); Button(version.optimizerFile == nil ? "Run this" : "Revert & Resume") {
                                         Task {
                                             if await model.activateVersion(version) { draft.activeVersionID = version.id }
@@ -707,14 +707,14 @@ private struct NeuralNetworkInputOverview: View {
                     NeuralInputMetric(
                         title: "Inputs each decision",
                         value: shortCount(capacity.inputValues),
-                        detail: "\(capacity.inputValues.formatted()) exact values",
+                        detail: "\(capacity.inputValues.formatted(.number.locale(AppNumberFormat.locale))) exact values",
                         color: ATColor.cyan
                     )
                     Image(systemName: "arrow.right").font(.headline).foregroundStyle(.tertiary)
                     NeuralInputMetric(
                         title: "Selected network size",
                         value: shortCount(capacity.parameterCount),
-                        detail: "\(capacity.parameterCount.formatted()) learned parameters",
+                        detail: "\(capacity.parameterCount.formatted(.number.locale(AppNumberFormat.locale))) learned parameters",
                         color: color
                     )
                 }
@@ -741,14 +741,14 @@ private struct NeuralNetworkInputOverview: View {
             HStack(spacing: 10) {
                 NeuralInputMetric(
                     title: "Current-frame convolution",
-                    value: input.currentFirstConvolutionValues.formatted(),
+                    value: input.currentFirstConvolutionValues.formatted(.number.locale(AppNumberFormat.locale)),
                     detail: "\(profile.preprocessing.width) × \(profile.preprocessing.height) × \(profile.preprocessing.channelCount + 2)",
                     color: ATColor.violet
                 )
                 NeuralInputMetric(
                     title: "Whole training batch",
-                    value: input.valuesPerTrainingBatch.formatted(),
-                    detail: "\(input.valuesPerDecision.formatted()) × batch \(input.batchSize.formatted())",
+                    value: input.valuesPerTrainingBatch.formatted(.number.locale(AppNumberFormat.locale)),
+                    detail: "\(input.valuesPerDecision.formatted(.number.locale(AppNumberFormat.locale))) × batch \(input.batchSize.formatted(.number.locale(AppNumberFormat.locale)))",
                     color: ATColor.green
                 )
             }
@@ -756,51 +756,51 @@ private struct NeuralNetworkInputOverview: View {
             LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], alignment: .leading, spacing: 10) {
                 NeuralInputBreakdown(
                     title: "Packed current frame",
-                    value: "\(input.currentPackedVisionValues.formatted()) UInt8 values",
+                    value: "\(input.currentPackedVisionValues.formatted(.number.locale(AppNumberFormat.locale))) UInt8 values",
                     detail: currentPackedVisionDetail(input),
                     color: ATColor.amber
                 )
                 NeuralInputBreakdown(
                     title: "Packed past frames",
-                    value: "\((input.pastPackedVisionValuesPerFrame * input.pastFrameCount).formatted()) UInt8 values",
+                    value: "\((input.pastPackedVisionValuesPerFrame * input.pastFrameCount).formatted(.number.locale(AppNumberFormat.locale))) UInt8 values",
                     detail: pastPackedVisionDetail(input),
                     color: ATColor.amber
                 )
                 NeuralInputBreakdown(
                     title: "Expanded current vision",
-                    value: "\(input.currentExpandedVisionValues.formatted()) values",
+                    value: "\(input.currentExpandedVisionValues.formatted(.number.locale(AppNumberFormat.locale))) values",
                     detail: "\(profile.preprocessing.width) × \(profile.preprocessing.height) × \(profile.preprocessing.channelCount) after chroma expansion",
                     color: ATColor.cyan
                 )
                 NeuralInputBreakdown(
                     title: "Expanded past vision",
-                    value: "\((input.pastExpandedVisionValuesPerFrame * input.pastFrameCount).formatted()) values",
-                    detail: "\(input.pastFrameCount.formatted()) real lower-resolution frames; no motion extraction or upscaling",
+                    value: "\((input.pastExpandedVisionValuesPerFrame * input.pastFrameCount).formatted(.number.locale(AppNumberFormat.locale))) values",
+                    detail: "\(input.pastFrameCount.formatted(.number.locale(AppNumberFormat.locale))) real lower-resolution frames; no motion extraction or upscaling",
                     color: ATColor.cyan
                 )
                 NeuralInputBreakdown(
                     title: "Generated coordinates",
-                    value: "\((input.currentCoordinateValues + input.pastCoordinateValuesPerFrame * input.pastFrameCount).formatted()) values",
+                    value: "\((input.currentCoordinateValues + input.pastCoordinateValuesPerFrame * input.pastFrameCount).formatted(.number.locale(AppNumberFormat.locale))) values",
                     detail: "Independent X/Y planes for the current frame and every native-size past frame",
                     color: ATColor.violet
                 )
                 NeuralInputBreakdown(
                     title: "Frame-aligned controls",
-                    value: "\(input.pastControlValues.formatted()) values",
-                    detail: "\(input.pastFrameCount.formatted()) frames × \(input.actionValuesPerPastFrame.formatted()) causal controls • \(input.temporalLookbackSeconds.formatted(.number.precision(.fractionLength(3))))s lookback",
+                    value: "\(input.pastControlValues.formatted(.number.locale(AppNumberFormat.locale))) values",
+                    detail: "\(input.pastFrameCount.formatted(.number.locale(AppNumberFormat.locale))) frames × \(input.actionValuesPerPastFrame.formatted(.number.locale(AppNumberFormat.locale))) causal controls • \(input.temporalLookbackSeconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(3))))s lookback",
                     color: ATColor.green
                 )
                 NeuralInputBreakdown(
                     title: "Explicit timing",
-                    value: "\(input.timingValues.formatted()) Float32 values",
+                    value: "\(input.timingValues.formatted(.number.locale(AppNumberFormat.locale))) Float32 values",
                     detail: "Current decision and past observations: hold ages, edges, durations, movement intervals, frame age, and validity",
                     color: ATColor.coral
                 )
                 if input.contextValues > 0 {
                     NeuralInputBreakdown(
                         title: "Context conditioning",
-                        value: "\(input.contextValues.formatted()) categorical values",
-                        detail: "\(contextSchema.fields.count.formatted()) custom field\(contextSchema.fields.count == 1 ? "" : "s"); one trained value per field can be active",
+                        value: "\(input.contextValues.formatted(.number.locale(AppNumberFormat.locale))) categorical values",
+                        detail: "\(contextSchema.fields.count.formatted(.number.locale(AppNumberFormat.locale))) custom field\(contextSchema.fields.count == 1 ? "" : "s"); one trained value per field can be active",
                         color: ATColor.amber
                     )
                 }
@@ -814,11 +814,11 @@ private struct NeuralNetworkInputOverview: View {
             }
             HStack(spacing: 8) {
                 Image(systemName: "speedometer").foregroundStyle(ATColor.green)
-                Text("Perception \(profile.training.perceptionFPS.formatted()) FPS • actions \(profile.training.actionFPS.formatted()) FPS • \(input.runtimeValuesPerSecond.formatted()) nominal input values/s • \(bytes(input.packedVisionBytesPerSecond)) packed vision/s")
+                Text("Perception \(profile.training.perceptionFPS.formatted(.number.locale(AppNumberFormat.locale))) FPS • actions \(profile.training.actionFPS.formatted(.number.locale(AppNumberFormat.locale))) FPS • \(input.runtimeValuesPerSecond.formatted(.number.locale(AppNumberFormat.locale))) nominal input values/s • \(bytes(input.packedVisionBytesPerSecond)) packed vision/s")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 Spacer()
             }
-            Text("The \(statusTitle(capacity.level).lowercased()) capacity status is a conservative guide based on \(capacity.inputsPerParameter.formatted(.number.precision(.fractionLength(2)))) input values per learned parameter. Convolutional sharing means this is not a hard limit or a promise of training quality. Resize changes framing; enabled controls change losses; architecture widths change the network size.")
+            Text("The \(statusTitle(capacity.level).lowercased()) capacity status is a conservative guide based on \(capacity.inputsPerParameter.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(2)))) input values per learned parameter. Convolutional sharing means this is not a hard limit or a promise of training quality. Resize changes framing; enabled controls change losses; architecture widths change the network size.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
     }
@@ -882,16 +882,16 @@ private struct NeuralNetworkInputOverview: View {
             let scaled = value / 1_000
             return String(format: scaled < 10 ? "%.1fK" : "%.0fK", scaled)
         }
-        return count.formatted()
+        return count.formatted(.number.locale(AppNumberFormat.locale))
     }
 
     private func currentPackedVisionDetail(_ input: NeuralInputSummary) -> String {
         let storedBytes = bytes(input.currentPackedVisionValues)
-        let levels = input.quantizationLevels.formatted()
+        let levels = input.quantizationLevels.formatted(.number.locale(AppNumberFormat.locale))
         if profile.preprocessing.colorMode == .grayscale {
-            return "\(input.currentLumaValues.formatted()) Y • \(storedBytes) stored • \(levels) levels"
+            return "\(input.currentLumaValues.formatted(.number.locale(AppNumberFormat.locale))) Y • \(storedBytes) stored • \(levels) levels"
         }
-        return "\(input.currentLumaValues.formatted()) Y + 2 × \(input.currentChromaValuesPerPlane.formatted()) chroma at \(profile.preprocessing.chroma.rawValue) • \(storedBytes) stored • \(levels) levels"
+        return "\(input.currentLumaValues.formatted(.number.locale(AppNumberFormat.locale))) Y + 2 × \(input.currentChromaValuesPerPlane.formatted(.number.locale(AppNumberFormat.locale))) chroma at \(profile.preprocessing.chroma.rawValue) • \(storedBytes) stored • \(levels) levels"
     }
 
     private func pastPackedVisionDetail(_ input: NeuralInputSummary) -> String {
@@ -902,11 +902,11 @@ private struct NeuralNetworkInputOverview: View {
         let colorDetail = profile.preprocessing.colorMode == .color
             ? "color/\(profile.preprocessing.chroma.rawValue)"
             : "grayscale luminance"
-        return "\(input.pastFrameCount.formatted()) × \(pastSpec.width) × \(pastSpec.height) • same \(colorDetail) and \(profile.preprocessing.bitDepth)-bit detail • every \(input.frameSpacingSeconds.formatted(.number.precision(.fractionLength(3))))s"
+        return "\(input.pastFrameCount.formatted(.number.locale(AppNumberFormat.locale))) × \(pastSpec.width) × \(pastSpec.height) • same \(colorDetail) and \(profile.preprocessing.bitDepth)-bit detail • every \(input.frameSpacingSeconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(3))))s"
     }
 
     private func bytes(_ count: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: count, countStyle: .memory)
+        AppNumberFormat.bytes(count, style: .memory)
     }
 }
 
@@ -1207,8 +1207,8 @@ private struct RestrictionChip: View {
     }
 }
 
-private struct IntField: View { let title: String; @Binding var value: Int; var help: String?; init(_ title: String, value: Binding<Int>, help: String? = nil) { self.title = title; _value = value; self.help = help }; var body: some View { VStack(alignment: .leading, spacing: 4) { HStack(spacing: 4) { Text(title); if let help { InfoTip(help) } }.font(.caption).foregroundStyle(.secondary); TextField(title, value: $value, format: .number).textFieldStyle(.roundedBorder) }.frame(minWidth: 92) } }
-private struct DoubleField: View { let title: String; @Binding var value: Double; var help: String?; init(_ title: String, value: Binding<Double>, help: String? = nil) { self.title = title; _value = value; self.help = help }; var body: some View { VStack(alignment: .leading, spacing: 4) { HStack(spacing: 4) { Text(title); if let help { InfoTip(help) } }.font(.caption).foregroundStyle(.secondary); TextField(title, value: $value, format: .number).textFieldStyle(.roundedBorder) }.frame(minWidth: 110) } }
+private struct IntField: View { let title: String; @Binding var value: Int; var help: String?; init(_ title: String, value: Binding<Int>, help: String? = nil) { self.title = title; _value = value; self.help = help }; var body: some View { VStack(alignment: .leading, spacing: 4) { HStack(spacing: 4) { Text(title); if let help { InfoTip(help) } }.font(.caption).foregroundStyle(.secondary); TextField(title, value: $value, format: .number.locale(AppNumberFormat.locale).grouping(.never)).textFieldStyle(.roundedBorder) }.frame(minWidth: 92) } }
+private struct DoubleField: View { let title: String; @Binding var value: Double; var help: String?; init(_ title: String, value: Binding<Double>, help: String? = nil) { self.title = title; _value = value; self.help = help }; var body: some View { VStack(alignment: .leading, spacing: 4) { HStack(spacing: 4) { Text(title); if let help { InfoTip(help) } }.font(.caption).foregroundStyle(.secondary); DecimalTextField(title, value: $value).textFieldStyle(.roundedBorder) }.frame(minWidth: 110) } }
 private struct IntArrayField: View {
     let title: String
     @Binding var values: [Int]
@@ -1231,7 +1231,7 @@ private struct DoubleArrayField: View {
     init(_ title: String, values: Binding<[Double]>) {
         self.title = title
         _values = values
-        _text = State(initialValue: values.wrappedValue.map { $0.formatted(.number.precision(.fractionLength(3))) }.joined(separator: ", "))
+        _text = State(initialValue: AppNumberFormat.decimalList(values.wrappedValue))
     }
 
     var body: some View {
@@ -1246,12 +1246,9 @@ private struct DoubleArrayField: View {
     }
 
     private func commit() {
-        let parsed = text.split(separator: ",").compactMap {
-            Double($0.trimmingCharacters(in: .whitespaces))
-        }
-        if !parsed.isEmpty {
+        if let parsed = try? AppNumberFormat.parseDecimalList(text), !parsed.isEmpty {
             values = parsed
-            text = parsed.map { $0.formatted(.number.precision(.fractionLength(3))) }.joined(separator: ", ")
+            text = AppNumberFormat.decimalList(parsed)
         }
     }
 }
@@ -1325,20 +1322,20 @@ struct TrainingView: View {
     }
 
     private func lossText(_ value: Double?) -> String {
-        value.map { $0.formatted(.number.precision(.fractionLength(6))) } ?? "—"
+        value.map { $0.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(6))) } ?? "—"
     }
 
     private func validationSummary(_ report: ValidationReport) -> String {
-        var components = ["Validation report: \(report.sampleCount.formatted()) diverse held-out samples"]
+        var components = ["Validation report: \(report.sampleCount.formatted(.number.locale(AppNumberFormat.locale))) diverse held-out samples"]
         if let binary = report.binary {
-            components.append("binary precision \((100 * binary.precision).formatted(.number.precision(.fractionLength(1))))%")
-            components.append("recall \((100 * binary.recall).formatted(.number.precision(.fractionLength(1))))%")
-            components.append("F1 \((100 * binary.f1).formatted(.number.precision(.fractionLength(1))))%")
-            components.append("false-positive rate \((100 * binary.falsePositiveRate).formatted(.number.precision(.fractionLength(2))))%")
+            components.append("binary precision \((100 * binary.precision).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))))%")
+            components.append("recall \((100 * binary.recall).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))))%")
+            components.append("F1 \((100 * binary.f1).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))))%")
+            components.append("false-positive rate \((100 * binary.falsePositiveRate).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(2))))%")
         }
-        if let value = report.activeRelativeMouseMAE { components.append("active mouse MAE \(value.formatted(.number.precision(.fractionLength(4))))") }
-        if let movement = report.movement { components.append("mouse activity recall \((movement.recall * 100).formatted(.number.precision(.fractionLength(1))))% • idle false moves \((movement.falsePositiveRate * 100).formatted(.number.precision(.fractionLength(1))))% at 1×") }
-        if let value = report.activeScrollMAE { components.append("active scroll MAE \(value.formatted(.number.precision(.fractionLength(4))))") }
+        if let value = report.activeRelativeMouseMAE { components.append("active mouse MAE \(value.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(4))))") }
+        if let movement = report.movement { components.append("mouse activity recall \((movement.recall * 100).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))))% • idle false moves \((movement.falsePositiveRate * 100).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))))% at 1×") }
+        if let value = report.activeScrollMAE { components.append("active scroll MAE \(value.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(4))))") }
         return components.joined(separator: " • ")
     }
 
@@ -1398,7 +1395,7 @@ struct TrainingView: View {
                         LossChart(values: graphValues, zoomFraction: zoomFraction, color: graphAccent, isActive: model.isAppActive)
                             .id("\(graphKind.rawValue)-\(zoomFraction)")
                             .frame(height: 250)
-                        HStack { Text(graphKind.rawValue).foregroundStyle(graphAccent).font(.caption.bold()); Spacer(); Text(graphValues.last?.formatted(.number.precision(.fractionLength(8))) ?? "No data yet").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+                        HStack { Text(graphKind.rawValue).foregroundStyle(graphAccent).font(.caption.bold()); Spacer(); Text(graphValues.last?.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(8))) ?? "No data yet").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                     }
                 }
                 HStack(spacing: 12) {
@@ -1406,13 +1403,13 @@ struct TrainingView: View {
                     MetricCard(title: "Epoch-average loss", value: lossText(model.trainingMetrics.epochTrainingLoss), symbol: "chart.xyaxis.line", color: ATColor.green)
                     MetricCard(title: "Held-out loss", value: lossText(model.trainingMetrics.validationLoss), symbol: "checkmark.shield.fill", color: ATColor.violet)
                     MetricCard(title: "Effective LR • envelope", value: model.trainingMetrics.effectiveLearningRate > 0 ? String(format: "%.2e • %.3fx", model.trainingMetrics.effectiveLearningRate, model.trainingMetrics.learningRateScale) : "—", symbol: "speedometer", color: ATColor.amber)
-                    MetricCard(title: "Held-out binary F1", value: model.trainingMetrics.validationReport?.binary.map { "\((100 * $0.f1).formatted(.number.precision(.fractionLength(1))))%" } ?? "—", symbol: "scope", color: ATColor.coral)
+                    MetricCard(title: "Held-out binary F1", value: model.trainingMetrics.validationReport?.binary.map { "\((100 * $0.f1).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))))%" } ?? "—", symbol: "scope", color: ATColor.coral)
                 }
                 HStack(spacing: 12) {
                     MetricCard(title: "Actual training time", value: TrainingDurationFormatter.string(seconds: displayedTiming.trainingSeconds), symbol: "clock.fill", color: ATColor.cyan)
                     MetricCard(title: "Equivalent experience", value: (displayedTiming.experienceIsEstimated ? "~" : "") + TrainingDurationFormatter.string(seconds: displayedTiming.experienceSeconds), symbol: "brain.head.profile.fill", color: ATColor.violet)
-                    MetricCard(title: "Samples / sec", value: model.trainingMetrics.samplesPerSecond.formatted(.number.precision(.fractionLength(0))), symbol: "bolt.fill", color: ATColor.amber)
-                    MetricCard(title: "Optimizer steps", value: displayedSteps.formatted(), symbol: "arrow.triangle.2.circlepath", color: ATColor.green)
+                    MetricCard(title: "Samples / sec", value: model.trainingMetrics.samplesPerSecond.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(0))), symbol: "bolt.fill", color: ATColor.amber)
+                    MetricCard(title: "Optimizer steps", value: displayedSteps.formatted(.number.locale(AppNumberFormat.locale)), symbol: "arrow.triangle.2.circlepath", color: ATColor.green)
                 }
                 HStack(spacing: 12) {
                     MetricCard(title: "Immediate action loss", value: lossText(model.trainingMetrics.immediateActionLoss), symbol: "bolt.horizontal.fill", color: ATColor.green)
@@ -1423,23 +1420,23 @@ struct TrainingView: View {
                     MetricCard(title: "Total objective", value: lossText(model.trainingMetrics.trainingLoss), symbol: "sum", color: ATColor.amber)
                 }
                 HStack(spacing: 12) {
-                    MetricCard(title: "Pipelined step", value: "\(model.trainingMetrics.trainingStepMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms", symbol: "timer", color: ATColor.cyan)
-                    MetricCard(title: "Mapped input gather", value: "\(model.trainingMetrics.batchPreparationMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms", symbol: "externaldrive.fill", color: ATColor.violet)
-                    MetricCard(title: "Throughput retained", value: "\((100 * model.trainingMetrics.throughputRetention).formatted(.number.precision(.fractionLength(0))))%", symbol: "chart.line.uptrend.xyaxis", color: model.trainingMetrics.throughputRetention < 0.8 ? ATColor.coral : ATColor.green)
+                    MetricCard(title: "Pipelined step", value: "\(model.trainingMetrics.trainingStepMilliseconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1)))) ms", symbol: "timer", color: ATColor.cyan)
+                    MetricCard(title: "Mapped input gather", value: "\(model.trainingMetrics.batchPreparationMilliseconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1)))) ms", symbol: "externaldrive.fill", color: ATColor.violet)
+                    MetricCard(title: "Throughput retained", value: "\((100 * model.trainingMetrics.throughputRetention).formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(0))))%", symbol: "chart.line.uptrend.xyaxis", color: model.trainingMetrics.throughputRetention < 0.8 ? ATColor.coral : ATColor.green)
                     MetricCard(title: "Thermal pressure", value: model.trainingMetrics.thermalState.rawValue, symbol: "thermometer.medium", color: model.trainingMetrics.thermalState == .nominal ? ATColor.green : ATColor.coral)
                 }
                 HStack(spacing: 12) {
-                    MetricCard(title: "MLX active unified", value: ByteCountFormatter.string(fromByteCount: Int64(model.trainingMetrics.mlxActiveMemory), countStyle: .memory), symbol: "memorychip", color: ATColor.green)
-                    MetricCard(title: "MLX reusable cache", value: ByteCountFormatter.string(fromByteCount: Int64(model.trainingMetrics.mlxCacheMemory), countStyle: .memory), symbol: "internaldrive", color: ATColor.violet)
-                    MetricCard(title: "MLX peak active", value: ByteCountFormatter.string(fromByteCount: Int64(model.trainingMetrics.mlxPeakMemory), countStyle: .memory), symbol: "chart.bar.fill", color: ATColor.amber)
+                    MetricCard(title: "MLX active unified", value: AppNumberFormat.bytes(Int64(model.trainingMetrics.mlxActiveMemory), style: .memory), symbol: "memorychip", color: ATColor.green)
+                    MetricCard(title: "MLX reusable cache", value: AppNumberFormat.bytes(Int64(model.trainingMetrics.mlxCacheMemory), style: .memory), symbol: "internaldrive", color: ATColor.violet)
+                    MetricCard(title: "MLX peak active", value: AppNumberFormat.bytes(Int64(model.trainingMetrics.mlxPeakMemory), style: .memory), symbol: "chart.bar.fill", color: ATColor.amber)
                     MetricCard(title: "Epoch", value: "\(model.trainingMetrics.epoch) / \(model.trainingMetrics.totalEpochs)", symbol: "chart.line.uptrend.xyaxis", color: ATColor.cyan)
                     MetricCard(title: "Batch", value: "\(model.trainingMetrics.batch) / \(model.trainingMetrics.totalBatches)", symbol: "square.stack.3d.up.fill", color: ATColor.violet)
                 }
                 if let profile = displayedProfile {
                     HStack(spacing: 12) {
-                        MetricCard(title: "Parameters", value: ModelSizing.parameterCount(profile, contextSchema: displayedContextSchema).formatted(), symbol: "circle.grid.cross", color: ATColor.cyan)
-                        MetricCard(title: "Packed sample", value: ByteCountFormatter.string(fromByteCount: Int64(profile.preprocessing.sampleByteCount), countStyle: .memory), symbol: "shippingbox.fill", color: ATColor.violet)
-                        MetricCard(title: "Workspace storage", value: ByteCountFormatter.string(fromByteCount: model.storageBytes, countStyle: .file), symbol: "internaldrive", color: ATColor.green)
+                        MetricCard(title: "Parameters", value: ModelSizing.parameterCount(profile, contextSchema: displayedContextSchema).formatted(.number.locale(AppNumberFormat.locale)), symbol: "circle.grid.cross", color: ATColor.cyan)
+                        MetricCard(title: "Packed sample", value: AppNumberFormat.bytes(Int64(profile.preprocessing.sampleByteCount), style: .memory), symbol: "shippingbox.fill", color: ATColor.violet)
+                        MetricCard(title: "Workspace storage", value: AppNumberFormat.bytes(model.storageBytes, style: .file), symbol: "internaldrive", color: ATColor.green)
                     }
                 }
                 OLEDCard {
@@ -1457,7 +1454,7 @@ struct TrainingView: View {
                         if let report = model.trainingMetrics.validationReport {
                             Text(validationSummary(report)).font(.caption).foregroundStyle(ATColor.green)
                         }
-                        if let profile = displayedProfile { Text("\(profile.preprocessing.width) × \(profile.preprocessing.height) • \(profile.preprocessing.bitDepth)-bit \(profile.preprocessing.chroma.rawValue) • \(profile.training.precision.rawValue) • perception \(profile.training.perceptionFPS.formatted()) FPS • action \(profile.training.actionFPS.formatted()) FPS").font(.caption).foregroundStyle(.secondary) }
+                        if let profile = displayedProfile { Text("\(profile.preprocessing.width) × \(profile.preprocessing.height) • \(profile.preprocessing.bitDepth)-bit \(profile.preprocessing.chroma.rawValue) • \(profile.training.precision.rawValue) • perception \(profile.training.perceptionFPS.formatted(.number.locale(AppNumberFormat.locale))) FPS • action \(profile.training.actionFPS.formatted(.number.locale(AppNumberFormat.locale))) FPS").font(.caption).foregroundStyle(.secondary) }
                         Text("Exact continuation always uses the latest optimizer and adaptive-scheduler checkpoint. When a validation split exists, completed training runs the lowest-loss held-out brain so late regression is never silently activated.").font(.caption2).foregroundStyle(.secondary)
                         Text("MLX reports allocator-backed unified memory: active arrays, reusable cache, and process-lifetime peak. It is not separate VRAM on Apple silicon.").font(.caption2).foregroundStyle(.tertiary)
                     }
@@ -1742,7 +1739,7 @@ struct RunView: View {
                             HStack { Picker("Mouse execution", selection: $model.runMouseMode) { ForEach(MouseControlMode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).disabled(model.agentIsActiveOrStarting); InfoTip("Auto checks the selected AI's recordings and chooses normal cursor movement or signed Game Camera deltas. This prevents a locked-camera recording from being run as positive screen coordinates, which can look like the AI only moves right and down. Use Absolute Cursor only for a visibly moving pointer.") }
                                 if model.runMouseMode != .absolute {
                                     VStack(alignment: .leading, spacing: 9) {
-                                        HStack { Text(model.runMouseMode == .automatic ? "Game Camera settings (when Auto detects it)" : "Game Camera").font(.subheadline.bold()).foregroundStyle(ATColor.violet); Spacer(); Text("\(model.gameCamera.sensitivity.formatted(.number.precision(.fractionLength(2))))× sensitivity").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+                                        HStack { Text(model.runMouseMode == .automatic ? "Game Camera settings (when Auto detects it)" : "Game Camera").font(.subheadline.bold()).foregroundStyle(ATColor.violet); Spacer(); Text("\(model.gameCamera.sensitivity.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(2))))× sensitivity").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                                         Slider(value: $model.gameCamera.sensitivity, in: 0.1...3, step: 0.05).tint(ATColor.violet).disabled(model.agentIsActiveOrStarting)
                                         Toggle("Recenter before and after every raw delta", isOn: $model.gameCamera.recenterCursor).tint(ATColor.cyan).disabled(model.agentIsActiveOrStarting)
                                         Text(model.gameCamera.recenterCursor ? "Recommended for locked-camera software. A HID-system event is posted at the capture center and the cursor is restored immediately, preventing screen-edge damping." : "Raw deltas are posted without warping. Use this only for software that rejects cursor recentering.")
@@ -1751,13 +1748,13 @@ struct RunView: View {
                                     .padding(10)
                                     .raisedGlassSurface(cornerRadius: 10, tint: ATColor.amber)
                                 }
-                                LabeledContent("Perception", value: "\(profile.training.perceptionFPS.formatted()) FPS")
-                                LabeledContent("Action", value: "\(profile.training.actionFPS.formatted()) FPS")
+                                LabeledContent("Perception", value: "\(profile.training.perceptionFPS.formatted(.number.locale(AppNumberFormat.locale))) FPS")
+                                LabeledContent("Action", value: "\(profile.training.actionFPS.formatted(.number.locale(AppNumberFormat.locale))) FPS")
                                 Text("Mouse mode, sensitivity, and recentering apply when Run starts.").font(.caption).foregroundStyle(.secondary)
                                 LabeledContent("Movement memory", value: (model.runningMovementHistoryMode ?? profile.training.effectiveMovementHistoryMode).rawValue)
                                 Text("A fresh timing-aware decision runs at Action FPS using the latest encoded vision. Frame age and actual posted controls update between perceptions; each movement and scroll output executes once.").font(.caption).foregroundStyle(.secondary)
                                 Divider(); Toggle("Stop immediately on my input", isOn: $model.safety.stopOnHumanInput); Toggle("Stop if target focus is lost", isOn: $model.safety.stopOnFocusLoss); Toggle("Allow full-Mac control", isOn: $model.safety.allowFullMac).tint(ATColor.coral)
-                                Divider(); Toggle("Show exact AI-vision PIP", isOn: $model.showVisionPreview).tint(ATColor.green); if model.showVisionPreview { Toggle("Update exactly with AI perception", isOn: $model.visionPreviewMatchesPerception).tint(ATColor.cyan); if !model.visionPreviewMatchesPerception { LabeledNumber("Independent PIP FPS", value: $model.visionPreviewFPS) }; Text(model.visionPreviewMatchesPerception ? "The preview updates on the same processed frames as the AI." : "Preview refresh is independent; AI perception remains \(profile.training.perceptionFPS.formatted()) FPS.").font(.caption).foregroundStyle(.secondary) }
+                                Divider(); Toggle("Show exact AI-vision PIP", isOn: $model.showVisionPreview).tint(ATColor.green); if model.showVisionPreview { Toggle("Update exactly with AI perception", isOn: $model.visionPreviewMatchesPerception).tint(ATColor.cyan); if !model.visionPreviewMatchesPerception { LabeledNumber("Independent PIP FPS", value: $model.visionPreviewFPS) }; Text(model.visionPreviewMatchesPerception ? "The preview updates on the same processed frames as the AI." : "Preview refresh is independent; AI perception remains \(profile.training.perceptionFPS.formatted(.number.locale(AppNumberFormat.locale))) FPS.").font(.caption).foregroundStyle(.secondary) }
                                 Divider()
                                 Toggle("Show live CNN internals", isOn: $model.cnnVisualizationSettings.enabled).tint(ATColor.cyan)
                                 if model.cnnVisualizationSettings.enabled {
@@ -1765,7 +1762,7 @@ struct RunView: View {
                                     HStack {
                                         Text("Diagnostic rate").font(.caption).foregroundStyle(.secondary)
                                         Slider(value: $model.cnnVisualizationSettings.framesPerSecond, in: 0.5...15, step: 0.5).tint(ATColor.cyan)
-                                        Text("\(model.cnnVisualizationSettings.framesPerSecond.formatted(.number.precision(.fractionLength(1)))) FPS").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 58, alignment: .trailing)
+                                        Text("\(model.cnnVisualizationSettings.framesPerSecond.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1)))) FPS").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 58, alignment: .trailing)
                                     }
                                     switch model.cnnVisualizationSettings.mode {
                                     case .activationOverlay:
@@ -1802,11 +1799,11 @@ struct RunView: View {
                         OLEDCard {
                             VStack(alignment: .leading, spacing: 12) {
                                 Text("Live runtime").font(.headline)
-                                LabeledContent("Perception", value: model.runtimeMetrics.perceptionFPS.formatted(.number.precision(.fractionLength(1))) + " FPS")
-                                LabeledContent("Actions", value: model.runtimeMetrics.actionFPS.formatted(.number.precision(.fractionLength(1))) + " FPS")
-                                LabeledContent("Visual encoding", value: model.runtimeMetrics.latencyMilliseconds.formatted(.number.precision(.fractionLength(1))) + " ms")
-                                LabeledContent("Action inference", value: model.runtimeMetrics.actionInferenceMilliseconds.formatted(.number.precision(.fractionLength(1))) + " ms")
-                                LabeledContent("Source-frame age", value: model.runtimeMetrics.observationAgeMilliseconds.formatted(.number.precision(.fractionLength(1))) + " ms")
+                                LabeledContent("Perception", value: model.runtimeMetrics.perceptionFPS.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))) + " FPS")
+                                LabeledContent("Actions", value: model.runtimeMetrics.actionFPS.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))) + " FPS")
+                                LabeledContent("Visual encoding", value: model.runtimeMetrics.latencyMilliseconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))) + " ms")
+                                LabeledContent("Action inference", value: model.runtimeMetrics.actionInferenceMilliseconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))) + " ms")
+                                LabeledContent("Source-frame age", value: model.runtimeMetrics.observationAgeMilliseconds.formatted(.number.locale(AppNumberFormat.locale).precision(.fractionLength(1))) + " ms")
                                 LabeledContent("Dropped frames", value: "\(model.runtimeMetrics.droppedFrames)")
                                 if let progress = profile.trainingProgress { LabeledContent("Training", value: "\(progress.globalStep) steps • epoch \(progress.epoch)") }
                                 Text("The capture-excluded bottom-right HUD shows AI inputs during Run.").font(.caption).foregroundStyle(ATColor.violet)
@@ -1859,7 +1856,7 @@ private struct CNNOverlayOpacityControl: View {
             HStack {
                 Text("Overlay").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Text(value.formatted(.percent.precision(.fractionLength(0)))).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Text(value.formatted(.percent.locale(AppNumberFormat.locale).precision(.fractionLength(0)))).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
             Slider(value: $value, in: 0.2...0.9, step: 0.05).tint(ATColor.cyan)
         }
@@ -1889,8 +1886,8 @@ struct DiagnosticsView: View {
                     Button("Reveal Logs") { logs.revealLogs() }.primaryButton(color: ATColor.violet)
                 }
                 PermissionStrip(model: model)
-                HStack(spacing: 12) { MetricCard(title: "MLX active", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .memory), symbol: "memorychip", color: ATColor.green); MetricCard(title: "MLX peak", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .memory), symbol: "chart.bar.fill", color: ATColor.amber); MetricCard(title: "MLX cache", value: ByteCountFormatter.string(fromByteCount: Int64(Memory.cacheMemory), countStyle: .memory), symbol: "shippingbox", color: ATColor.violet) }
-                OLEDCard { VStack(alignment: .leading, spacing: 10) { LabeledContent("Chip", value: hardwareName()); LabeledContent("MLX device", value: Device.defaultDevice().deviceType == .gpu ? "Apple GPU" : "CPU"); LabeledContent("Physical unified memory", value: ByteCountFormatter.string(fromByteCount: Int64(ProcessInfo.processInfo.physicalMemory), countStyle: .memory)); LabeledContent("Local workspace", value: ByteCountFormatter.string(fromByteCount: model.storageBytes, countStyle: .file)); LabeledContent("Bundle identifier", value: Bundle.main.bundleIdentifier ?? "local.agenttrainer.mac"); LabeledContent("Networking", value: "GitHub Releases update check only") } }
+                HStack(spacing: 12) { MetricCard(title: "MLX active", value: AppNumberFormat.bytes(Int64(Memory.activeMemory), style: .memory), symbol: "memorychip", color: ATColor.green); MetricCard(title: "MLX peak", value: AppNumberFormat.bytes(Int64(Memory.peakMemory), style: .memory), symbol: "chart.bar.fill", color: ATColor.amber); MetricCard(title: "MLX cache", value: AppNumberFormat.bytes(Int64(Memory.cacheMemory), style: .memory), symbol: "shippingbox", color: ATColor.violet) }
+                OLEDCard { VStack(alignment: .leading, spacing: 10) { LabeledContent("Chip", value: hardwareName()); LabeledContent("MLX device", value: Device.defaultDevice().deviceType == .gpu ? "Apple GPU" : "CPU"); LabeledContent("Physical unified memory", value: AppNumberFormat.bytes(Int64(ProcessInfo.processInfo.physicalMemory), style: .memory)); LabeledContent("Local workspace", value: AppNumberFormat.bytes(model.storageBytes, style: .file)); LabeledContent("Bundle identifier", value: Bundle.main.bundleIdentifier ?? "local.agenttrainer.mac"); LabeledContent("Networking", value: "GitHub Releases update check only") } }
                 OLEDCard { HStack { VStack(alignment: .leading) { HStack { Text("Packed dataset caches").font(.headline); InfoTip("Caches store each perception once at current and configured past-frame resolution, map action ticks to exact causal frame sequences, and retain complete controls paired with every perception interval. Clearing them never deletes recordings, profiles, or checkpoints.") }; Text("Delete reusable decoded observations without deleting recordings or models.").foregroundStyle(.secondary) }; Spacer(); Button("Clear Caches") { Task { await model.clearCaches() } }.primaryButton(color: ATColor.amber) } }
                 let crashReports = AppLogStore.crashReports()
                 OLEDCard {
@@ -2009,7 +2006,7 @@ private struct StorageSettingsView: View {
                         ProgressView().controlSize(.small)
                         Text("Copying and verifying…").font(.caption.bold()).foregroundStyle(ATColor.amber)
                     } else {
-                        StatusPill(text: ByteCountFormatter.string(fromByteCount: model.storageUsage.totalBytes, countStyle: .file), color: ATColor.amber)
+                        StatusPill(text: AppNumberFormat.bytes(model.storageUsage.totalBytes, style: .file), color: ATColor.amber)
                     }
                 }
 
@@ -2084,7 +2081,7 @@ private struct StorageLocationRow: View {
                     Text(detail).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))
+                Text(AppNumberFormat.bytes(bytes, style: .file))
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
             HStack(spacing: 8) {
@@ -2156,7 +2153,7 @@ private struct ThemeSettingsView: View {
                         value: $appearance.tuning.surfaceContrast,
                         range: 0.7...1.45,
                         step: 0.05,
-                        renderedValue: appearance.tuning.surfaceContrast.formatted(.percent.precision(.fractionLength(0)))
+                        renderedValue: appearance.tuning.surfaceContrast.formatted(.percent.locale(AppNumberFormat.locale).precision(.fractionLength(0)))
                     )
                     AppearanceTuningControl(
                         title: "Accent fill",
@@ -2166,7 +2163,7 @@ private struct ThemeSettingsView: View {
                         value: $appearance.tuning.accentIntensity,
                         range: 0.65...1.5,
                         step: 0.05,
-                        renderedValue: appearance.tuning.accentIntensity.formatted(.percent.precision(.fractionLength(0)))
+                        renderedValue: appearance.tuning.accentIntensity.formatted(.percent.locale(AppNumberFormat.locale).precision(.fractionLength(0)))
                     )
                     AppearanceTuningControl(
                         title: "Sidebar width",
