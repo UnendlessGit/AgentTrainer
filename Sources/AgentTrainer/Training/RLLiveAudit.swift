@@ -78,6 +78,11 @@ enum RLLiveAudit {
                 if let report { try write(result, to: report) }
                 return
             }
+            if manifest.operation == "evaluate" {
+                let result = try await evaluateSaved(model: model, manifest: manifest, root: root)
+                if let report { try write(result, to: report) }
+                return
+            }
             for (index, cell) in manifest.cells.enumerated() {
                 let sources = try await CaptureService.availableSources()
                 guard let source = sources.first(where: { $0.kind == .window && $0.name == "AgentTrainer RL Validation Game" }) else {
@@ -195,6 +200,54 @@ enum RLLiveAudit {
             if let report { try? write(["error": error.localizedDescription, "results": results], to: report) }
             print("RL_AUDIT_ERROR \(error.localizedDescription)")
         }
+    }
+
+    private static func evaluateSaved(model: AppModel, manifest: RLAuditManifest, root: URL) async throws -> [String: Any] {
+        var results: [[String: Any]] = []
+        let workspace = URL(fileURLWithPath: environment["AGENTTRAINER_WORKSPACE_ROOT"]!).lastPathComponent
+        guard workspace.hasSuffix("-workspace") else { throw AgentTrainerError.model("Invalid evaluation workspace.") }
+        let sourceName = String(workspace.dropLast("-workspace".count))
+        guard let report = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent(sourceName + ".json"))) as? [String: Any],
+              let recorded = report["results"] as? [[String: Any]] else { throw AgentTrainerError.model("Invalid training report.") }
+        for cell in manifest.cells {
+            let suffix = "-\(cell.task)-\(cell.seed)"
+            guard let expected = recorded.first(where: { ($0["label"] as? String)?.hasSuffix(suffix) == true })?["finalHash"] as? String else {
+                throw AgentTrainerError.model("The original training report is required for frozen evaluation.")
+            }
+            var selected: AIProfile?
+            for candidate in model.profiles where candidate.name.hasSuffix(suffix) {
+                guard let id = candidate.activeVersionID else { continue }
+                let directory = await WorkspaceStore.shared.versionDirectory(profileID: candidate.id, versionID: id)
+                if (try? hash(directory.appendingPathComponent("weights.safetensors"))) == expected { selected = candidate; break }
+            }
+            guard var profile = selected else {
+                throw AgentTrainerError.model("Select an existing isolated profile for frozen evaluation.")
+            }
+            let sources = try await CaptureService.availableSources()
+            guard let source = sources.first(where: { $0.kind == .window && $0.name == "AgentTrainer RL Validation Game" }) else {
+                throw AgentTrainerError.capture("The audit game is unavailable.")
+            }
+            guard let old = profile.effectiveRL.rewardRegion else { throw AgentTrainerError.model("The saved profile has no reward region.") }
+            var settings = profile.effectiveRL
+            settings.rewardRegion = RLRewardRegion(sourceID: source.id, isWindow: true, normalized: old.normalized)
+            profile.rlTraining = settings
+            let initial = root.appendingPathComponent(profile.name).appendingPathComponent("initial")
+            let final = await WorkspaceStore.shared.rlCheckpointDirectory(profile: profile)
+            var row: [String: Any] = ["task": cell.task, "seed": cell.seed, "profile": profile.name]
+            for (name, weights) in [("initial", initial), ("final", final)] {
+                let policy = AgentPolicy(profile: profile)
+                let heads = RLHeads(width: policy.fusionWidth)
+                try policy.loadWeights(from: weights.appendingPathComponent("weights.safetensors"))
+                try heads.update(parameters: ModuleParameters.unflattened(MLX.loadArrays(url: weights.appendingPathComponent("heads.safetensors"))), verify: .all)
+                let snapshot = RLWeightSnapshot(policy: RLWeightTransfer.copy(policy), heads: RLWeightTransfer.copy(heads), revision: 0)
+                row[name] = try await evaluate(profile: profile, snapshot: snapshot, weights: weights, source: source,
+                    mode: cell.task == "relative" ? .relative : .absolute, root: root,
+                    label: manifest.implementation + "-\(cell.task)-\(cell.seed)-\(name)", seconds: manifest.evaluationSeconds,
+                    seedBase: manifest.evaluationSeed ?? 900001)
+            }
+            results.append(row)
+        }
+        return ["results": results]
     }
 
     private static func smoke(model: AppModel, manifest: RLAuditManifest, root: URL) async throws -> [String: Any] {

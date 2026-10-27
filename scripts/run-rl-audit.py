@@ -9,7 +9,7 @@ import subprocess
 import time
 
 parser = argparse.ArgumentParser()
-parser.add_argument("implementation", choices=["baseline", "improved", "canary", "screening", "smoke"])
+parser.add_argument("implementation", choices=["baseline", "improved", "canary", "screening", "smoke", "evaluate"])
 parser.add_argument("app", type=Path)
 parser.add_argument("--seconds", type=float, default=90)
 parser.add_argument("--seeds", default="7,42,101")
@@ -48,14 +48,14 @@ if args.implementation == "screening":
     args.evaluation_seconds = 0
 manifest = dict(implementation=run_name, root=str(root), cells=cells,
                 evaluationSeed=args.evaluation_seed,
-                operation="smoke" if args.implementation == "smoke" else "train",
+                operation=args.implementation if args.implementation in ["smoke", "evaluate"] else "train",
                 evaluationSeconds=args.evaluation_seconds)
 manifest_path = root / f"{run_name}-manifest.json"
 manifest_path.write_text(json.dumps(manifest, indent=2))
 binary = args.app.resolve() / "Contents/MacOS/AgentTrainer"
 env = os.environ | {
     "AGENTTRAINER_RL_VALIDATION": "1",
-    "AGENTTRAINER_WORKSPACE_ROOT": str(root / ((args.source_workspace if args.implementation == "smoke" else run_name) + "-workspace")),
+    "AGENTTRAINER_WORKSPACE_ROOT": str(root / ((args.source_workspace if args.implementation in ["smoke", "evaluate"] else run_name) + "-workspace")),
     "AGENTTRAINER_RL_AUDIT_MANIFEST": str(manifest_path),
     "AGENTTRAINER_RL_VALIDATION_REPORT": str(root / f"{run_name}.json"),
 }

@@ -60,13 +60,17 @@ def arm(name):
         item["initialHeadsTensorSHA256"] = tensor_hash(initial / "heads.safetensors")
         for key in ["trainingInitialDelta", "policyDelta", "headsDelta"]:
             item[key] = {k: cell[key][k] for k in ["changed", "l2", "max"]}
+        item["encoderDeltaL2"] = sum(t["l2"] ** 2 for t in cell["policyDelta"]["tensors"] if t["name"].startswith("convolutions.")) ** 0.5
+        item["criticDeltaL2"] = sum(t["l2"] ** 2 for t in cell["headsDelta"]["tensors"] if t["name"].startswith("critic.")) ** 0.5
+        item["explorationDeltaL2"] = sum(t["l2"] ** 2 for t in cell["headsDelta"]["tensors"] if "StandardDeviation" in t["name"]) ** 0.5
         item["evaluations"] = {}
         for checkpoint in ["initial", "final"]:
             for mode in ["deterministic", "stochastic"]:
                 item["evaluations"][checkpoint + "-" + mode] = outcomes(cell["label"] + "-" + checkpoint + "-" + mode)
             evaluation = cell.get(checkpoint + "Evaluation", {})
             item["evaluations"][checkpoint + "-integrity"] = {
-                "unchanged": evaluation.get("hashBefore") == evaluation.get("hashAfter"),
+                "performed": bool(evaluation),
+                "unchanged": bool(evaluation) and evaluation.get("hashBefore") == evaluation.get("hashAfter"),
                 "optimizerInvocations": evaluation.get("optimizerInvocations"),
             }
         samples = cell["samples"][5:] or cell["samples"]
@@ -74,6 +78,13 @@ def arm(name):
             ["actionFPS", "perceptionFPS", "rewardFPS", "headMS", "visionMS", "observationAgeMS", "activeBytes", "cacheBytes"]}
         item["performance"]["discardedActions"] = samples[-1]["discarded"]
         item["performance"]["finalKL"] = samples[-1]["kl"]
+        workspace = root / (name + "-workspace") / "Profiles"
+        for state in workspace.glob("*/Versions/*/state.json"):
+            policy = state.parent / "weights.safetensors"
+            if policy.exists() and hashlib.sha256(policy.read_bytes()).hexdigest() == cell["finalHash"]:
+                saved = json.loads(state.read_text())
+                item["trainingState"] = {k: saved.get(k) for k in ["learningSemanticsVersion", "revision", "updates", "optimizerSteps", "attemptedUpdates", "rejectedUpdates", "episodeCount"]}
+                break
         result.append(item)
     return result
 
@@ -98,6 +109,8 @@ summary = {
     "interpretation": "Paired descriptive engineering trials. Sparse controls and short sweeps do not establish mastery or statistical significance. Error reductions are favorable; accuracy/success increases are favorable.",
     "liveBudget": json.loads((root / "live-budget.json").read_text()),
     "baseline": baseline, "improved": improved, "pairs": pairs,
+    "configurationFollowup": {"development": arm("mouse-development"), "confirmation": arm("mouse-confirmation")},
+    "screening": arm("screening"),
     "technicalRetests": [
         {"attempt": "failed-baseline", "reason": "Native integer-zero OCR failure; fixture changed to decimal length before both matched arms."},
         {"attempt": "improved", "reason": "Human-input safety stop during final frozen pointer-seed-7 evaluation; retained the three completed keyboard cells and retested the unfinished pointer cell in improved-rest."},

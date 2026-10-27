@@ -114,8 +114,10 @@ final class AuditGame: NSView {
         guard !event.isARepeat else { return }
         if event.keyCode == 15 { reset(); return }
         if event.keyCode == 14 { end(); return }
-        guard length > 0, trial >= 0 else { return }
-        keys.insert(event.keyCode); add("keyDown\(event.keyCode)")
+        guard length > 0 else { return }
+        keys.insert(event.keyCode)
+        guard trial >= 0 else { return }
+        add("keyDown\(event.keyCode)")
         if setup.task == "keyboard", kind == 2, event.keyCode == 49, !success {
             reward += 1; add("spaceEdges"); success = true
         }
