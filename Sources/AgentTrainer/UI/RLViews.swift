@@ -274,7 +274,8 @@ struct RLDashboard: View {
                         metric("Total episodes", "\(m.totalEpisodes)")
                         metric("Time remaining", m.remaining.formatted(.number.precision(.fractionLength(1))) + " s")
                         metric("Training time", TrainingDurationFormatter.string(seconds: m.trainingSeconds))
-                        metric("Applied learning", "\(m.updates) updates • \(m.optimizerSteps) steps")
+                        metric(m.legacyUpdateAttempts > 0 ? "Applied updates since upgrade" : "Applied learning",
+                            "\(max(0, m.updates - m.legacyUpdateAttempts)) updates • \(m.optimizerSteps) total steps")
                         metric("Rollouts attempted / rejected", "\(m.attemptedUpdates) / \(m.rejectedUpdates)")
                         metric("Action / perception FPS", String(format: "%.1f / %.1f", model.runtimeMetrics.actionFPS, model.runtimeMetrics.perceptionFPS))
                         metric("Reward FPS / OCR latency", String(format: "%.1f / %.1f ms", m.rewardFPS, m.recognitionLatency))

@@ -353,6 +353,7 @@ struct RLMetrics: Sendable {
     var optimizerSteps = 0
     var attemptedUpdates = 0
     var rejectedUpdates = 0
+    var legacyUpdateAttempts = 0
     var klRejectedActions = 0
     var unobservedActions = 0
     var controls = ""

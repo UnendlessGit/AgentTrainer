@@ -103,9 +103,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let model,
               model.isTraining || model.recordingIsActiveOrStarting
                 || model.agentIsActiveOrStarting
-                || model.isReplaying else { return .terminateNow }
+                || model.isReplaying || RLLiveAudit.hasActiveEvaluation else {
+            RLLiveAudit.suspendActiveEvaluation()
+            return .terminateNow
+        }
+        RLLiveAudit.suspendActiveEvaluation()
         if model.isTraining { model.pauseTraining() }
         Task { @MainActor in
+            await RLLiveAudit.stopActiveEvaluation(reason: "Application quitting")
             if model.agentIsActiveOrStarting { await model.stopAgent() }
             if model.isReplaying { model.stopReenactment() }
             if model.hasUnsavedRLProgress { sender.reply(toApplicationShouldTerminate: false); return }

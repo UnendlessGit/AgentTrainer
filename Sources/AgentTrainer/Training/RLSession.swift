@@ -78,6 +78,7 @@ final class RLSession {
         metrics.updates = prepared.1.updates; metrics.optimizerSteps = prepared.1.optimizerSteps
         metrics.attemptedUpdates = prepared.1.attemptedUpdates ?? prepared.1.updates
         metrics.rejectedUpdates = prepared.1.rejectedUpdates ?? 0
+        metrics.legacyUpdateAttempts = prepared.1.legacyUpdateAttempts ?? 0
         metrics.resumeNotice = prepared.1.resumeNotice ?? ""
         priorElapsed = prepared.1.trainingSeconds; priorExperience = prepared.1.experienceSeconds ?? 0
         metrics.trainingSeconds = priorElapsed

@@ -25,7 +25,7 @@ def tensor_hash(path):
 def outcomes(label):
     # A label can have multiple episodes, but only independently received
     # terminal events establish complete evaluation outcomes.
-    ends = [row for row in logs if row["label"] == label and row["event"] == "terminal"]
+    ends = [row for row in logs if row["label"] == label and row["event"] == "terminal"][-1:]
     counts = {}
     for row in ends:
         for key, value in row["counts"].items():
@@ -98,6 +98,12 @@ summary = {
     "interpretation": "Paired descriptive engineering trials. Sparse controls and short sweeps do not establish mastery or statistical significance. Error reductions are favorable; accuracy/success increases are favorable.",
     "liveBudget": json.loads((root / "live-budget.json").read_text()),
     "baseline": baseline, "improved": improved, "pairs": pairs,
+    "technicalRetests": [
+        {"attempt": "failed-baseline", "reason": "Native integer-zero OCR failure; fixture changed to decimal length before both matched arms."},
+        {"attempt": "improved", "reason": "Human-input safety stop during final frozen pointer-seed-7 evaluation; retained the three completed keyboard cells and retested the unfinished pointer cell in improved-rest."},
+    ],
+    "provenance": [json.loads(path.read_text()) for name in ["baseline", "improved", "improved-rest"]
+                   if (path := root / f"{name}-provenance.json").exists()],
 }
 summary["liveSeconds"] = sum(row["seconds"] for row in summary["liveBudget"])
 destination = repo / "docs/validation-2.61.json"

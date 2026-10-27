@@ -17,6 +17,7 @@ struct RLLearningState: Codable, Sendable {
     var learningSemanticsVersion: Int? = 2
     var attemptedUpdates: Int? = 0
     var rejectedUpdates: Int? = 0
+    var legacyUpdateAttempts: Int? = 0
     var resumeNotice: String? = nil
     var rolloutStartStep: Int? = nil
     var activeVersionID: UUID?
@@ -159,7 +160,11 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                     state.revision = saved.revision; state.actorRandom = saved.actorRandom; state.optimizerSteps = saved.optimizerSteps
                     state.attemptedUpdates = saved.attemptedUpdates ?? saved.updates
                     state.rejectedUpdates = saved.rejectedUpdates ?? 0
+                    state.legacyUpdateAttempts = saved.learningSemanticsVersion == nil ? saved.updates : saved.legacyUpdateAttempts
                     state.resumeNotice = "Retained active policy; started a fresh optimizer and excluded incompatible pending experience."
+                    if (state.legacyUpdateAttempts ?? 0) > 0 {
+                        state.resumeNotice! += " Historical rollout counts include legacy attempts; applied updates below count new semantics only."
+                    }
                 }
             } else if let activeWeights { try model.policy.loadWeights(from: activeWeights) }
             optimizer.initialize(model: model)

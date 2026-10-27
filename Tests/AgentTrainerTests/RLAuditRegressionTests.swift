@@ -112,6 +112,28 @@ final class RLAuditRegressionTests: XCTestCase {
         XCTAssertEqual(TrainingConfiguration().effectiveLearningRateSchedule, .adaptiveCosine)
     }
 
+    func testCorruptOptimizerMomentsAreRejectedBeforeTheyCanPoisonTheBrain() throws {
+        let model = Linear(2, 1)
+        let optimizer = ResumableAdamW(learningRate: 0.001, weightDecay: 0)
+        optimizer.initialize(model: model)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let valid = root.appendingPathComponent("valid.safetensors")
+        try optimizer.save(to: valid)
+        let saved = try MLX.loadArraysAndMetadata(url: valid)
+        for badVariance in [Float.nan, Float(-1)] {
+            var arrays = saved.0
+            let name = try XCTUnwrap(arrays.keys.first { $0.hasPrefix("v.") })
+            arrays[name] = MLXArray.full(arrays[name]!.shape, values: MLXArray(badVariance))
+            let corrupt = root.appendingPathComponent("corrupt.safetensors")
+            try MLX.save(arrays: arrays, metadata: saved.1, url: corrupt)
+            let restored = ResumableAdamW(learningRate: 0.001, weightDecay: 0)
+            restored.initialize(model: model)
+            XCTAssertThrowsError(try restored.load(from: corrupt))
+        }
+    }
+
     func testKLRejectionDoesNotAdvanceWeightsStepsOrPolicyAge() async throws {
         var p = AIProfile.fresh()
         p.preprocessing = PreprocessingSpec(width: 16, height: 16, colorMode: .grayscale)
@@ -260,6 +282,7 @@ final class RLAuditRegressionTests: XCTestCase {
         let restored = try await migrated.prepare(profile: p, contextSchema: .empty, mouseMode: .absolute,
             activeWeights: next.appendingPathComponent("weights.safetensors"), checkpoint: next)
         XCTAssertTrue(restored.1.pending.isEmpty); XCTAssertNotNil(restored.1.resumeNotice)
+        XCTAssertEqual(restored.1.legacyUpdateAttempts, sa.updates)
         for (name, tensor) in actual.snapshot.policy { XCTAssertEqual(restored.0.policy[name]?.values, tensor.values) }
     }
 }

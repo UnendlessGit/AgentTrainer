@@ -1611,6 +1611,11 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
               }) else {
             throw AgentTrainerError.model("The optimizer checkpoint is incomplete or does not match this model.")
         }
+        guard restoredFirst.values.allSatisfy({ $0.asType(.float32).asArray(Float.self).allSatisfy(\.isFinite) }),
+              restoredMaster.values.allSatisfy({ $0.asType(.float32).asArray(Float.self).allSatisfy(\.isFinite) }),
+              restoredSecond.values.allSatisfy({ $0.asType(.float32).asArray(Float.self).allSatisfy { $0.isFinite && $0 >= 0 } }) else {
+            throw AgentTrainerError.model("The optimizer checkpoint contains non-finite weights/moments or negative variances. The active brain was preserved.")
+        }
         firstMoments = restoredFirst
         secondMoments = restoredSecond
         masterWeights = restoredMaster

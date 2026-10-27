@@ -1247,7 +1247,7 @@ final class AppModel: ObservableObject {
         do { try reenactor.start(recording: recording); isReplaying = true; activityStatus = "Guarded reenactment running"; AppLog.write(category: "Replay", "Reenactment started", details: recording.manifest.name) } catch { present(error) }
     }
     func stopReenactment() { reenactor.stop(); if isReplaying { AppLog.write(category: "Replay", "Reenactment stopped") }; isReplaying = false; activityStatus = "Reenactment stopped" }
-    func panic() { AppLog.write(.warning, category: "Safety", "Panic stop requested"); agent?.suspendRLActions(); Task { stopReenactment(); if rlSession != nil { await stopRL(reason: "Panic stop • RL progress saved") } else { await stopAgent() }; if recordingIsActiveOrStarting { await stopRecording() }; if isTraining { stopTraining() } } }
+    func panic() { AppLog.write(.warning, category: "Safety", "Panic stop requested"); RLLiveAudit.suspendActiveEvaluation(); agent?.suspendRLActions(); Task { await RLLiveAudit.stopActiveEvaluation(reason: "Panic stop"); stopReenactment(); if rlSession != nil { await stopRL(reason: "Panic stop • RL progress saved") } else { await stopAgent() }; if recordingIsActiveOrStarting { await stopRecording() }; if isTraining { stopTraining() } } }
     func clearCaches() async { do { try await WorkspaceStore.shared.clearCaches(); await refreshStorageState(); activityStatus = "Dataset caches cleared"; AppLog.write(category: "Storage", "Dataset caches cleared") } catch { present(error) } }
 
     func chooseStorageLocation(_ kind: WorkspaceDataKind) async {

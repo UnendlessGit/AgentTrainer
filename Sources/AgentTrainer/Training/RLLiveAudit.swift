@@ -14,9 +14,13 @@ struct RLAuditCell: Codable {
     var height: Int = 64
     var color = false
     var history: Int = 0
+    var learningRate: Double? = nil
+    var explorationScale: Double? = nil
 }
 
 struct RLAuditManifest: Codable {
+    var operation: String? = nil
+    var evaluationSeed: UInt64? = nil
     var implementation: String
     var root: String
     var cells: [RLAuditCell]
@@ -29,6 +33,17 @@ struct RLAuditManifest: Codable {
 enum RLLiveAudit {
     private static let environment = ProcessInfo.processInfo.environment
     private static var hasRun = false
+    private static var activeEvaluation: AgentRuntime?
+    private static var activeReader: RewardReader?
+    static var hasActiveEvaluation: Bool { activeEvaluation != nil }
+    static func suspendActiveEvaluation() { activeEvaluation?.suspendRLActions() }
+    static func stopActiveEvaluation(reason: String) async {
+        let runtime = activeEvaluation, reader = activeReader
+        runtime?.suspendRLActions()
+        await runtime?.stop(reason: reason)
+        await reader?.stop()
+        if activeEvaluation === runtime { activeEvaluation = nil; activeReader = nil }
+    }
     static func run(model: AppModel) async {
         guard !hasRun, environment["AGENTTRAINER_RL_VALIDATION"] == "1",
               let path = environment["AGENTTRAINER_RL_AUDIT_MANIFEST"],
@@ -58,7 +73,7 @@ enum RLLiveAudit {
             }
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             await model.bootstrap()
-            if manifest.implementation == "smoke" {
+            if manifest.operation == "smoke" || manifest.implementation == "smoke" {
                 let result = try await smoke(model: model, manifest: manifest, root: root)
                 if let report { try write(result, to: report) }
                 return
@@ -86,7 +101,9 @@ enum RLLiveAudit {
                 configuration.mouseMovement = cell.task != "keyboard"; configuration.scroll = cell.task == "relative"
                 configuration.endKey = 14; configuration.controlsInitialized = true; configuration.seed = cell.seed
                 configuration.rolloutSize = 64; configuration.batchSize = 16; configuration.epochs = 2
-                configuration.learningRate = 0.0003; configuration.autosaveSeconds = 86400
+                configuration.learningRate = cell.learningRate ?? 0.0003
+                configuration.explorationScale = cell.explorationScale ?? 1
+                configuration.autosaveSeconds = 86400
                 configuration.rewardRegion = RLRewardRegion(sourceID: source.id, isWindow: true,
                     normalized: CodableRect(CGRect(x: 0.01, y: 0.71, width: 0.98, height: 0.28)))
                 profile.rlTraining = configuration
@@ -101,7 +118,8 @@ enum RLLiveAudit {
                     "initialHash": try hash(initialDirectory.appendingPathComponent("weights.safetensors"))]
                 if manifest.evaluationSeconds > 0 {
                     row["initialEvaluation"] = try await evaluate(profile: profile, snapshot: initial.0, weights: initialDirectory,
-                        source: source, mode: mode, root: root, label: label + "-initial", seconds: manifest.evaluationSeconds)
+                        source: source, mode: mode, root: root, label: label + "-initial", seconds: manifest.evaluationSeconds,
+                        seedBase: manifest.evaluationSeed ?? 900001)
                 }
                 try control(root: root, task: cell.task, seed: 1000 + cell.seed, label: label + "-train")
                 try await WorkspaceStore.shared.saveProfile(profile)
@@ -163,7 +181,8 @@ enum RLLiveAudit {
                     try heads.update(parameters: ModuleParameters.unflattened(MLX.loadArrays(url: checkpoint.appendingPathComponent("heads.safetensors"))), verify: .all)
                     let snapshot = RLWeightSnapshot(policy: RLWeightTransfer.copy(policy), heads: RLWeightTransfer.copy(heads), revision: model.rlMetrics.updates)
                     row["finalEvaluation"] = try await evaluate(profile: profile, snapshot: snapshot, weights: checkpoint,
-                        source: source, mode: mode, root: root, label: label + "-final", seconds: manifest.evaluationSeconds)
+                        source: source, mode: mode, root: root, label: label + "-final", seconds: manifest.evaluationSeconds,
+                        seedBase: manifest.evaluationSeed ?? 900001)
                 }
                 results.append(row)
                 if let report { try write(["implementation": manifest.implementation, "results": results], to: report) }
@@ -239,16 +258,20 @@ enum RLLiveAudit {
     }
 
     private static func evaluate(profile: AIProfile, snapshot: RLWeightSnapshot, weights: URL, source: CaptureSourceOption,
-                                 mode: MouseControlMode, root: URL, label: String, seconds: Double) async throws -> [String: Any] {
+                                 mode: MouseControlMode, root: URL, label: String, seconds: Double, seedBase: UInt64 = 900001) async throws -> [String: Any] {
         let before = try hash(weights.appendingPathComponent("weights.safetensors"))
         var episodes: [[String: Any]] = []
         // Independent held-out schedules; both implementations use these exact
         // seeds. Each evaluation mode is reported separately.
         for deterministic in [true, false] {
-            let seed: UInt64 = deterministic ? 900001 : 900002
+            let seed: UInt64 = seedBase + (deterministic ? 0 : 1)
             try control(root: root, task: label.contains("keyboard") ? "keyboard" : (mode == .relative ? "relative" : "pointer"),
                 seed: seed, label: label + (deterministic ? "-deterministic" : "-stochastic"))
             let runtime = try AgentRuntime(), reader = RewardReader()
+            activeEvaluation = runtime; activeReader = reader
+            defer {
+                if activeEvaluation === runtime { activeEvaluation = nil; activeReader = nil }
+            }
             let state = AuditEvaluationState()
             runtime.onWillStop = { reason in
                 if let reason { Task { @MainActor in state.failure = reason } }
