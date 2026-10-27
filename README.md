@@ -76,7 +76,7 @@ The current formats are recording manifest schema 4, event format `ATREVT01` ver
 
 ## Build and signing
 
-`./build.sh` builds, signs, installs, and packages the app. Its default installation path is `/Applications/AgentTrainer.app`; `APP_PATH` selects another location. The script exits if AgentTrainer is running. Its outputs are `outputs/AgentTrainer-2.60.dmg`, `outputs/AgentTrainer-Source.zip`, and `outputs/SHA256SUMS.txt`.
+`./build.sh` builds, signs, installs, and packages the app. Its default installation path is `/Applications/AgentTrainer.app`; `APP_PATH` selects another location. The script exits if AgentTrainer is running. Its outputs are `outputs/AgentTrainer-2.61.dmg`, `outputs/AgentTrainer-Source.zip`, and `outputs/SHA256SUMS.txt`.
 
 Certificate signing is configured by `scripts/signing.sh`. It resolves usable certificate fingerprints and saves the certificate/permission-identity pin outside the checkout in `~/Library/Application Support/AgentTrainer/BuildSigning`. For a pinned installation, a missing key or mismatched designated requirement stops replacement. Matching signing identity lets macOS recognize app updates and retain privacy grants; a new Mac still needs its own permissions.
 

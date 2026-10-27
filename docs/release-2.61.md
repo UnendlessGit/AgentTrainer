@@ -120,6 +120,6 @@ Frozen re-evaluation uses the `evaluate` operation and `--source-workspace` to l
 
 ## Delivery verification
 
-Version 2.61/build 39 retains Policy v9, schema 15, the pinned certificate, and the existing transactional installation/package workflow. Signing regression checks, shell syntax checks, and the full enabled regression suite pass. Installation and packaging are verified against the original designated requirement; the repository branch and local installer are updated without publishing a GitHub release.
+Version 2.61/build 39 retains Policy v9, schema 15, the pinned certificate, and the existing transactional installation/package workflow. Signing regression checks, shell syntax checks, and the full enabled regression suite pass. Installation and packaging are verified against the original designated requirement. Distribution artifacts include the signed installer, source archive, and SHA-256 checksums.
 
 Full manifests, checkpoints, logs, signed diagnostic apps, and the live-budget ledger remain under ignored `work/rl-validation/audit`. Sanitized tensor checks, per-control results, provenance hashes, and timing data are in [validation-2.61.json](validation-2.61.json). Raw data, screenshots, private keys, and machine-local signing pins are excluded from distribution archives.
