@@ -1447,6 +1447,8 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         let warmupScale = minimum(stepArray / warmupSteps, MLXArray(1, dtype: .float32))
         let scheduleScale: MLXArray
         switch schedule {
+        case .constant:
+            scheduleScale = warmupScale
         case .legacyInverseSquareRoot:
             let decayScale = sqrt(warmupSteps / stepArray)
             scheduleScale = minimum(warmupScale, decayScale)
@@ -1562,6 +1564,8 @@ final class ResumableAdamW: Updatable, @unchecked Sendable {
         let warmup = min(1, Float(step) / Float(max(1, warmupSteps)))
         let scale: Float
         switch schedule {
+        case .constant:
+            scale = warmup
         case .legacyInverseSquareRoot:
             scale = min(warmup, sqrt(Float(warmupSteps) / Float(step)))
         case .adaptiveCosine:

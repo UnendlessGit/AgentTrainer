@@ -1907,6 +1907,7 @@ extension AppModel {
             workingProfile.training.futureStatePrediction = FutureStatePredictionConfiguration(enabled: false)
             try validateProfile(workingProfile)
             let settings = try profile.effectiveRL.validated()
+            profile = RLControlContract.profile(profile, permissions: runtimeOutputPermissions)
             guard let region = settings.rewardRegion, region.matches(source) else {
                 throw AgentTrainerError.invalidConfiguration("Select the reward region for this capture source.")
             }

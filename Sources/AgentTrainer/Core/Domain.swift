@@ -728,6 +728,7 @@ enum FrameMode: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 enum LearningRateSchedule: String, Codable, CaseIterable, Identifiable, Sendable {
+    case constant = "Constant"
     /// Linear warmup followed by bounded cosine restarts. Epoch-end validation
     /// (or epoch-average training loss when no validation is possible) reduces
     /// the cycle envelope when progress stalls.

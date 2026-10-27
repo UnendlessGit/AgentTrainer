@@ -14,6 +14,11 @@ struct RLSavedSummary: Codable, Hashable, Sendable {
 
 struct RLLearningState: Codable, Sendable {
     var format = 1
+    var learningSemanticsVersion: Int? = 2
+    var attemptedUpdates: Int? = 0
+    var rejectedUpdates: Int? = 0
+    var resumeNotice: String? = nil
+    var rolloutStartStep: Int? = nil
     var activeVersionID: UUID?
     var revision = 0
     var updates = 0
@@ -55,6 +60,9 @@ struct RLUpdateResult: Sendable {
     var entropy: Double
     var kl: Double
     var rejectedActions: Int = 0
+    var attemptedUpdates: Int = 0
+    var rejectedUpdates: Int = 0
+    var klRejectedActions: Int = 0
 }
 
 protocol RLLearningAlgorithm: Sendable {
@@ -78,7 +86,10 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
     private let queue = DispatchQueue(label: "AgentTrainer.RLLearner", qos: .utility)
     private let cancellation = NSLock()
     private let budget: RLComputeBudget?
-    init(budget: RLComputeBudget? = nil) { self.budget = budget }
+    private let didApplyStep: (@Sendable (Int) -> Void)?
+    init(budget: RLComputeBudget? = nil, didApplyStep: (@Sendable (Int) -> Void)? = nil) {
+        self.budget = budget; self.didApplyStep = didApplyStep
+    }
     private var interrupted = false
     private var model: RLTrainablePolicy!
     private var optimizer: ResumableAdamW!
@@ -113,7 +124,7 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
             model = withRandomState(randomState) { RLTrainablePolicy(policy: AgentPolicy(profile: profile, contextSchema: contextSchema,
                 movementSensitivity: mouseMode == .relative ? movementSensitivity : 1)) }
             optimizer = ResumableAdamW(learningRate: Float(settings.learningRate), weightDecay: Float(settings.weightDecay),
-                warmupSteps: 1, cycleSteps: 1_000_000, minimumLearningRateRatio: 1)
+                warmupSteps: 1, schedule: .constant)
             state = RLLearningState(random: RLRandom(state: settings.seed), actorRandom: RLRandom(state: settings.seed ^ 0x12345678),
                 configuration: settings, preprocessing: profile.preprocessing, architecture: profile.training.architecture,
                 temporal: profile.training.effectiveTemporalVision, contextSchema: contextSchema,
@@ -126,7 +137,8 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                 let sameLayout = saved.preprocessing == profile.preprocessing
                     && saved.architecture.weightLayout == profile.training.architecture.weightLayout
                     && saved.temporal == profile.training.effectiveTemporalVision && saved.contextSchema.hasSameLayout(as: contextSchema)
-                if sameLayout, saved.activeVersionID == profile.activeVersionID, saved.configuration.hasSameLearningContract(as: settings),
+                if sameLayout, saved.learningSemanticsVersion == 2,
+                   saved.activeVersionID == profile.activeVersionID, saved.configuration.hasSameLearningContract(as: settings),
                    saved.channels == profile.channels, saved.restrictions == profile.effectiveRestrictions, saved.precision == profile.training.precision, saved.mouseMode == mouseMode,
                    saved.movementSensitivity == movementSensitivity, saved.actionFPS == profile.training.actionFPS,
                    saved.perceptionFPS == profile.training.perceptionFPS {
@@ -145,6 +157,9 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                     state.history = saved.history; state.episodeCount = saved.episodeCount
                     state.trainingSeconds = saved.trainingSeconds; state.updates = saved.updates; state.experienceSeconds = saved.experienceSeconds
                     state.revision = saved.revision; state.actorRandom = saved.actorRandom; state.optimizerSteps = saved.optimizerSteps
+                    state.attemptedUpdates = saved.attemptedUpdates ?? saved.updates
+                    state.rejectedUpdates = saved.rejectedUpdates ?? 0
+                    state.resumeNotice = "Retained active policy; started a fresh optimizer and excluded incompatible pending experience."
                 }
             } else if let activeWeights { try model.policy.loadWeights(from: activeWeights) }
             optimizer.initialize(model: model)
@@ -206,6 +221,17 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
         try await perform { [self] in
             let c = state.configuration
             var rejectedActions = 0
+            guard state.pending.isEmpty || transitions.isEmpty else {
+                throw AgentTrainerError.model("Finish pending PPO work before admitting a new rollout.")
+            }
+            guard transitions.allSatisfy({ transition in
+                transition.reward.isFinite && transition.duration.isFinite && transition.duration > 0
+                    && transition.bootstrapValue.isFinite && transition.decisions.allSatisfy {
+                        $0.logProbability.isFinite && $0.value.isFinite
+                            && $0.latent.count == 8 && $0.latent.allSatisfy(\.isFinite)
+                            && $0.binary.count == ActionLayout.count && $0.binary.allSatisfy { $0 == 0 || $0 == 1 }
+                    }
+            }) else { throw AgentTrainerError.model("Invalid or non-finite PPO experience; no update was applied.") }
             if state.pending.isEmpty {
                 var accepted: [RLTransition] = []
                 for transition in transitions {
@@ -224,6 +250,8 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                     var empty = result(losses: [0, 0, 0, 0]); empty.rejectedActions = rejectedActions; return empty
                 }
                 state.pending = accepted; state.epoch = 0; state.offset = 0
+                state.rolloutStartStep = state.optimizerSteps
+                state.attemptedUpdates = (state.attemptedUpdates ?? 0) + 1
                 let divisor: Float = c.normalizeRewards ? Float(sqrt(state.rewardSquareSum / state.rewardCount + 1e-8)) : 1
                 let values = accepted.map { $0.decisions[0].value }
                 let targets = RLReturns.advantages(accepted, values: values, configuration: c,
@@ -235,19 +263,16 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                     state.advantages = state.advantages.map { ($0 - mean) / sqrt(variance + 1e-8) }
                 }
                 state.order = Array(accepted.indices)
+                shuffleOrder()
                 for step in accepted {
                     state.rewardSquareSum += Double(step.reward) * Double(step.reward); state.rewardCount += 1
                 }
             }
             var latest: [Double] = [0, 0, 0, 0]
             var stopForKL = false
+            var klRejectedActions = 0
+            let stepsBefore = state.optimizerSteps
             while state.epoch < c.epochs && !stopForKL && !shouldInterrupt {
-                if state.offset == 0 {
-                    for i in state.order.indices.dropFirst().reversed() {
-                        let j = min(i, Int(state.random.uniform() * Float(i + 1)))
-                        state.order.swapAt(i, j)
-                    }
-                }
                 while state.offset < state.order.count && !shouldInterrupt {
                     let end = min(state.order.count, state.offset + c.batchSize)
                     let indices = Array(state.order[state.offset..<end])
@@ -293,7 +318,9 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                         losses[3] += Double(surrogate.kl) / Double(intervals.count)
                     }
                     guard losses.allSatisfy(\.isFinite) else { throw AgentTrainerError.model("Non-finite PPO objective; the last valid weights were preserved.") }
-                    if losses[3] > c.targetKL * 1.5 { latest = losses; stopForKL = true; break }
+                    if losses[3] > c.targetKL * 1.5 {
+                        latest = losses; stopForKL = true; klRejectedActions += decisions.count; break
+                    }
                     for offset in stride(from: 0, to: decisions.count, by: microSize) {
                         let workBegan = DispatchTime.now().uptimeNanoseconds
                         let end = min(decisions.count, offset + microSize)
@@ -325,14 +352,26 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                         gradientNorm: norm, maxGradientNorm: Float(c.maximumGradientNorm), preserveParameterTypes: true)
                     MLX.eval(model!.parameters(), optimizer!.stateArrays())
                     state.optimizerSteps += 1; state.offset = end; latest = losses
+                    didApplyStep?(state.optimizerSteps)
                 }
-                if !shouldInterrupt { state.epoch += 1; state.offset = 0 }
+                if !shouldInterrupt {
+                    state.epoch += 1; state.offset = 0
+                    if state.epoch < c.epochs { shuffleOrder() }
+                }
             }
             if !shouldInterrupt {
+                if state.optimizerSteps > (state.rolloutStartStep ?? stepsBefore) { state.updates += 1 }
+                else if stopForKL { state.rejectedUpdates = (state.rejectedUpdates ?? 0) + 1 }
                 state.pending = []; state.order = []; state.advantages = []; state.returns = []
-                state.epoch = 0; state.offset = 0; state.updates += 1; state.revision += 1
+                state.epoch = 0; state.offset = 0
+                state.rolloutStartStep = nil
             }
-            var update = result(losses: latest); update.rejectedActions = rejectedActions; return update
+            // Inference must never age otherwise-current experience merely
+            // because an unchanged policy rejected a rollout before any step.
+            if state.optimizerSteps > stepsBefore { state.revision += 1 }
+            var update = result(losses: latest)
+            update.rejectedActions = rejectedActions; update.klRejectedActions = klRejectedActions
+            return update
         }
     }
 
@@ -343,9 +382,17 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
         return inputs
     }
 
+    private func shuffleOrder() {
+        for i in state.order.indices.dropFirst().reversed() {
+            let j = min(i, Int(state.random.uniform() * Float(i + 1)))
+            state.order.swapAt(i, j)
+        }
+    }
+
     private func result(losses: [Double]) -> RLUpdateResult {
         RLUpdateResult(snapshot: snapshot(), updates: state.updates, steps: state.optimizerSteps,
-            policyLoss: losses[0], valueLoss: losses[1], entropy: losses[2], kl: losses[3])
+            policyLoss: losses[0], valueLoss: losses[1], entropy: losses[2], kl: losses[3],
+            attemptedUpdates: state.attemptedUpdates ?? state.updates, rejectedUpdates: state.rejectedUpdates ?? 0)
     }
 
     func save(to directory: URL, versionID: UUID, actorRandom: RLRandom, history: [RLEpisodeRecord],

@@ -113,7 +113,7 @@ final class RewardReader: RewardReading, @unchecked Sendable {
                     else if numericRects.count == 2, frame.time - lastCalibration < 1_000_000_000,
                             let fast = try numericPair(frame.image) { pair = fast.0; confidence = fast.1 }
                     else {
-                        let recognized = try recognize(frame.image, accurate: true)
+                        let recognized = try Self.accurateFields(in: frame.image, minimumConfidence: minimumConfidence)
                         pair = RLTextParser.pair(recognized.map(\.0))
                         confidence = recognized.map(\.1).min() ?? 0
                         numericRects = pair == nil ? [] : rectangles(recognized, image: frame.image)
@@ -135,7 +135,7 @@ final class RewardReader: RewardReading, @unchecked Sendable {
         }
     }
 
-    private func recognize(_ image: CGImage, accurate: Bool) throws -> [(String, Float, VNRecognizedText)] {
+    private static func recognize(_ image: CGImage, accurate: Bool) throws -> [(String, Float, VNRecognizedText)] {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = accurate ? .accurate : .fast
         request.recognitionLanguages = ["en-US"]; request.usesLanguageCorrection = false
@@ -144,6 +144,40 @@ final class RewardReader: RewardReading, @unchecked Sendable {
             guard let text = observation.topCandidates(1).first else { return nil }
             return (text.string, text.confidence, text)
         }
+    }
+
+    /// Vision can omit an isolated integer zero at Retina text sizes even
+    /// though it reads the same pixels correctly at a smaller scale. Retry
+    /// accurate OCR on the complete pair; never substitute guessed characters
+    /// or lower the configured confidence requirement.
+    static func accurateFields(in image: CGImage, minimumConfidence: Float) throws -> [(String, Float, VNRecognizedText)] {
+        guard minimumConfidence.isFinite, (0...1).contains(minimumConfidence) else { return [] }
+        let native = try recognize(image, accurate: true)
+        func valid(_ fields: [(String, Float, VNRecognizedText)]) -> Bool {
+            RLTextParser.pair(fields.map(\.0)) != nil && (fields.map(\.1).min() ?? 0) >= minimumConfidence
+        }
+        if valid(native) { return native }
+        let text = native.map(\.0).joined(separator: "\n")
+        for label in [#"(?i)\breward\s*:"#, #"(?i)\bepisode\s*length\s*:"#] {
+            let regex = try NSRegularExpression(pattern: label)
+            if regex.numberOfMatches(in: text, range: NSRange(text.startIndex..., in: text)) > 1 { return native }
+        }
+        for scale in [0.75, 0.5] {
+            let width = max(1, Int(Double(image.width) * scale)), height = max(1, Int(Double(image.height) * scale))
+            guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { continue }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            guard let smaller = context.makeImage() else { continue }
+            let fields = try recognize(smaller, accurate: true)
+            if valid(fields) { return fields }
+        }
+        return native
+    }
+
+    static func validatedPair(in image: CGImage, minimumConfidence: Float) throws -> (Double, Double)? {
+        let fields = try accurateFields(in: image, minimumConfidence: minimumConfidence)
+        guard (fields.map(\.1).min() ?? 0) >= minimumConfidence else { return nil }
+        return RLTextParser.pair(fields.map(\.0))
     }
 
     private func rectangles(_ lines: [(String, Float, VNRecognizedText)], image: CGImage) -> [CGRect] {
@@ -168,7 +202,7 @@ final class RewardReader: RewardReading, @unchecked Sendable {
     private func numericPair(_ image: CGImage) throws -> ((Double, Double), Float)? {
         var values: [Double] = [], confidence: Float = 1
         for rect in numericRects {
-            guard let crop = image.cropping(to: rect), let text = try recognize(crop, accurate: false).first,
+            guard let crop = image.cropping(to: rect), let text = try Self.recognize(crop, accurate: false).first,
                   text.1 >= minimumConfidence, let number = RLTextParser.number(text.0.filter { !$0.isWhitespace }) else { return nil }
             let range = text.0.startIndex..<text.0.endIndex
             if let bounds = try? text.2.boundingBox(for: range), bounds.boundingBox.maxX > 0.96 { return nil }

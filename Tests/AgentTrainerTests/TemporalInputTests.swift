@@ -132,7 +132,8 @@ final class TemporalInputTests: XCTestCase {
     }
 
     func testInjectorHistoryReportsPostedEdgesAndPermissionReleases() {
-        let injector = InputInjector(eventSink: { _ in }, cursorWarp: { _ in })
+        let point = CGPoint(x: rect.midX, y: rect.midY)
+        let injector = InputInjector(eventSink: { _ in }, cursorWarp: { _ in }, cursorLocation: { point })
         injector.enable()
         defer { injector.disableAndReleaseAll() }
         var profile = AIProfile.fresh()

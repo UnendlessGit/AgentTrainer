@@ -2490,7 +2490,7 @@ final class DomainTests: XCTestCase {
 
     func testGameCameraContractRoundTripsRawDeltaIndependentOfCaptureSize() {
         let collector = EventCollector()
-        let injector = InputInjector(eventSink: { collector.append($0) }, cursorWarp: { collector.warp($0) })
+        let injector = InputInjector(eventSink: { collector.append($0) }, cursorWarp: { collector.warp($0) }, cursorLocation: { CGPoint(x: 50, y: 50) })
         var profile = AIProfile.fresh()
         profile.channels.buttons = false
         profile.channels.scroll = false
@@ -2512,7 +2512,7 @@ final class DomainTests: XCTestCase {
 
     func testInjectorDropsNonFinitePredictionsBeforePosting() {
         let collector = EventCollector()
-        let injector = InputInjector(eventSink: { collector.append($0) })
+        let injector = InputInjector(eventSink: { collector.append($0) }, cursorLocation: { CGPoint(x: 50, y: 50) })
         var prediction = [Float](repeating: 0, count: ActionLayout.count)
         prediction[0] = .nan
         injector.enable()
@@ -2523,7 +2523,7 @@ final class DomainTests: XCTestCase {
 
     func testSharedEpisodeKeyHasTwoIndependentTapsWhileNormalActionsRemainDisabled() {
         let collector = EventCollector()
-        let injector = InputInjector(eventSink: { collector.append($0) })
+        let injector = InputInjector(eventSink: { collector.append($0) }, cursorLocation: { CGPoint(x: 50, y: 50) })
         injector.disableAndReleaseAll()
         injector.tapControllerKey(15); injector.tapControllerKey(15)
         XCTAssertEqual(collector.events.map(\.0), [.keyDown, .keyUp, .keyDown, .keyUp])
@@ -2620,7 +2620,7 @@ final class DomainTests: XCTestCase {
 
     func testGameCameraDoesNotReplayStaleOrZeroDeltasAndNeverUsesDragEvents() {
         let collector = EventCollector()
-        let injector = InputInjector(eventSink: { collector.append($0) }, cursorWarp: { collector.warp($0) })
+        let injector = InputInjector(eventSink: { collector.append($0) }, cursorWarp: { collector.warp($0) }, cursorLocation: { CGPoint(x: 50, y: 50) })
         var profile = AIProfile.fresh()
         profile.channels.mouseMovement = true
         profile.channels.buttons = true
@@ -2680,7 +2680,7 @@ final class DomainTests: XCTestCase {
 
     func testInjectorCannotPostAfterDisableAndReleasesHeldControls() {
         let collector = EventCollector()
-        let injector = InputInjector(eventSink: { collector.append($0) })
+        let injector = InputInjector(eventSink: { collector.append($0) }, cursorLocation: { CGPoint(x: 50, y: 50) })
         var profile = AIProfile.fresh()
         profile.channels.mouseMovement = false
         profile.channels.scroll = false
@@ -2704,7 +2704,7 @@ final class DomainTests: XCTestCase {
 
     func testRuntimeCursorPermissionBlocksMovementWithoutBlockingMouseButtons() {
         let collector = EventCollector()
-        let injector = InputInjector(eventSink: { collector.append($0) })
+        let injector = InputInjector(eventSink: { collector.append($0) }, cursorLocation: { CGPoint(x: 50, y: 50) })
         var profile = AIProfile.fresh()
         profile.channels.scroll = false
         profile.channels.keyboard = false
@@ -2724,7 +2724,7 @@ final class DomainTests: XCTestCase {
 
     func testDisablingRuntimeKeyboardImmediatelyReleasesKeysAndPreventsRepress() {
         let collector = EventCollector()
-        let injector = InputInjector(eventSink: { collector.append($0) })
+        let injector = InputInjector(eventSink: { collector.append($0) }, cursorLocation: { CGPoint(x: 50, y: 50) })
         var profile = AIProfile.fresh()
         profile.channels.mouseMovement = false
         profile.channels.buttons = false
@@ -2911,7 +2911,7 @@ final class DomainTests: XCTestCase {
 
     func testInjectorCannotEmitAKeyMissingFromTraining() {
         let collector = EventCollector()
-        let injector = InputInjector(eventSink: { collector.append($0) })
+        let injector = InputInjector(eventSink: { collector.append($0) }, cursorLocation: { CGPoint(x: 50, y: 50) })
         var profile = AIProfile.fresh()
         profile.channels.mouseMovement = false
         profile.channels.buttons = false

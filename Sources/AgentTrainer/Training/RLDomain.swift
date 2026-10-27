@@ -131,12 +131,42 @@ struct RLConfiguration: Codable, Hashable, Sendable {
     func capabilities(profile: AIProfile, mouseMode: MouseControlMode) -> ModelOutputCapabilities {
         var reserved = Set([startKey, endKey].compactMap { $0 })
         for pair in [[UInt16(56), 60], [59, 62], [58, 61], [55, 54]] where !reserved.isDisjoint(with: pair) { reserved.formUnion(pair) }
-        let keys = allowedKeys.subtracting(reserved).filter { profile.effectiveRestrictions.allowsKey($0) }
-        let buttons = allowedButtons.filter { profile.effectiveRestrictions.allowsButton($0) }
+        let modifierPairs: [[UInt16]] = [[56, 60], [59, 62], [58, 61], [55, 54]]
+        let keys = allowedKeys.subtracting(reserved).filter { code in
+            guard profile.effectiveRestrictions.allowsKey(code) else { return false }
+            if let index = modifierPairs.firstIndex(where: { $0.contains(code) }) {
+                return (index == 0 ? profile.channels.keyboard : profile.channels.modifiers)
+                    && profile.effectiveRestrictions.allowsModifier(index)
+            }
+            return profile.channels.keyboard
+        }
+        let buttons = profile.channels.buttons ? allowedButtons.filter { profile.effectiveRestrictions.allowsButton($0) } : []
         return ModelOutputCapabilities(allowedKeyCodes: Set(keys), allowedMouseButtons: Set(buttons),
             allowsAbsoluteMouseMovement: mouseMovement && profile.channels.mouseMovement && mouseMode != .relative,
             allowsRelativeMouseMovement: mouseMovement && profile.channels.mouseMovement && mouseMode == .relative,
             allowsScroll: scroll && profile.channels.scroll)
+    }
+}
+
+enum RLControlContract {
+    /// Runtime permission edits pause RL, so this immutable intersection is
+    /// shared by collection, likelihood replay and saved output capabilities.
+    static func profile(_ input: AIProfile, permissions: RuntimeOutputPermissions) -> AIProfile {
+        var result = input
+        result.channels.keyboard = input.channels.keyboard && permissions.keyboard
+        result.channels.modifiers = input.channels.modifiers && permissions.keyboard
+        result.channels.mouseMovement = input.channels.mouseMovement && permissions.cursorMovement
+        return result
+    }
+}
+
+struct RLEpisodeKeyState {
+    private(set) var endSent = false
+    mutating func reset() { endSent = false }
+    mutating func takeEnd(_ key: UInt16?) -> UInt16? {
+        guard !endSent else { return nil }
+        endSent = true
+        return key
     }
 }
 
@@ -250,8 +280,28 @@ struct RLTransition: Codable, Sendable {
 }
 
 enum RLExperienceBuffer {
+    static func bytes(_ decision: RLDecision) -> Int {
+        let o = decision.observation
+        return o.current.count + o.past.reduce(0) { $0 + $1.count }
+            + (o.controls.count + o.timing.count + o.pastTiming.count + o.context.count
+                + decision.latent.count + decision.binary.count) * MemoryLayout<Float>.size + 128
+    }
+    static func takeReady(_ transitions: inout [RLTransition], minimumActions: Int, force: Bool,
+                          fallbackValue: Float) -> [RLTransition]? {
+        let terminal = transitions.firstIndex(where: \.terminal)
+        let eligible = terminal.map { $0 + 1 } ?? (force ? transitions.count : max(0, transitions.count - 1))
+        guard eligible > 0 else { return nil }
+        let actions = transitions.prefix(eligible).reduce(0) { $0 + $1.decisions.count }
+        guard force || terminal != nil || actions >= minimumActions else { return nil }
+        var batch = Array(transitions.prefix(eligible))
+        transitions.removeFirst(eligible)
+        let last = batch.count - 1
+        batch[last].boundary = !batch[last].terminal
+        batch[last].bootstrapValue = batch[last].terminal ? 0 : (transitions.first?.decisions.first?.value ?? fallbackValue)
+        return batch
+    }
     static func bytes(_ transition: RLTransition) -> Int {
-        transition.decisions.reduce(0) { $0 + $1.observation.current.count + $1.observation.past.reduce(0) { $0 + $1.count } }
+        transition.decisions.reduce(0) { $0 + bytes($1) }
     }
 
     /// Keep terminal rewards and the current uncommitted tail. If those alone
@@ -301,6 +351,12 @@ struct RLMetrics: Sendable {
     var experienceSeconds = 0.0
     var updates = 0
     var optimizerSteps = 0
+    var attemptedUpdates = 0
+    var rejectedUpdates = 0
+    var klRejectedActions = 0
+    var unobservedActions = 0
+    var controls = ""
+    var resumeNotice = ""
     var policyLoss = 0.0
     var valueLoss = 0.0
     var entropy = 0.0
@@ -361,7 +417,7 @@ final class RLDecisionInbox: @unchecked Sendable {
     private var overflow = false
     func append(_ decision: RLDecision) {
         lock.withLock {
-            let size = decision.observation.current.count + decision.observation.past.reduce(0) { $0 + $1.count }
+            let size = RLExperienceBuffer.bytes(decision)
             guard bytes + size <= 512 * 1024 * 1024, decisions.count < 4096 else { overflow = true; return }
             decisions.append(decision); bytes += size
         }
@@ -370,11 +426,19 @@ final class RLDecisionInbox: @unchecked Sendable {
         lock.withLock {
             let count = decisions.prefix { $0.timestamp < timestamp }.count
             let result = Array(decisions.prefix(count)); decisions.removeFirst(count)
-            bytes -= result.reduce(0) { $0 + $1.observation.current.count + $1.observation.past.reduce(0) { $0 + $1.count } }
+            bytes -= result.reduce(0) { $0 + RLExperienceBuffer.bytes($1) }
             return (result, overflow, decisions.first?.value)
         }
     }
     func clear() { lock.withLock { decisions = []; bytes = 0; overflow = false } }
+    @discardableResult
+    func discardAll() -> Int {
+        lock.withLock {
+            let count = decisions.count
+            decisions = []; bytes = 0; overflow = false
+            return count
+        }
+    }
 }
 
 /// Bounds learner duty cycle while the independent inference stream is active.

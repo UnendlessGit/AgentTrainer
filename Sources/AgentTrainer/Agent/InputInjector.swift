@@ -3,6 +3,8 @@ import CoreGraphics
 import Foundation
 
 final class InputInjector: @unchecked Sendable {
+    private let cursorLocation: @Sendable () -> CGPoint
+    private var lastButtonPosition = CGPoint.zero
     var onState: (@Sendable (InputState) -> Void)?
 
     private let eventSink: @Sendable (CGEvent) -> Void
@@ -61,12 +63,14 @@ final class InputInjector: @unchecked Sendable {
         eventSink: @escaping @Sendable (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
         cursorWarp: @escaping @Sendable (CGPoint) -> Void = { point in _ = CGWarpMouseCursorPosition(point) },
         monotonicClock: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
-        associateCursor: @escaping @Sendable () -> Void = { _ = CGAssociateMouseAndMouseCursorPosition(1) }
+        associateCursor: @escaping @Sendable () -> Void = { _ = CGAssociateMouseAndMouseCursorPosition(1) },
+        cursorLocation: @escaping @Sendable () -> CGPoint = { CGEvent(source: nil)?.location ?? .zero }
     ) {
         self.eventSink = eventSink
         self.cursorWarp = cursorWarp
         self.monotonicClock = monotonicClock
         self.associateCursor = associateCursor
+        self.cursorLocation = cursorLocation
         let origin = monotonicClock()
         decisionTimeline = CausalControlTimeline(origin: origin, censorInitialOnsets: false)
         perceptionTimeline = CausalControlTimeline(origin: origin, censorInitialOnsets: false)
@@ -86,7 +90,7 @@ final class InputInjector: @unchecked Sendable {
         if shouldResetGameCamera { postNeutralGameCameraMove(at: previousPosition) }
         heldKeys.removeAll(); heldButtons.removeAll(); modifiers = 0
         self.outputPermissions = outputPermissions
-        cursor = CGEvent(source: hidEventSource)?.location ?? cursor
+        cursor = cursorLocation()
         // Display discovery crosses into WindowServer. Cache it once per run
         // instead of repeating the query at the action rate.
         fullMacRect = Self.combinedScreenRect()
@@ -143,6 +147,7 @@ final class InputInjector: @unchecked Sendable {
         let allowed = requested.isNull || requested.isEmpty || !requested.hasFiniteComponents ? captureRect : requested
         var mouseDelta = CGSize.zero
         var scrollDelta = CGSize.zero
+        if !outputPermissions.cursorMovement || !channels.mouseMovement { cursor = cursorLocation() }
 
         if predictionIsFresh, outputPermissions.cursorMovement, channels.mouseMovement, mouseMode == .relative {
             let dx = GameCameraContract.runtimeDelta(forPrediction: prediction[2], sensitivity: gameCamera.sensitivity)
@@ -166,13 +171,15 @@ final class InputInjector: @unchecked Sendable {
         }
 
         if channels.buttons {
-            let desired = Set((0..<8).compactMap { prediction[4 + $0] >= 0.5 && restrictions.allowsButton(UInt8($0)) ? UInt8($0) : nil })
-            for button in heldButtons.subtracting(desired) { postButton(button, down: false, at: cursor) }
+            let inRegion = allowed.contains(cursor)
+            let desired = Set((0..<8).compactMap { inRegion && prediction[4 + $0] >= 0.5 && restrictions.allowsButton(UInt8($0)) ? UInt8($0) : nil })
+            for button in heldButtons.subtracting(desired) { postButton(button, down: false, at: inRegion ? cursor : lastButtonPosition) }
             for button in desired.subtracting(heldButtons) { postButton(button, down: true, at: cursor) }
+            if !desired.isEmpty { lastButtonPosition = cursor }
             heldButtons = desired
         }
 
-        if predictionIsFresh, channels.scroll {
+        if predictionIsFresh, channels.scroll, allowed.contains(cursor) {
             let sx = CGFloat(min(1, max(-1, prediction[12]))) * 20
             let sy = CGFloat(min(1, max(-1, prediction[13]))) * 20
             let postedX = Int32(sx.rounded())
@@ -298,6 +305,7 @@ final class InputInjector: @unchecked Sendable {
 
     private func postScroll(dx: Int32, dy: Int32) {
         guard let event = CGEvent(scrollWheelEvent2Source: hidEventSource, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) else { return }
+        event.location = cursor
         post(event)
     }
 

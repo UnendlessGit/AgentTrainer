@@ -44,6 +44,7 @@ final class RLSession {
     private var generation: UInt64 = 0
     private var episodeCount = 0
     private var lastDecisionValue: Float = 0
+    private var episodeKeys = RLEpisodeKeyState()
 
     init(profile: AIProfile, runtime: AgentRuntime, mouseMode: MouseControlMode, context: ModelContextSchema, movementSensitivity: Double = 1) {
         self.profile = profile; self.runtime = runtime; self.mouseMode = mouseMode
@@ -51,6 +52,8 @@ final class RLSession {
         learner = RLAlgorithmFactory.make(profile.effectiveRL.algorithm, budget: budget)
         self.movementSensitivity = movementSensitivity
         self.context = context; configuration = profile.effectiveRL
+        let distribution = RLActionDistribution(profile: profile, configuration: profile.effectiveRL, mouseMode: mouseMode)
+        metrics.controls = "\(mouseMode.rawValue) • \(distribution.binaryIndices.count) binary / \(distribution.continuousIndices.count) analog controls"
     }
 
     func prepare() async throws -> RLWeightSnapshot {
@@ -73,6 +76,9 @@ final class RLSession {
         episodeCount = max(prepared.1.episodeCount, prepared.1.history.map(\.id).max() ?? 0)
         metrics.totalEpisodes = episodeCount; metrics.history = prepared.1.history
         metrics.updates = prepared.1.updates; metrics.optimizerSteps = prepared.1.optimizerSteps
+        metrics.attemptedUpdates = prepared.1.attemptedUpdates ?? prepared.1.updates
+        metrics.rejectedUpdates = prepared.1.rejectedUpdates ?? 0
+        metrics.resumeNotice = prepared.1.resumeNotice ?? ""
         priorElapsed = prepared.1.trainingSeconds; priorExperience = prepared.1.experienceSeconds ?? 0
         metrics.trainingSeconds = priorElapsed
         metrics.experienceSeconds = priorExperience
@@ -144,11 +150,13 @@ final class RLSession {
         guard !stopping else { return }
         runtime.suspendRLActions(); metrics.status = "Resetting environment"
         do {
+            episodeKeys.reset()
             try await runtime.episodeKey(configuration.startKey)
             guard !stopping else { return }
             reducer.reset(at: DispatchTime.now().uptimeNanoseconds)
             readyNotBefore = reducer.resetAt + UInt64(configuration.resetSettlingSeconds * 1e9)
-            lastValidAt = reducer.resetAt; lastDecisionValue = 0; inbox.clear()
+            lastValidAt = reducer.resetAt; lastDecisionValue = 0
+            metrics.unobservedActions += inbox.discardAll()
             metrics.episode = episodeCount + 1; metrics.episodeReward = 0
             metrics.status = "Waiting for Reward: 0 and positive Episode Length"
         } catch { await stop(reason: error.localizedDescription) }
@@ -222,7 +230,7 @@ final class RLSession {
         }
         if reducer.phase == .active, metrics.remaining <= 0 {
             reducer.phase = .finishing; runtime.suspendRLActions(); metrics.status = "Reading final reward"
-            do { try await runtime.episodeKey(configuration.endKey) } catch { await stop(reason: error.localizedDescription); return }
+            do { try await runtime.episodeKey(episodeKeys.takeEnd(configuration.endKey)) } catch { await stop(reason: error.localizedDescription); return }
             let token = generation
             let finalDrainSeconds = max(0.5, configuration.detectionTimeout)
             resetTask = Task { [weak self] in
@@ -249,7 +257,7 @@ final class RLSession {
         metrics.history.append(RLEpisodeRecord(id: episodeCount, reward: reducer.reward, duration: elapsed))
         metrics.history = RLEpisodeRecord.boundedHistory(metrics.history)
         if sendEnd {
-            do { try await runtime.episodeKey(configuration.endKey) } catch { await stop(reason: error.localizedDescription); return }
+            do { try await runtime.episodeKey(episodeKeys.takeEnd(configuration.endKey)) } catch { await stop(reason: error.localizedDescription); return }
         }
         maybeUpdate(force: true)
         metrics.status = "Between episodes"; onMetrics?(metrics)
@@ -267,14 +275,8 @@ final class RLSession {
         // Keep one reward interval uncommitted until the next reading. A final
         // reward after releasing the last action can then extend this tail even
         // when the preceding rollout is already being optimized.
-        let terminalIndex = transitions.firstIndex(where: \.terminal)
-        let eligible = terminalIndex.map { $0 + 1 } ?? (force ? transitions.count : max(0, transitions.count - 1))
-        guard eligible > 0 else { return }
-        let actions = transitions.prefix(eligible).reduce(0) { $0 + $1.decisions.count }
-        guard force || terminalIndex != nil || actions >= configuration.rolloutSize else { return }
-        var batch = Array(transitions.prefix(eligible)); transitions.removeFirst(eligible)
-        batch[batch.count - 1].boundary = !batch[batch.count - 1].terminal
-        batch[batch.count - 1].bootstrapValue = lastDecisionValue
+        guard let batch = RLExperienceBuffer.takeReady(&transitions, minimumActions: configuration.rolloutSize,
+            force: force, fallbackValue: lastDecisionValue) else { return }
         updateTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -284,7 +286,13 @@ final class RLSession {
                 metrics.policyLoss = update.policyLoss; metrics.valueLoss = update.valueLoss
                 metrics.entropy = update.entropy; metrics.kl = update.kl
                 metrics.discardedActions += update.rejectedActions
-            } catch { if !stopping { Task { await self.stop(reason: "RL update stopped: \(error.localizedDescription)") } } }
+                metrics.attemptedUpdates = update.attemptedUpdates; metrics.rejectedUpdates = update.rejectedUpdates
+                metrics.klRejectedActions += update.klRejectedActions
+            } catch {
+                updateTask = nil
+                if !stopping { await self.stop(reason: "RL update stopped: \(error.localizedDescription)") }
+                return
+            }
             updateTask = nil
             if !stopping { maybeUpdate() }
         }
@@ -344,6 +352,7 @@ final class RLSession {
         let interrupted = reducer.phase == .active || reducer.phase == .finishing
         reducer.phase = .paused
         await reader.stop()
+        metrics.unobservedActions += inbox.discardAll()
         await updateTask?.value
         if interrupted {
             let elapsed = max(0, Double(stoppedAt - reducer.startedAt) / 1e9)

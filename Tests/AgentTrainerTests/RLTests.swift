@@ -124,8 +124,34 @@ final class RLTests: XCTestCase {
             activeWeights: root.appendingPathComponent("weights.safetensors"), checkpoint: root)
         XCTAssertEqual(restored.1.optimizerSteps, update.steps)
         for (name, tensor) in update.snapshot.policy { XCTAssertEqual(restored.0.policy[name]?.values, tensor.values) }
-        let a = try await engine.update(rows), b = try await resumed.update(rows)
+        // New behavior must come from the saved policy. Replaying the old
+        // rollout could let both engines reject for KL without taking a step.
+        try RLWeightTransfer.install(update.snapshot.policy, in: actor.policy)
+        try RLWeightTransfer.install(update.snapshot.heads, in: actor.heads)
+        var fresh: [RLTransition] = []
+        for i in 0..<16 {
+            let obs = observation(p, cue: i.isMultiple(of: 2)), output = actor.forward(obs)
+            MLX.eval(output.0, output.1)
+            let sampled = distribution.sample(logits: output.0.asArray(Float.self),
+                logStd: actor.heads.logStandardDeviation.asArray(Float.self), random: &random)
+            let decision = RLDecision(observation: obs, latent: sampled.latent, binary: sampled.binary,
+                logProbability: sampled.logProbability, value: output.1.item(Float.self),
+                timestamp: UInt64(i + 1), revision: update.snapshot.revision)
+            fresh.append(RLTransition(decisions: [decision], reward: sampled.binary[14] > 0 ? 1 : -1,
+                duration: 1 / 60, terminal: true))
+        }
+        let a = try await engine.update(fresh), b = try await resumed.update(fresh)
+        XCTAssertGreaterThan(a.steps, update.steps); XCTAssertEqual(a.steps, b.steps)
         for (name, tensor) in a.snapshot.policy { XCTAssertEqual(b.snapshot.policy[name]?.values, tensor.values) }
+        for (name, tensor) in a.snapshot.heads { XCTAssertEqual(b.snapshot.heads[name]?.values, tensor.values) }
+        let firstSaved = root.appendingPathComponent("continued"), secondSaved = root.appendingPathComponent("resumed")
+        let sa = try await engine.save(to: firstSaved, versionID: id, actorRandom: random, history: [], episodes: 1, elapsed: 3, pending: [])
+        let sb = try await resumed.save(to: secondSaved, versionID: id, actorRandom: random, history: [], episodes: 1, elapsed: 3, pending: [])
+        XCTAssertEqual(sa.random.state, sb.random.state); XCTAssertEqual(sa.actorRandom.state, sb.actorRandom.state)
+        let oa = try MLX.loadArraysAndMetadata(url: firstSaved.appendingPathComponent("optimizer.safetensors"))
+        let ob = try MLX.loadArraysAndMetadata(url: secondSaved.appendingPathComponent("optimizer.safetensors"))
+        XCTAssertEqual(oa.1, ob.1)
+        for (name, tensor) in oa.0 { XCTAssertEqual(tensor.asArray(Float.self), ob.0[name]?.asArray(Float.self)) }
     }
 }
 

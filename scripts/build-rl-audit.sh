@@ -12,6 +12,7 @@ DESTINATION="${1:?Pass the diagnostic app destination}"
 cd "$ROOT"
 swift build --build-system native -c release
 /usr/bin/ditto "$APP" "$DESTINATION"
+/bin/cp "$ROOT/Resources/Info.plist" "$DESTINATION/Contents/Info.plist"
 /bin/cp .build/release/AgentTrainer "$DESTINATION/Contents/MacOS/AgentTrainer"
 KEYCHAIN_ARGUMENTS=()
 if [[ -n "$SIGN_KEYCHAIN" ]]; then KEYCHAIN_ARGUMENTS=(--keychain "$SIGN_KEYCHAIN"); fi
