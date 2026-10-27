@@ -286,7 +286,7 @@ struct RLDashboard: View {
                     Text("Live RL pauses and saves on physical input or target focus loss to avoid learning from another controller.").font(.caption).foregroundStyle(.secondary)
                     Text(m.status).font(.subheadline.bold()).foregroundStyle(model.isRLTraining ? ATColor.green : .secondary)
                     Text(m.controls).font(.caption).foregroundStyle(.secondary)
-                    Text("Backlog: \(m.backlogActions) • stale/buffer exclusions: \(m.discardedActions) • KL stopped actions: \(m.klRejectedActions) • unread actions: \(m.unobservedActions)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Text("Backlog: \(m.backlogActions) • stale/buffer exclusions: \(m.discardedActions) • KL-untrained actions: \(m.klRejectedActions) • unread actions: \(m.unobservedActions)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     if !m.resumeNotice.isEmpty { Text(m.resumeNotice).font(.caption).foregroundStyle(.secondary) }
                     Text(String(format: "Inference p95 • actions %.1f ms • vision %.1f ms", model.runtimeMetrics.actionP95Milliseconds, model.runtimeMetrics.encodingP95Milliseconds))
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)

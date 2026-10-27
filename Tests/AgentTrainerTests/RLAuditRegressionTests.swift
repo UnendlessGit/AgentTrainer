@@ -5,6 +5,22 @@ import MLXNN
 @testable import AgentTrainer
 
 final class RLAuditRegressionTests: XCTestCase {
+    @MainActor
+    func testLowFPSRLProfileCanBeSavedWithUnusedFutureObjectives() async throws {
+        let model = AppModel()
+        var p = AIProfile.fresh(name: "Low FPS RL regression")
+        p.training.actionFPS = 5; p.training.perceptionFPS = 5
+        p.rlTraining = RLConfiguration(); p.rlTraining!.allowedKeys = [49]
+        model.saveProfile(p)
+        for _ in 0..<100 {
+            if await WorkspaceStore.shared.listProfiles().contains(where: { $0.id == p.id }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let saved = await WorkspaceStore.shared.listProfiles().first { $0.id == p.id }
+        XCTAssertNotNil(saved, "Unused demonstration horizons must not prevent configuring low-FPS RL.")
+        XCTAssertNil(model.errorMessage)
+        if let saved { try await WorkspaceStore.shared.deleteProfile(saved) }
+    }
     private func decision(_ value: Float = 0) -> RLDecision {
         RLDecision(observation: RLObservation(current: Data([0]), past: [], controls: [], timing: [0], pastTiming: [], context: []),
             latent: Array(repeating: 0, count: 8), binary: Array(repeating: 0, count: ActionLayout.count),
@@ -143,7 +159,7 @@ final class RLAuditRegressionTests: XCTestCase {
         p.training.architecture.strides = [2]; p.training.architecture.visualEmbedding = 8
         p.training.architecture.recurrentWidth = 8; p.training.architecture.fusionWidths = [16]
         p.training.architecture.dropout = 0; p.training.architecture.attentionHeads = 2
-        var c = RLConfiguration(); c.allowedKeys = [0]; c.normalizeRewards = false; p.rlTraining = c
+        var c = RLConfiguration(); c.allowedKeys = [0]; c.batchSize = 1; c.normalizeRewards = false; p.rlTraining = c
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let engine = RLTrainingEngine()
@@ -153,11 +169,11 @@ final class RLAuditRegressionTests: XCTestCase {
         d.observation.current = Data(repeating: 0, count: p.preprocessing.sampleByteCount)
         d.observation.timing = Array(repeating: 0, count: TemporalInputContract.valueCount)
         d.logProbability = 1000 // grossly inconsistent behavior density
-        let rejected = try await engine.update([RLTransition(decisions: [d], reward: 1, duration: 0.1, terminal: true)])
+        let rejected = try await engine.update(Array(repeating: RLTransition(decisions: [d], reward: 1, duration: 0.1, terminal: true), count: 4))
         XCTAssertEqual(rejected.steps, 0); XCTAssertEqual(rejected.updates, 0)
         XCTAssertEqual(rejected.snapshot.revision, initial.0.revision)
         XCTAssertEqual(rejected.attemptedUpdates, 1); XCTAssertEqual(rejected.rejectedUpdates, 1)
-        XCTAssertEqual(rejected.klRejectedActions, 1)
+        XCTAssertEqual(rejected.klRejectedActions, 4, "The unvisited remainder is also untrained after KL rejection.")
         for (name, tensor) in initial.0.policy { XCTAssertEqual(tensor.values, rejected.snapshot.policy[name]?.values) }
         d.value = .nan
         do {
@@ -180,6 +196,33 @@ final class RLAuditRegressionTests: XCTestCase {
             let objective = RLPPOObjective.evaluate(logRatio: ratio, advantage: 1, clip: 0.2)
             XCTAssertEqual(objective.kl, exp(ratio) - 1 - ratio, accuracy: 1e-6)
             XCTAssertTrue(objective.loss.isFinite)
+        }
+    }
+
+    func testOCRGroupingChangesTargetsAndRMSScaleForTheSameRewardStream() {
+        // Eight unit rewards, with their times hidden by cumulative OCR.
+        // The collector can retain only each interval's undiscounted sum.
+        var c = RLConfiguration(); c.discount = 0.9; c.gaeLambda = 1
+        let perDecision = Float((1 - pow(0.9, 8)) / (1 - 0.9))
+        var previous: Float = 0
+        for group in [1, 2, 4, 8] {
+            let rows = (0..<(8 / group)).map { index in
+                RLTransition(decisions: Array(repeating: decision(), count: group), reward: Float(group),
+                    duration: Double(group) / 15, terminal: index == 8 / group - 1)
+            }
+            let values = Array(repeating: Float(0), count: rows.count)
+            let actual = RLReturns.advantages(rows, values: values, configuration: c, actionFPS: 15).returns[0]
+            let intervalDiscount = pow(0.9, Double(group))
+            let expected = Float(Double(group) * (1 - pow(intervalDiscount, Double(rows.count))) / (1 - intervalDiscount))
+            XCTAssertEqual(actual, expected, accuracy: 1e-5)
+            XCTAssertGreaterThan(actual, previous); previous = actual
+            if group == 1 { XCTAssertEqual(actual, perDecision, accuracy: 1e-5) }
+            else { XCTAssertGreaterThan(actual, perDecision, "Unknown within-interval timing prevents exact regrouping equivalence.") }
+            // For a steady stream of group-sized rewards, the interval RMS is
+            // group-sized too. This is deliberately not assumed invariant.
+            let normalized = RLReturns.advantages(rows, values: values, configuration: c,
+                actionFPS: 15, rewardDivisor: Float(group)).returns[0]
+            XCTAssertEqual(normalized, expected / Float(group), accuracy: 1e-5)
         }
     }
 

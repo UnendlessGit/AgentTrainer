@@ -8,6 +8,7 @@ struct AuditSetup: Decodable {
     var seed: UInt64
     var label: String
     var episodeSeconds: Double = 10
+    var forceDrag: Bool? = nil
 }
 
 final class AuditGame: NSView {
@@ -19,7 +20,7 @@ final class AuditGame: NSView {
     var keys = Set<UInt16>(), buttons = Set<Int>()
     var pointer = CGPoint(x: 0.5, y: 0.5), target = CGPoint(x: 0.5, y: 0.5)
     var pawn = CGPoint(x: 0.5, y: 0.5)
-    var best = 1.0, success = false, picked = false
+    var best = 1.0, success = false, picked = false, pickupRewarded = false
     var counts: [String: Double] = [:]
     var timer: Timer?
     var tracking: NSTrackingArea?
@@ -80,16 +81,17 @@ final class AuditGame: NSView {
     }
     func nextTrial(_ index: Int) {
         closeTrial(); trial = index
-        kind = Int(random() * (setup.task == "keyboard" ? 4 : 3))
+        kind = setup.forceDrag == true ? 2 : Int(random() * (setup.task == "keyboard" ? 4 : 3))
         target = CGPoint(x: random() < 0.5 ? 0.25 : 0.75, y: random() < 0.5 ? 0.22 : 0.54)
-        pawn = CGPoint(x: 0.5, y: 0.38); success = false; picked = false
+        if setup.forceDrag == true { target = CGPoint(x: 0.75, y: 0.54) }
+        pawn = CGPoint(x: 0.5, y: 0.38); success = false; picked = false; pickupRewarded = false
         best = distance(setup.task == "pointer" ? pointer : pawn)
     }
     func distance(_ point: CGPoint) -> Double { hypot(point.x - target.x, point.y - target.y) }
-    func approach(_ point: CGPoint) {
+    func approach(_ point: CGPoint, rewarded: Bool = true) {
         let d = distance(point)
         add("errorSum\(kind)", d); add("errorSamples\(kind)")
-        if d < best { reward += (best - d) * 3; best = d }
+        if rewarded, d < best { reward += (best - d) * 3; best = d }
     }
     func tick() {
         let now = CACurrentMediaTime()
@@ -98,7 +100,7 @@ final class AuditGame: NSView {
         guard elapsed >= 0.6 else { needsDisplay = true; return }
         let dt = min(0.1, now - previous); previous = now
         if elapsed >= setup.episodeSeconds - 0.2 { end(); return }
-        let index = Int((elapsed - 0.6) / 1.5)
+        let index = Int((elapsed - 0.6) / (setup.forceDrag == true ? 10 : 1.5))
         if index != trial { nextTrial(index) }
         if setup.task == "keyboard" {
             let required: UInt16 = [0, 2, 49, 1][kind]
@@ -106,7 +108,7 @@ final class AuditGame: NSView {
             add("seconds\(kind)", dt)
             if correct { add("correctSeconds\(kind)", dt); reward += dt * 2; if kind != 2 { success = true } }
             else { reward -= dt * 0.5 }
-        } else if setup.task == "pointer" { approach(pointer) }
+        } else if setup.task == "pointer" { approach(pointer, rewarded: kind != 2 || picked) }
         else { approach(pawn) }
         needsDisplay = true
     }
@@ -144,14 +146,21 @@ final class AuditGame: NSView {
         move(event)
         guard length > 0, trial >= 0 else { return }
         let b = event.buttonNumber
+        let wasHeld = buttons.contains(b)
         add("button\(b)\(down ? "Down" : "Up")")
         if down { buttons.insert(b) } else { buttons.remove(b) }
         if setup.task == "pointer" {
             if kind < 2, down, b == kind, distance(pointer) < 0.15, !success {
                 success = true; reward += 3
             } else if kind == 2, b == 0 {
-                if down, hypot(pointer.x - 0.5, pointer.y - 0.38) < 0.15 { picked = true; reward += 0.2 }
-                if !down, picked, distance(pointer) < 0.15, !success { success = true; reward += 3; add("dragCompletions") }
+                if down, hypot(pointer.x - 0.5, pointer.y - 0.38) < 0.15 {
+                    picked = true
+                    if !pickupRewarded { reward += 0.2; best = distance(pointer); pickupRewarded = true }
+                }
+                if !down, picked {
+                    if wasHeld, distance(pointer) < 0.15, !success { success = true; reward += 3; add("dragCompletions") }
+                    picked = false
+                }
             } else if down { reward -= 0.05 }
         }
         log("input")
@@ -185,7 +194,8 @@ final class AuditGame: NSView {
             else if kind == 1 { rect.fill() }
             else { NSBezierPath(rect: rect).stroke() }
             NSColor.gray.setFill()
-            NSBezierPath(ovalIn: CGRect(x: 300, y: 132, width: 40, height: 40)).fill()
+            let object = picked ? CGPoint(x: pointer.x * 640 - 20, y: pointer.y * 400 - 20) : CGPoint(x: 300, y: 132)
+            NSBezierPath(ovalIn: CGRect(origin: object, size: CGSize(width: 40, height: 40))).fill()
             let p = setup.task == "pointer" ? pointer : pawn
             NSColor.systemOrange.setFill()
             NSBezierPath(ovalIn: CGRect(x: p.x * 640 - 6, y: p.y * 400 - 6, width: 12, height: 12)).fill()

@@ -2,7 +2,7 @@
 
 Back to [architecture overview](../ARCHITECTURE.md).
 
-Live inference, input execution, UI behavior, and updates in AgentTrainer 2.60. Timing features and policy decoding are described in [Model and training](model-and-training.md#explicit-timing).
+Live inference, input execution, UI behavior, and updates in AgentTrainer 2.61. Timing features and policy decoding are described in [Model and training](model-and-training.md#explicit-timing).
 
 ## Runtime execution
 
@@ -11,6 +11,8 @@ Live inference, input execution, UI behavior, and updates in AgentTrainer 2.60. 
 Temporal history uses a fixed-capacity ring of reduced packed images, embeddings, controls, and timing. Missing startup slots use the current reduced image with zero controls and invalid timing. Idle capture keeps the original source-frame timestamp. The action timer checks staleness independently of pending inference. At 60 Action FPS, nominal execution spacing is approximately 16.7 ms; event timestamp precision does not provide sub-tick output scheduling.
 
 `InputInjector` filters each action using saved output capabilities, current channel disables, profile key/button/modifier restrictions, demonstrated key codes, live cursor/keyboard permissions, and the control region unless full-Mac control is selected. It ignores predictions shorter than 146 values or containing non-finite values in the first 146 positions. Mode selection chooses absolute cursor or relative game-camera execution. Relative outputs are sensitivity-scaled, rounded, and posted as HID movement.
+
+Click and scroll containment is independent of movement permission. Button-only and scroll-only execution checks the actual cursor position, scroll events carry an explicit target location, and forced releases use the last button position. RL resolves its sampled controls through the same effective channel/permission/modifier contract used for execution. The dashboard shows the resolved mouse mode and executable controls.
 
 Executed events, including forced releases, feed separate action/perception `CausalControlTimeline` reducers under the injector lock. Commands blocked by permissions, restrictions, rounding, or clipping do not become fictitious control history. Synthetic events carry `agentTrainerSyntheticTag`; physical-input safety monitoring ignores that tag.
 
@@ -25,6 +27,8 @@ The SwiftUI interface uses shared appearance settings, a custom top bar/sidebar,
 ## RL execution
 
 Run remains deterministic. RL Training samples a hybrid policy while retaining execution receipts on the HID queue. Its thread-safe inbox aligns action timestamps with capture timestamps, independently of main-actor callback order and OCR completion time. The controller blocks AI output during reset/finalization, sends reserved episode keys, and acknowledges fresh zero reward before resuming.
+
+Timeout and terminal acknowledgment share a once-per-episode end-key latch. Learner errors block collection immediately. Truncated training prefixes use the first retained successor value, including intervals containing multiple actions. Applied steps and policy revisions advance only when optimization changes the model; rollout attempts and exclusions have separate counters.
 
 A separate native-resolution capture reads both reward fields. Cached unchanged pixels and calibrated numeric crops reduce OCR cost; ambiguous recognition falls back to accurate Vision recognition. Invalid readings never become zero. Source-local geometry follows window movement; source loss, resize, or scale changes stop safely. Reward masking happens in the Metal preprocessing shader before resize sampling, with a sampling-footprint guard band.
 

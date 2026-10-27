@@ -1,6 +1,6 @@
 # AgentTrainer architecture
 
-AgentTrainer 2.60 (build 38) is a local macOS demonstration-recording, behavioral-cloning, live reinforcement-learning, and input-execution app. This reference describes the implementation in this checkout.
+AgentTrainer 2.61 (build 39) is a local macOS demonstration-recording, behavioral-cloning, live reinforcement-learning, and input-execution app. This reference describes the implementation in this checkout.
 
 ## System flow
 

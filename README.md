@@ -1,6 +1,6 @@
 # AgentTrainer
 
-AgentTrainer is an Apple-silicon macOS app that records screen and input demonstrations, trains behavioral cloning and live reinforcement learning policies locally with MLX, and runs those policies through macOS keyboard and mouse events. This checkout identifies the app as **2.60, build 38**.
+AgentTrainer is an Apple-silicon macOS app that records screen and input demonstrations, trains behavioral cloning and live reinforcement learning policies locally with MLX, and runs those policies through macOS keyboard and mouse events. This checkout identifies the app as **2.61, build 39**.
 
 Recordings, datasets, model weights, and diagnostics are stored locally. The app's networking is used for checking and downloading public GitHub releases; it does not upload training data or telemetry. Published installers are available from [GitHub Releases](https://github.com/UnendlessGit/AgentTrainer/releases).
 
@@ -37,7 +37,7 @@ PPO updates during episodes from short rollouts. Capture, action inference, and 
 
 The dashboard includes reward history and a rolling average. The capture-excluded HUD retains its existing vision/input views and adds episode, reward, remaining time, and status. Checkpoints preserve the critic, exploration, optimizer masters/moments, random state, normalization, pending experience, and statistics. Advanced settings expose the implemented PPO controls; architecture/vision changes retain their existing explicit brain-reset confirmation.
 
-See [RL implementation and environment contract](docs/reinforcement-learning.md) for timing and checkpoints, and [2.60 validation](docs/release-2.60.md) for measured learning and live performance results. Improvements in controlled tests do not guarantee learning speed or success in an arbitrary game.
+See [RL implementation and environment contract](docs/reinforcement-learning.md) for timing and checkpoints, and [2.61 audit and validation](docs/release-2.61.md) for matched live experiments and their limits. Improvements in controlled tests do not guarantee learning speed or success in an arbitrary game.
 
 ## Recording and labels
 

@@ -2,7 +2,7 @@
 
 Back to [architecture overview](../ARCHITECTURE.md).
 
-Vision preprocessing, dataset formats, explicit timing, Policy v9, and saved training state in AgentTrainer 2.60. The live execution path is described in [Runtime](runtime.md).
+Vision preprocessing, dataset formats, explicit timing, Policy v9, and saved training state in AgentTrainer 2.61. The live execution path is described in [Runtime](runtime.md).
 
 ## Vision and dataset construction
 

@@ -35,10 +35,12 @@ enum RLLiveAudit {
     private static var hasRun = false
     private static var activeEvaluation: AgentRuntime?
     private static var activeReader: RewardReader?
-    static var hasActiveEvaluation: Bool { activeEvaluation != nil }
-    static func suspendActiveEvaluation() { activeEvaluation?.suspendRLActions() }
+    private static var contractInjector: InputInjector?
+    static var hasActiveEvaluation: Bool { activeEvaluation != nil || contractInjector != nil }
+    static func suspendActiveEvaluation() { activeEvaluation?.suspendRLActions(); contractInjector?.releaseAll() }
     static func stopActiveEvaluation(reason: String) async {
         let runtime = activeEvaluation, reader = activeReader
+        contractInjector?.releaseAll(); contractInjector = nil
         runtime?.suspendRLActions()
         await runtime?.stop(reason: reason)
         await reader?.stop()
@@ -80,6 +82,11 @@ enum RLLiveAudit {
             }
             if manifest.operation == "evaluate" {
                 let result = try await evaluateSaved(model: model, manifest: manifest, root: root)
+                if let report { try write(result, to: report) }
+                return
+            }
+            if manifest.operation == "fixture" {
+                let result = try await validateDragFixture(root: root)
                 if let report { try write(result, to: report) }
                 return
             }
@@ -202,6 +209,60 @@ enum RLLiveAudit {
         }
     }
 
+    /// Scripted environment-contract validation, explicitly not policy learning.
+    private static func validateDragFixture(root: URL) async throws -> [String: Any] {
+        let sources = try await CaptureService.availableSources()
+        guard let source = sources.first(where: { $0.kind == .window && $0.name == "AgentTrainer RL Validation Game" }),
+              let fixture = NSRunningApplication.runningApplications(withBundleIdentifier: "local.agenttrainer.rlfixture").first else {
+            throw AgentTrainerError.capture("The audit fixture is unavailable.")
+        }
+        let label = "fixture-contract"
+        try write(["task": "pointer", "seed": 7, "label": label, "episodeSeconds": 10, "forceDrag": true],
+            to: root.appendingPathComponent("fixture-control.json"))
+        _ = fixture.activate(options: [.activateAllWindows])
+        try await Task.sleep(for: .milliseconds(100))
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == fixture.processIdentifier else { throw AgentTrainerError.model("Focus the audit fixture.") }
+        let injector = InputInjector()
+        contractInjector = injector
+        defer { injector.releaseAll(); if contractInjector === injector { contractInjector = nil } }
+        injector.tapControllerKey(15)
+        try await Task.sleep(for: .milliseconds(700))
+        injector.enable()
+        var profile = AIProfile.fresh(); profile.channels.keyboard = false; profile.channels.scroll = false
+        let title = source.frame.height - 400
+        func action(_ x: Float, _ y: Float, _ held: Bool) async throws {
+            guard contractInjector === injector, NSWorkspace.shared.frontmostApplication?.processIdentifier == fixture.processIdentifier else {
+                throw AgentTrainerError.model("Fixture contract interrupted; inputs released.")
+            }
+            var p = Array(repeating: Float(0), count: ActionLayout.count)
+            p[0] = x; p[1] = Float((title + CGFloat(y) * 400) / source.frame.height); p[4] = held ? 1 : 0
+            injector.execute(p, profile: profile, allowedKeyCodes: [], mouseMode: .absolute, captureRect: source.frame, safety: AgentSafetyPolicy())
+            try await Task.sleep(for: .milliseconds(80))
+        }
+        func latest() throws -> [String: Any] {
+            let text = try String(contentsOf: root.appendingPathComponent("fixture.jsonl"), encoding: .utf8)
+            return try text.split(separator: "\n").reversed().compactMap { line -> [String: Any]? in
+                let row = try JSONSerialization.jsonObject(with: Data(line.utf8)) as! [String: Any]
+                return row["label"] as? String == label ? row : nil
+            }.first!
+        }
+        try await action(0.5, 0.38, true); try await action(0.5, 0.38, false)
+        try await action(0.75, 0.54, false); try await action(0.75, 0.54, true); try await action(0.75, 0.54, false)
+        let invalid = try latest()
+        let invalidCounts = invalid["counts"] as! [String: Double]
+        guard invalidCounts["dragCompletions", default: 0] == 0 else { throw AgentTrainerError.model("An invalid release was counted as a drag.") }
+        for _ in 0..<3 { try await action(0.5, 0.38, true); try await action(0.5, 0.38, false) }
+        let repeated = try latest()
+        guard abs((repeated["reward"] as! Double) - (invalid["reward"] as! Double)) < 0.001 else {
+            throw AgentTrainerError.model("Repeated pickups farmed reward.")
+        }
+        try await action(0.5, 0.38, true); try await action(0.75, 0.54, true); try await action(0.75, 0.54, false)
+        let valid = try latest(), counts = valid["counts"] as! [String: Double]
+        guard counts["dragCompletions"] == 1 else { throw AgentTrainerError.model("A valid held drag did not complete.") }
+        injector.releaseAll(); injector.tapControllerKey(14)
+        return ["scriptedContractOnly": true, "invalidDropCompletions": 0, "pickupRewardRepeated": false, "validDragCompletions": 1]
+    }
+
     private static func evaluateSaved(model: AppModel, manifest: RLAuditManifest, root: URL) async throws -> [String: Any] {
         var results: [[String: Any]] = []
         let workspace = URL(fileURLWithPath: environment["AGENTTRAINER_WORKSPACE_ROOT"]!).lastPathComponent
@@ -253,7 +314,7 @@ enum RLLiveAudit {
     private static func smoke(model: AppModel, manifest: RLAuditManifest, root: URL) async throws -> [String: Any] {
         var results: [[String: Any]] = []
         for cell in manifest.cells {
-            guard let profile = model.profiles.first(where: { $0.name.hasSuffix("-\(cell.task)-\(cell.seed)") }),
+            guard var profile = model.profiles.first(where: { $0.name.hasSuffix("-\(cell.task)-\(cell.seed)") }),
                   let id = profile.activeVersionID,
                   let fixture = NSRunningApplication.runningApplications(withBundleIdentifier: "local.agenttrainer.rlfixture").first else {
                 throw AgentTrainerError.model("Smoke tests require an existing isolated trained profile and the audit fixture.")
@@ -262,11 +323,18 @@ enum RLLiveAudit {
             guard let source = sources.first(where: { $0.kind == .window && $0.name == "AgentTrainer RL Validation Game" }) else {
                 throw AgentTrainerError.capture("The audit fixture is unavailable.")
             }
+            if let old = profile.effectiveRL.rewardRegion {
+                var settings = profile.effectiveRL
+                settings.rewardRegion = RLRewardRegion(sourceID: source.id, isWindow: true, normalized: old.normalized)
+                profile.rlTraining = settings
+                try await WorkspaceStore.shared.saveProfile(profile)
+                await model.refreshLibrary()
+            }
             let directory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: id)
             let before = try hash(directory.appendingPathComponent("weights.safetensors"))
             try control(root: root, task: cell.task, seed: 900003, label: "smoke-\(cell.task)-\(cell.seed)")
             model.captureSources = sources; model.captureKind = .window; model.selectedSourceID = source.id
-            model.selectedProfileID = profile.id; model.runUsesRL = false
+            model.selectedProfileID = profile.id; model.selection = .run; model.runUsesRL = false
             model.runtimeOutputPermissions = RuntimeOutputPermissions()
             model.runMouseMode = cell.task == "relative" ? .relative : .absolute
             model.showVisionPreview = false; model.cnnVisualizationSettings.enabled = false
@@ -296,6 +364,7 @@ enum RLLiveAudit {
                 try control(root: root, task: cell.task, seed: 700007, label: "smoke-resume")
                 await model.startRL()
                 guard model.isRLTraining else { throw AgentTrainerError.model(model.runtimeStatus) }
+                try await Task.sleep(for: .milliseconds(150))
                 row["stepsBeforeResume"] = previous.optimizerSteps
                 row["stepsAtResume"] = model.rlMetrics.optimizerSteps
                 try await Task.sleep(for: .seconds(8))
@@ -306,6 +375,13 @@ enum RLLiveAudit {
                 }
             }
             results.append(row)
+        }
+        model.runUsesRL = true
+        try await Task.sleep(for: .milliseconds(200))
+        if let window = NSApp.windows.first(where: { $0.isVisible && $0.frame.width >= 1000 }),
+           let image = try? await CaptureService.snapshot(spec: CaptureSpec(kind: .window, windowID: UInt32(window.windowNumber))),
+           let bytes = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
+            try? bytes.write(to: root.appendingPathComponent(manifest.implementation + "-ui.png"))
         }
         return ["results": results]
     }

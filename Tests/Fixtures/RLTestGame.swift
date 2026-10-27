@@ -22,7 +22,13 @@ final class GameView: NSView {
         guard !event.isARepeat else { return }
         if event.keyCode == 15 {
             episode += 1; reward = 0; length = scenario == "timeout" ? 4 : 10; started = Date(); ticks = 0; keys = []
-        } else if event.keyCode == 14 { length = 0; started = nil; keys = [] }
+        } else if event.keyCode == 14 {
+            length = 0; started = nil; keys = []
+            if let logURL, let data = try? JSONSerialization.data(withJSONObject: ["event": "controllerEnd", "episode": episode, "reward": reward]),
+               let handle = try? FileHandle(forWritingTo: logURL) {
+                _ = try? handle.seekToEnd(); try? handle.write(contentsOf: data + Data([10])); try? handle.close()
+            }
+        }
         else { keys.insert(event.keyCode) }
         needsDisplay = true
     }

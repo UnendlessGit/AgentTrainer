@@ -9,7 +9,7 @@ import subprocess
 import time
 
 parser = argparse.ArgumentParser()
-parser.add_argument("implementation", choices=["baseline", "improved", "canary", "screening", "smoke", "evaluate"])
+parser.add_argument("implementation", choices=["baseline", "improved", "canary", "screening", "smoke", "evaluate", "fixture"])
 parser.add_argument("app", type=Path)
 parser.add_argument("--seconds", type=float, default=90)
 parser.add_argument("--seeds", default="7,42,101")
@@ -29,6 +29,10 @@ if not args.source_workspace or any(not (c.isascii() and (c.isalnum() or c in "-
 repo = Path(__file__).resolve().parents[1]
 root = repo / "work/rl-validation/audit"
 root.mkdir(parents=True, exist_ok=True)
+if any((root / f"{run_name}{suffix}").exists() for suffix in [".json", "-manifest.json", ".log"]):
+    raise SystemExit("This run name already has artifacts. Choose a new --run-name to preserve the evidence.")
+if subprocess.run(["pgrep", "-x", "AgentTrainer"], stdout=subprocess.DEVNULL).returncode == 0:
+    raise SystemExit("Quit the running AgentTrainer before starting an isolated audit process.")
 ledger = root / "live-budget.json"
 entries = json.loads(ledger.read_text()) if ledger.exists() else []
 used = sum(row["seconds"] for row in entries)
@@ -48,7 +52,7 @@ if args.implementation == "screening":
     args.evaluation_seconds = 0
 manifest = dict(implementation=run_name, root=str(root), cells=cells,
                 evaluationSeed=args.evaluation_seed,
-                operation=args.implementation if args.implementation in ["smoke", "evaluate"] else "train",
+                operation=args.implementation if args.implementation in ["smoke", "evaluate", "fixture"] else "train",
                 evaluationSeconds=args.evaluation_seconds)
 manifest_path = root / f"{run_name}-manifest.json"
 manifest_path.write_text(json.dumps(manifest, indent=2))
@@ -63,7 +67,8 @@ metadata = {"implementation": run_name, "codeArm": args.implementation,
             "binarySHA256": hashlib.sha256(binary.read_bytes()).hexdigest(),
             "manifestSHA256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
             "fixtureSHA256": hashlib.sha256((repo / "Tests/Fixtures/RLAuditGame.swift").read_bytes()).hexdigest(),
-            "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()}
+            "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
+            "trackedDiffSHA256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=repo)).hexdigest()}
 (root / f"{run_name}-provenance.json").write_text(json.dumps(metadata, indent=2))
 began = time.monotonic()
 process = None

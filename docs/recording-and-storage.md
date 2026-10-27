@@ -2,7 +2,7 @@
 
 Back to [architecture overview](../ARCHITECTURE.md).
 
-Capture, synchronized input, recording packages, and library storage in AgentTrainer 2.60. Dataset preprocessing is described in [Model and training](model-and-training.md#vision-and-dataset-construction).
+Capture, synchronized input, recording packages, and library storage in AgentTrainer 2.61. Dataset preprocessing is described in [Model and training](model-and-training.md#vision-and-dataset-construction).
 
 ## Recording pipeline
 

@@ -325,7 +325,7 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                     }
                     guard losses.allSatisfy(\.isFinite) else { throw AgentTrainerError.model("Non-finite PPO objective; the last valid weights were preserved.") }
                     if losses[3] > c.targetKL * 1.5 {
-                        latest = losses; stopForKL = true; klRejectedActions += decisions.count; break
+                        latest = losses; stopForKL = true; break
                     }
                     for offset in stride(from: 0, to: decisions.count, by: microSize) {
                         if shouldInterrupt { break optimization }
@@ -361,12 +361,15 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                     state.optimizerSteps += 1; state.offset = end; latest = losses
                     didApplyStep?(state.optimizerSteps)
                 }
-                if !shouldInterrupt {
+                if !shouldInterrupt && !stopForKL {
                     state.epoch += 1; state.offset = 0
                     if state.epoch < c.epochs { shuffleOrder() }
                 }
             }
             if !shouldInterrupt {
+                if stopForKL, state.epoch == 0 {
+                    klRejectedActions = state.order.suffix(from: state.offset).reduce(0) { $0 + state.pending[$1].decisions.count }
+                }
                 if state.optimizerSteps > (state.rolloutStartStep ?? stepsBefore) { state.updates += 1 }
                 else if stopForKL { state.rejectedUpdates = (state.rejectedUpdates ?? 0) + 1 }
                 state.pending = []; state.order = []; state.advantages = []; state.returns = []
