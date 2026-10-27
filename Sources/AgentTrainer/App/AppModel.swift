@@ -983,7 +983,7 @@ final class AppModel: ObservableObject {
             present(AgentTrainerError.invalidConfiguration("Maximum Steps must be zero or greater, and Autosave Steps must be from 1 through 100,000,000."))
             return
         }
-        do { try validateProfile(profile) } catch { present(error); return }
+        do { try validateProfile(profile, requiresDemonstrationObjectives: true) } catch { present(error); return }
         let folderIDs = Set(profile.effectiveFolderIDs)
         let selected = recordings.filter { profile.recordingIDs.contains($0.id) || $0.manifest.folderID.map(folderIDs.contains) == true }
         guard !selected.isEmpty else { present(AgentTrainerError.noData); return }
@@ -1022,7 +1022,7 @@ final class AppModel: ObservableObject {
                isAutoTraining,
                autoTrainingProfileID == profileID,
                let profile = profiles.first(where: { $0.id == profileID }) {
-                do { try validateProfile(profile) } catch { finishTraining(with: error); present(error); return }
+                do { try validateProfile(profile, requiresDemonstrationObjectives: true) } catch { finishTraining(with: error); present(error); return }
                 let folderIDs = Set(profile.effectiveFolderIDs)
                 let selected = recordings.filter { profile.recordingIDs.contains($0.id) || $0.manifest.folderID.map(folderIDs.contains) == true }
                 guard !selected.isEmpty else { let error = AgentTrainerError.noData; finishTraining(with: error); present(error); return }
@@ -1678,7 +1678,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func validateProfile(_ profile: AIProfile, checkMemory: Bool = true) throws {
+    private func validateProfile(_ profile: AIProfile, checkMemory: Bool = true, requiresDemonstrationObjectives: Bool = false) throws {
         guard !profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AgentTrainerError.invalidConfiguration("AI names cannot be empty.")
         }
@@ -1711,7 +1711,7 @@ final class AppModel: ObservableObject {
             throw AgentTrainerError.invalidConfiguration("Use bounded finite training values: learning rate 0.0000001–0.003, weight decay 0–1, cosine cycles 1–10,000 epochs, plateau patience 1–1,000, minimum learning-rate ratio 0.001–0.5, focal gamma 0–4, Perception FPS no higher than Action FPS (both at most 240), and validation from 0 up to but not including 1.")
         }
         let futureAction = training.effectiveFutureActionPrediction
-        if futureAction.enabled {
+        if requiresDemonstrationObjectives && futureAction.enabled {
             let offsets = futureAction.actionOffsets(actionFPS: training.actionFPS)
             guard Set(offsets).count == offsets.count else {
                 throw AgentTrainerError.invalidConfiguration(
@@ -1899,7 +1899,6 @@ extension AppModel {
         guard token == agentLaunchRevision else { return }
         profile = profiles.first { $0.id == profile.id } ?? profile
         do {
-            try validateProfile(profile, checkMemory: false)
             var workingProfile = profile
             workingProfile.training.batchSize = 2
             workingProfile.training.visualAugmentation = VisualAugmentationConfiguration(enabled: false)

@@ -110,10 +110,11 @@ summary = {
     "liveBudget": json.loads((root / "live-budget.json").read_text()),
     "baseline": baseline, "improved": improved, "pairs": pairs,
     "configurationFollowup": {"development": arm("mouse-development"), "confirmation": arm("mouse-confirmation")},
-    "screening": arm("screening"),
+    "screening": arm("screening-fixed") or arm("screening"),
     "technicalRetests": [
         {"attempt": "failed-baseline", "reason": "Native integer-zero OCR failure; fixture changed to decimal length before both matched arms."},
         {"attempt": "improved", "reason": "Human-input safety stop during final frozen pointer-seed-7 evaluation; retained the three completed keyboard cells and retested the unfinished pointer cell in improved-rest."},
+        {"attempt": "screening", "reason": "Low Action FPS was blocked by demonstration-only auxiliary horizon validation; fixed the RL startup/profile validation path and restarted the screen."},
     ],
     "provenance": [json.loads(path.read_text()) for name in ["baseline", "improved", "improved-rest"]
                    if (path := root / f"{name}-provenance.json").exists()],

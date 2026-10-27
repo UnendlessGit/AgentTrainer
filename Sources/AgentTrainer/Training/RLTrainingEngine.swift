@@ -277,7 +277,7 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
             var stopForKL = false
             var klRejectedActions = 0
             let stepsBefore = state.optimizerSteps
-            while state.epoch < c.epochs && !stopForKL && !shouldInterrupt {
+            optimization: while state.epoch < c.epochs && !stopForKL && !shouldInterrupt {
                 while state.offset < state.order.count && !shouldInterrupt {
                     let end = min(state.order.count, state.offset + c.batchSize)
                     let indices = Array(state.order[state.offset..<end])
@@ -298,6 +298,7 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                     var rowLogP = [Float](repeating: 0, count: decisions.count)
                     var rowEntropy = rowLogP, rowValues = rowLogP
                     for offset in stride(from: 0, to: decisions.count, by: microSize) {
+                        if shouldInterrupt { break optimization }
                         let workBegan = DispatchTime.now().uptimeNanoseconds
                         let end = min(decisions.count, offset + microSize)
                         var chunk = Array(decisions[offset..<end])
@@ -327,6 +328,7 @@ final class RLTrainingEngine: RLLearningAlgorithm, @unchecked Sendable {
                         latest = losses; stopForKL = true; klRejectedActions += decisions.count; break
                     }
                     for offset in stride(from: 0, to: decisions.count, by: microSize) {
+                        if shouldInterrupt { break optimization }
                         let workBegan = DispatchTime.now().uptimeNanoseconds
                         let end = min(decisions.count, offset + microSize)
                         var chunk = Array(decisions[offset..<end]), weights: [Float] = []
