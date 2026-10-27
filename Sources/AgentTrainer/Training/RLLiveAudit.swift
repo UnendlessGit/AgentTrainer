@@ -28,10 +28,12 @@ struct RLAuditManifest: Codable {
 @MainActor
 enum RLLiveAudit {
     private static let environment = ProcessInfo.processInfo.environment
+    private static var hasRun = false
     static func run(model: AppModel) async {
-        guard environment["AGENTTRAINER_RL_VALIDATION"] == "1",
+        guard !hasRun, environment["AGENTTRAINER_RL_VALIDATION"] == "1",
               let path = environment["AGENTTRAINER_RL_AUDIT_MANIFEST"],
               let workspace = environment["AGENTTRAINER_WORKSPACE_ROOT"], workspace.contains("rl-validation") else { return }
+        hasRun = true
         let report = environment["AGENTTRAINER_RL_VALIDATION_REPORT"].map { URL(fileURLWithPath: $0) }
         let saved = UserDefaults.standard.data(forKey: "AgentTrainer.WorkflowSettings")
         defer {
@@ -42,14 +44,25 @@ enum RLLiveAudit {
         var results: [[String: Any]] = []
         do {
             let manifest = try JSONDecoder().decode(RLAuditManifest.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
-            guard manifest.root.contains("rl-validation"), !manifest.cells.isEmpty,
-                  manifest.cells.allSatisfy({ ["keyboard", "pointer", "relative"].contains($0.task) && $0.seconds > 0 && $0.seconds <= 90 }),
+            let root = URL(fileURLWithPath: manifest.root).standardizedFileURL.resolvingSymlinksInPath()
+            let isolated = URL(fileURLWithPath: workspace).standardizedFileURL.resolvingSymlinksInPath()
+            guard root.pathComponents.contains("rl-validation"), isolated.path.hasPrefix(root.path + "/"),
+                  !manifest.implementation.isEmpty,
+                  manifest.implementation.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }),
+                  !manifest.cells.isEmpty,
+                  manifest.cells.allSatisfy({ ["keyboard", "pointer", "relative"].contains($0.task) && $0.seconds > 0 && $0.seconds <= 90
+                      && (1...240).contains($0.actionFPS) && $0.perceptionFPS > 0 && $0.perceptionFPS <= $0.actionFPS
+                      && (16...1920).contains($0.width) && (16...1080).contains($0.height) && (0...8).contains($0.history) }),
                   manifest.evaluationSeconds >= 0, manifest.evaluationSeconds <= 20 else {
                 throw AgentTrainerError.invalidConfiguration("Invalid bounded audit manifest.")
             }
-            let root = URL(fileURLWithPath: manifest.root)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             await model.bootstrap()
+            if manifest.implementation == "smoke" {
+                let result = try await smoke(model: model, manifest: manifest, root: root)
+                if let report { try write(result, to: report) }
+                return
+            }
             for (index, cell) in manifest.cells.enumerated() {
                 let sources = try await CaptureService.availableSources()
                 guard let source = sources.first(where: { $0.kind == .window && $0.name == "AgentTrainer RL Validation Game" }) else {
@@ -159,9 +172,70 @@ enum RLLiveAudit {
             }
         } catch {
             await model.stopRL()
+            await model.stopAgent()
             if let report { try? write(["error": error.localizedDescription, "results": results], to: report) }
             print("RL_AUDIT_ERROR \(error.localizedDescription)")
         }
+    }
+
+    private static func smoke(model: AppModel, manifest: RLAuditManifest, root: URL) async throws -> [String: Any] {
+        var results: [[String: Any]] = []
+        for cell in manifest.cells {
+            guard let profile = model.profiles.first(where: { $0.name.hasSuffix("-\(cell.task)-\(cell.seed)") }),
+                  let id = profile.activeVersionID,
+                  let fixture = NSRunningApplication.runningApplications(withBundleIdentifier: "local.agenttrainer.rlfixture").first else {
+                throw AgentTrainerError.model("Smoke tests require an existing isolated trained profile and the audit fixture.")
+            }
+            let sources = try await CaptureService.availableSources()
+            guard let source = sources.first(where: { $0.kind == .window && $0.name == "AgentTrainer RL Validation Game" }) else {
+                throw AgentTrainerError.capture("The audit fixture is unavailable.")
+            }
+            let directory = await WorkspaceStore.shared.versionDirectory(profileID: profile.id, versionID: id)
+            let before = try hash(directory.appendingPathComponent("weights.safetensors"))
+            try control(root: root, task: cell.task, seed: 900003, label: "smoke-\(cell.task)-\(cell.seed)")
+            model.captureSources = sources; model.captureKind = .window; model.selectedSourceID = source.id
+            model.selectedProfileID = profile.id; model.runUsesRL = false
+            model.runtimeOutputPermissions = RuntimeOutputPermissions()
+            model.runMouseMode = cell.task == "relative" ? .relative : .absolute
+            model.showVisionPreview = false; model.cnnVisualizationSettings.enabled = false
+            model.safety.stopOnFocusLoss = true; model.safety.stopOnHumanInput = true; model.safety.allowFullMac = false
+            model.safety.controlRegion = CodableRect(CGRect(x: source.frame.minX, y: source.frame.minY + 30,
+                width: source.frame.width, height: source.frame.height * 0.62))
+            _ = fixture.activate(options: [.activateAllWindows])
+            try await Task.sleep(for: .milliseconds(100))
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == fixture.processIdentifier else {
+                throw AgentTrainerError.model("The audit fixture must be focused.")
+            }
+            let controller = InputInjector()
+            controller.tapControllerKey(15)
+            await model.startAgent()
+            guard model.isRunning else { throw AgentTrainerError.model(model.runtimeStatus) }
+            try await Task.sleep(for: .seconds(10))
+            let ran = model.isRunning, fps = model.runtimeMetrics.actionFPS
+            await model.stopAgent()
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == fixture.processIdentifier { controller.tapControllerKey(14) }
+            let after = try hash(directory.appendingPathComponent("weights.safetensors"))
+            guard ran, before == after else { throw AgentTrainerError.model("Ordinary Run stopped early or changed the saved policy.") }
+            var row: [String: Any] = ["task": cell.task, "ordinaryRun": true, "actionFPS": fps,
+                "hashBefore": before, "hashAfter": after]
+            if cell.task == "keyboard" {
+                let checkpoint = await WorkspaceStore.shared.rlCheckpointDirectory(profile: profile)
+                let previous = try JSONDecoder().decode(RLLearningState.self, from: Data(contentsOf: checkpoint.appendingPathComponent("state.json")))
+                try control(root: root, task: cell.task, seed: 700007, label: "smoke-resume")
+                await model.startRL()
+                guard model.isRLTraining else { throw AgentTrainerError.model(model.runtimeStatus) }
+                row["stepsBeforeResume"] = previous.optimizerSteps
+                row["stepsAtResume"] = model.rlMetrics.optimizerSteps
+                try await Task.sleep(for: .seconds(8))
+                await model.stopRL()
+                row["stepsAfterResume"] = model.rlMetrics.optimizerSteps
+                guard model.rlMetrics.optimizerSteps > previous.optimizerSteps else {
+                    throw AgentTrainerError.model("Resume did not apply another optimizer step.")
+                }
+            }
+            results.append(row)
+        }
+        return ["results": results]
     }
 
     private static func evaluate(profile: AIProfile, snapshot: RLWeightSnapshot, weights: URL, source: CaptureSourceOption,
@@ -176,6 +250,9 @@ enum RLLiveAudit {
                 seed: seed, label: label + (deterministic ? "-deterministic" : "-stochastic"))
             let runtime = try AgentRuntime(), reader = RewardReader()
             let state = AuditEvaluationState()
+            runtime.onWillStop = { reason in
+                if let reason { Task { @MainActor in state.failure = reason } }
+            }
             reader.onReading = { reading in Task { @MainActor in state.latest = reading } }
             reader.onFailure = { message in Task { @MainActor in state.failure = message } }
             let c = profile.effectiveRL, caps = c.capabilities(profile: profile, mouseMode: mode)
@@ -214,12 +291,17 @@ enum RLLiveAudit {
                         if accepted.terminal { break }
                     }
                 }
+                if let failure = state.failure { throw AgentTrainerError.model(failure) }
                 runtime.suspendRLActions(); try await runtime.episodeKey(c.endKey)
                 try await Task.sleep(for: .milliseconds(100))
                 await reader.stop(); await runtime.stop(reason: nil)
                 episodes.append(["deterministic": deterministic, "seed": seed, "reward": reducer.reward,
                     "actions": state.count, "ready": reducer.startedAt > 0, "seconds": CACurrentMediaTime() - began])
-            } catch { runtime.suspendRLActions(); await reader.stop(); await runtime.stop(reason: nil); throw error }
+            } catch {
+                runtime.suspendRLActions(); await reader.stop(); await runtime.stop(reason: nil)
+                if let failure = state.failure { throw AgentTrainerError.model(failure) }
+                throw error
+            }
         }
         let after = try hash(weights.appendingPathComponent("weights.safetensors"))
         guard before == after else { throw AgentTrainerError.model("Frozen evaluation changed weights.") }

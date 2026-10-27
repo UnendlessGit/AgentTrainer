@@ -3,10 +3,24 @@
 import json
 from pathlib import Path
 import statistics
+import hashlib
+import struct
 
 repo = Path(__file__).resolve().parents[1]
 root = repo / "work/rl-validation/audit"
 logs = [json.loads(line) for line in (root / "fixture.jsonl").read_text().splitlines()]
+
+def tensor_hash(path):
+    data = path.read_bytes()
+    length = struct.unpack("<Q", data[:8])[0]
+    header = json.loads(data[8:8 + length])
+    digest = hashlib.sha256()
+    for name in sorted(k for k in header if k != "__metadata__"):
+        entry = header[name]
+        digest.update(json.dumps([name, entry["dtype"], entry["shape"]], separators=(",", ":")).encode())
+        begin, end = entry["data_offsets"]
+        digest.update(data[8 + length + begin:8 + length + end])
+    return digest.hexdigest()
 
 def outcomes(label):
     # A label can have multiple episodes, but only independently received
@@ -36,11 +50,14 @@ def arm(name):
     if not path.exists():
         return []
     report = json.loads(path.read_text())
-    if report.get("error"):
+    if report.get("error") and not report.get("results"):
         raise SystemExit(report["error"])
     result = []
     for cell in report["results"]:
         item = {k: cell[k] for k in ["label", "cell", "initialHash", "finalHash", "trainingSeconds", "optimizerSteps", "endedEarly", "status"]}
+        initial = root / cell["label"] / "initial"
+        item["initialTensorSHA256"] = tensor_hash(initial / "weights.safetensors")
+        item["initialHeadsTensorSHA256"] = tensor_hash(initial / "heads.safetensors")
         for key in ["trainingInitialDelta", "policyDelta", "headsDelta"]:
             item[key] = {k: cell[key][k] for k in ["changed", "l2", "max"]}
         item["evaluations"] = {}
@@ -60,13 +77,15 @@ def arm(name):
         result.append(item)
     return result
 
-baseline, improved = arm("baseline"), arm("improved")
+baseline, improved = arm("baseline"), arm("improved") + arm("improved-rest")
 by_key = {(x["cell"]["task"], x["cell"]["seed"]): x for x in baseline}
 pairs = []
 for after in improved:
     key = (after["cell"]["task"], after["cell"]["seed"])
     before = by_key[key]
-    pair = {"task": key[0], "seed": key[1], "identicalInitialPolicy": before["initialHash"] == after["initialHash"], "deltas": {}}
+    pair = {"task": key[0], "seed": key[1],
+            "identicalInitialPolicy": before["initialTensorSHA256"] == after["initialTensorSHA256"],
+            "identicalInitialHeads": before["initialHeadsTensorSHA256"] == after["initialHeadsTensorSHA256"], "deltas": {}}
     for mode in ["deterministic", "stochastic"]:
         original = before["evaluations"]["final-" + mode]
         changed = after["evaluations"]["final-" + mode]
