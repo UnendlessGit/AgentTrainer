@@ -8,6 +8,8 @@ struct RLRuntimeOptions: Sendable {
     var distribution: RLActionDistribution
     var budget: RLComputeBudget? = nil
     var mask: CGRect
+    /// QA evaluation uses the deployed decoder without stochastic exploration.
+    var deterministic = false
     var onDecision: @Sendable (RLDecision) -> Void
 }
 

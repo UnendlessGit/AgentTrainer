@@ -1015,7 +1015,7 @@ final class AgentRuntime: @unchecked Sendable {
                 guard sampled.logProbability.isFinite, sampled.latent.allSatisfy(\.isFinite), outputs[2].item(Float.self).isFinite else {
                     throw AgentTrainerError.model("The RL policy produced a non-finite action or value; inputs were stopped safely.")
                 }
-                values = sampled.prediction
+                values = options.deterministic ? outputs[0].asArray(Float.self) : sampled.prediction
                 let currentTiming = inputs[vision.past.isEmpty ? 1 : 3].asArray(Float.self)
                 let pastTiming = vision.past.isEmpty ? [] : inputs[4].asArray(Float.self)
                 decision = RLDecision(observation: RLObservation(current: vision.packed, past: vision.past.map(\.packed),

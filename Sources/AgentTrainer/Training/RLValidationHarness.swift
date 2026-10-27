@@ -9,6 +9,10 @@ import SwiftUI
 enum RLValidationHarness {
     private static var hasRun = false
     static func run(model: AppModel) async {
+        if ProcessInfo.processInfo.environment["AGENTTRAINER_RL_AUDIT_MANIFEST"] != nil {
+            await RLLiveAudit.run(model: model)
+            return
+        }
         guard !hasRun, ProcessInfo.processInfo.environment["AGENTTRAINER_RL_VALIDATION"] == "1",
               let workspace = ProcessInfo.processInfo.environment["AGENTTRAINER_WORKSPACE_ROOT"],
               let report = ProcessInfo.processInfo.environment["AGENTTRAINER_RL_VALIDATION_REPORT"],
