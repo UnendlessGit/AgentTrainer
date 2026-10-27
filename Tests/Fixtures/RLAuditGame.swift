@@ -191,7 +191,7 @@ final class AuditGame: NSView {
         NSColor.black.setFill(); CGRect(x: 0, y: 280, width: 640, height: 120).fill()
         let a: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedSystemFont(ofSize: 28, weight: .regular), .foregroundColor: NSColor.white]
         String(format: "Reward: %.2f", reward).draw(at: CGPoint(x: 16, y: 292), withAttributes: a)
-        String(format: "Episode Length: %.0f", length).draw(at: CGPoint(x: 16, y: 344), withAttributes: a)
+        String(format: "Episode Length: %.1f", length).draw(at: CGPoint(x: 16, y: 344), withAttributes: a)
     }
 }
 

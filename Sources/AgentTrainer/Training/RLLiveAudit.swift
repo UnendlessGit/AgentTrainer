@@ -123,10 +123,17 @@ enum RLLiveAudit {
                         "backlog": m.backlogActions, "discarded": m.discardedActions,
                         "policyLoss": m.policyLoss, "valueLoss": m.valueLoss, "kl": m.kl,
                         "activeBytes": Memory.snapshot().activeMemory, "cacheBytes": Memory.snapshot().cacheMemory,
+                        "detectedReward": model.rewardPreview?.reading?.reward as Any? ?? NSNull(),
+                        "detectedLength": model.rewardPreview?.reading?.episodeLength as Any? ?? NSNull(),
+                        "detection": model.rewardPreview?.status ?? "none",
                         "status": m.status])
                 }
                 row["trainingSeconds"] = CACurrentMediaTime() - began
                 let endedEarly = !model.isRLTraining
+                if endedEarly, let preview = model.rewardPreview,
+                   let bytes = NSBitmapImageRep(cgImage: preview.image).representation(using: .png, properties: [:]) {
+                    try bytes.write(to: directory.appendingPathComponent("failed-reward.png"))
+                }
                 await model.stopRL()
                 row["endedEarly"] = endedEarly; row["status"] = model.runtimeStatus
                 row["samples"] = samples; row["optimizerSteps"] = model.rlMetrics.optimizerSteps
