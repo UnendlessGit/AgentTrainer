@@ -34,7 +34,7 @@ let package = Package(
         .target(name: "ATRuntime", dependencies: ["ATCore", "ATModel", "ATCapture", "ATLanguage"]),
         .executableTarget(name: "atctl", dependencies: ["ATCore", "ATModel", "ATTraining", "ATLanguage"]),
         .testTarget(name: "ATCoreTests", dependencies: ["ATCore"]),
-        .testTarget(name: "ATModelTests", dependencies: ["ATModel", "ATCore"]),
+        .testTarget(name: "ATModelTests", dependencies: ["ATModel", "ATCore"], resources: [.copy("Fixtures")]),
     ],
     swiftLanguageModes: [.v5]
 )

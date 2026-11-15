@@ -17,3 +17,4 @@ Packages/AgentKit/.build/
 # macOS
 .DS_Store
 *.profraw
+!Packages/AgentKit/Tests/ATModelTests/Fixtures/*.ckpt

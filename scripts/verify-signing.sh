@@ -9,14 +9,14 @@ fail() { echo "✗ $1" >&2; exit 1; }
 
 codesign --verify --deep --strict "$APP" || fail "codesign verification failed for $APP"
 check() {
-  local path=$1 ident=$2
-  local dr; dr=$(codesign -d -r- "$path" 2>&1 | grep '^designated')
-  [[ $dr == *"identifier \"$ident\""* ]] || fail "$path: identifier is not $ident ($dr)"
-  [[ $dr == *"leaf[subject.OU] = $TEAM"* ]] || fail "$path: requirement not pinned to team $TEAM ($dr)"
-  local info; info=$(codesign -dvv "$path" 2>&1)
-  [[ $info == *"TeamIdentifier=$TEAM"* ]] || fail "$path: wrong team"
-  [[ $info == *"flags=0x10000(runtime)"* ]] || fail "$path: hardened runtime missing"
-  [[ $info != *"Signature=adhoc"* ]] || fail "$path: ad-hoc signed"
+  local target=$1 ident=$2
+  local dr; dr=$(codesign -d -r- "$target" 2>&1 | grep '^designated')
+  [[ $dr == *"identifier \"$ident\""* ]] || fail "$target: identifier is not $ident ($dr)"
+  [[ $dr == *"leaf[subject.OU] = $TEAM"* ]] || fail "$target: requirement not pinned to team $TEAM ($dr)"
+  local info; info=$(codesign -dvv "$target" 2>&1)
+  [[ $info == *"TeamIdentifier=$TEAM"* ]] || fail "$target: wrong team"
+  [[ $info == *"flags=0x10000(runtime)"* ]] || fail "$target: hardened runtime missing"
+  [[ $info != *"Signature=adhoc"* ]] || fail "$target: ad-hoc signed"
   echo "✓ $ident  $(echo $info | grep -m1 '^Authority=')"
 }
 check "$APP" com.unendless.AgentTrainer
