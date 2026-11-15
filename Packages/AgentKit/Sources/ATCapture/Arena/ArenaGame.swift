@@ -106,6 +106,18 @@ public final class ArenaGame: @unchecked Sendable {
         return p
     }
 
+    /// Distance from the player to the current goal (chase modes), for takeover rules.
+    public var goalDistance: Double? {
+        switch mode {
+        case .chase, .colorChase: let t = targets[mode == .chase ? 0 : goal].pos; return hypot(t.x - player.x, t.y - player.y)
+        case .aim: return hypot(aimTarget.x - view.x, aimTarget.y - view.y)
+        case .clickButton: return hypot(buttons[goal].rect.midX - pointer.x, buttons[goal].rect.midY - pointer.y)
+        case .typeWord: return Double(word.count - typed.count)
+        }
+    }
+
+    public var nearWall: Bool { mode == .chase || mode == .colorChase ? (player.x < 0.06 || player.x > 0.94 || player.y < 0.1 || player.y > 0.94) : false }
+
     public var debugState: String {
         switch mode {
         case .chase, .colorChase: String(format: "player (%.2f, %.2f) target (%.2f, %.2f)", player.x, player.y, targets[mode == .chase ? 0 : goal].pos.x, targets[mode == .chase ? 0 : goal].pos.y)

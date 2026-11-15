@@ -105,3 +105,48 @@ extension ArenaEvaluator {
         return (Double(okA) / Double(n), Double(okB) / Double(n), Double(pressed) / Double(n))
     }
 }
+
+
+extension ArenaEvaluator {
+    /// Writes a correction recording: the model plays; the expert takes over (like a person would)
+    /// when the model stops making progress or runs into a wall, then hands control back. The model's
+    /// own stretches are kept as history but masked from the loss (Pixel2Play's correction data).
+    @discardableResult
+    public static func correctionRecording(model: PolicyModel, mode: ArenaGame.Mode, seconds: Double, seed: UInt64,
+                                           destination: URL, name: String, encoder: InstructionEncoder? = nil) throws -> (url: URL, expertShare: Double) {
+        let rate = model.architecture.stepRateHz, size = model.architecture.frameSize
+        let stepper = PolicyStepper(model: model)
+        let resizer = FrameResizer()!
+        let feed = model.architecture.usesDecoderMemory ? LanguageFeed(architecture: model.architecture, encoder: encoder) : nil
+        var textCache: [String: [Float]] = [:]
+        var takeover = 0, expertSteps = 0, total = 0
+        var best = Double.infinity, sinceProgress = 0
+        var lastInstruction: String?
+        let url = try ArenaRecorder.generate(mode: mode, seconds: seconds, rateHz: rate, seed: seed, destination: destination, name: name) { game, pb, _ in
+            total += 1
+            if game.instruction != lastInstruction { best = .infinity; sinceProgress = 0; lastInstruction = game.instruction }
+            let frame: MLXArray = resizer.resize(pb, size: size) { MLXArray(Data($0), [size, size, 3], dtype: .uint8) }!
+            var text: [Float]?
+            if let ins = game.instruction, let encoder {
+                if textCache[ins] == nil { textCache[ins] = try? encoder.embed([ins]).first }
+                text = textCache[ins]
+            }
+            if let feed { feed.setInstruction(game.instruction); if case .some(let l) = feed.update() { stepper.setLanguage(l) } }
+            if let d = game.goalDistance {
+                if d < best - 0.01 { best = d; sinceProgress = 0 } else { sinceProgress += 1 }
+            }
+            if takeover == 0, sinceProgress > Int(1.5 * Double(rate)) || game.nearWall { takeover = 2 * rate; sinceProgress = 0; best = .infinity }
+            if takeover > 0 {
+                takeover -= 1
+                expertSteps += 1
+                let a = game.expertAction()
+                _ = stepper.step(frame: frame, text: text, previousAction: model.actions.encode(a))
+                return (a, false)
+            }
+            var a = model.actions.decode(stepper.step(frame: frame, text: text).classes)
+            a.absX = game.pointer.x; a.absY = game.pointer.y
+            return (a, true)
+        }
+        return (url, Double(expertSteps) / Double(max(total, 1)))
+    }
+}

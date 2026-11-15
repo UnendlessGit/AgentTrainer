@@ -32,6 +32,8 @@ do {
         try ArenaCommands.generate(rest)
     case "train":
         try ArenaCommands.train(rest)
+    case "arena-correct":
+        try ArenaCommands.corrections(rest)
     case "arena-eval":
         try ArenaCommands.evaluate(rest)
     case "embed":

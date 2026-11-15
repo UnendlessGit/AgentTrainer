@@ -13,6 +13,7 @@ struct ArenaView: View {
     @State private var result: String?
     @State private var syncResult: String?
     @State private var selectedModel: UUID?
+    @State private var correcting = false
 
     var body: some View {
         ScrollView {
@@ -35,6 +36,9 @@ struct ArenaView: View {
                             ForEach(app.models.models.filter { !$0.checkpoints.isEmpty }) { Text($0.definition.name).tag(Optional($0.id)) }
                         }
                         Button(evaluating ? "Playing…" : "Play 3 × 60 s") { Task { await evaluate() } }.disabled(evaluating || selectedModel == nil)
+                        Button(correcting ? "Recording corrections…" : "Record 5 min of corrections") { Task { await corrections() } }
+                            .disabled(correcting || evaluating || selectedModel == nil)
+                            .help("The model plays; the expert takes over when it gets stuck, like you would in Run. Adds a correction recording to the Library for further training.")
                         if let result { Text(result).font(.callout.monospaced()).fixedSize(horizontal: false, vertical: true) }
                         Text("Runs the model closed-loop in the simulator (it sees rendered frames and its own actions drive the game) and compares with the expert and with random input.").font(.caption).foregroundStyle(.secondary)
                     }
@@ -98,6 +102,25 @@ struct ArenaView: View {
                 return lines.joined(separator: "\n") + String(format: "\n%@ → %.0f%% of the expert's performance", ckpt, rel * 100)
             } catch { return error.localizedDescription }
         }.value
+    }
+
+    func corrections() async {
+        guard let e = app.models.entry(selectedModel) else { return }
+        correcting = true
+        defer { correcting = false }
+        let url = e.url, m = mode, root = app.settings.paths.pretrainedRoot
+        let folder = app.library.fs.root.appendingPathComponent("Test Arena", isDirectory: true).appendingPathComponent("Corrections", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        result = await Task.detached {
+            do {
+                let (model, _, _) = try ModelLoader.load(url)
+                let r = try ArenaEvaluator.correctionRecording(model: model, mode: m, seconds: 300, seed: UInt64(Date().timeIntervalSince1970),
+                                                               destination: folder, name: "\(m.rawValue) corrections \(Date().formatted(.dateTime.hour().minute()))",
+                                                               encoder: LanguageModels.instructionEncoder(pretrainedRoot: root))
+                return String(format: "Saved corrections (expert in control %.0f%% of the time). Select them with the demonstrations in Training and continue training.", r.expertShare * 100)
+            } catch { return error.localizedDescription }
+        }.value
+        app.library.refresh()
     }
 
     func analyzeSync() {

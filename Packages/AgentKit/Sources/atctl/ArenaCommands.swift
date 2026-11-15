@@ -72,6 +72,23 @@ enum ArenaCommands {
         trainer.run()
     }
 
+    /// atctl arena-correct --model m.atmodel --mode chase --minutes 10 --out <folder>
+    static func corrections(_ args: [String]) throws {
+        let o = Options(args)
+        let (model, _, ckpt) = try ModelLoader.load(URL(fileURLWithPath: o.value("--model") ?? "model.atmodel"))
+        let mode = ArenaGame.Mode(rawValue: o.value("--mode") ?? "chase")!
+        let out = URL(fileURLWithPath: o.value("--out") ?? "arena-corrections")
+        try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        let enc = LanguageModels.instructionEncoder(pretrainedRoot: AppPaths.standard.pretrainedRoot)
+        let episodes = o.int("--episodes", 4)
+        let seconds = o.double("--minutes", 10) * 60 / Double(episodes)
+        for e in 0 ..< episodes {
+            let r = try ArenaEvaluator.correctionRecording(model: model, mode: mode, seconds: seconds, seed: UInt64(20_000 + e + o.int("--seed", 0)),
+                                                           destination: out, name: "\(mode.rawValue)-corrections-\(ckpt)-\(e)", encoder: enc)
+            print(String(format: "wrote %@ (expert in control %.0f%% of the time)", r.url.lastPathComponent, r.expertShare * 100))
+        }
+    }
+
     /// atctl arena-eval --model <x.atmodel> --mode chase [--seconds 60] [--temperature 1]
     static func evaluate(_ args: [String]) throws {
         let o = Options(args)
@@ -89,7 +106,7 @@ enum ArenaCommands {
                                             temperature: Float(o.double("--temperature", 1)), useHistory: !o.flag("--no-history"),
                                             embed: { t in try? enc?.embed([t]).first }, encoder: enc,
                                             trace: o.flag("--trace") && s == 0 ? { i, a, st in
-                                                if i < 120 && i % 3 == 0 { print("  t=\(i) keys=\(a.keys.sorted()) \(st)") }
+                                                if (i < 120 && i % 3 == 0) || i % 60 == 0 { print("  t=\(i) keys=\(a.keys.sorted()) \(st)") }
                                             } : nil)
             print("episode \(s) [\(ckpt)]: \(r)")
             results.append(r)

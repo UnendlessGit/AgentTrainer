@@ -1,4 +1,5 @@
 import ATCore
+import ATRuntime
 import AVKit
 import SwiftUI
 
@@ -10,6 +11,9 @@ struct RecordingDetailView: View {
     @State private var activity: [ActivityRow] = []
     @State private var currentTime = 0.0
     @State private var timeObserver: Any?
+    @State private var comparison: ReplayInspector.Result?
+    @State private var comparing = false
+    @State private var compareError: String?
 
     init(app: AppModel, recording: LibraryRecording) {
         self.app = app
@@ -41,6 +45,7 @@ struct RecordingDetailView: View {
                     player.seek(to: CMTime(seconds: t, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
                 }
                 .frame(height: CGFloat(max(activity.count, 1)) * 14 + 34)
+                replayInspector
                 infoGrid
                 AnnotationEditor(annotations: $annotations, currentTime: currentTime, duration: recording.meta.duration, app: app, recording: recording)
             }
@@ -60,6 +65,38 @@ struct RecordingDetailView: View {
             player.pause()
             if let o = timeObserver { player.removeTimeObserver(o) }
         }
+    }
+
+    /// Replay Inspector: what a trained model would have pressed at each moment, under yours.
+    private var replayInspector: some View {
+        let trained = app.models.models.filter { !$0.checkpoints.isEmpty }
+        return Card(title: "Compare with a model", symbol: "person.2.wave.2") {
+            HStack {
+                Menu(comparing ? "Running…" : "Choose model") {
+                    ForEach(trained) { m in
+                        Button(m.definition.name) { Task { await compare(m) } }
+                    }
+                }
+                .fixedSize()
+                .disabled(comparing || trained.isEmpty)
+                Text(trained.isEmpty ? "Train a model first." : "Runs the model on the next 60 s from the playhead, with your real action history.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let e = compareError { Text(e).font(.caption).foregroundStyle(.orange) }
+            if let c = comparison {
+                Text(String(format: "From %@: the model chose exactly your keys %.0f%% of the time", c.start.durationText, c.keyAgreement * 100)).font(.callout)
+                KeyComparisonStrip(result: c).frame(height: 120)
+            }
+        }
+    }
+
+    private func compare(_ m: ModelEntry) async {
+        comparing = true; compareError = nil
+        defer { comparing = false }
+        let url = m.url, rec = recording.url, start = currentTime
+        do {
+            comparison = try await Task.detached(priority: .userInitiated) { try ReplayInspector.compare(modelURL: url, recording: rec, from: start, seconds: 60) }.value
+        } catch { compareError = error.localizedDescription }
     }
 
     private var infoGrid: some View {
@@ -221,5 +258,30 @@ struct TimeField: View {
     @Binding var value: Double
     var body: some View {
         TextField("", value: $value, format: .number.precision(.fractionLength(1))).monospacedDigit().multilineTextAlignment(.trailing)
+    }
+}
+
+/// Your keys (top) vs. the model's (bottom) for the most used keys in the window.
+struct KeyComparisonStrip: View {
+    let result: ReplayInspector.Result
+    var body: some View {
+        let counts = result.human.flatMap(\.keys).reduce(into: [String: Int]()) { $0[$1, default: 0] += 1 }
+            .merging(result.model.flatMap(\.keys).reduce(into: [String: Int]()) { $0[$1, default: 0] += 1 }, uniquingKeysWith: +)
+        let keys = counts.sorted { $0.value > $1.value }.prefix(4).map(\.key)
+        Canvas { ctx, size in
+            let n = max(result.human.count, 1), labelW: CGFloat = 70, w = size.width - labelW
+            let rowH = size.height / CGFloat(max(keys.count * 2, 1))
+            for (ki, k) in keys.enumerated() {
+                for (j, (seq, name)) in [(result.human, "You"), (result.model, "Model")].enumerated() {
+                    let y = CGFloat(ki * 2 + j) * rowH
+                    ctx.draw(Text("\(KeyCatalog.info(k)?.label.uppercased() ?? k) · \(name)").font(.caption2).foregroundStyle(.secondary), at: CGPoint(x: 2, y: y + rowH / 2), anchor: .leading)
+                    for (t, a) in seq.enumerated() where a.keys.contains(k) {
+                        ctx.fill(Path(CGRect(x: labelW + w * CGFloat(t) / CGFloat(n), y: y + 2, width: max(1, w / CGFloat(n)), height: rowH - 4)),
+                                 with: .color(j == 0 ? .accentColor : .green))
+                    }
+                }
+            }
+        }
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
     }
 }

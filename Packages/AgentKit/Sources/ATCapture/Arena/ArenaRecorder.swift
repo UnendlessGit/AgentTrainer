@@ -13,9 +13,12 @@ public enum ArenaRecorder {
         return pb
     }
 
+    /// Decides each step's action. Returns the action and whether a model (not the expert/person) chose it.
+    public typealias Policy = (_ game: ArenaGame, _ frame: CVPixelBuffer, _ step: Int) -> (action: TimestepAction, byModel: Bool)
+
     @discardableResult
     public static func generate(mode: ArenaGame.Mode, seconds: Double, rateHz: Int = 30, pixelSize: Int = 480, proxySize: Int = 192,
-                                seed: UInt64, destination: URL, name: String) throws -> URL {
+                                seed: UInt64, destination: URL, name: String, policy: Policy? = nil) throws -> URL {
         let game = ArenaGame(mode: mode, seed: seed)
         let pkg = destination.appendingPathComponent(name).appendingPathExtension(RecordingPackage.fileExtension)
         try? FileManager.default.removeItem(at: pkg)
@@ -38,6 +41,8 @@ public enum ArenaRecorder {
         var annotations = RecordingAnnotations()
         var currentInstruction: (text: String, start: Double)?
         var thumb: CGImage?
+        var modelRanges: [TimeRange] = []
+        var modelStart: Double?
         for k in 0 ..< n {
             let t = Int64(k) * stepNs
             game.render(into: pb)
@@ -53,13 +58,16 @@ public enum ArenaRecorder {
                 currentInstruction = (ins, now)
             }
 
-            let a = game.expertAction()
+            let (a, byModel) = policy?(game, pb, k) ?? (game.expertAction(), false)
+            if byModel, modelStart == nil { modelStart = now }
+            if !byModel, let s0 = modelStart { modelRanges.append(TimeRange(start: s0, end: now)); modelStart = nil }
+            let flag: UInt8 = byModel ? 1 : 0
             // Input happens after the frame was shown, inside this step's window.
             for key in held.subtracting(a.keys) {
-                events.append(BinaryRecords.encode(InputEventRecord(timeNs: t + 3_000_000, kind: .keyUp, code: KeyCatalog.info(key)!.keyCode)))
+                events.append(BinaryRecords.encode(InputEventRecord(timeNs: t + 3_000_000, kind: .keyUp, flags: flag, code: KeyCatalog.info(key)!.keyCode)))
             }
             for key in a.keys.subtracting(held) {
-                events.append(BinaryRecords.encode(InputEventRecord(timeNs: t + 4_000_000, kind: .keyDown, code: KeyCatalog.info(key)!.keyCode)))
+                events.append(BinaryRecords.encode(InputEventRecord(timeNs: t + 4_000_000, kind: .keyDown, flags: flag, code: KeyCatalog.info(key)!.keyCode)))
             }
             held = a.keys
             let px = Float(a.absX * Double(pixelSize)), py = Float(a.absY * Double(pixelSize))
@@ -76,6 +84,8 @@ public enum ArenaRecorder {
             game.step(a, dt: 1 / Double(rateHz))
         }
         if let c = currentInstruction { annotations.segments.append(TextSegment(start: c.start, end: seconds + 1, text: c.text, source: .auto)) }
+        if let s0 = modelStart { modelRanges.append(TimeRange(start: s0, end: seconds + 1)) }
+        annotations.modelControlled = modelRanges
         try proxy.finish()
         vin.markAsFinished()
         let sem = DispatchSemaphore(value: 0)
@@ -91,6 +101,7 @@ public enum ArenaRecorder {
         meta.eventCount = events.count / InputEventRecord.size
         meta.proxySizes = [proxySize]
         meta.eventClock = "synthetic"
+        meta.isCorrectionRun = policy != nil
         try RecordingIO.writeMeta(meta, to: pkg)
         try RecordingIO.writeAnnotations(annotations, to: pkg)
         if let img = thumb, let dest = CGImageDestinationCreateWithURL(pkg.appendingPathComponent(RecordingPackage.thumbnail) as CFURL, "public.jpeg" as CFString, 1, nil) {
