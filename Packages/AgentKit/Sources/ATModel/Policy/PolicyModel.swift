@@ -60,6 +60,8 @@ public final class PolicyModel: Module {
     @ParameterInfo(key: "thinking") var thinking: MLXArray
     @ParameterInfo(key: "action_out") var actionOut: MLXArray
     @ParameterInfo(key: "action_pos") var actionPos: MLXArray
+    /// Stands in for past actions that are hidden (history dropout, or running without history).
+    @ParameterInfo(key: "action_unknown") var actionUnknown: MLXArray
     @ModuleInfo var decoder: ActionDecoder
     @ModuleInfo(key: "emb_key") var embKey: Embedding
     @ModuleInfo(key: "emb_pointer") var embPointer: Embedding
@@ -69,6 +71,12 @@ public final class PolicyModel: Module {
     @ModuleInfo(key: "head_pointer") var headPointer: Linear
     @ModuleInfo(key: "head_x") var headX: Linear
     @ModuleInfo(key: "head_y") var headY: Linear
+
+    /// Recompute activations in backward (needed to fit 10 s clips in memory).
+    public var gradientCheckpointing = false
+    /// Frames per clip that get gradients through the EfficientNet stem (0 = all frames).
+    public var visionGradientFrames = 32
+    private var layerCheckpoints: [ModuleCheckpoint<TransformerLayer>] = []
 
     public let architecture: PolicyArchitecture
     public let actions: ActionSpaceConfig
@@ -96,6 +104,7 @@ public final class PolicyModel: Module {
         _thinking.wrappedValue = MLXRandom.normal([a.thinkingTokens, d]) * 0.05
         _actionOut.wrappedValue = MLXRandom.normal([1, d]) * 0.05
         _actionPos.wrappedValue = MLXRandom.normal([actions.slotCount, d]) * 0.05
+        _actionUnknown.wrappedValue = MLXArray.zeros([actions.slotCount, d])
         _decoder.wrappedValue = ActionDecoder(width: d, layers: a.decoderLayers, heads: a.decoderHeads,
                                               sinks: a.decoderSinks, slots: actions.slotCount, dropout: dropout)
         func emb(_ n: Int) -> Embedding {
@@ -121,12 +130,39 @@ public final class PolicyModel: Module {
 
     /// uint8 `[N, H, W, 3]` RGB → `[N, D]` image tokens (P2P: `/255`, no mean/std).
     func imageTokens(_ frames: MLXArray) -> MLXArray {
+        let n = frames.dim(0)
+        guard training, visionGradientFrames > 0, n > visionGradientFrames else { return vision(normalize(frames)) + imgPos }
+        // Stem gradient sampling: every frame goes through the EfficientNet stem without gradients,
+        // a random subset is recomputed with gradients (scaled by n/k so the estimate is unbiased).
+        // BatchNorm statistics are frozen in training, so both passes give identical values.
+        let k = visionGradientFrames
+        let all = stopGradient(vision.stem(normalize(frames))).reshaped(n, -1)
+        let order = argSort(MLXRandom.uniform(0 ..< 1, [n]))[0 ..< k]
+        let sub = vision.stem(normalize(frames[order])).reshaped(k, -1)
+        let mixed = all.at[order].add((sub - stopGradient(sub)) * (Float(n) / Float(k)))
+        return vision.norm(vision.proj(mixed)) + imgPos
+    }
+
+    func normalize(_ frames: MLXArray) -> MLXArray {
         var f = frames.asType(computeDType) / 255
         if architecture.grayscale {
             let g = (f[.ellipsis, 0 ..< 1] * 0.299 + f[.ellipsis, 1 ..< 2] * 0.587 + f[.ellipsis, 2 ..< 3] * 0.114)
             f = concatenated([g, g, g], axis: -1)
         }
-        return vision(f) + imgPos
+        return f
+    }
+
+    /// Training mode with frozen BatchNorm statistics in the vision stem (affine parameters still learn).
+    public func setTraining() {
+        train(true)
+        for (_, m) in vision.namedModules() where m is BatchNorm { m.train(false) }
+    }
+
+    /// Excludes BatchNorm running statistics from the trainable parameters (no weight decay on them).
+    public func freezeBatchNormStatistics() {
+        for (_, m) in vision.namedModules() where m is BatchNorm {
+            m.freeze(recursive: false, keys: ["running_mean", "running_var"])
+        }
     }
 
     /// `[N, 768]` text embeddings + `[N]` presence → `[N, D]` text tokens.
@@ -198,7 +234,7 @@ public final class PolicyModel: Module {
     /// - text: `[B, T, 768]` instruction embeddings, `textPresent`: bool `[B, T]`
     /// - thinkingExtra: optional `[B, T, D]` added to the first thinking token (screen-text summary)
     public func callAsFunction(frames: MLXArray, actionsIn: MLXArray, text: MLXArray, textPresent: MLXArray,
-                               thinkingExtra: MLXArray? = nil) -> PolicyLogits {
+                               thinkingExtra: MLXArray? = nil, historyKeep: MLXArray? = nil) -> PolicyLogits {
         let B = frames.dim(0), T = frames.dim(1), D = width, S = actions.slotCount
         let img = imageTokens(frames.reshaped(B * T, frames.dim(2), frames.dim(3), frames.dim(4))).reshaped(B, T, 1, D)
         let txt = textTokens(text.reshaped(B * T, -1), present: textPresent.reshaped(B * T)).reshaped(B, T, 1, D)
@@ -209,11 +245,22 @@ public final class PolicyModel: Module {
         }
         let aOut = broadcast(actionOut.expandedDimensions(axes: [0, 1]), to: [B, T, 1, D])
         let actEmb = actionEmbeddings(actionsIn)
-        let act = actEmb + actionPos
+        var act = actEmb + actionPos
+        if let keep = historyKeep {
+            act = which(keep.reshaped(B, T, 1, 1), act, broadcast(actionUnknown + actionPos, to: act.shape).asType(act.dtype))
+        }
         var x = concatenated([txt, img, think, aOut, act], axis: 2).reshaped(B, T * layout.tokensPerStep, D)
         debugTrace["seq_in"] = x
+        if gradientCheckpointing && training && layerCheckpoints.count != backbone.count {
+            layerCheckpoints = backbone.map { l in ModuleCheckpoint(l) { m, a in [m(a[0], mask: a[1])] } }
+        }
         for (i, layer) in backbone.enumerated() {
-            x = layer(x, mask: mask(steps: T, history: history(forLayer: i, steps: T)))
+            let m = mask(steps: T, history: history(forLayer: i, steps: T))
+            if gradientCheckpointing && training {
+                x = layerCheckpoints[i]([x, m])[0]
+            } else {
+                x = layer(x, mask: m)
+            }
             if i == 0 { debugTrace["layer0"] = x }
         }
         debugTrace["seq_out"] = x

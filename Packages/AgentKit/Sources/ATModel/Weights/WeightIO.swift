@@ -21,11 +21,16 @@ extension PolicyModel {
     public func loadWeights(from url: URL) throws {
         let loaded = try loadArrays(url: url)
         let current = Dictionary(uniqueKeysWithValues: parameters().flattened())
+        // Parameters added after a checkpoint was written keep their (neutral) initial values.
+        let optional: Set<String> = ["action_unknown"]
         for (k, v) in current {
-            guard let w = loaded[k] else { throw WeightIOError.mismatch("missing \(k)") }
+            guard let w = loaded[k] else {
+                if optional.contains(k) { continue }
+                throw WeightIOError.mismatch("missing \(k)")
+            }
             guard w.shape == v.shape else { throw WeightIOError.mismatch("\(k) is \(w.shape), expected \(v.shape)") }
         }
-        update(parameters: ModuleParameters.unflattened(current.keys.map { ($0, loaded[$0]!.asType(current[$0]!.dtype)) }))
+        update(parameters: ModuleParameters.unflattened(current.keys.compactMap { k in loaded[k].map { (k, $0.asType(current[k]!.dtype)) } }))
         eval(self)
     }
 }

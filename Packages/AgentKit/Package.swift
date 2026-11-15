@@ -15,6 +15,8 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.33.0")),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", revision: "6352907543270ae9c61fcaf59cb3e07b0b989ea1", traits: []),
+        .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMinor(from: "1.4.0")),
     ],
     targets: [
         .target(name: "ATCore"),
@@ -29,10 +31,18 @@ let package = Package(
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
             ]),
         .target(name: "ATCapture", dependencies: ["ATCore"]),
-        .target(name: "ATLanguage", dependencies: ["ATCore", "ATModel"]),
-        .target(name: "ATTraining", dependencies: ["ATCore", "ATModel", "ATLanguage"]),
+        .target(
+            name: "ATLanguage",
+            dependencies: [
+                "ATCore", "ATModel",
+                .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
+                .product(name: "MLXVLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ]),
+        .target(name: "ATTraining", dependencies: ["ATCore", "ATModel", "ATLanguage", "ATCapture"]),
         .target(name: "ATRuntime", dependencies: ["ATCore", "ATModel", "ATCapture", "ATLanguage"]),
-        .executableTarget(name: "atctl", dependencies: ["ATCore", "ATModel", "ATTraining", "ATLanguage"]),
+        .executableTarget(name: "atctl", dependencies: ["ATCore", "ATModel", "ATTraining", "ATLanguage", "ATCapture", "ATRuntime"]),
         .testTarget(name: "ATCoreTests", dependencies: ["ATCore"]),
         .testTarget(name: "ATModelTests", dependencies: ["ATModel", "ATCore"], resources: [.copy("Fixtures")]),
     ],

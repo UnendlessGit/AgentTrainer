@@ -63,9 +63,33 @@ public struct TrainingHyperparameters: Codable, Hashable, Sendable {
     public var augmentations: [Augmentation] = Augmentation.allCases
     public var augmentationStrength = 1.0
     public var instructionDropout = 0.25
+    /// Fraction of past-action tokens hidden during training (in random spans). Forces the model to
+    /// decide from what it sees instead of copying its previous actions (anti-copycat).
+    public var historyDropout = 0.5
     public var bf16 = true
     public var seed = 0
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case learningRate, weightDecay, beta1, beta2, warmupSteps, schedule, minLRFactor, gradientClip, zLossWeight, batchSize
+        case gradientAccumulation, totalSteps, validationFraction, validateEverySteps, checkpointEveryMinutes, augmentations
+        case augmentationStrength, instructionDropout, historyDropout, bf16, seed
+    }
+
+    public init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        let def = TrainingHyperparameters()
+        func v<T: Decodable>(_ k: CodingKeys, _ x: T) -> T { (try? c.decodeIfPresent(T.self, forKey: k)) ?? x }
+        learningRate = v(.learningRate, def.learningRate); weightDecay = v(.weightDecay, def.weightDecay)
+        beta1 = v(.beta1, def.beta1); beta2 = v(.beta2, def.beta2); warmupSteps = v(.warmupSteps, def.warmupSteps)
+        schedule = v(.schedule, def.schedule); minLRFactor = v(.minLRFactor, def.minLRFactor); gradientClip = v(.gradientClip, def.gradientClip)
+        zLossWeight = v(.zLossWeight, def.zLossWeight); batchSize = v(.batchSize, def.batchSize)
+        gradientAccumulation = v(.gradientAccumulation, def.gradientAccumulation); totalSteps = v(.totalSteps, def.totalSteps)
+        validationFraction = v(.validationFraction, def.validationFraction); validateEverySteps = v(.validateEverySteps, def.validateEverySteps)
+        checkpointEveryMinutes = v(.checkpointEveryMinutes, def.checkpointEveryMinutes); augmentations = v(.augmentations, def.augmentations)
+        augmentationStrength = v(.augmentationStrength, def.augmentationStrength); instructionDropout = v(.instructionDropout, def.instructionDropout)
+        historyDropout = v(.historyDropout, def.historyDropout); bf16 = v(.bf16, def.bf16); seed = v(.seed, def.seed)
+    }
 
     public static var fineTune: TrainingHyperparameters {
         var h = TrainingHyperparameters(); h.learningRate = 3e-5; h.warmupSteps = 100; return h

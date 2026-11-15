@@ -337,6 +337,9 @@ struct TrainingSettingsSection: View {
             LabeledSlider(title: "Held-out recordings", value: $training.validationFraction, range: 0 ... 0.4, step: 0.05, format: { "\(Int($0 * 100))%" })
             Stepper("Validate every \(training.validateEverySteps) steps", value: $training.validateEverySteps, in: 50 ... 10000, step: 50)
             LabeledSlider(title: "Checkpoint every", value: $training.checkpointEveryMinutes, range: 2 ... 60, step: 1, format: { "\(Int($0)) min" })
+            LabeledSlider(title: "Action-history dropout", value: $training.historyDropout, range: 0 ... 0.9, step: 0.05, format: { "\(Int($0 * 100))%" })
+            Text("Hides past actions from the model during training so it learns to act on what it sees instead of copying itself. Raise it if the model keeps repeating actions in Run.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("bf16 mixed precision", isOn: $training.bf16)
             VStack(alignment: .leading) {
                 Text("Augmentations (same for every frame of a clip, as in Pixel2Play)").font(.callout)

@@ -64,6 +64,9 @@ public final class RecordingSession: @unchecked Sendable {
     private var stopped = false
     private var meta: RecordingMeta
 
+    /// Host time of the first captured frame (recording time zero).
+    public var firstFrameHostNs: UInt64? { lock.lock(); defer { lock.unlock() }; return firstFrameHost }
+
     public var stats: RecordingStats {
         lock.lock(); defer { lock.unlock() }
         var s = _stats

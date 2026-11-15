@@ -7,3 +7,8 @@ extension PolicyModel {
         vision(frames.asType(computeDType) / 255)
     }
 }
+
+extension PolicyModel {
+    /// Image tokens through the training path (checkpointed when enabled), for memory diagnostics.
+    public func debugImageTokens(_ frames: MLXArray) -> MLXArray { imageTokens(frames) }
+}

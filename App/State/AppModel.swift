@@ -39,6 +39,8 @@ final class AppModel {
     let training: TrainingController
     let runner: RunController
     let downloads: DownloadCenter
+    let hub: HubDownloads
+    let labels: LabelController
     var tab: AppTab = .recordings
     var selectedModelID: UUID?
 
@@ -49,10 +51,14 @@ final class AppModel {
         library = LibraryStore(root: s.paths.libraryRoot)
         models = ModelStore(root: s.paths.modelsRoot)
         downloads = DownloadCenter(paths: s.paths)
+        hub = HubDownloads(pretrainedRoot: s.paths.pretrainedRoot)
+        labels = LabelController(settings: s)
         recorder = RecorderController(settings: s, library: library)
         training = TrainingController(settings: s, models: models, library: library)
         runner = RunController(settings: s, models: models)
         selectedModelID = models.models.first?.id
+        runner.library = library
+        labels.onFinished = { [weak library] in library?.refresh() }
         registerHotkeys()
     }
 

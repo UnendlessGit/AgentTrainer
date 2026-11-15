@@ -24,6 +24,8 @@ public final class PolicyStepper {
     public let model: PolicyModel
     public let contextSteps: Int
     public var temperature: Float = 1
+    /// When false, past actions are hidden from the model (it decides from what it sees only).
+    public var useActionHistory = true
     /// RoPE positions are rebased once they exceed this (kept small enough for fp32 angle precision).
     public var rebaseThreshold = 1 << 20
 
@@ -105,7 +107,7 @@ public final class PolicyStepper {
         if let p = previousAction { previous = MLXArray(p).reshaped(1, S) }
 
         // Tokens: actions(t-1) then [text, image, thinking, a_out](t).
-        let act = m.actionEmbeddings(previous) + m.actionPos
+        let act = useActionHistory ? m.actionEmbeddings(previous) + m.actionPos : (m.actionUnknown + m.actionPos).expandedDimensions(axis: 0)
         let txt = textTokenFor(text)
         let img = m.imageTokens(frame.reshaped(1, frame.dim(0), frame.dim(1), frame.dim(2))).reshaped(1, 1, D)
         var think = m.thinking.expandedDimensions(axis: 0)

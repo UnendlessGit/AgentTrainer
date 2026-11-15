@@ -24,6 +24,18 @@ do {
         try StreamParityCommand.run(rest)
     case "profile":
         try ProfileCommand.run(rest)
+    case "train-bench":
+        try TrainBenchCommand.run(rest)
+    case "vision-mem":
+        try VisionMemCommand.run(rest)
+    case "arena-gen":
+        try ArenaCommands.generate(rest)
+    case "train":
+        try ArenaCommands.train(rest)
+    case "arena-eval":
+        try ArenaCommands.evaluate(rest)
+    case "embed":
+        try EmbedCommand.run(rest)
     case "bench":
         try BenchCommand.run(rest)
     default:

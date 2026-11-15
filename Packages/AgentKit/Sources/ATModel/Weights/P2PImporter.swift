@@ -176,3 +176,24 @@ public enum P2PImporter {
         if map.count < classes { report.partiallyTransferred.append("\(ours) vocabulary (\(map.count)/\(classes) classes from P2P)") }
     }
 }
+
+extension P2PImporter {
+    /// Copies only P2P's EfficientNet stem (and its BatchNorm statistics) - a strong starting point
+    /// for blank models of any width.
+    public static func loadVisionStem(checkpoint url: URL, into model: PolicyModel) throws {
+        let reader = try TorchCheckpointReader(url: url)
+        let sd = try reader.stateDict()
+        var out: [(String, MLXArray)] = []
+        let current = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        for (k, ref) in sd where k.hasPrefix("bc_transformer.image_tokenizer.efficientnet_preprocess.") {
+            let rest = String(k.dropFirst("bc_transformer.image_tokenizer.efficientnet_preprocess.".count))
+            guard !rest.hasSuffix("num_batches_tracked"), let target = mapEfficientNet(rest, stageOffsets: [0, 1, 3, 5, 8]) else { continue }
+            var v = try reader.load(ref).asType(.float32)
+            if v.ndim == 4 { v = v.transposed(0, 2, 3, 1) }
+            let name = "vision.stem." + target
+            if let c = current[name], c.shape == v.shape { out.append((name, v.asType(c.dtype))) }
+        }
+        model.update(parameters: ModuleParameters.unflattened(out))
+        eval(model)
+    }
+}
