@@ -16,7 +16,9 @@ struct RunPreferences: Codable {
     var dryRun = false
     var focusGuard = true
     var recordCorrections = false
-    var useActionHistory = true
+    /// Off by default: with little training data, models fed their own past actions tend to repeat
+    /// themselves (copycat). Pixel2Play feeds history; turn it on for large datasets.
+    var useActionHistory = false
     var hud = HUDOptions()
 
     init() {}
@@ -107,6 +109,7 @@ final class RunController {
             o.useActionHistory = prefs.useActionHistory
             o.pauseOnHumanInput = settings.stored.pauseOnHumanInput
             o.captureMaxHeight = settings.stored.captureMaxHeight
+            o.keepGPUWarm = settings.stored.keepGPUWarm
             let st = settings.stored
             o.hotkeys = [st.recordHotkey, st.runHotkey, st.pauseHotkey, st.emergencyHotkey].map { ($0.keyCode, $0.cgFlags) }
             let rt = try AgentRuntime(model: model, definition: def, target: target, options: o)
@@ -148,6 +151,7 @@ final class RunController {
     func stop() {
         guard isRunning else { return }
         runtime?.stop()
+        runtime?.waitUntilStopped()
         timer?.invalidate()
         hud.hide()
         isRunning = false

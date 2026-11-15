@@ -31,8 +31,12 @@ public final class Trainer: @unchecked Sendable {
     private func log(_ s: String) { emit(.log(s)) }
 
     public func run() {
+        // Training can take hours: don't let App Nap or idle sleep slow it down or stop it.
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled], reason: "Training an AI model")
+        defer { ProcessInfo.processInfo.endActivity(activity) }
         do {
-            try train()
+            // MLX errors (e.g. a shape that doesn't fit) become a failed job instead of a crash.
+            try withError { mlxErrors in try train(mlxErrors) }
         } catch is CancellationError {
             emit(.phase(.stopped, "Stopped"))
         } catch {
@@ -43,7 +47,7 @@ public final class Trainer: @unchecked Sendable {
 
     // MARK: Setup
 
-    private func train() throws {
+    private func train(_ mlxErrors: ErrorBox) throws {
         emit(.phase(.preparing, "Reading model"))
         var def = try ModelPackage.read(request.modelURL)
         let hp = def.training
@@ -216,11 +220,13 @@ public final class Trainer: @unchecked Sendable {
                     inputs += [l.screenEmbeddings ?? empty, l.screenBoxes ?? empty, l.screenMask ?? empty, l.typingBytes ?? empty]
                 }
                 let (values, grads) = vg(compute, inputs)
+                try mlxErrors.check()
                 let g32 = grads.mapValues { $0.asType(.float32) }
                 accumulated = accumulated.map { acc in
                     ModuleParameters.unflattened(zip(acc.flattened(), g32.flattened()).map { ($0.0.0, $0.0.1 + $0.1.1) })
                 } ?? g32
                 eval(values, accumulated!)
+                try mlxErrors.check()
                 for (i, v) in values.enumerated() { losses[i] += Double(v.item(Float.self)) / Double(accumulation) }
             }
             var grads = accumulated!
@@ -235,6 +241,7 @@ public final class Trainer: @unchecked Sendable {
             opt.update(model: master, gradients: grads)
             compute.update(parameters: ModuleParameters.unflattened(master.trainableParameters().flattened().map { ($0.0, $0.1.asType(computeType)) }))
             eval(master, opt, compute)
+            try mlxErrors.check()
             step += 1
             lastLoss = losses[0]
             smoothed = smoothed.map { $0 * 0.9 + losses[0] * 0.1 } ?? losses[0]

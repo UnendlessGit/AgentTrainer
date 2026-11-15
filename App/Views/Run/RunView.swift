@@ -45,7 +45,8 @@ struct RunView: View {
                         LabeledSlider(title: "Mouse sensitivity", value: $run.prefs.sensitivity, range: 0.25 ... 3, step: 0.05, format: { String(format: "%.2f×", $0) })
                         Picker("Mouse output", selection: $run.prefs.mouseMode) { ForEach(MouseOutputMode.allCases, id: \.self) { Text($0.label).tag($0) } }
                         Toggle("Only act while the target is in front", isOn: $run.prefs.focusGuard)
-                        Toggle("Use action history (turn off if the model keeps repeating itself)", isOn: $run.prefs.useActionHistory)
+                        Toggle("Feed the model its own past actions", isOn: $run.prefs.useActionHistory)
+                            .help("Pixel2Play does this. With small datasets models often play better without it, because they stop copying their own previous actions.")
                         Toggle("Dry run (show actions in the HUD, send nothing)", isOn: $run.prefs.dryRun)
                         Toggle("Record my corrections for training", isOn: $run.prefs.recordCorrections)
                         Button("Test mouse control on the target") { Task { await run.mouseTest() } }

@@ -139,7 +139,7 @@ public final class PolicyModel: Module {
         let dropout = Float(a.dropout)
         _vision.wrappedValue = ConvTokenizer(frameSize: a.frameSize, width: d, stochasticDepth: Float(a.stochasticDepth))
         _backbone.wrappedValue = (0 ..< a.layers).map { _ in
-            TransformerLayer(width: d, heads: a.heads, kvHeads: a.kvHeads, dropout: dropout, sinks: 0)
+            TransformerLayer(width: d, heads: a.heads, kvHeads: a.resolvedKVHeads, dropout: dropout, sinks: 0)
         }
         _textProj.wrappedValue = Linear(a.textEmbeddingDim, d, bias: false)
         _imgPos.wrappedValue = MLXRandom.normal([1, d]) * 0.05

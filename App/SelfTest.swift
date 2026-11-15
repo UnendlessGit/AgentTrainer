@@ -1,6 +1,9 @@
 import AppKit
 import ATCapture
 import ATCore
+import ATModel
+import MLX
+import ATRuntime
 import ScreenCaptureKit
 
 /// `--selftest-capture <dir>`: records AgentTrainer's own Sync Check window with the real
@@ -56,5 +59,126 @@ enum CaptureSelfTest {
         } catch {
             report.append("FAIL: \(error.localizedDescription)")
         }
+    }
+}
+
+
+/// `--selftest-run <model.atmodel> <dir>`: a trained model plays AgentTrainer's own arena window live
+/// (real capture → model → synthetic keys). Keys are only sent while that window is in front.
+@MainActor
+enum RunSelfTest {
+    static func runIfRequested() async {
+        guard let i = CommandLine.arguments.firstIndex(of: "--selftest-run"), i + 2 < CommandLine.arguments.count else { return }
+        let modelURL = URL(fileURLWithPath: CommandLine.arguments[i + 1]), out = URL(fileURLWithPath: CommandLine.arguments[i + 2])
+        try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        var report: [String] = []
+        func mark(_ s: String) { report.append(s); try? report.joined(separator: "\n").write(to: out.appendingPathComponent("run-report.txt"), atomically: true, encoding: .utf8) }
+        defer {
+            try? report.joined(separator: "\n").write(to: out.appendingPathComponent("run-report.txt"), atomically: true, encoding: .utf8)
+            NSApp.terminate(nil)
+        }
+        mark("stage: start")
+        let view = ArenaGameView(mode: .chase)
+        ArenaWindows.show(view, title: "AgentTrainer Test Arena — selftest")
+        NSApp.activate(ignoringOtherApps: true)
+        try? await Task.sleep(for: .seconds(1.5))
+        do {
+            mark("stage: loading model")
+            let (model, def, ckpt) = try await Task.detached { try ModelLoader.load(modelURL) }.value
+            let bench: Double = await Task.detached {
+                let st = PolicyStepper(model: model)
+                let frames = PolicyModel.randomFrames(4, size: def.architecture.frameSize)
+                for i in 0 ..< 40 { _ = st.step(frame: frames[i % 4], text: nil) }
+                var total = 0.0
+                for i in 0 ..< 120 {
+                    let t0 = Date()
+                    _ = st.step(frame: frames[i % 4], text: nil)
+                    total += Date().timeIntervalSince(t0)
+                    Thread.sleep(forTimeInterval: 0.018)
+                }
+                return total / 120 * 1000
+            }.value
+            mark(String(format: "in-app stepper only (paced): %.1f ms/step", bench))
+            mark("stage: listing targets")
+            let (targets, own) = try await CaptureTargets.load()
+            guard let target = targets.first(where: { ($0.info.title ?? "").hasPrefix("AgentTrainer Test Arena") }) else { report.append("FAIL: arena window not found"); return }
+            var o = RuntimeOptions()
+            o.permissions.mouseMovement = false; o.permissions.mouseButtons = false; o.permissions.scroll = false
+            o.pauseOnHumanInput = false
+            o.focusGuard = true
+            o.useActionHistory = !CommandLine.arguments.contains("--no-history")
+            if CommandLine.arguments.contains("--dry") { o.dryRun = true }
+            if let j = CommandLine.arguments.firstIndex(of: "--capture-fps"), let f = Int(CommandLine.arguments[j + 1]) { o.captureFPS = f }
+            if let j = CommandLine.arguments.firstIndex(of: "--capture-height"), let h = Int(CommandLine.arguments[j + 1]) { o.captureMaxHeight = h }
+            if CommandLine.arguments.contains("--no-warm") { o.keepGPUWarm = false }
+            let rt = try AgentRuntime(model: model, definition: def, target: target, options: o)
+            mark("stage: starting runtime")
+            try await rt.start(excluding: own)
+            mark("stage: running")
+            let start = view.game.score
+            try? await Task.sleep(for: .seconds(30))
+            let s = rt.currentStats
+            rt.stop()
+            rt.waitUntilStopped()
+            report.append("model \(def.name) \(ckpt), \(def.architecture.stepRateHz) Hz, history \(o.useActionHistory), GPU warm \(o.keepGPUWarm)")
+            report.append(String(format: "live: %.1f decisions/s, model step %.1f ms, preprocess %.1f ms, frame age %.1f ms, screen→action %.1f ms, missed ticks %d, steps %d",
+                                 s.fps, s.modelMs, s.preprocessMs, s.frameAgeMs, s.endToEndMs, s.droppedTicks, s.steps))
+            report.append(String(format: "step time: %.1f ms (steps 50-150), %.1f ms (last 100)", s.earlyStepMs, s.lateStepMs))
+            report.append(String(format: "MLX memory: active %.0f MB, cache %.0f MB, peak %.0f MB", Double(MLX.GPU.activeMemory) / 1e6, Double(MLX.GPU.cacheMemory) / 1e6, Double(MLX.GPU.peakMemory) / 1e6))
+            report.append("score in 30 s: \(view.game.score - start)")
+            if !s.pauseReason.isEmpty { report.append("note: \(s.pauseReason)") }
+        } catch {
+            report.append("FAIL: \(error.localizedDescription)")
+        }
+    }
+}
+
+/// `--selftest-train <data dir> <dir>`: submits a short training job to the XPC engine, like the Training tab.
+@MainActor
+enum EngineTrainSelfTest {
+    static func runIfRequested(app: AppModel) async {
+        guard let i = CommandLine.arguments.firstIndex(of: "--selftest-train"), i + 2 < CommandLine.arguments.count else { return }
+        let data = URL(fileURLWithPath: CommandLine.arguments[i + 1]), out = URL(fileURLWithPath: CommandLine.arguments[i + 2])
+        try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        var report: [String] = []
+        defer {
+            try? report.joined(separator: "\n").write(to: out.appendingPathComponent("train-report.txt"), atomically: true, encoding: .utf8)
+            NSApp.terminate(nil)
+        }
+        var def = ModelDefinition.make(.compact, name: "selftest")
+        def.training.totalSteps = 20
+        def.training.validateEverySteps = 20
+        def.architecture.memorySeconds = 4
+        let modelURL = out.appendingPathComponent("selftest.atmodel")
+        try? FileManager.default.removeItem(at: modelURL)
+        do { try ModelPackage.write(def, to: modelURL) } catch { report.append("FAIL: \(error)"); return }
+        let recs = LibraryFileSystem(root: data).recordings(in: data, recursive: true).map(\.url)
+        let entry = ModelEntry(url: modelURL, definition: def, checkpoints: [])
+        app.training.selection[def.id] = Set(recs.prefix(3))
+        app.training.start(model: entry)
+        let t0 = Date()
+        var pausedOnce = false
+        while Date().timeIntervalSince(t0) < 600 {
+            try? await Task.sleep(for: .seconds(1))
+            if let p = app.training.phase, [.finished, .failed, .stopped].contains(p) { break }
+            // Exercise pause/resume over XPC once training is under way.
+            if !pausedOnce, app.training.phase == .training, (app.training.progress.last?.step ?? 0) >= 3 {
+                pausedOnce = true
+                let before = app.training.progress.last?.step ?? 0
+                app.training.control("pause")
+                var sawPaused = false
+                for _ in 0 ..< 30 { try? await Task.sleep(for: .seconds(1)); if app.training.phase == .paused { sawPaused = true; break } }
+                let during = app.training.progress.last?.step ?? 0
+                try? await Task.sleep(for: .seconds(4))
+                let after = app.training.progress.last?.step ?? 0
+                report.append("pause: phase paused \(sawPaused), steps \(before)→\(during)→\(after) while paused (should not advance)")
+                app.training.control("resume")
+            }
+        }
+        report.append("phase: \(app.training.phase?.rawValue ?? "none") · \(app.training.message)")
+        if let e = app.training.errorMessage { report.append("error: \(e)") }
+        if let p = app.training.progress.last { report.append(String(format: "steps %d, loss %.3f, %.0f frames/s", p.step, p.loss, p.framesPerSecond)) }
+        if let v = app.training.validation.last { report.append(String(format: "validation key F1 %.2f", v.keyF1)) }
+        report.append("checkpoints: \(ModelPackage.checkpointNames(modelURL))")
     }
 }

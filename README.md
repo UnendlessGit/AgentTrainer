@@ -26,7 +26,7 @@ starting point. Details, extensions and measured numbers: [`docs/ARCHITECTURE.md
 
 Measured on an M3 Max (36 GB):
 
-- **Inference**: P2P-150M with 10 s of memory at 30 Hz: 13 ms per step (~76 FPS); 300M: ~48 FPS.
+- **Inference**: P2P-150M with 10 s of memory at 30 Hz: 13 ms per step (~76 FPS); 300M: ~48 FPS. In a live run on the Test Arena: 30.1 decisions/s, 14.5 ms per step, 25 ms screen → action, no missed ticks.
 - **Training**: 10-second clips at 30 Hz, ~1.4 s per clip (bf16 compute, fp32 master weights), ~11 GB peak.
 - **Sync**: key press → captured frame 16 ms median, ±5 ms jitter.
 

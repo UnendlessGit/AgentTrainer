@@ -1,4 +1,5 @@
 import ATCore
+import ATCapture
 import ATModel
 import Foundation
 import MLX
@@ -29,11 +30,27 @@ enum BenchCommand {
         print("warming up (\(warm) steps to fill memory)…")
         for i in 0 ..< warm { _ = stepper.step(frame: frames[i % 8], text: nil) }
         var times: [Double] = []
-        for i in 0 ..< n {
-            let t0 = DispatchTime.now().uptimeNanoseconds
-            _ = stepper.step(frame: frames[i % 8], text: nil)
-            times.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+        let paced = o.int("--paced", 0)
+        let warmer = o.flag("--warm") ? GPUWarmer() : nil
+        let body = {
+            var next = HostClock.now()
+            for i in 0 ..< n {
+                if paced > 0 { next += UInt64(1_000_000_000 / paced); HostClock.sleep(untilNanoseconds: next) }
+                warmer?.finish()
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                _ = stepper.step(frame: frames[i % 8], text: nil, previousAction: o.flag("--prev") ? [0, 0, 0, 0, 0, 0, 11, 8] : nil)
+                times.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+                if paced > 0 { warmer?.fill(until: next + UInt64(1_000_000_000 / paced)) }
+            }
         }
+        if o.flag("--thread") {
+            let done = DispatchSemaphore(value: 0)
+            let t = Thread { body(); done.signal() }
+            t.qualityOfService = .userInteractive
+            t.stackSize = 16 << 20
+            t.start()
+            done.wait()
+        } else { body() }
         times.sort()
         func p(_ q: Double) -> Double { times[min(times.count - 1, Int(Double(times.count) * q))] }
         let mean = times.reduce(0, +) / Double(times.count)

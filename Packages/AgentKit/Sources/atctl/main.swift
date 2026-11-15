@@ -38,6 +38,8 @@ do {
         try ArenaCommands.evaluate(rest)
     case "embed":
         try EmbedCommand.run(rest)
+    case "label":
+        try LabelCommand.run(rest)
     case "bench":
         try BenchCommand.run(rest)
     default:

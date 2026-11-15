@@ -74,7 +74,27 @@ struct StoredSettings: Codable {
     var mlxMemoryLimitGB = 24.0
     var inferenceQuantized = false
     var pauseOnHumanInput = true
+    var keepGPUWarm = true
     var reduceRecordingWhileTraining = true
+
+    /// Decodes saved settings on top of the defaults, so settings added in later versions (and any
+    /// that fail to decode) fall back to their defaults instead of resetting everything.
+    static func decodeMerging(_ data: Data) -> StoredSettings? {
+        guard let saved = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let defaultsData = try? JSONEncoder().encode(StoredSettings()),
+              var merged = try? JSONSerialization.jsonObject(with: defaultsData) as? [String: Any] else { return nil }
+        for (k, v) in saved { merged[k] = v }
+        if let d = try? JSONSerialization.data(withJSONObject: merged), let s = try? JSONDecoder().decode(StoredSettings.self, from: d) { return s }
+        // A single bad value: keep the defaults for the keys that don't decode.
+        var result = merged
+        for (k, v) in saved {
+            var trial = merged
+            trial[k] = v
+            if let d = try? JSONSerialization.data(withJSONObject: trial), (try? JSONDecoder().decode(StoredSettings.self, from: d)) != nil { result[k] = v } else { result[k] = merged[k] }
+        }
+        guard let d = try? JSONSerialization.data(withJSONObject: result) else { return nil }
+        return try? JSONDecoder().decode(StoredSettings.self, from: d)
+    }
 }
 
 /// App-wide preferences, persisted in UserDefaults.
@@ -83,7 +103,7 @@ final class AppSettings {
     var stored: StoredSettings { didSet { save() } }
 
     init() {
-        if let d = UserDefaults.standard.data(forKey: "settings"), let s = try? JSONDecoder().decode(StoredSettings.self, from: d) {
+        if let d = UserDefaults.standard.data(forKey: "settings"), let s = StoredSettings.decodeMerging(d) {
             stored = s
         } else {
             stored = StoredSettings()

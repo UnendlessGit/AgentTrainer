@@ -32,6 +32,8 @@ public struct PolicyArchitecture: Codable, Hashable, Sendable {
 
     public var contextSteps: Int { max(2, Int((memorySeconds * Double(stepRateHz)).rounded())) }
     public var headDim: Int { width / heads }
+    /// Key/value heads actually used: `kvHeads` when it divides `heads`, otherwise one per query head.
+    public var resolvedKVHeads: Int { kvHeads >= 1 && kvHeads <= heads && heads % kvHeads == 0 ? kvHeads : heads }
     public var decoderHeadDim: Int { width / decoderHeads }
     public var ffnHidden: Int { Self.swigluHidden(width) }
     public static func swigluHidden(_ d: Int) -> Int { 8 * ((Int(2 * (4 * d) / 3) + 7) / 8) }
@@ -52,6 +54,6 @@ public struct PolicyArchitecture: Codable, Hashable, Sendable {
     public static var p2p150M: PolicyArchitecture { PolicyArchitecture() }
     public static var p2p300M: PolicyArchitecture { var a = PolicyArchitecture(); a.layers = 20; return a }
     public static var compact60M: PolicyArchitecture {
-        var a = PolicyArchitecture(); a.width = 768; a.layers = 6; a.heads = 12; a.decoderHeads = 6; a.decoderLayers = 2; return a
+        var a = PolicyArchitecture(); a.width = 768; a.layers = 6; a.heads = 12; a.kvHeads = 12; a.decoderHeads = 6; a.decoderLayers = 2; return a
     }
 }

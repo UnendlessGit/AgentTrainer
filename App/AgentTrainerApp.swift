@@ -21,14 +21,35 @@ struct AgentTrainerMain {
     }
 }
 
+/// Runs headless self-tests and debug modes as soon as the app has launched (independent of windows).
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard CommandLine.arguments.contains(where: { $0.hasPrefix("--selftest") || $0 == "--ui-snapshot" }) else { return }
+        Task { @MainActor in
+            let app = AppModel.shared
+            await UISnapshotter.runIfRequested(app: app)
+            await CaptureSelfTest.runIfRequested()
+            await RunSelfTest.runIfRequested()
+            await EngineTrainSelfTest.runIfRequested(app: app)
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Stop a running model (releasing any held keys) before the process exits.
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { AppModel.shared.runner.stop() }
+    }
+}
+
 struct AgentTrainerApp: App {
-    @State private var app = AppModel()
-    @State private var showPermissions = !PrivacyPermission.allCases.allSatisfy(\.isGranted) && !CommandLine.arguments.contains("--ui-snapshot") && !CommandLine.arguments.contains("--selftest-capture")
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @State private var app = AppModel.shared
+    @State private var showPermissions = !PrivacyPermission.allCases.allSatisfy(\.isGranted) && !CommandLine.arguments.contains("--ui-snapshot") && !CommandLine.arguments.contains(where: { $0.hasPrefix("--selftest") })
 
     var body: some Scene {
         Window("AgentTrainer", id: "main") {
             RootView(app: app)
-                .task { await UISnapshotter.runIfRequested(app: app); await CaptureSelfTest.runIfRequested() }
                 .sheet(isPresented: $showPermissions) {
                     PermissionsView()
                         .frame(width: 560)
@@ -118,6 +139,9 @@ enum UISnapshotter {
         let dir = URL(fileURLWithPath: CommandLine.arguments[i + 1])
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? await Task.sleep(for: .seconds(2))
+        if !NSApp.windows.contains(where: { $0.isVisible && $0.title == "AgentTrainer" }) {
+            NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
+        }
         let only = CommandLine.arguments.firstIndex(of: "--tab").map { CommandLine.arguments[$0 + 1] }
         for tab in AppTab.allCases where only == nil || only == tab.rawValue {
             app.tab = tab

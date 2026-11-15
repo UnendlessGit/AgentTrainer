@@ -69,6 +69,22 @@ final class SelfAttention: Module {
         return (q, k, v)
     }
 
+    /// Same as `projectQKV` with the RoPE offset as an array (lets the step be compiled once).
+    func projectQKV(_ x: MLXArray, ropeOffset: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        let (B, T) = (x.dim(0), x.dim(1))
+        let qkv = cAttn(x)
+        let qw = heads * headDim, kw = kvHeads * headDim
+        var q = qNorm(qkv[.ellipsis, 0 ..< qw])
+        var k = kNorm(qkv[.ellipsis, qw ..< qw + kw])
+        var v = qkv[.ellipsis, (qw + kw)...]
+        q = q.reshaped(B, T, heads, headDim).transposed(0, 2, 1, 3)
+        k = k.reshaped(B, T, kvHeads, headDim).transposed(0, 2, 1, 3)
+        v = v.reshaped(B, T, kvHeads, headDim).transposed(0, 2, 1, 3)
+        q = MLXFast.RoPE(q, dimensions: headDim, traditional: true, base: 10_000, scale: 1, offset: ropeOffset)
+        k = MLXFast.RoPE(k, dimensions: headDim, traditional: true, base: 10_000, scale: 1, offset: ropeOffset)
+        return (q, k, v)
+    }
+
     /// Attention over `keys`/`values` (already including any cache), then output projection.
     /// `mask` is boolean `[T, S]` (true = may attend), sinks are prepended and always visible.
     func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, mask: MLXArray?) -> MLXArray {

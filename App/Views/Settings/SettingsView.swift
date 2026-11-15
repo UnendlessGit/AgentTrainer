@@ -35,6 +35,8 @@ struct SettingsView: View {
                 LabeledSlider(title: "GPU memory limit", value: $settings.stored.mlxMemoryLimitGB, range: 8 ... 32, step: 1, format: { "\(Int($0)) GB" })
                 Toggle("8-bit weights when running models (slightly faster, tiny accuracy cost)", isOn: $settings.stored.inferenceQuantized)
                 Toggle("Pause the AI when I touch the keyboard or mouse", isOn: $settings.stored.pauseOnHumanInput)
+                Toggle("Keep the GPU clocked up while a model runs", isOn: $settings.stored.keepGPUWarm)
+                    .help("Runs a tiny GPU task between model steps so macOS doesn't lower the GPU clock. Without it, steps can take 2–3× longer once a run has been going for a few seconds. Uses a little more power.")
                 Text(verbatim: "\(SystemInfo.chipName) · \(ProcessInfo.processInfo.physicalMemory / 1_073_741_824) GB unified memory · \(ProcessInfo.processInfo.activeProcessorCount) CPU cores")
                     .font(.caption).foregroundStyle(.secondary)
             }

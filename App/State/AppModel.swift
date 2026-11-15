@@ -32,6 +32,7 @@ enum AppTab: String, CaseIterable, Identifiable {
 /// Root state shared by every tab.
 @MainActor @Observable
 final class AppModel {
+    static let shared = AppModel()
     let settings: AppSettings
     let library: LibraryStore
     let models: ModelStore

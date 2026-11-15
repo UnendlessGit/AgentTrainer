@@ -43,6 +43,38 @@ public final class PolicyStepper {
     private var language: LanguageInputs?
     private var textCacheKey: [Float]?
     private var textToken: MLXArray?
+    // Per-step pieces compiled once with fixed shapes (weights captured as constants): far fewer
+    // GPU dispatches than op-by-op execution, which matters when the GPU is shared with a game.
+    private lazy var compiledVision: ([MLXArray]) -> [MLXArray] = {
+        let m = model
+        return compile { a in [m.imageTokens(a[0])] }
+    }()
+
+    private lazy var compiledMask: ([MLXArray]) -> [MLXArray] = {
+        let tps = self.tps, img = Int32(layout.imageTypeCount), aOut = Int32(layout.aOutIndex), hist = Int32(contextSteps - 1)
+        return compile { a in
+            let t = MLXArray(Int32(tps))
+            let qPos = a[0], kPos = a[1], valid = a[2]
+            let qs = floorDivide(qPos, t).expandedDimensions(axis: 1), qr = (qPos % t).expandedDimensions(axis: 1)
+            let ks = floorDivide(kPos, t).expandedDimensions(axis: 0), kr = (kPos % t).expandedDimensions(axis: 0)
+            return [PolicyLayout.maskOps(qs: qs, qr: qr, ks: ks, kr: kr, imageTypes: img, aOut: aOut, history: hist) .&& valid.expandedDimensions(axis: 0)]
+        }
+    }()
+
+    private lazy var compiledQKV: [([MLXArray]) -> [MLXArray]] = model.backbone.map { layer in
+        compile { a in
+            let (q, k, v) = layer.attention.projectQKV(layer.attentionNorm(a[0]), ropeOffset: a[1])
+            return [q, k, v]
+        }
+    }
+
+    private lazy var compiledAttendFFN: [([MLXArray]) -> [MLXArray]] = model.backbone.map { layer in
+        compile { a in
+            let h = a[0] + layer.attention.attend(a[1], a[2], a[3], mask: a[4])
+            return [h + layer.ffn(layer.ffnNorm(h))]
+        }
+    }
+
     /// Sampling loop compiled once (weights are captured as constants; recreate the stepper after reloading weights).
     private lazy var compiledDecode: ([MLXArray]) -> [MLXArray] = makeDecoder(withMemory: false)
     private lazy var compiledDecodeWithMemory: ([MLXArray]) -> [MLXArray] = makeDecoder(withMemory: true)
@@ -81,8 +113,8 @@ public final class PolicyStepper {
         capacity = cap
         let a = model.architecture
         let dt = model.computeDType
-        keys = (0 ..< a.layers).map { _ in MLXArray.zeros([1, a.kvHeads, cap, a.headDim], dtype: dt) }
-        values = (0 ..< a.layers).map { _ in MLXArray.zeros([1, a.kvHeads, cap, a.headDim], dtype: dt) }
+        keys = (0 ..< a.layers).map { _ in MLXArray.zeros([1, a.resolvedKVHeads, cap, a.headDim], dtype: dt) }
+        values = (0 ..< a.layers).map { _ in MLXArray.zeros([1, a.resolvedKVHeads, cap, a.headDim], dtype: dt) }
         slotPos = Array(repeating: 0, count: cap)
         slotValid = Array(repeating: false, count: slotPos.count)
         previous = MLXArray.zeros([1, model.actions.slotCount], dtype: .int32)
@@ -109,7 +141,7 @@ public final class PolicyStepper {
     /// - previousAction: what actually happened during the last step (defaults to what the model sampled).
     /// - forced: teacher-forced classes for this step's decoder (parity tests / replay evaluation).
     public func step(frame: MLXArray, text: [Float]?, previousAction: [Int32]? = nil, forced: [Int32]? = nil,
-                     thinkingExtra: MLXArray? = nil, returnLogits: Bool = false) -> StepResult {
+                     thinkingExtra: MLXArray? = nil, returnLogits: Bool = false, imageToken: MLXArray? = nil) -> StepResult {
         rebaseIfNeeded()
         let m = model
         let D = m.width, S = m.actions.slotCount
@@ -126,7 +158,7 @@ public final class PolicyStepper {
         // Tokens: actions(t-1) then [text, image, thinking, a_out](t).
         let act = useActionHistory ? m.actionEmbeddings(previous) + m.actionPos : (m.actionUnknown + m.actionPos).expandedDimensions(axis: 0)
         let txt = textTokenFor(text)
-        let img = m.imageTokens(frame.reshaped(1, frame.dim(0), frame.dim(1), frame.dim(2))).reshaped(1, 1, D)
+        let img = (imageToken ?? compiledVision([frame.reshaped(1, frame.dim(0), frame.dim(1), frame.dim(2))])[0]).reshaped(1, 1, D)
         var think = m.thinking.expandedDimensions(axis: 0)
         if let extra = thinkingExtra {
             let first = think[0..., 0 ..< 1, 0...] + extra.reshaped(1, 1, D).asType(think.dtype)
@@ -145,14 +177,14 @@ public final class PolicyStepper {
             slotValid[first + j] = !(stepIndex == 0 && j < S)
         }
         let qPos = MLXArray(Int32(blockStart) ..< Int32(blockStart + tps))
-        let mask = streamingMask(qPos: qPos)
+        let mask = compiledMask([qPos, MLXArray(slotPos), MLXArray(slotValid)])[0]
+        let offset = MLXArray(Int32(blockStart))
 
-        for (l, layer) in m.backbone.enumerated() {
-            let (q, k, v) = layer.attention.projectQKV(layer.attentionNorm(x), ropeOffset: blockStart)
-            keys[l][0..., 0..., first ..< first + tps, 0...] = k
-            values[l][0..., 0..., first ..< first + tps, 0...] = v
-            let h = x + layer.attention.attend(q, keys[l], values[l], mask: mask)
-            x = h + layer.ffn(layer.ffnNorm(h))
+        for l in m.backbone.indices {
+            let qkv = compiledQKV[l]([x, offset])
+            keys[l][0..., 0..., first ..< first + tps, 0...] = qkv[1]
+            values[l][0..., 0..., first ..< first + tps, 0...] = qkv[2]
+            x = compiledAttendFFN[l]([x, qkv[0], keys[l], values[l], mask])[0]
         }
         let aOutState = x[0..., tps - 1, 0...] // a_out is the last token of the pass
         lastAOutState = aOutState
@@ -166,10 +198,11 @@ public final class PolicyStepper {
             let classes = memory != nil
                 ? compiledDecodeWithMemory([aOutState, u, MLXArray(max(temperature, 1e-4)), memory!, memoryMask!])[0]
                 : compiledDecode([aOutState, u, MLXArray(max(temperature, 1e-4))])[0]
-            previous = classes.reshaped(1, S)
             eval(classes, keys, values)
+            let c = canonical(classes.asArray(Int32.self))
+            previous = MLXArray(c).reshaped(1, S)
             stepIndex += 1
-            return StepResult(classes: classes.asArray(Int32.self), logits: nil)
+            return StepResult(classes: c, logits: nil)
         }
         var inputs: [MLXArray] = []
         var sampled: [MLXArray] = []
@@ -191,11 +224,31 @@ public final class PolicyStepper {
             inputs.append(m.embedSlot(s, cls).reshaped(1, 1, D))
         }
         let classes = concatenated(sampled, axis: 0)
-        previous = classes.reshaped(1, S)
         if returnLogits { eval(classes, keys, values, allLogits) } else { eval(classes, keys, values) }
+        let c = forced ?? canonical(classes.asArray(Int32.self))
+        previous = MLXArray(c).reshaped(1, S)
         stepIndex += 1
-        return StepResult(classes: classes.asArray(Int32.self),
+        return StepResult(classes: c,
                           logits: returnLogits ? allLogits.map { $0.asArray(Float.self) } : nil)
+    }
+
+    /// Runs the (compiled) vision encoder on a frame and keeps the GPU clocked up between ticks.
+    /// Returns the image token so a step can reuse it if no newer frame arrived.
+    public func encode(frame: MLXArray) -> MLXArray {
+        let t = compiledVision([frame.reshaped(1, frame.dim(0), frame.dim(1), frame.dim(2))])[0]
+        eval(t)
+        return t
+    }
+
+    /// The model samples each slot separately; training only ever shows sorted, de-duplicated,
+    /// zero-padded key / pointer sets. Feed back (and return) the same canonical form.
+    func canonical(_ c: [Int32]) -> [Int32] {
+        let ks = model.actions.keySlots, ps = model.actions.pointerSlots
+        func group(_ r: Range<Int>) -> [Int32] {
+            let v = Array(Set(c[r].filter { $0 > 0 })).sorted()
+            return Array((v + Array(repeating: 0, count: r.count)).prefix(r.count))
+        }
+        return group(0 ..< ks) + group(ks ..< ks + ps) + Array(c[(ks + ps)...])
     }
 
     private func textTokenFor(_ text: [Float]?) -> MLXArray {

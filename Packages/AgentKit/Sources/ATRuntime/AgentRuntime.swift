@@ -21,6 +21,9 @@ public struct RuntimeOptions: Sendable {
     public var focusGuard = true
     /// Feed the model its past actions (as in training). Off = decide from the screen only.
     public var useActionHistory = true
+    /// Keep the GPU clocked up between steps with a tiny filler kernel. Without it the GPU drops to a
+    /// low clock when the model leaves it idle half the time, and steps get 2-3× slower.
+    public var keepGPUWarm = true
     public var captureMaxHeight = 720
     public var captureFPS = 60
     public var hotkeys: [(code: UInt16, modifiers: CGEventFlags)] = []
@@ -39,6 +42,9 @@ public struct RuntimeStats: Sendable, Equatable {
     public var paused = false
     public var pauseReason = ""
     public var actionsPerSecond = 0.0
+    /// Mean model-step time over steps 50-150 and over the last 100 steps (diagnostics).
+    public var earlyStepMs = 0.0
+    public var lateStepMs = 0.0
     public init() {}
 }
 
@@ -57,14 +63,23 @@ public final class AgentRuntime: @unchecked Sendable {
     private var screenItems: [ScreenTextItem]?
     private let ocrQueue = DispatchQueue(label: "agenttrainer.ocr", qos: .utility)
     private var ocrTimer: DispatchSourceTimer?
+    /// Keeps macOS from napping / deprioritizing AgentTrainer while the game is in front.
+    private var activity: NSObjectProtocol?
+    /// Frontmost app, kept current by workspace notifications (asking NSWorkspace every tick is slow).
+    private var frontmostPID: pid_t = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+    private var workspaceObserver: NSObjectProtocol?
     public var onStop: ((String?) -> Void)?
 
-    private let stepper: PolicyStepper
+    /// Created on the loop thread itself: MLX work stays on that thread's stream.
+    private var stepper: PolicyStepper!
     private let capturer = ScreenCapturer()
     private let tap = InputTap()
     private let executor = ActionExecutor()
     private let resizer: FrameResizer
     private let lock = NSLock()
+    /// Signalled when the loop thread has finished (keys released, MLX idle).
+    private let loopFinished = DispatchSemaphore(value: 0)
+    private var loopStarted = false
     private var latest: CapturedFrame?
     private var running = false
     private var paused = false
@@ -89,7 +104,6 @@ public final class AgentRuntime: @unchecked Sendable {
         self.definition = definition
         self.target = target
         self.options = options
-        stepper = PolicyStepper(model: model)
         guard let r = FrameResizer() else { throw NSError(domain: "AgentTrainer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Metal is unavailable"]) }
         resizer = r
     }
@@ -106,8 +120,6 @@ public final class AgentRuntime: @unchecked Sendable {
         guard AXIsProcessTrusted() || options.dryRun else {
             throw NSError(domain: "AgentTrainer", code: 2, userInfo: [NSLocalizedDescriptionKey: "AgentTrainer needs Accessibility permission to press keys and move the mouse."])
         }
-        stepper.temperature = options.temperature
-        stepper.useActionHistory = options.useActionHistory
         executor.mouseMode = options.mouseMode
         executor.sensitivity = options.mouseSensitivity
         capturer.onFrame = { [weak self] f in
@@ -115,12 +127,20 @@ public final class AgentRuntime: @unchecked Sendable {
             self.lock.lock(); self.latest = f; self.lock.unlock()
         }
         capturer.onStop = { [weak self] e in self?.stop(reason: e?.localizedDescription ?? "Capture stopped") }
-        let settings = CaptureSettings.fitting(target, maxHeight: options.captureMaxHeight, fps: options.captureFPS, showsCursor: !(definition.actions.mouseMode == .absolute))
+        let settings = CaptureSettings.fitting(target, maxHeight: options.captureMaxHeight, fps: options.captureFPS,
+                                               showsCursor: definition.actions.mouseMode != .absolute)
         try await capturer.start(target, settings: settings, excluding: own)
         tap.ignoredHotkeys = options.hotkeys
         tap.onEvent = { [weak self] e in self?.human(e) }
-        try? tap.start() // without Input Monitoring the model still runs; takeover detection is off
+        // Takeover detection needs the tap (and Input Monitoring); without it the model still runs.
+        if options.pauseOnHumanInput { try? tap.start() }
         running = true
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil) { [weak self] n in
+            guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            self?.lock.lock(); self?.frontmostPID = app.processIdentifier; self?.lock.unlock()
+        }
+        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled, .idleDisplaySleepDisabled],
+                                                         reason: "Running an AI model in real time")
         controlStart = HostClock.now()
         if definition.architecture.usesDecoderMemory { feed = LanguageFeed(architecture: definition.architecture, encoder: encoder) }
         if definition.architecture.screenText {
@@ -134,12 +154,21 @@ public final class AgentRuntime: @unchecked Sendable {
             t.resume()
             ocrTimer = t
         }
-        let t = Thread { [weak self] in self?.loop() }
-        t.qualityOfService = .userInteractive
-        t.name = "agenttrainer.runtime"
-        t.stackSize = 16 << 20
-        thread = t
-        t.start()
+        loopStarted = true
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            self?.loop()
+            self?.loopFinished.signal()
+        }
+    }
+
+    /// Waits for the loop thread to finish its current step and release held input. Call after
+    /// `stop()` before quitting, so the process never exits while the GPU is mid-step.
+    @discardableResult
+    public func waitUntilStopped(timeout: Double = 2) -> Bool {
+        guard loopStarted else { return true }
+        let ok = loopFinished.wait(timeout: .now() + timeout) == .success
+        if ok { loopStarted = false }
+        return ok
     }
 
     public func stop(reason: String? = nil) {
@@ -150,6 +179,8 @@ public final class AgentRuntime: @unchecked Sendable {
         lock.unlock()
         ocrTimer?.cancel()
         ocrTimer = nil
+        if let a = activity { ProcessInfo.processInfo.endActivity(a); activity = nil }
+        if let o = workspaceObserver { NSWorkspace.shared.notificationCenter.removeObserver(o); workspaceObserver = nil }
         tap.stop()
         Task { await capturer.stop() }
         DispatchQueue.main.async { self.onStop?(reason) }
@@ -208,6 +239,9 @@ public final class AgentRuntime: @unchecked Sendable {
     // MARK: Loop
 
     private func loop() {
+        stepper = PolicyStepper(model: model)
+        stepper.temperature = options.temperature
+        stepper.useActionHistory = options.useActionHistory
         let rate = definition.architecture.stepRateHz
         let period = UInt64(1_000_000_000 / rate)
         let size = definition.architecture.frameSize
@@ -217,6 +251,9 @@ public final class AgentRuntime: @unchecked Sendable {
         var next = HostClock.now()
         var tickTimes: [UInt64] = []
         var actionCount = 0
+        var stepTimes: [Double] = []
+        let warmer = options.keepGPUWarm ? GPUWarmer() : nil
+        defer { warmer?.finish() }
         while true {
             lock.lock(); let isRunning = running; lock.unlock()
             if !isRunning { break }
@@ -227,6 +264,7 @@ public final class AgentRuntime: @unchecked Sendable {
                 next = now
             }
             HostClock.sleep(untilNanoseconds: next)
+            warmer?.finish()
             guard let frame = latestFrame() else { continue }
             let t0 = HostClock.now()
 
@@ -241,13 +279,14 @@ public final class AgentRuntime: @unchecked Sendable {
             let t1 = HostClock.now()
 
             lock.lock(); let text = self.text, extra = self.thinkingExtra, isPaused = paused, prev = previous
-            let items = screenItems, insText = instructionText; lock.unlock()
+            let items = screenItems, insText = instructionText, front = frontmostPID; lock.unlock()
             if let feed {
                 feed.setInstruction(insText)
                 if let items { feed.setScreenText(items) }
                 if case .some(let l) = feed.update() { stepper.setLanguage(l) }
             }
-            let focusOK = !options.focusGuard || target.isDisplay || NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processID
+            let focusOK = !options.focusGuard || target.isDisplay || front == target.processID
+            let tm = HostClock.now()
             let result = stepper.step(frame: input, text: text, previousAction: prev, thinkingExtra: extra)
             let t2 = HostClock.now()
             var action = space.decode(result.classes)
@@ -283,13 +322,17 @@ public final class AgentRuntime: @unchecked Sendable {
             previous = enc
             stats.steps += 1
             stats.preprocessMs = stats.preprocessMs * 0.9 + Double(t1 - t0) / 1e6 * 0.1
-            stats.modelMs = stats.modelMs * 0.9 + Double(t2 - t1) / 1e6 * 0.1
+            stats.modelMs = stats.modelMs * 0.9 + Double(t2 - tm) / 1e6 * 0.1
+            stepTimes.append(Double(t2 - tm) / 1e6)
+            if stepTimes.count == 150 { stats.earlyStepMs = stepTimes[50 ..< 150].reduce(0, +) / 100 }
+            if stepTimes.count > 150 { stats.lateStepMs = stepTimes.suffix(100).reduce(0, +) / 100 }
             stats.frameAgeMs = stats.frameAgeMs * 0.9 + Double(t0 > frame.hostNs ? t0 - frame.hostNs : 0) / 1e6 * 0.1
             stats.endToEndMs = stats.endToEndMs * 0.9 + Double(t3 > frame.hostNs ? t3 - frame.hostNs : 0) / 1e6 * 0.1
             if tickTimes.count > 1 { stats.fps = Double(tickTimes.count - 1) / (Double(tickTimes.last! - tickTimes.first!) / 1e9) }
             stats.actionsPerSecond = stats.actionsPerSecond * 0.95 + Double(actionCount) * Double(rate) * 0.05
             actionCount = 0
             lock.unlock()
+            warmer?.fill(until: next + period)
         }
         executor.releaseAll()
         output.clear()
