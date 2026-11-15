@@ -34,6 +34,7 @@ public struct RecordingStats: Sendable, Equatable {
     public var droppedFrames = 0
     public var bytes: Int64 = 0
     public var averageFPS: Double { elapsed > 0 ? Double(frames) / elapsed : 0 }
+    public init() {}
 }
 
 /// Records one session into a `.atrec` package: HEVC video, lossless training proxy, frame and
