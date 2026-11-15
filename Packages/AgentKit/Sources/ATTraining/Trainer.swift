@@ -76,10 +76,14 @@ public final class Trainer: @unchecked Sendable {
 
         let a = def.architecture
         let length = a.contextSteps
-        let trainSet = TrainingDataset(recordings: trainRecs, length: length, frameSize: a.frameSize, slots: def.actions.slotCount,
+        var trainSet = TrainingDataset(recordings: trainRecs, length: length, frameSize: a.frameSize, slots: def.actions.slotCount,
                                        absoluteCursor: def.actions.mouseMode == .absolute)
-        let valSet = TrainingDataset(recordings: valRecs, length: length, frameSize: a.frameSize, slots: def.actions.slotCount,
+        var valSet = TrainingDataset(recordings: valRecs, length: length, frameSize: a.frameSize, slots: def.actions.slotCount,
                                      absoluteCursor: def.actions.mouseMode == .absolute)
+        if a.screenText {
+            trainSet.screenItems = a.screenTextItems
+            valSet.screenItems = a.screenTextItems
+        }
         let batch = hp.batchSize > 0 ? hp.batchSize : Self.autoBatch(a, limitGB: request.memoryLimitGB, bf16: hp.bf16)
         let accumulation = max(1, hp.gradientAccumulation)
         let loader = ClipLoader(dataset: trainSet, seed: UInt64(hp.seed) &+ 17)
@@ -148,8 +152,33 @@ public final class Trainer: @unchecked Sendable {
             return (table.take(rows, axis: 0).reshaped(clips.count, T, embedDim), present)
         }
 
+        /// Screen-text and typing inputs for a batch of clips (nil for models without them).
+        func languageInputs(_ clips: [ClipData]) -> LanguageInputs? {
+            guard a.usesDecoderMemory else { return nil }
+            let T = length, B = clips.count
+            var l = LanguageInputs()
+            if a.screenText, let table = textTable {
+                let K = a.screenTextItems
+                let ids = clips.flatMap(\.screenIds)
+                let rows = MLXArray(ids.map { $0 >= 0 ? $0 : Int32(table.dim(0) - 1) })
+                l.screenEmbeddings = table.take(rows, axis: 0).reshaped(B, T, K, embedDim)
+                l.screenBoxes = MLXArray(clips.flatMap(\.screenBoxes), [B, T, K, 5])
+                l.screenMask = MLXArray(ids.map { $0 >= 0 }, [B, T, K])
+            }
+            if a.literalTyping {
+                let bytes = clips.flatMap { c in c.text.flatMap { id in LanguageInputs.bytes(id >= 0 ? texts.strings[Int(id)] : nil, length: a.typingBytes) } }
+                l.typingBytes = MLXArray(bytes, [B, T, a.typingBytes])
+            }
+            return l
+        }
+
         let vg = valueAndGrad(model: compute) { (m: PolicyModel, b: [MLXArray]) -> [MLXArray] in
-            let logits = m(frames: b[0], actionsIn: b[1], text: b[3], textPresent: b[4], historyKeep: b[5])
+            var lang: LanguageInputs?
+            if b.count > 6 {
+                lang = LanguageInputs(screenEmbeddings: b[6].size > 0 ? b[6] : nil, screenBoxes: b[7].size > 0 ? b[7] : nil,
+                                      screenMask: b[8].size > 0 ? b[8] : nil, typingBytes: b[9].size > 0 ? b[9] : nil)
+            }
+            let logits = m(frames: b[0], actionsIn: b[1], text: b[3], textPresent: b[4], historyKeep: b[5], language: lang)
             let p = PolicyLoss.compute(logits, actions: b[1], mask: b[2], space: space, zWeight: Float(hp.zLossWeight))
             return [p.total] + p.perHead
         }
@@ -181,7 +210,12 @@ public final class Trainer: @unchecked Sendable {
                 let mask = MLXArray(clips.flatMap(\.mask), [clips.count, T])
                 let (text, present) = textArrays(clips, dropout: true)
                 let keep = MLXArray(clips.flatMap { _ in Self.historyKeepMask(length: T, dropout: hp.historyDropout) }, [clips.count, T])
-                let (values, grads) = vg(compute, [frames.asType(computeType), acts, mask, text, present, keep])
+                var inputs = [frames.asType(computeType), acts, mask, text, present, keep]
+                if let l = languageInputs(clips) {
+                    let empty = MLXArray.zeros([0])
+                    inputs += [l.screenEmbeddings ?? empty, l.screenBoxes ?? empty, l.screenMask ?? empty, l.typingBytes ?? empty]
+                }
+                let (values, grads) = vg(compute, inputs)
                 let g32 = grads.mapValues { $0.asType(.float32) }
                 accumulated = accumulated.map { acc in
                     ModuleParameters.unflattened(zip(acc.flattened(), g32.flattened()).map { ($0.0.0, $0.0.1 + $0.1.1) })
@@ -218,7 +252,7 @@ public final class Trainer: @unchecked Sendable {
 
             if let v = validator, step % hp.validateEverySteps == 0 || step == hp.totalSteps {
                 emit(.phase(.validating, "Validating"))
-                if let m = v.run(model: compute, embed: { c in textArrays([c], dropout: false) }, step: step) {
+                if let m = v.run(model: compute, embed: { c in textArrays([c], dropout: false) }, language: { c in languageInputs([c]) }, step: step) {
                     emit(.validation(m))
                     Self.append(logHandle, TrainingLogLine(validation: m))
                     let total = m.nll.enumerated().map { $0.element / Foundation.log(Double([space.keyClasses, space.pointerClasses, space.xClasses, space.yClasses][$0.offset])) }.reduce(0, +)

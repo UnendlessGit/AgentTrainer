@@ -40,19 +40,24 @@ public final class PolicyStepper {
     private var stepIndex = 0
     private var positionShift = 0
     private var previous: MLXArray
+    private var language: LanguageInputs?
     private var textCacheKey: [Float]?
     private var textToken: MLXArray?
     /// Sampling loop compiled once (weights are captured as constants; recreate the stepper after reloading weights).
-    private lazy var compiledDecode: ([MLXArray]) -> [MLXArray] = {
+    private lazy var compiledDecode: ([MLXArray]) -> [MLXArray] = makeDecoder(withMemory: false)
+    private lazy var compiledDecodeWithMemory: ([MLXArray]) -> [MLXArray] = makeDecoder(withMemory: true)
+
+    private func makeDecoder(withMemory: Bool) -> ([MLXArray]) -> [MLXArray] {
         let m = model
         let S = m.actions.slotCount, D = m.width
         let counts = m.actions.slotClassCounts
         return compile { (inputs: [MLXArray]) -> [MLXArray] in
             let aOut = inputs[0], u = inputs[1], temp = inputs[2]
+            let memory = withMemory ? inputs[3] : nil, memoryMask = withMemory ? inputs[4] : nil
             var embs: [MLXArray] = []
             var out: [MLXArray] = []
             for s in 0 ..< S {
-                let h = m.decoder.run(aOut: aOut, inputs: embs.isEmpty ? nil : concatenated(embs, axis: 1))
+                let h = m.decoder.run(aOut: aOut, inputs: embs.isEmpty ? nil : concatenated(embs, axis: 1), memory: memory, memoryMask: memoryMask)
                 let logits = m.headLogits(slot: s, h[0..., h.dim(1) - 1, 0...]).asType(.float32)
                 let g = -log(-log(u[s, 0 ..< counts[s]]))
                 let cls = argMax(logits / temp + g, axis: -1).asType(.int32)
@@ -61,7 +66,7 @@ public final class PolicyStepper {
             }
             return [concatenated(out, axis: 0)]
         }
-    }()
+    }
     /// Backbone output at `a_out` from the last step (diagnostics).
     public private(set) var lastAOutState: MLXArray?
 
@@ -94,6 +99,10 @@ public final class PolicyStepper {
 
     public var stepsTaken: Int { stepIndex }
 
+    /// Current screen text / typing inputs (shapes without the leading batch/time dims: `[K, 768]`,
+    /// `[K, 5]`, `[K]`, `[L]`). Kept until replaced.
+    public func setLanguage(_ l: LanguageInputs?) { language = l }
+
     /// Runs one timestep.
     /// - frame: uint8 `[H, W, 3]` at the model's resolution.
     /// - text: 768-d instruction embedding, or nil for "no instruction".
@@ -104,6 +113,14 @@ public final class PolicyStepper {
         rebaseIfNeeded()
         let m = model
         let D = m.width, S = m.actions.slotCount
+        var lang: LanguageInputs?
+        if let l = language {
+            lang = LanguageInputs(screenEmbeddings: l.screenEmbeddings?.expandedDimensions(axis: 0), screenBoxes: l.screenBoxes?.expandedDimensions(axis: 0),
+                                  screenMask: l.screenMask?.expandedDimensions(axis: 0), typingBytes: l.typingBytes?.expandedDimensions(axis: 0))
+        }
+        let langTokens = m.languageTokens(lang, leading: [1])
+        var thinkingExtra = thinkingExtra
+        if let s = langTokens?.summary { thinkingExtra = thinkingExtra.map { $0.reshaped(1, -1) + s } ?? s }
         if let p = previousAction { previous = MLXArray(p).reshaped(1, S) }
 
         // Tokens: actions(t-1) then [text, image, thinking, a_out](t).
@@ -142,10 +159,13 @@ public final class PolicyStepper {
 
         // Autoregressive decoding: one decoder pass per slot (recomputing the ≤9-token prefix is
         // as cheap as caching because the decoder is weight-bandwidth bound).
+        let memory = langTokens?.memory, memoryMask = langTokens?.mask
         if forced == nil && !returnLogits {
             let maxC = m.actions.slotClassCounts.max()!
             let u = MLXRandom.uniform(low: Float(1e-9), high: 1, [S, maxC])
-            let classes = compiledDecode([aOutState, u, MLXArray(max(temperature, 1e-4))])[0]
+            let classes = memory != nil
+                ? compiledDecodeWithMemory([aOutState, u, MLXArray(max(temperature, 1e-4)), memory!, memoryMask!])[0]
+                : compiledDecode([aOutState, u, MLXArray(max(temperature, 1e-4))])[0]
             previous = classes.reshaped(1, S)
             eval(classes, keys, values)
             stepIndex += 1
@@ -155,7 +175,7 @@ public final class PolicyStepper {
         var sampled: [MLXArray] = []
         var allLogits: [MLXArray] = []
         for s in 0 ..< S {
-            let h = m.decoder.run(aOut: aOutState, inputs: inputs.isEmpty ? nil : concatenated(inputs, axis: 1))
+            let h = m.decoder.run(aOut: aOutState, inputs: inputs.isEmpty ? nil : concatenated(inputs, axis: 1), memory: memory, memoryMask: memoryMask)
             let logits = m.headLogits(slot: s, h[0..., h.dim(1) - 1, 0...]).asType(.float32)
             let cls: MLXArray
             if let f = forced {

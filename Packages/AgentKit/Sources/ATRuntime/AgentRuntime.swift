@@ -1,5 +1,6 @@
 import AppKit
 import ATCapture
+import ATLanguage
 import ATCore
 import ATModel
 import CoreVideo
@@ -49,6 +50,13 @@ public final class AgentRuntime: @unchecked Sendable {
     public let output = LiveInputState()
     public var options: RuntimeOptions
     public var onVision: ((CGImage) -> Void)?
+    /// Instruction / screen-text encoder (EmbeddingGemma) for language-enabled models.
+    public var encoder: InstructionEncoder?
+    private var feed: LanguageFeed?
+    private var instructionText: String?
+    private var screenItems: [ScreenTextItem]?
+    private let ocrQueue = DispatchQueue(label: "agenttrainer.ocr", qos: .utility)
+    private var ocrTimer: DispatchSourceTimer?
     public var onStop: ((String?) -> Void)?
 
     private let stepper: PolicyStepper
@@ -90,7 +98,7 @@ public final class AgentRuntime: @unchecked Sendable {
     public var isPaused: Bool { lock.lock(); defer { lock.unlock() }; return paused }
 
     /// Sets the instruction embedding (nil = no instruction). Takes effect on the next step.
-    public func setInstruction(_ embedding: [Float]?) { lock.lock(); text = embedding; lock.unlock() }
+    public func setInstruction(_ embedding: [Float]?, text: String? = nil) { lock.lock(); self.text = embedding; instructionText = text; lock.unlock() }
     public func setThinkingExtra(_ v: MLXArray?) { lock.lock(); thinkingExtra = v; lock.unlock() }
     public func latestFrame() -> CapturedFrame? { lock.lock(); defer { lock.unlock() }; return latest }
 
@@ -114,6 +122,18 @@ public final class AgentRuntime: @unchecked Sendable {
         try? tap.start() // without Input Monitoring the model still runs; takeover detection is off
         running = true
         controlStart = HostClock.now()
+        if definition.architecture.usesDecoderMemory { feed = LanguageFeed(architecture: definition.architecture, encoder: encoder) }
+        if definition.architecture.screenText {
+            let t = DispatchSource.makeTimerSource(queue: ocrQueue)
+            t.schedule(deadline: .now() + 0.2, repeating: ScreenTextReader.interval)
+            t.setEventHandler { [weak self] in
+                guard let self, let f = self.latestFrame() else { return }
+                let items = ScreenTextReader.read(f.pixelBuffer, maxItems: self.definition.architecture.screenTextItems)
+                self.lock.lock(); self.screenItems = items; self.lock.unlock()
+            }
+            t.resume()
+            ocrTimer = t
+        }
         let t = Thread { [weak self] in self?.loop() }
         t.qualityOfService = .userInteractive
         t.name = "agenttrainer.runtime"
@@ -128,6 +148,8 @@ public final class AgentRuntime: @unchecked Sendable {
         running = false
         if let s = controlStart { controlRanges.append((s, HostClock.now())); controlStart = nil }
         lock.unlock()
+        ocrTimer?.cancel()
+        ocrTimer = nil
         tap.stop()
         Task { await capturer.stop() }
         DispatchQueue.main.async { self.onStop?(reason) }
@@ -218,7 +240,13 @@ public final class AgentRuntime: @unchecked Sendable {
             guard let input else { continue }
             let t1 = HostClock.now()
 
-            lock.lock(); let text = self.text, extra = self.thinkingExtra, isPaused = paused, prev = previous; lock.unlock()
+            lock.lock(); let text = self.text, extra = self.thinkingExtra, isPaused = paused, prev = previous
+            let items = screenItems, insText = instructionText; lock.unlock()
+            if let feed {
+                feed.setInstruction(insText)
+                if let items { feed.setScreenText(items) }
+                if case .some(let l) = feed.update() { stepper.setLanguage(l) }
+            }
             let focusOK = !options.focusGuard || target.isDisplay || NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processID
             let result = stepper.step(frame: input, text: text, previousAction: prev, thinkingExtra: extra)
             let t2 = HostClock.now()

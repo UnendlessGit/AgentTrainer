@@ -142,9 +142,3 @@ struct BlockedKeysEditor: View {
         }
     }
 }
-
-struct ArenaView: View {
-    let app: AppModel
-    var body: some View { ContentUnavailableView("Test Arena", systemImage: "gamecontroller", description: Text("Coming in the next build.")) }
-}
-

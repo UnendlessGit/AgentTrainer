@@ -1,6 +1,7 @@
 import ATCore
 import Foundation
 import MLX
+import MLXNN
 import MLXRandom
 import Testing
 @testable import ATModel
@@ -98,5 +99,64 @@ func tinyArchitecture(window: Int? = nil) -> PolicyArchitecture {
             #expect(zip(got, expected).allSatisfy { abs($0 - $1) < 1e-6 }, "\(name)")
         }
         #expect(sd["b"]!.dtype == .bfloat16 && sd["c"]!.dtype == .int64)
+    }
+}
+
+@Suite(.serialized) struct LanguagePolicyTests {
+    func arch() -> PolicyArchitecture {
+        var a = tinyArchitecture(window: 3)
+        a.screenText = true; a.screenTextItems = 2; a.literalTyping = true; a.typingBytes = 8
+        return a
+    }
+
+    @Test func streamingMatchesBatchWithLanguageMemory() {
+        MLXRandom.seed(11)
+        let a = arch(), T = 6, W = 3, K = 2, L = 8
+        let actions = ActionSpaceConfig.appDefault
+        let model = PolicyModel(architecture: a, actions: actions)
+        // Open the gates so the memory path actually contributes.
+        for m in model.decoder.memoryAttention { m.update(parameters: ModuleParameters.unflattened(["gate": MLXArray([Float(0.7)])])) }
+        model.screenSummary?.update(parameters: ModuleParameters.unflattened(["weight": MLXRandom.normal([a.width, a.width]) * 0.02]))
+        model.train(false)
+        let S = actions.slotCount
+        let frames = PolicyModel.randomFrames(T, size: 32).reshaped(1, T, 32, 32, 3)
+        let counts = actions.slotClassCounts
+        let acts = stacked((0 ..< S).map { MLXRandom.randInt(low: 0, high: counts[$0], [1, T]).asType(.int32) }, axis: -1)
+        let emb = MLXRandom.normal([1, T, K, 768]), box = MLXRandom.uniform(0 ..< 1, [1, T, K, 5])
+        let mask = MLXArray((0 ..< T * K).map { $0 % 3 != 1 }, [1, T, K])
+        let bytes = MLXArray((0 ..< T).flatMap { t in LanguageInputs.bytes(t % 2 == 0 ? "type hi" : nil, length: L) }, [1, T, L])
+        let lang = LanguageInputs(screenEmbeddings: emb, screenBoxes: box, screenMask: mask, typingBytes: bytes)
+        let batch = model(frames: frames, actionsIn: acts, text: MLXArray.zeros([1, T, 768]), textPresent: MLXArray.zeros([1, T], dtype: .bool), language: lang)
+        let stepper = PolicyStepper(model: model, contextSteps: W)
+        let flat = acts.asArray(Int32.self)
+        var worst: Float = 0
+        for t in 0 ..< T {
+            stepper.setLanguage(LanguageInputs(screenEmbeddings: emb[0, t], screenBoxes: box[0, t], screenMask: mask[0, t], typingBytes: bytes[0, t]))
+            let r = stepper.step(frame: frames[0, t], text: nil, previousAction: t > 0 ? Array(flat[(t - 1) * S ..< t * S]) : nil,
+                                 forced: Array(flat[t * S ..< (t + 1) * S]), returnLogits: true)
+            worst = max(worst, abs(MLXArray(r.logits![0]) - batch.keys[0, t, 0]).max().item(Float.self))
+            worst = max(worst, abs(MLXArray(r.logits![S - 1]) - batch.y[0, t, 0]).max().item(Float.self))
+        }
+        #expect(worst < 1e-3)
+    }
+
+    @Test func closedGatesLeaveOutputsUnchanged() {
+        MLXRandom.seed(5)
+        let a = arch(), T = 3
+        let model = PolicyModel(architecture: a, actions: .appDefault)
+        model.train(false)
+        let frames = PolicyModel.randomFrames(T, size: 32).reshaped(1, T, 32, 32, 3)
+        let acts = MLXArray.zeros([1, T, model.actions.slotCount], dtype: .int32)
+        let text = MLXArray.zeros([1, T, 768]), present = MLXArray.zeros([1, T], dtype: .bool)
+        let lang = LanguageInputs(screenEmbeddings: MLXRandom.normal([1, T, 2, 768]), screenBoxes: MLXRandom.uniform(0 ..< 1, [1, T, 2, 5]),
+                                  screenMask: MLXArray.ones([1, T, 2], dtype: .bool), typingBytes: MLXArray(LanguageInputs.bytes("type x", length: 8) + LanguageInputs.bytes("type x", length: 8) + LanguageInputs.bytes("type x", length: 8), [1, T, 8]))
+        let with = model(frames: frames, actionsIn: acts, text: text, textPresent: present, language: lang)
+        let without = model(frames: frames, actionsIn: acts, text: text, textPresent: present)
+        #expect(abs(with.keys - without.keys).max().item(Float.self) < 1e-5)
+    }
+
+    @Test func historyDropoutTokenIsNeutralAtInit() {
+        let model = PolicyModel(architecture: tinyArchitecture(), actions: .p2p)
+        #expect(model.actionUnknown.abs().max().item(Float.self) == 0)
     }
 }

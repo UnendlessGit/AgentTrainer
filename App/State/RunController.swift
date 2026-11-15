@@ -112,8 +112,12 @@ final class RunController {
             let rt = try AgentRuntime(model: model, definition: def, target: target, options: o)
             rt.onVision = { [weak self] img in DispatchQueue.main.async { MainActor.assumeIsolated { self?.visionImage = img } } }
             rt.onStop = { [weak self] reason in MainActor.assumeIsolated { if let reason { self?.errorMessage = reason }; self?.stop() } }
-            if def.usesInstructions { prepareEncoder() }
-            if def.usesInstructions, let e = embedding(for: instruction) { rt.setInstruction(e); appliedInstruction = instruction }
+            if def.usesInstructions || def.architecture.usesDecoderMemory { prepareEncoder() }
+            rt.encoder = encoder
+            if def.usesInstructions {
+                rt.setInstruction(embedding(for: instruction), text: instruction.isEmpty ? nil : instruction)
+                appliedInstruction = instruction.isEmpty ? nil : instruction
+            }
             try await rt.start(excluding: ownApps)
             runtime = rt
             loadedCheckpoint = ckpt
@@ -183,7 +187,7 @@ final class RunController {
 
     func applyInstruction() {
         guard let rt = runtime else { return }
-        rt.setInstruction(embedding(for: instruction))
+        rt.setInstruction(embedding(for: instruction), text: instruction.isEmpty ? nil : instruction)
         appliedInstruction = instruction.isEmpty ? nil : instruction
     }
 

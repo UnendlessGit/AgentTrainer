@@ -55,9 +55,11 @@ public enum CaptureTargets {
                                      title: content.displays.count > 1 ? "Display \(i + 1) (\(d.width)×\(d.height))" : "Entire display (\(d.width)×\(d.height))"),
                                      frame: d.frame, processID: nil))
         }
+        // AgentTrainer's own windows are never offered, except its Test Arena / Sync Check windows.
         let windows = content.windows.filter {
             $0.windowLayer == 0 && $0.isOnScreen && $0.frame.width >= 120 && $0.frame.height >= 90
-                && $0.owningApplication?.bundleIdentifier != me && !($0.owningApplication?.applicationName.isEmpty ?? true)
+                && ($0.owningApplication?.bundleIdentifier != me || ($0.title ?? "").hasPrefix("AgentTrainer Test Arena") || ($0.title ?? "").hasPrefix("AgentTrainer Sync Check"))
+                && !($0.owningApplication?.applicationName.isEmpty ?? true)
         }
         for w in windows.sorted(by: { ($0.owningApplication?.applicationName ?? "") < ($1.owningApplication?.applicationName ?? "") }) {
             let app = w.owningApplication

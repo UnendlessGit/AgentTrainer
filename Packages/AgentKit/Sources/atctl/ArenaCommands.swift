@@ -87,9 +87,9 @@ enum ArenaCommands {
         for s in 0 ..< o.int("--episodes", 3) {
             let r = ArenaEvaluator.evaluate(model: model, mode: mode, seconds: o.double("--seconds", 60), seed: UInt64(50_000 + s),
                                             temperature: Float(o.double("--temperature", 1)), useHistory: !o.flag("--no-history"),
-                                            embed: { t in try? enc?.embed([t]).first },
-                                            trace: o.flag("--trace") && s == 0 ? { i, a in
-                                                if i < 90 || i % 150 == 0 { print("  t=\(i) keys=\(a.keys.sorted()) ptr=\(a.pointer.map(\.rawValue)) dx=\(Int(a.dx)) dy=\(Int(a.dy))") }
+                                            embed: { t in try? enc?.embed([t]).first }, encoder: enc,
+                                            trace: o.flag("--trace") && s == 0 ? { i, a, st in
+                                                if i < 120 && i % 3 == 0 { print("  t=\(i) keys=\(a.keys.sorted()) \(st)") }
                                             } : nil)
             print("episode \(s) [\(ckpt)]: \(r)")
             results.append(r)

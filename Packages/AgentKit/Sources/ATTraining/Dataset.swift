@@ -13,6 +13,10 @@ final class PreparedRecording {
     let lossMask: [Bool]
     let text: [Int32]
     let cursor: [(Double, Double)]
+    /// Per step: index into `screenItems` (latest OCR sample), or -1.
+    var screenSample: [Int32] = []
+    /// OCR samples: (text id, x, y, w, h, confidence) per item.
+    var screenItems: [[(Int32, [Float])]] = []
     var stepCount: Int { frameIndex.count }
 
     init(url: URL, meta: RecordingMeta, proxyURL: URL, frameIndex: [Int32], classes: [[Int32]], lossMask: [Bool], text: [Int32], cursor: [(Double, Double)]) {
@@ -30,6 +34,7 @@ final class TrainingDataset {
     let frameSize: Int
     let slots: Int
     let absoluteCursor: Bool
+    var screenItems = 0
 
     init(recordings: [PreparedRecording], length: Int, frameSize: Int, slots: Int, absoluteCursor: Bool) {
         self.recordings = recordings; self.length = length; self.frameSize = frameSize; self.slots = slots; self.absoluteCursor = absoluteCursor
@@ -79,20 +84,38 @@ enum DatasetBuilder {
         for url in urls {
             guard let meta = try? RecordingIO.readMeta(url) else { log("Skipped \(url.lastPathComponent): unreadable"); continue }
             let frames = try RecordingIO.readFrames(url), events = try RecordingIO.readEvents(url)
-            let ann = RecordingIO.readAnnotations(url)
+            var ann = RecordingIO.readAnnotations(url)
+            if model.architecture.literalTyping {
+                // Typing bursts become `type "…"` instructions (appended last so they take precedence).
+                ann.segments += TypingDetector.segments(events: events)
+            }
             let steps = TimelineBuilder.build(frames: frames, events: events, meta: meta, annotations: ann, rateHz: rate)
             guard !steps.isEmpty else { log("Skipped \(meta.name): too short"); continue }
             let proxy = try proxyURL(for: url, meta: meta, size: size, cacheRoot: cacheRoot, log: log)
             var cursor: [(Double, Double)] = []
             var prev = (steps[0].action.absX, steps[0].action.absY)
             for s in steps { cursor.append(prev); prev = (s.action.absX, s.action.absY) }
-            out.append(PreparedRecording(
+            var screenSample: [Int32] = [], screenItems: [[(Int32, [Float])]] = []
+            if model.architecture.screenText {
+                log("Reading on-screen text in \(meta.name)…")
+                let samples = (try? ScreenTextReader.index(recording: url)) ?? []
+                screenItems = samples.map { $0.items.prefix(model.architecture.screenTextItems).map { (texts.id(for: $0.text), [$0.x, $0.y, $0.w, $0.h, $0.confidence]) } }
+                var j = -1
+                for st in steps {
+                    while j + 1 < samples.count, samples[j + 1].time <= st.time { j += 1 }
+                    screenSample.append(Int32(j))
+                }
+            }
+            let prepared = PreparedRecording(
                 url: url, meta: meta, proxyURL: proxy,
                 frameIndex: steps.map { Int32($0.frameIndex) },
                 classes: steps.map { model.actions.encode($0.action) },
                 lossMask: steps.map { !$0.modelControlled && !$0.excluded },
                 text: steps.map { model.usesInstructions ? texts.id(for: $0.instruction) : -1 },
-                cursor: cursor))
+                cursor: cursor)
+            prepared.screenSample = screenSample
+            prepared.screenItems = screenItems
+            out.append(prepared)
         }
         return out
     }
@@ -140,6 +163,8 @@ struct ClipData {
     var classes: [Int32]   // T × slots
     var mask: [Bool]       // T
     var text: [Int32]      // T (-1 = none)
+    var screenIds: [Int32] = []    // T × K (-1 = none)
+    var screenBoxes: [Float] = []  // T × K × 5
 }
 
 /// Background loader: decodes proxy frames and assembles clips ahead of the trainer.
@@ -221,6 +246,8 @@ final class ClipLoader: @unchecked Sendable {
         defer { give(ref.recording, rd) }
         var frames = Data(count: T * fb)
         var classes = [Int32](), mask = [Bool](), text = [Int32]()
+        let K = dataset.screenItems
+        var sIds = [Int32](), sBoxes = [Float]()
         classes.reserveCapacity(T * dataset.slots)
         try frames.withUnsafeMutableBytes { buf in
             for t in 0 ..< T {
@@ -235,9 +262,16 @@ final class ClipLoader: @unchecked Sendable {
                 classes += rec.classes[i]
                 mask.append(valid && rec.lossMask[i])
                 text.append(rec.text[i])
+                if K > 0 {
+                    let si = i < rec.screenSample.count ? Int(rec.screenSample[i]) : -1
+                    let items = si >= 0 ? rec.screenItems[si] : []
+                    for k in 0 ..< K {
+                        if k < items.count { sIds.append(items[k].0); sBoxes += items[k].1 } else { sIds.append(-1); sBoxes += [0, 0, 0, 0, 0] }
+                    }
+                }
             }
         }
-        return ClipData(frames: frames, classes: classes, mask: mask, text: text)
+        return ClipData(frames: frames, classes: classes, mask: mask, text: text, screenIds: sIds, screenBoxes: sBoxes)
     }
 }
 

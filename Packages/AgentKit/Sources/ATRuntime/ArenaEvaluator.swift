@@ -1,4 +1,5 @@
 import ATCapture
+import ATLanguage
 import ATCore
 import ATModel
 import Foundation
@@ -20,7 +21,8 @@ public enum ArenaEvaluator {
     }
 
     public static func evaluate(model: PolicyModel, mode: ArenaGame.Mode, seconds: Double, seed: UInt64, temperature: Float = 1, useHistory: Bool = true,
-                                pixelSize: Int = 480, embed: ((String) -> [Float]?)? = nil, trace: ((Int, TimestepAction) -> Void)? = nil) -> Result {
+                                pixelSize: Int = 480, embed: ((String) -> [Float]?)? = nil, encoder: InstructionEncoder? = nil,
+                                trace: ((Int, TimestepAction, String) -> Void)? = nil) -> Result {
         let rate = model.architecture.stepRateHz, n = Int(seconds * Double(rate))
         let size = model.architecture.frameSize
         let game = ArenaGame(mode: mode, seed: seed)
@@ -31,9 +33,16 @@ public enum ArenaEvaluator {
         let pb = ArenaRecorder.makePixelBuffer(width: pixelSize, height: pixelSize)!
         var textCache: [String: [Float]] = [:]
         let absolute = model.actions.mouseMode == .absolute
+        let feed = model.architecture.usesDecoderMemory ? LanguageFeed(architecture: model.architecture, encoder: encoder) : nil
+        let ocrEvery = max(1, Int(ScreenTextReader.interval * Double(rate)))
         var elapsed = 0.0
-        for _ in 0 ..< n {
+        for i in 0 ..< n {
             game.render(into: pb)
+            if let feed {
+                feed.setInstruction(game.instruction)
+                if model.architecture.screenText, i % ocrEvery == 0 { feed.setScreenText(ScreenTextReader.read(pb, maxItems: model.architecture.screenTextItems)) }
+                if case .some(let l) = feed.update(budget: 32) { stepper.setLanguage(l) }
+            }
             let frame: MLXArray = resizer.resize(pb, size: size, cursor: absolute ? game.pointer : nil) { buf in
                 MLXArray(Data(buf), [size, size, 3], dtype: .uint8)
             }!
@@ -47,7 +56,7 @@ public enum ArenaEvaluator {
             elapsed += Date().timeIntervalSince(t0)
             var a = model.actions.decode(r.classes)
             if !absolute { a.absX = game.pointer.x; a.absY = game.pointer.y }
-            trace?(game.steps, a)
+            trace?(game.steps, a, game.debugState + " expert \(game.expertAction().keys.sorted())")
             game.step(a, dt: 1 / Double(rate))
         }
         let expert = ArenaGame(mode: mode, seed: seed)

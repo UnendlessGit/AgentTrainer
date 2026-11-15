@@ -4,21 +4,56 @@ import MLX
 import MLXNN
 import MLXRandom
 
+/// Gated cross-attention from decoder tokens to a memory of on-screen text items and instruction
+/// bytes. The gate starts at 0 (tanh), so a pretrained decoder behaves exactly as before until
+/// training opens it (Flamingo-style).
+final class MemoryCrossAttention: Module {
+    @ModuleInfo var norm: RMSNormF32
+    @ModuleInfo var query: Linear
+    @ModuleInfo(key: "key_value") var keyValue: Linear
+    @ModuleInfo var out: Linear
+    @ParameterInfo var gate: MLXArray
+    let heads: Int, headDim: Int
+
+    init(width: Int, heads: Int) {
+        self.heads = heads
+        headDim = width / heads
+        _norm.wrappedValue = RMSNormF32(dimensions: width)
+        _query.wrappedValue = Linear(width, width, bias: false)
+        _keyValue.wrappedValue = Linear(width, 2 * width, bias: false)
+        _out.wrappedValue = Linear(width, width, bias: false)
+        _gate.wrappedValue = MLXArray.zeros([1])
+    }
+
+    func callAsFunction(_ x: MLXArray, memory: MLXArray, mask: MLXArray) -> MLXArray {
+        let N = x.dim(0), L = x.dim(1), M = memory.dim(1), D = heads * headDim
+        let q = query(norm(x)).reshaped(N, L, heads, headDim).transposed(0, 2, 1, 3)
+        let kv = keyValue(memory.asType(x.dtype))
+        let k = kv[.ellipsis, 0 ..< D].reshaped(N, M, heads, headDim).transposed(0, 2, 1, 3)
+        let v = kv[.ellipsis, D...].reshaped(N, M, heads, headDim).transposed(0, 2, 1, 3)
+        let a = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: 1 / Float(headDim).squareRoot(),
+                                                  mask: .array(mask.reshaped(N, 1, 1, M)))
+        return x + tanh(gate).asType(x.dtype) * out(a.transposed(0, 2, 1, 3).reshaped(N, L, D))
+    }
+}
+
 /// Pixel2Play's autoregressive action decoder: a small causal transformer that turns the
 /// backbone's `a_out` token into one token per action slot.
 final class ActionDecoder: Module {
     @ModuleInfo(key: "input_proj") var inputProj: Linear
     @ParameterInfo(key: "pos_tokens") var posTokens: MLXArray
     @ModuleInfo(key: "transformer_layers") var layers: [TransformerLayer]
+    @ModuleInfo(key: "memory_attention") var memoryAttention: [MemoryCrossAttention]
     let slots: Int
 
-    init(width: Int, layers n: Int, heads: Int, sinks: Int, slots: Int, dropout: Float) {
+    init(width: Int, layers n: Int, heads: Int, sinks: Int, slots: Int, dropout: Float, memory: Bool = false) {
         self.slots = slots
         _inputProj.wrappedValue = Linear(width, width, bias: true)
         _posTokens.wrappedValue = MLXRandom.normal([slots + 1, width]) * 3.0
         _layers.wrappedValue = (0 ..< n).map { _ in
             TransformerLayer(width: width, heads: heads, kvHeads: heads, dropout: dropout, sinks: sinks)
         }
+        _memoryAttention.wrappedValue = memory ? (0 ..< n).map { _ in MemoryCrossAttention(width: width, heads: heads) } : []
     }
 
     static func causalMask(_ n: Int) -> MLXArray {
@@ -28,13 +63,16 @@ final class ActionDecoder: Module {
 
     /// Runs the decoder over `[proj(a_out), inputs...]` and returns hidden states `[N, L, D]`
     /// (L = 1 + inputs.count). Used both teacher-forced (training) and per sampling step.
-    func run(aOut: MLXArray, inputs: MLXArray?) -> MLXArray {
+    func run(aOut: MLXArray, inputs: MLXArray?, memory: MLXArray? = nil, memoryMask: MLXArray? = nil) -> MLXArray {
         var x = inputProj(aOut).expandedDimensions(axis: 1)
         if let inputs { x = concatenated([x, inputs], axis: 1) }
         let L = x.dim(1)
         x = x + posTokens[0 ..< L].asType(x.dtype)
         let mask = Self.causalMask(L)
-        for layer in layers { x = layer(x, mask: mask) }
+        for (i, layer) in layers.enumerated() {
+            x = layer(x, mask: mask)
+            if let memory, let memoryMask, i < memoryAttention.count { x = memoryAttention[i](x, memory: memory, mask: memoryMask) }
+        }
         return x
     }
 }
@@ -71,6 +109,12 @@ public final class PolicyModel: Module {
     @ModuleInfo(key: "head_pointer") var headPointer: Linear
     @ModuleInfo(key: "head_x") var headX: Linear
     @ModuleInfo(key: "head_y") var headY: Linear
+    // Optional language extensions (screen text, literal typing).
+    @ModuleInfo(key: "screen_item_proj") var screenItemProj: Linear?
+    @ModuleInfo(key: "screen_summary") var screenSummary: Linear?
+    @ModuleInfo(key: "byte_emb") var byteEmb: Embedding?
+    @ParameterInfo(key: "byte_pos") var bytePos: MLXArray?
+    @ParameterInfo(key: "memory_null") var memoryNull: MLXArray?
 
     /// Recompute activations in backward (needed to fit 10 s clips in memory).
     public var gradientCheckpointing = false
@@ -106,7 +150,20 @@ public final class PolicyModel: Module {
         _actionPos.wrappedValue = MLXRandom.normal([actions.slotCount, d]) * 0.05
         _actionUnknown.wrappedValue = MLXArray.zeros([actions.slotCount, d])
         _decoder.wrappedValue = ActionDecoder(width: d, layers: a.decoderLayers, heads: a.decoderHeads,
-                                              sinks: a.decoderSinks, slots: actions.slotCount, dropout: dropout)
+                                              sinks: a.decoderSinks, slots: actions.slotCount, dropout: dropout, memory: a.usesDecoderMemory)
+        if a.screenText {
+            _screenItemProj.wrappedValue = Linear(a.textEmbeddingDim + 5, d)
+            let summary = Linear(d, d)
+            summary.update(parameters: ModuleParameters.unflattened(["weight": MLXArray.zeros([d, d]), "bias": MLXArray.zeros([d])]))
+            _screenSummary.wrappedValue = summary
+        }
+        if a.literalTyping {
+            let e = Embedding(embeddingCount: 257, dimensions: d)
+            e.update(parameters: ModuleParameters.unflattened(["weight": MLXRandom.normal([257, d]) * 0.02]))
+            _byteEmb.wrappedValue = e
+            _bytePos.wrappedValue = MLXRandom.normal([a.typingBytes, d]) * 0.02
+        }
+        if a.usesDecoderMemory { _memoryNull.wrappedValue = MLXRandom.normal([1, d]) * 0.02 }
         func emb(_ n: Int) -> Embedding {
             let e = Embedding(embeddingCount: n, dimensions: d)
             e.update(parameters: ModuleParameters.unflattened(["weight": MLXRandom.normal([n, d]) * 0.1]))
@@ -226,6 +283,27 @@ public final class PolicyModel: Module {
         return m
     }
 
+    /// Screen-text item tokens, their summary (for the thinking token) and the decoder memory.
+    func languageTokens(_ l: LanguageInputs?, leading: [Int]) -> (summary: MLXArray?, memory: MLXArray, mask: MLXArray)? {
+        guard architecture.usesDecoderMemory, let l, let null = memoryNull else { return nil }
+        let D = width
+        var parts: [MLXArray] = [broadcast(null.asType(computeDType), to: leading + [1, D])]
+        var masks: [MLXArray] = [MLXArray.ones(leading + [1], dtype: .bool)]
+        var summary: MLXArray?
+        if let proj = screenItemProj, let emb = l.screenEmbeddings, let box = l.screenBoxes, let m = l.screenMask {
+            let items = proj(concatenated([emb.asType(computeDType), box.asType(computeDType)], axis: -1))
+            let mf = m.asType(computeDType).expandedDimensions(axis: -1)
+            let mean = (items * mf).sum(axis: -2) / maximum(mf.sum(axis: -2), MLXArray(Float(1)).asType(computeDType))
+            summary = screenSummary.map { $0(mean) }
+            parts.append(items); masks.append(m)
+        }
+        if let be = byteEmb, let pos = bytePos, let bytes = l.typingBytes {
+            parts.append(be(bytes) + pos[0 ..< bytes.dim(-1)].asType(computeDType))
+            masks.append(bytes .!= Int32(256))
+        }
+        return (summary, concatenated(parts, axis: -2), concatenated(masks, axis: -1))
+    }
+
     // MARK: Training / reference forward
 
     /// Teacher-forced forward over whole clips.
@@ -234,8 +312,13 @@ public final class PolicyModel: Module {
     /// - text: `[B, T, 768]` instruction embeddings, `textPresent`: bool `[B, T]`
     /// - thinkingExtra: optional `[B, T, D]` added to the first thinking token (screen-text summary)
     public func callAsFunction(frames: MLXArray, actionsIn: MLXArray, text: MLXArray, textPresent: MLXArray,
-                               thinkingExtra: MLXArray? = nil, historyKeep: MLXArray? = nil) -> PolicyLogits {
+                               thinkingExtra: MLXArray? = nil, historyKeep: MLXArray? = nil, language: LanguageInputs? = nil) -> PolicyLogits {
         let B = frames.dim(0), T = frames.dim(1), D = width, S = actions.slotCount
+        let lang = languageTokens(language, leading: [B, T])
+        var extras = [MLXArray]()
+        if let t = thinkingExtra { extras.append(t) }
+        if let s = lang?.summary { extras.append(s) }
+        let thinkingExtra: MLXArray? = extras.isEmpty ? nil : extras.dropFirst().reduce(extras[0], +)
         let img = imageTokens(frames.reshaped(B * T, frames.dim(2), frames.dim(3), frames.dim(4))).reshaped(B, T, 1, D)
         let txt = textTokens(text.reshaped(B * T, -1), present: textPresent.reshaped(B * T)).reshaped(B, T, 1, D)
         var think = broadcast(thinking.expandedDimensions(axes: [0, 1]), to: [B, T, architecture.thinkingTokens, D])
@@ -266,8 +349,26 @@ public final class PolicyModel: Module {
         debugTrace["seq_out"] = x
         let aOutStates = x.reshaped(B, T, layout.tokensPerStep, D)[0..., 0..., layout.aOutIndex, 0...]
         lastAOutStates = aOutStates
-        let h = decoder.run(aOut: aOutStates.reshaped(B * T, D), inputs: actEmb.reshaped(B * T, S, D))
+        let h = decoder.run(aOut: aOutStates.reshaped(B * T, D), inputs: actEmb.reshaped(B * T, S, D),
+                            memory: lang?.memory.reshaped(B * T, -1, D), memoryMask: lang?.mask.reshaped(B * T, -1))
         let out = h[0..., 0 ..< S, 0...].reshaped(B, T, S, D)
         return logits(fromDecoder: out)
+    }
+}
+
+/// Optional per-timestep language inputs (all shaped with the same leading dims as the frames).
+public struct LanguageInputs {
+    public var screenEmbeddings: MLXArray?  // [..., K, 768]
+    public var screenBoxes: MLXArray?       // [..., K, 5]  x, y, w, h, confidence
+    public var screenMask: MLXArray?        // [..., K] bool
+    public var typingBytes: MLXArray?       // [..., L] int32, 256 = padding
+    public init(screenEmbeddings: MLXArray? = nil, screenBoxes: MLXArray? = nil, screenMask: MLXArray? = nil, typingBytes: MLXArray? = nil) {
+        self.screenEmbeddings = screenEmbeddings; self.screenBoxes = screenBoxes; self.screenMask = screenMask; self.typingBytes = typingBytes
+    }
+
+    /// UTF-8 bytes of an instruction, padded/truncated to `length` (256 = padding).
+    public static func bytes(_ s: String?, length: Int) -> [Int32] {
+        let b = Array((s ?? "").utf8.prefix(length)).map(Int32.init)
+        return b + Array(repeating: 256, count: length - b.count)
     }
 }

@@ -16,6 +16,8 @@ public final class ArenaGame: @unchecked Sendable {
         case colorChase
         /// Click the button whose label the instruction names (absolute pointer, reading text).
         case clickButton
+        /// Type the word the instruction gives, then press Return (literal typing).
+        case typeWord
         public var id: String { rawValue }
         public var title: String {
             switch self {
@@ -23,9 +25,10 @@ public final class ArenaGame: @unchecked Sendable {
             case .aim: "Aim (mouse)"
             case .colorChase: "Go to the named color (instructions)"
             case .clickButton: "Click the named button (pointer + text)"
+            case .typeWord: "Type the given word (typing)"
             }
         }
-        public var usesInstructions: Bool { self == .colorChase || self == .clickButton }
+        public var usesInstructions: Bool { self == .colorChase || self == .clickButton || self == .typeWord }
         public var keys: [String] { ["w", "a", "s", "d"] }
     }
 
@@ -33,6 +36,7 @@ public final class ArenaGame: @unchecked Sendable {
         ("red", (0.95, 0.27, 0.27)), ("green", (0.25, 0.85, 0.4)), ("blue", (0.3, 0.5, 1.0)), ("yellow", (0.98, 0.85, 0.2)),
     ]
     public static let buttonWords = ["Play", "Settings", "Shop", "Quit", "Help", "Map"]
+    public static let typingWords = ["apple", "river", "stone", "cloud", "tiger", "lemon", "grass", "piano", "rocket", "forest", "candle", "wizard"]
 
     public let mode: Mode
     public private(set) var score = 0
@@ -51,6 +55,11 @@ public final class ArenaGame: @unchecked Sendable {
     var buttons: [(rect: CGRect, word: Int)] = []
     public private(set) var pointer = CGPoint(x: 0.5, y: 0.5)
     var expertMemory: (keys: Set<String>, hold: Int) = ([], 0)
+    // typeWord
+    var word = ""
+    public private(set) var typed = ""
+    var lastKeys = Set<String>()
+    var typeCooldown = 0
     var lastButtonDown = false
 
     public init(mode: Mode, seed: UInt64) {
@@ -84,6 +93,10 @@ public final class ArenaGame: @unchecked Sendable {
             }
             goal = Int(rng.next() % 4)
             instruction = "click the \(Self.buttonWords[buttons[goal].word]) button"
+        case .typeWord:
+            word = Self.typingWords[Int(rng.next() % UInt64(Self.typingWords.count))]
+            typed = ""
+            instruction = "type \"\(word)\""
         }
     }
 
@@ -91,6 +104,15 @@ public final class ArenaGame: @unchecked Sendable {
         var p: CGPoint
         repeat { p = CGPoint(x: 0.08 + r() * 0.84, y: 0.12 + r() * 0.8) } while hypot(p.x - player.x, p.y - player.y) < 0.25
         return p
+    }
+
+    public var debugState: String {
+        switch mode {
+        case .chase, .colorChase: String(format: "player (%.2f, %.2f) target (%.2f, %.2f)", player.x, player.y, targets[mode == .chase ? 0 : goal].pos.x, targets[mode == .chase ? 0 : goal].pos.y)
+        case .aim: String(format: "aim error (%.3f, %.3f)", aimTarget.x - view.x, aimTarget.y - view.y)
+        case .clickButton: String(format: "pointer (%.2f, %.2f) goal %@", pointer.x, pointer.y, "\(buttons[goal].rect)")
+        case .typeWord: "typed '\(typed)' of '\(word)'"
+        }
     }
 
     // MARK: Dynamics
@@ -134,6 +156,19 @@ public final class ArenaGame: @unchecked Sendable {
                 }
             }
             lastButtonDown = down
+        case .typeWord:
+            // Newly pressed keys type; held keys don't repeat.
+            for k in a.keys.subtracting(lastKeys).sorted() {
+                if k == "return" {
+                    score += typed == word ? 1 : (typed.isEmpty ? 0 : -1)
+                    reset()
+                } else if k == "delete" {
+                    if !typed.isEmpty { typed.removeLast() }
+                } else if let ch = KeyCatalog.info(k)?.character, ch.isLetter, typed.count < 24 {
+                    typed.append(ch)
+                }
+            }
+            lastKeys = a.keys
         }
     }
 
@@ -169,6 +204,13 @@ public final class ArenaGame: @unchecked Sendable {
             a.absX = d < 0.01 ? tx : pointer.x + (tx - pointer.x) * k
             a.absY = d < 0.01 ? ty : pointer.y + (ty - pointer.y) * k
             if target.insetBy(dx: 0.02, dy: 0.02).contains(pointer) && !lastButtonDown { a.pointer = [.left] }
+        case .typeWord:
+            // Press the next letter for one step, release for at least one, like a quick typist.
+            if typeCooldown > 0 { typeCooldown -= 1; a.keys = []; break }
+            if !lastKeys.isEmpty { a.keys = []; typeCooldown = Int(rng.next() % 2); break }
+            if typed == word { a.keys = ["return"] }
+            else if word.hasPrefix(typed) { a.keys = [String(word[word.index(word.startIndex, offsetBy: typed.count)])] }
+            else { a.keys = ["delete"] }
         }
         if mode != .clickButton { a.absX = pointer.x; a.absY = pointer.y }
         return a
@@ -233,6 +275,15 @@ public final class ArenaGame: @unchecked Sendable {
                 ctx.fillPath()
                 drawText(Self.buttonWords[b.word], in: rect, ctx: ctx, size: rect.height * 0.45)
             }
+        case .typeWord:
+            let field = CGRect(x: 0.1 * W, y: 0.42 * H, width: 0.8 * W, height: 0.16 * H)
+            ctx.setFillColor(CGColor(gray: 0.18, alpha: 1))
+            ctx.addPath(CGPath(roundedRect: field, cornerWidth: 10, cornerHeight: 10, transform: nil))
+            ctx.fillPath()
+            drawText(typed.isEmpty ? " " : typed, in: field, ctx: ctx, size: field.height * 0.5)
+            let caretX = field.midX + CGFloat(typed.count) * field.height * 0.15
+            ctx.setFillColor(CGColor(gray: 1, alpha: 0.8))
+            ctx.fill(CGRect(x: caretX, y: field.minY + field.height * 0.2, width: 2, height: field.height * 0.6))
         }
         ctx.restoreGState()
     }

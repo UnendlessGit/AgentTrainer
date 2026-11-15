@@ -52,7 +52,7 @@ import Testing
         #expect(steps[0].action.keys == ["w"])
         #expect(steps[1].action.keys == ["w", "a"]) // the short tap is kept
         #expect(steps[1].action.dx == 10 && steps[1].action.dy == -1)
-        #expect(steps[2].action.keys.isEmpty == false) // pressed? no - w released, but w was held at window start
+        #expect(steps[2].action.keys.isEmpty) // w was released mid-window and nothing was pressed in it (P2P: held at end)
         #expect(steps[2].action.pointer.contains(.scrollUp) && steps[2].action.pointer.contains(.left))
         #expect(abs(steps[2].action.absX - 0.25) < 1e-9 && abs(steps[2].action.absY - 0.25) < 1e-9)
         // Frame for step k is the latest frame at or before k*50ms.

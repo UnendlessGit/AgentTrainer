@@ -36,7 +36,7 @@ final class Validator {
         return counts.map { row in let t = row.reduce(0, +); return row.map { $0 / t } }
     }
 
-    func run(model: PolicyModel, embed: (ClipData) -> (MLXArray, MLXArray), step: Int) -> ValidationMetrics? {
+    func run(model: PolicyModel, embed: (ClipData) -> (MLXArray, MLXArray), language: (ClipData) -> LanguageInputs?, step: Int) -> ValidationMetrics? {
         guard !clips.isEmpty else { return nil }
         let wasTraining = model.training
         model.train(false)
@@ -56,17 +56,20 @@ final class Validator {
             let acts = MLXArray(clip.classes, [1, T, S])
             let mask = MLXArray(clip.mask, [1, T])
             let (text, present) = embed(clip)
-            let logits = model(frames: frames, actionsIn: acts, text: text, textPresent: present)
+            let lang = language(clip)
+            let logits = model(frames: frames, actionsIn: acts, text: text, textPresent: present, language: lang)
             let parts = PolicyLoss.compute(logits, actions: acts, mask: mask, space: space, zWeight: 0)
             // Visual reliance: same clip with frames rolled half a clip in time.
             let rolled = concatenated([frames[0..., (T / 2)..., 0...], frames[0..., 0 ..< (T / 2), 0...]], axis: 1)
-            let shuffled = PolicyLoss.compute(model(frames: rolled, actionsIn: acts, text: text, textPresent: present), actions: acts, mask: mask, space: space, zWeight: 0)
-            let blind = PolicyLoss.compute(model(frames: frames, actionsIn: acts, text: text, textPresent: present, historyKeep: MLXArray.zeros([1, T], dtype: .bool)),
+            let shuffled = PolicyLoss.compute(model(frames: rolled, actionsIn: acts, text: text, textPresent: present, language: lang), actions: acts, mask: mask, space: space, zWeight: 0)
+            let blind = PolicyLoss.compute(model(frames: frames, actionsIn: acts, text: text, textPresent: present, historyKeep: MLXArray.zeros([1, T], dtype: .bool), language: lang),
                                            actions: acts, mask: mask, space: space, zWeight: 0)
             var textParts: PolicyLoss.Parts?
             let hasText = clip.text.contains { $0 >= 0 }
             if hasText {
-                textParts = PolicyLoss.compute(model(frames: frames, actionsIn: acts, text: text, textPresent: MLXArray.zeros([1, T], dtype: .bool)),
+                var noLang = lang
+                if let b = lang?.typingBytes { noLang?.typingBytes = MLXArray.full(b.shape, values: MLXArray(Int32(256))) }
+                textParts = PolicyLoss.compute(model(frames: frames, actionsIn: acts, text: text, textPresent: MLXArray.zeros([1, T], dtype: .bool), language: noLang),
                                                actions: acts, mask: mask, space: space, zWeight: 0)
             }
             let keyPred = argMax(logits.keys, axis: -1), ptrPred = argMax(logits.pointer, axis: -1)

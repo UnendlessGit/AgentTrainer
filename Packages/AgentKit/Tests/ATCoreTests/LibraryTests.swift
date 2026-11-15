@@ -39,7 +39,9 @@ import Testing
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("m-\(UUID()).atmodel")
         defer { try? FileManager.default.removeItem(at: url) }
         try ModelPackage.write(m, to: url)
-        let back = try ModelPackage.read(url)
+        var back = try ModelPackage.read(url)
+        #expect(abs(back.createdAt.timeIntervalSince(m.createdAt)) < 1) // ISO-8601 keeps whole seconds
+        back.createdAt = m.createdAt
         #expect(back == m)
         #expect(back.actions.mouseMode == .absolute && back.architecture.literalTyping)
     }
