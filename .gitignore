@@ -1,0 +1,19 @@
+# Build output
+build/
+DerivedData/
+*.xcresult
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+.swiftpm/
+Packages/AgentKit/.build/
+# Local data, weights and caches (never commit)
+*.safetensors
+*.ckpt
+*.atrec/
+*.atmodel/
+/data/
+/scratch/
+# macOS
+.DS_Store
+*.profraw

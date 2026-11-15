@@ -1,0 +1,19 @@
+#include "Base.xcconfig"
+#include "Signing.xcconfig"
+
+PRODUCT_NAME = AgentTrainer
+PRODUCT_BUNDLE_IDENTIFIER = com.unendless.AgentTrainer
+INFOPLIST_FILE = Config/App-Info.plist
+GENERATE_INFOPLIST_FILE = YES
+INFOPLIST_KEY_CFBundleDisplayName = AgentTrainer
+INFOPLIST_KEY_LSApplicationCategoryType = public.app-category.developer-tools
+INFOPLIST_KEY_NSHumanReadableCopyright = Copyright © 2026 AgentTrainer
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor
+CODE_SIGN_ENTITLEMENTS = Config/AgentTrainer.entitlements
+LD_RUNPATH_SEARCH_PATHS = $(inherited) @executable_path/../Frameworks
+COMBINE_HIDPI_IMAGES = YES
+ENABLE_PREVIEWS = YES
+// Keep Debug bundles structurally identical to Release (no preview stub dylibs) so
+// `codesign --verify --deep --strict` passes on every build.
+ENABLE_DEBUG_DYLIB = NO

@@ -1,0 +1,9 @@
+#include "Base.xcconfig"
+#include "Signing.xcconfig"
+
+PRODUCT_NAME = AgentTrainerEngine
+PRODUCT_BUNDLE_IDENTIFIER = com.unendless.AgentTrainer.Engine
+INFOPLIST_FILE = Config/Engine-Info.plist
+GENERATE_INFOPLIST_FILE = YES
+CODE_SIGN_ENTITLEMENTS = Config/AgentTrainerEngine.entitlements
+SKIP_INSTALL = YES

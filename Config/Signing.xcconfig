@@ -1,0 +1,11 @@
+// Stable code signing. Every build (Debug and Release) is signed with the same
+// Apple Development identity, selected by SHA-1 because a revoked certificate with
+// the same common name is still in the keychain. The designated requirement is
+// pinned to bundle identifier + team so macOS privacy grants (Screen Recording,
+// Accessibility, Input Monitoring) survive rebuilds and certificate renewals.
+CODE_SIGN_STYLE = Manual
+DEVELOPMENT_TEAM = V5S6J7KC33
+CODE_SIGN_IDENTITY = 1E3F98C6916444AFAAD362575B0DA874E73D992E
+PROVISIONING_PROFILE_SPECIFIER =
+ENABLE_HARDENED_RUNTIME = YES
+OTHER_CODE_SIGN_FLAGS = --timestamp=none --requirements $(SRCROOT)/Config/$(TARGET_NAME).req

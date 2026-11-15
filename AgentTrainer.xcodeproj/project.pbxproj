@@ -1,0 +1,376 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A70000000000000000000062 /* AgentTrainerEngine.xpc in Embed XPC Services */ = {isa = PBXBuildFile; fileRef = A70000000000000000000021 /* AgentTrainerEngine.xpc */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A70000000000000000000081 /* ATCore in Frameworks */ = {isa = PBXBuildFile; productRef = A70000000000000000000071 /* ATCore */; };
+		A70000000000000000000082 /* ATModel in Frameworks */ = {isa = PBXBuildFile; productRef = A70000000000000000000072 /* ATModel */; };
+		A70000000000000000000083 /* ATCapture in Frameworks */ = {isa = PBXBuildFile; productRef = A70000000000000000000073 /* ATCapture */; };
+		A70000000000000000000084 /* ATTraining in Frameworks */ = {isa = PBXBuildFile; productRef = A70000000000000000000074 /* ATTraining */; };
+		A70000000000000000000085 /* ATLanguage in Frameworks */ = {isa = PBXBuildFile; productRef = A70000000000000000000075 /* ATLanguage */; };
+		A70000000000000000000086 /* ATRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = A70000000000000000000076 /* ATRuntime */; };
+		A70000000000000000000087 /* ATCore in Frameworks */ = {isa = PBXBuildFile; productRef = A70000000000000000000077 /* ATCore */; };
+		A70000000000000000000088 /* ATModel in Frameworks */ = {isa = PBXBuildFile; productRef = A70000000000000000000078 /* ATModel */; };
+		A70000000000000000000089 /* ATTraining in Frameworks */ = {isa = PBXBuildFile; productRef = A70000000000000000000079 /* ATTraining */; };
+		A7000000000000000000008A /* ATLanguage in Frameworks */ = {isa = PBXBuildFile; productRef = A7000000000000000000007A /* ATLanguage */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A70000000000000000000060 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A70000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A70000000000000000000041;
+			remoteInfo = AgentTrainerEngine;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A70000000000000000000053 /* Embed XPC Services */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/XPCServices";
+			dstSubfolderSpec = 16;
+			files = (
+				A70000000000000000000062 /* AgentTrainerEngine.xpc in Embed XPC Services */,
+			);
+			name = "Embed XPC Services";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		A70000000000000000000020 /* AgentTrainer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AgentTrainer.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A70000000000000000000021 /* AgentTrainerEngine.xpc */ = {isa = PBXFileReference; explicitFileType = "wrapper.xpc-service"; includeInIndex = 0; path = AgentTrainerEngine.xpc; sourceTree = BUILT_PRODUCTS_DIR; };
+		A70000000000000000000030 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
+		A70000000000000000000031 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Signing.xcconfig; sourceTree = "<group>"; };
+		A70000000000000000000032 /* App.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = App.xcconfig; sourceTree = "<group>"; };
+		A70000000000000000000033 /* Engine.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Engine.xcconfig; sourceTree = "<group>"; };
+		A70000000000000000000034 /* App-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "App-Info.plist"; sourceTree = "<group>"; };
+		A70000000000000000000035 /* Engine-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Engine-Info.plist"; sourceTree = "<group>"; };
+		A70000000000000000000036 /* AgentTrainer.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AgentTrainer.entitlements; sourceTree = "<group>"; };
+		A70000000000000000000037 /* AgentTrainerEngine.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AgentTrainerEngine.entitlements; sourceTree = "<group>"; };
+		A70000000000000000000038 /* AgentKit */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = AgentKit; path = Packages/AgentKit; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		A70000000000000000000010 /* App */ = {isa = PBXFileSystemSynchronizedRootGroup; path = App; sourceTree = "<group>"; };
+		A70000000000000000000011 /* Engine */ = {isa = PBXFileSystemSynchronizedRootGroup; path = Engine; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A70000000000000000000051 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A70000000000000000000081 /* ATCore in Frameworks */,
+				A70000000000000000000082 /* ATModel in Frameworks */,
+				A70000000000000000000083 /* ATCapture in Frameworks */,
+				A70000000000000000000084 /* ATTraining in Frameworks */,
+				A70000000000000000000085 /* ATLanguage in Frameworks */,
+				A70000000000000000000086 /* ATRuntime in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A70000000000000000000055 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A70000000000000000000087 /* ATCore in Frameworks */,
+				A70000000000000000000088 /* ATModel in Frameworks */,
+				A70000000000000000000089 /* ATTraining in Frameworks */,
+				A7000000000000000000008A /* ATLanguage in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A70000000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				A70000000000000000000010 /* App */,
+				A70000000000000000000011 /* Engine */,
+				A70000000000000000000004 /* Config */,
+				A70000000000000000000038 /* AgentKit */,
+				A70000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A70000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A70000000000000000000020 /* AgentTrainer.app */,
+				A70000000000000000000021 /* AgentTrainerEngine.xpc */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A70000000000000000000004 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				A70000000000000000000030 /* Base.xcconfig */,
+				A70000000000000000000031 /* Signing.xcconfig */,
+				A70000000000000000000032 /* App.xcconfig */,
+				A70000000000000000000033 /* Engine.xcconfig */,
+				A70000000000000000000034 /* App-Info.plist */,
+				A70000000000000000000035 /* Engine-Info.plist */,
+				A70000000000000000000036 /* AgentTrainer.entitlements */,
+				A70000000000000000000037 /* AgentTrainerEngine.entitlements */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A70000000000000000000040 /* AgentTrainer */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A70000000000000000000091 /* Build configuration list for PBXNativeTarget "AgentTrainer" */;
+			buildPhases = (
+				A70000000000000000000050 /* Sources */,
+				A70000000000000000000051 /* Frameworks */,
+				A70000000000000000000052 /* Resources */,
+				A70000000000000000000053 /* Embed XPC Services */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A70000000000000000000061 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				A70000000000000000000010 /* App */,
+			);
+			name = AgentTrainer;
+			packageProductDependencies = (
+				A70000000000000000000071 /* ATCore */,
+				A70000000000000000000072 /* ATModel */,
+				A70000000000000000000073 /* ATCapture */,
+				A70000000000000000000074 /* ATTraining */,
+				A70000000000000000000075 /* ATLanguage */,
+				A70000000000000000000076 /* ATRuntime */,
+			);
+			productName = AgentTrainer;
+			productReference = A70000000000000000000020 /* AgentTrainer.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A70000000000000000000041 /* AgentTrainerEngine */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A70000000000000000000092 /* Build configuration list for PBXNativeTarget "AgentTrainerEngine" */;
+			buildPhases = (
+				A70000000000000000000054 /* Sources */,
+				A70000000000000000000055 /* Frameworks */,
+				A70000000000000000000056 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				A70000000000000000000011 /* Engine */,
+			);
+			name = AgentTrainerEngine;
+			packageProductDependencies = (
+				A70000000000000000000077 /* ATCore */,
+				A70000000000000000000078 /* ATModel */,
+				A70000000000000000000079 /* ATTraining */,
+				A7000000000000000000007A /* ATLanguage */,
+			);
+			productName = AgentTrainerEngine;
+			productReference = A70000000000000000000021 /* AgentTrainerEngine.xpc */;
+			productType = "com.apple.product-type.xpc-service";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A70000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2720;
+				LastUpgradeCheck = 2720;
+				TargetAttributes = {
+					A70000000000000000000040 = {
+						CreatedOnToolsVersion = 27.2;
+					};
+					A70000000000000000000041 = {
+						CreatedOnToolsVersion = 27.2;
+					};
+				};
+			};
+			buildConfigurationList = A70000000000000000000090 /* Build configuration list for PBXProject "AgentTrainer" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A70000000000000000000002;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = A70000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A70000000000000000000040 /* AgentTrainer */,
+				A70000000000000000000041 /* AgentTrainerEngine */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A70000000000000000000052 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A70000000000000000000056 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A70000000000000000000050 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A70000000000000000000054 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A70000000000000000000061 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A70000000000000000000041 /* AgentTrainerEngine */;
+			targetProxy = A70000000000000000000060 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		A700000000000000000000A0 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A70000000000000000000030 /* Base.xcconfig */;
+			buildSettings = {
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A700000000000000000000A1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A70000000000000000000030 /* Base.xcconfig */;
+			buildSettings = {
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		A700000000000000000000A2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A70000000000000000000032 /* App.xcconfig */;
+			buildSettings = {
+			};
+			name = Debug;
+		};
+		A700000000000000000000A3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A70000000000000000000032 /* App.xcconfig */;
+			buildSettings = {
+			};
+			name = Release;
+		};
+		A700000000000000000000A4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A70000000000000000000033 /* Engine.xcconfig */;
+			buildSettings = {
+			};
+			name = Debug;
+		};
+		A700000000000000000000A5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A70000000000000000000033 /* Engine.xcconfig */;
+			buildSettings = {
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A70000000000000000000090 /* Build configuration list for PBXProject "AgentTrainer" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A700000000000000000000A0 /* Debug */,
+				A700000000000000000000A1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A70000000000000000000091 /* Build configuration list for PBXNativeTarget "AgentTrainer" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A700000000000000000000A2 /* Debug */,
+				A700000000000000000000A3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A70000000000000000000092 /* Build configuration list for PBXNativeTarget "AgentTrainerEngine" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A700000000000000000000A4 /* Debug */,
+				A700000000000000000000A5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/AgentKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A70000000000000000000071 /* ATCore */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATCore; };
+		A70000000000000000000072 /* ATModel */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATModel; };
+		A70000000000000000000073 /* ATCapture */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATCapture; };
+		A70000000000000000000074 /* ATTraining */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATTraining; };
+		A70000000000000000000075 /* ATLanguage */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATLanguage; };
+		A70000000000000000000076 /* ATRuntime */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATRuntime; };
+		A70000000000000000000077 /* ATCore */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATCore; };
+		A70000000000000000000078 /* ATModel */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATModel; };
+		A70000000000000000000079 /* ATTraining */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATTraining; };
+		A7000000000000000000007A /* ATLanguage */ = {isa = XCSwiftPackageProductDependency; package = A70000000000000000000070 /* XCLocalSwiftPackageReference "Packages/AgentKit" */; productName = ATLanguage; };
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = A70000000000000000000001 /* Project object */;
+}
