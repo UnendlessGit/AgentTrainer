@@ -23,12 +23,12 @@ struct AgentTrainerMain {
 
 struct AgentTrainerApp: App {
     @State private var app = AppModel()
-    @State private var showPermissions = !PrivacyPermission.allCases.allSatisfy(\.isGranted) && !CommandLine.arguments.contains("--ui-snapshot")
+    @State private var showPermissions = !PrivacyPermission.allCases.allSatisfy(\.isGranted) && !CommandLine.arguments.contains("--ui-snapshot") && !CommandLine.arguments.contains("--selftest-capture")
 
     var body: some Scene {
         Window("AgentTrainer", id: "main") {
             RootView(app: app)
-                .task { await UISnapshotter.runIfRequested(app: app) }
+                .task { await UISnapshotter.runIfRequested(app: app); await CaptureSelfTest.runIfRequested() }
                 .sheet(isPresented: $showPermissions) {
                     PermissionsView()
                         .frame(width: 560)
