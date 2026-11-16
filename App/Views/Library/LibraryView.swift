@@ -24,6 +24,16 @@ struct LibraryView: View {
             }
             .frame(minWidth: 380, maxWidth: .infinity)
         }
+        .task {
+            // UI snapshot hook: open the first recording so the player can be checked.
+            if CommandLine.arguments.contains("--open-first-recording"), selectedRecording == nil {
+                for _ in 0 ..< 20 where lib.recordings.isEmpty {
+                    if let f = lib.flatFolders.first(where: { $0.url != lib.selectedFolder }), lib.recordings.isEmpty { lib.selectedFolder = f.url }
+                    try? await Task.sleep(for: .milliseconds(150))
+                }
+                selectedRecording = lib.recordings.first?.url
+            }
+        }
         .alert("New folder", isPresented: Binding(get: { newFolderParent != nil }, set: { if !$0 { newFolderParent = nil } })) {
             TextField("Name", text: $nameField)
             Button("Create") { if let p = newFolderParent { lib.createFolder(nameField, in: p) }; nameField = "" }

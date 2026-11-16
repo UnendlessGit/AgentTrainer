@@ -38,7 +38,7 @@ struct RecordingDetailView: View {
                     Button { NSWorkspace.shared.activateFileViewerSelecting([recording.url]) } label: { Image(systemName: "magnifyingglass") }
                         .help("Show in Finder")
                 }
-                VideoPlayer(player: player)
+                PlayerView(player: player)
                     .aspectRatio(CGFloat(recording.meta.captureWidth) / CGFloat(max(recording.meta.captureHeight, 1)), contentMode: .fit)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 ActivityTimeline(rows: activity, duration: recording.meta.duration, current: currentTime, annotations: annotations) { t in
@@ -283,5 +283,29 @@ struct KeyComparisonStrip: View {
             }
         }
         .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// AppKit's player view. SwiftUI's `VideoPlayer` (AVKit's SwiftUI overlay) crashes on this macOS
+/// version while building its type metadata, so the Library uses `AVPlayerView` directly.
+struct PlayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let v = AVPlayerView()
+        v.player = player
+        v.controlsStyle = .inline
+        v.showsFullScreenToggleButton = true
+        v.videoGravity = .resizeAspect
+        return v
+    }
+
+    func updateNSView(_ v: AVPlayerView, context: Context) {
+        if v.player !== player { v.player = player }
+    }
+
+    static func dismantleNSView(_ v: AVPlayerView, coordinator: ()) {
+        v.player?.pause()
+        v.player = nil
     }
 }
