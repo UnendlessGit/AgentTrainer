@@ -18,8 +18,19 @@ final class LibraryStore {
         fs = f
         tree = f.folderTree()
         selectedFolder = f.root
-        recordings = f.recordings(in: f.root, recursive: true)
+        normalizeSelection()
+        reloadRecordings()
     }
+
+    /// The library root itself isn't shown; its loose recordings appear as "Unsorted". Start on the
+    /// first folder when there is nothing unsorted.
+    private func normalizeSelection() {
+        if selectedFolder.standardizedFileURL == fs.root.standardizedFileURL, tree.recordingCount == 0, let first = tree.children.first {
+            selectedFolder = first.url
+        }
+    }
+
+    var isRootSelected: Bool { selectedFolder.standardizedFileURL == fs.root.standardizedFileURL }
 
     func setRoot(_ url: URL) {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -31,19 +42,22 @@ final class LibraryStore {
     func refresh() {
         tree = fs.folderTree()
         if !FileManager.default.fileExists(atPath: selectedFolder.path) { selectedFolder = fs.root }
+        normalizeSelection()
         reloadRecordings()
     }
 
-    private func reloadRecordings() { recordings = fs.recordings(in: selectedFolder, recursive: includeSubfolders) }
+    private func reloadRecordings() { recordings = fs.recordings(in: selectedFolder, recursive: includeSubfolders && !isRootSelected) }
 
     /// Every folder as (url, indented display name), for pickers.
     var flatFolders: [(url: URL, name: String, depth: Int)] {
         var out: [(URL, String, Int)] = []
         func walk(_ f: LibraryFolder, _ depth: Int) {
-            out.append((f.url, depth == 0 ? "Library" : f.name, depth))
+            out.append((f.url, f.name, depth))
             f.children.forEach { walk($0, depth + 1) }
         }
-        walk(tree, 0)
+        // The root holds loose ("Unsorted") recordings; folders are listed at the top level.
+        out.append((tree.url, "Unsorted", 0))
+        tree.children.forEach { walk($0, 0) }
         return out
     }
 
@@ -51,7 +65,7 @@ final class LibraryStore {
 
     func relativeName(_ folder: URL) -> String {
         let r = fs.root.standardizedFileURL.path, p = folder.standardizedFileURL.path
-        return p == r ? "Library" : "Library/" + p.dropFirst(r.count + 1)
+        return p == r ? "Unsorted" : String(p.dropFirst(r.count + 1))
     }
 
     private func perform(_ body: () throws -> Void) {
@@ -68,4 +82,33 @@ final class LibraryStore {
     }
     func move(_ url: URL, into folder: URL) { perform { _ = try fs.move(url, into: folder) } }
     func trash(_ url: URL) { perform { try fs.trash(url) } }
+
+    // MARK: Several recordings at once
+
+    func move(_ urls: [URL], into folder: URL) { perform { for u in urls where u.deletingLastPathComponent().standardizedFileURL != folder.standardizedFileURL { _ = try fs.move(u, into: folder) } } }
+    func trash(_ urls: [URL]) { perform { for u in urls { try fs.trash(u) } } }
+
+    /// Renames to "name 1", "name 2", … in the given order. Returns the new URLs.
+    @discardableResult
+    func rename(_ urls: [URL], base: String) -> [URL] {
+        var out: [URL] = []
+        perform { for (i, u) in urls.enumerated() { out.append(try fs.rename(u, to: urls.count == 1 ? base : "\(base) \(i + 1)")) } }
+        return out
+    }
+
+    /// Sets one instruction for the whole of each recording (replacing any previous whole-recording one).
+    func setInstruction(_ text: String, for urls: [URL]) {
+        perform {
+            for u in urls {
+                var ann = RecordingIO.readAnnotations(u)
+                ann.segments.removeAll { $0.source == .task }
+                let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty, let meta = try? RecordingIO.readMeta(u) {
+                    ann.segments.insert(TextSegment(start: 0, end: meta.duration + 1, text: t, source: .task), at: 0)
+                }
+                try RecordingIO.writeAnnotations(ann, to: u)
+            }
+        }
+    }
+
 }

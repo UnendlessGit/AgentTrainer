@@ -196,6 +196,20 @@ public final class RecordingSession: @unchecked Sendable {
         return CIContext().createCGImage(ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale)), from: ci.extent.applying(CGAffineTransform(scaleX: scale, y: scale)))
     }
 
+    /// Stops capture and deletes everything written so far (nothing is saved).
+    public func cancel() async {
+        tap.stop()
+        await capturer.stop()
+        lock.lock()
+        stopped = true
+        frameBuffer = Data(); eventBuffer = Data()
+        lock.unlock()
+        try? framesHandle?.close(); try? eventsHandle?.close()
+        try? proxy?.finish()
+        writer?.cancelWriting()
+        try? FileManager.default.removeItem(at: package)
+    }
+
     /// Stops capture, finalizes every file and returns the package URL.
     @discardableResult
     public func stop() async throws -> URL {

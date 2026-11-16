@@ -66,6 +66,7 @@ final class AppModel {
     func registerHotkeys() {
         let st = settings.stored
         HotkeyCenter.shared.register(1, st.recordHotkey) { [weak self] in Task { await self?.recorder.toggle() } }
+        HotkeyCenter.shared.register(5, st.cancelRecordingHotkey) { [weak self] in Task { await self?.recorder.cancel() } }
         HotkeyCenter.shared.register(2, st.runHotkey) { [weak self] in Task { await self?.runner.toggle() } }
         HotkeyCenter.shared.register(3, st.pauseHotkey) { [weak self] in self?.runner.togglePause() }
         HotkeyCenter.shared.register(4, st.emergencyHotkey) { [weak self] in self?.runner.emergencyStop() }

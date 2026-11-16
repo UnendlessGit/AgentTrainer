@@ -99,7 +99,7 @@ struct RecordControlCard: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(title(rec)).font(.title2.weight(.semibold))
                     Text(rec.selectedTarget.map { "Target: \($0.name)" } ?? "No target selected").foregroundStyle(.secondary)
-                    Text("Shortcut: \(app.settings.stored.recordHotkey.display)").font(.caption).foregroundStyle(.tertiary)
+                    Text("Save: \(app.settings.stored.recordHotkey.display) · Discard: \(app.settings.stored.cancelRecordingHotkey.display)").font(.caption).foregroundStyle(.tertiary)
                 }
                 Spacer()
                 if let last = rec.lastSaved, rec.phase == .idle {

@@ -21,7 +21,8 @@ struct SettingsView: View {
             }
 
             Section("Keyboard shortcuts (work everywhere, even in full-screen games)") {
-                HotkeyRow(title: "Start / stop recording", hotkey: $settings.stored.recordHotkey) { app.registerHotkeys() }
+                HotkeyRow(title: "Start / stop recording (saves it)", hotkey: $settings.stored.recordHotkey) { app.registerHotkeys() }
+                HotkeyRow(title: "Cancel recording (discards it)", hotkey: $settings.stored.cancelRecordingHotkey) { app.registerHotkeys() }
                 HotkeyRow(title: "Start / stop the AI", hotkey: $settings.stored.runHotkey) { app.registerHotkeys() }
                 HotkeyRow(title: "Pause / resume the AI", hotkey: $settings.stored.pauseHotkey) { app.registerHotkeys() }
                 HotkeyRow(title: "Emergency stop", hotkey: $settings.stored.emergencyHotkey) { app.registerHotkeys() }

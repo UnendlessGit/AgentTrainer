@@ -60,6 +60,7 @@ struct StoredSettings: Codable {
     var modelsRoot: String?
     var cacheRoot: String?
     var recordHotkey = Hotkey(keyCode: 0x0F, command: true, shift: true, option: true) // ⌥⇧⌘R
+    var cancelRecordingHotkey = Hotkey(keyCode: 0x07, command: true, shift: true, option: true) // ⌥⇧⌘X
     var runHotkey = Hotkey(keyCode: 0x31, command: true, shift: true, option: true) // ⌥⇧⌘Space
     var pauseHotkey = Hotkey(keyCode: 0x23, command: true, shift: true, option: true) // ⌥⇧⌘P
     var emergencyHotkey = Hotkey(keyCode: 0x35, command: true, shift: true) // ⇧⌘Esc

@@ -96,7 +96,7 @@ final class RecorderController {
                                   appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")
         cfg.videoQuality = settings.stored.videoQuality
         let st = settings.stored
-        cfg.ignoredHotkeys = [st.recordHotkey, st.runHotkey, st.pauseHotkey, st.emergencyHotkey].map { ($0.keyCode, $0.cgFlags) }
+        cfg.ignoredHotkeys = [st.recordHotkey, st.cancelRecordingHotkey, st.runHotkey, st.pauseHotkey, st.emergencyHotkey].map { ($0.keyCode, $0.cgFlags) }
         do {
             let s = try RecordingSession(config: cfg)
             s.onError = { [weak self] e in Task { @MainActor in self?.errorMessage = e.localizedDescription; await self?.stop() } }
@@ -116,6 +116,23 @@ final class RecorderController {
         } catch {
             phase = .idle
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Ends the recording (or countdown) without saving anything.
+    func cancel() async {
+        switch phase {
+        case .countdown: countdownTask?.cancel(); phase = .idle
+        case .recording:
+            guard let s = session else { return }
+            phase = .saving
+            statsTimer?.invalidate()
+            hud.hide()
+            await s.cancel()
+            session = nil
+            phase = .idle
+            library.refresh()
+        case .idle, .saving: break
         }
     }
 
