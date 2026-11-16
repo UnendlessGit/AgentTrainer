@@ -55,7 +55,7 @@ public enum PolicyLoss {
         for (lg, lb, classes) in groups {
             let (ce, zl) = maskedCE(lg, lb, mask)
             heads.append(ce)
-            total = total + ce / Float(log(Double(classes)))
+            total = total + ce * Float(ActionSpaceConfig.lossScale(classes: classes))
             z = z + zl
         }
         return Parts(total: total + z * zWeight, perHead: heads, z: z)

@@ -105,8 +105,17 @@ public final class Trainer: @unchecked Sendable {
         let master = PolicyModel(architecture: a, actions: def.actions)
         let opt = AdamW(learningRate: Float(hp.learningRate), betas: (Float(hp.beta1), Float(hp.beta2)), eps: 1e-8, weightDecay: Float(hp.weightDecay))
         var startStep = 0
-        if let ck = resumeCheckpoint(def) {
-            try master.loadWeights(from: ck.appendingPathComponent(ModelPackage.weights))
+        var resumeFrom = resumeCheckpoint(def)
+        while let ck = resumeFrom {
+            do {
+                try master.loadWeights(from: ck.appendingPathComponent(ModelPackage.weights))
+                break
+            } catch WeightIOError.notFinite {
+                log("Skipping \(ck.lastPathComponent): its weights are broken (NaN) from an earlier failed run")
+                resumeFrom = previousCheckpoint(before: ck.lastPathComponent)
+            }
+        }
+        if let ck = resumeFrom {
             let optURL = ck.appendingPathComponent(ModelPackage.optimizer)
             if FileManager.default.fileExists(atPath: optURL.path) {
                 opt.update(parameters: ModuleParameters.unflattened(try loadArrays(url: optURL)))
@@ -229,6 +238,7 @@ public final class Trainer: @unchecked Sendable {
                 try mlxErrors.check()
                 for (i, v) in values.enumerated() { losses[i] += Double(v.item(Float.self)) / Double(accumulation) }
             }
+            guard losses.allSatisfy(\.isFinite) else { throw TrainerError.diverged(step: step + 1) }
             var grads = accumulated!
             if accumulation > 1 { grads = grads.mapValues { $0 / Float(accumulation) } }
             var gradNorm = 0.0
@@ -262,7 +272,7 @@ public final class Trainer: @unchecked Sendable {
                 if let m = v.run(model: compute, embed: { c in textArrays([c], dropout: false) }, language: { c in languageInputs([c]) }, step: step) {
                     emit(.validation(m))
                     Self.append(logHandle, TrainingLogLine(validation: m))
-                    let total = m.nll.enumerated().map { $0.element / Foundation.log(Double([space.keyClasses, space.pointerClasses, space.xClasses, space.yClasses][$0.offset])) }.reduce(0, +)
+                    let total = m.nll.enumerated().map { $0.element * ActionSpaceConfig.lossScale(classes: [space.keyClasses, space.pointerClasses, space.xClasses, space.yClasses][$0.offset]) }.reduce(0, +)
                     if total < bestValidation { bestValidation = total; markBest(step: step) }
                 }
                 emit(.phase(.training, "Training"))
@@ -333,6 +343,11 @@ public final class Trainer: @unchecked Sendable {
 
     // MARK: Checkpoints
 
+    private func previousCheckpoint(before name: String) -> URL? {
+        let dir = request.modelURL.appendingPathComponent(ModelPackage.checkpoints)
+        return ModelPackage.checkpointNames(request.modelURL).filter { $0.hasPrefix("step-") && $0 < name }.last.map { dir.appendingPathComponent($0) }
+    }
+
     private func resumeCheckpoint(_ def: ModelDefinition) -> URL? {
         let names = ModelPackage.checkpointNames(request.modelURL)
         let dir = request.modelURL.appendingPathComponent(ModelPackage.checkpoints)
@@ -380,18 +395,19 @@ public final class Trainer: @unchecked Sendable {
     }
 
     static func append(_ h: FileHandle?, _ line: TrainingLogLine) {
-        guard let h, var d = try? JSONEncoder().encode(line) else { return }
+        guard let h, var d = try? TrainingJSON.encoder().encode(line) else { return }
         d.append(0x0A)
         h.write(d)
     }
 }
 
 public enum TrainerError: Error, LocalizedError {
-    case noData, missingPretrained(String)
+    case noData, missingPretrained(String), diverged(step: Int)
     public var errorDescription: String? {
         switch self {
         case .noData: "None of the selected recordings could be used for training."
         case .missingPretrained(let n): "\(n) weights aren't downloaded yet. Download them in the AI Models tab or in Settings."
+        case .diverged(let s): "Training stopped at step \(s): the loss became NaN or infinite. Nothing was saved from this step. Try a lower learning rate or turn gradient clipping on."
         }
     }
 }

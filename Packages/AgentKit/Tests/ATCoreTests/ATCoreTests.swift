@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 @testable import ATCore
 
 @Test func bundleIdentifiersAreStable() {
@@ -21,4 +22,24 @@ import Testing
     #expect(a.resolvedKVHeads == 12)
     a.kvHeads = 4
     #expect(a.resolvedKVHeads == 4)
+}
+
+@Test func singleClassHeadsDoNotDivideByZero() {
+    #expect(ActionSpaceConfig.lossScale(classes: 1) == 0)
+    #expect(abs(ActionSpaceConfig.lossScale(classes: 2) - 1 / log(2.0)) < 1e-12)
+    var space = ActionSpaceConfig.p2p
+    space.pointerEvents = []
+    #expect(space.pointerClasses == 1)
+    #expect(ActionSpaceConfig.lossScale(classes: space.pointerClasses).isFinite)
+}
+
+@Test func progressWithNaNStillReachesTheApp() {
+    let p = TrainingProgress(step: 3, totalSteps: 10, epoch: 0.1, loss: .nan, headLosses: [.nan, .infinity, 0, 0], learningRate: 1e-4,
+                             gradNorm: .nan, secondsPerStep: 1, framesPerSecond: 100, gpuMemoryGB: 1, peakMemoryGB: 2)
+    let data = TrainingEvent.progress(p).encoded()
+    #expect(!data.isEmpty)
+    guard case .progress(let back)? = TrainingEvent.decode(data) else { Issue.record("did not decode"); return }
+    #expect(back.step == 3)
+    #expect(back.loss.isNaN)
+    #expect(back.headLosses[1] == .infinity)
 }

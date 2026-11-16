@@ -99,8 +99,23 @@ public enum TrainingEvent: Codable, Sendable {
     case log(String)
     case failed(String)
 
-    public func encoded() -> Data { (try? JSONEncoder().encode(self)) ?? Data() }
-    public static func decode(_ d: Data) -> TrainingEvent? { try? JSONDecoder().decode(TrainingEvent.self, from: d) }
+    public func encoded() -> Data { (try? TrainingJSON.encoder().encode(self)) ?? Data() }
+    public static func decode(_ d: Data) -> TrainingEvent? { try? TrainingJSON.decoder().decode(TrainingEvent.self, from: d) }
+}
+
+/// JSON for training events and logs. Plain JSON can't hold NaN or infinity, and a single NaN loss
+/// used to make every progress event fail to encode, so training looked like it never started.
+public enum TrainingJSON {
+    public static func encoder() -> JSONEncoder {
+        let e = JSONEncoder()
+        e.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "inf", negativeInfinity: "-inf", nan: "nan")
+        return e
+    }
+    public static func decoder() -> JSONDecoder {
+        let d = JSONDecoder()
+        d.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "inf", negativeInfinity: "-inf", nan: "nan")
+        return d
+    }
 }
 
 /// One line of `training-log.jsonl` in the model package (lets the UI show history after restarts).

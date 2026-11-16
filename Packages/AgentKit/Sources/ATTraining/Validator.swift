@@ -122,7 +122,7 @@ final class Validator {
         let nll = ceSum.map { $0 / Double(nSteps) }
         let base = baseSum.map { $0 / Double(nSteps) }
         let classes = [space.keyClasses, space.pointerClasses, space.xClasses, space.yClasses]
-        let ppl = exp(zip(nll, classes).map { $0 / log(Double($1)) }.reduce(0, +))
+        let ppl = exp(zip(nll, classes).map { $0 * ActionSpaceConfig.lossScale(classes: $1) }.reduce(0, +))
         let rce = zip(nll, base).map { b in b.1 > 0 ? max(-100, 100 * (b.1 - b.0) / b.1) : 0 }
         let dirAcc = mx.isEmpty ? 0 : Double(mx.filter { ($0.0 > 0) == ($0.1 > 0) }.count) / Double(mx.count)
         return ValidationMetrics(step: step, nll: nll, perplexity: ppl, rce: rce, keyF1: keyStats.f1, clickF1: clickStats.f1,

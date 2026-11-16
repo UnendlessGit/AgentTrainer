@@ -66,7 +66,7 @@ final class TrainingController {
         guard !isActive || jobModelID != entry.id else { return }
         progress = []; validation = []; dataset = nil; logs = []; phase = nil; message = ""
         guard let text = try? String(contentsOf: entry.url.appendingPathComponent(ModelPackage.log), encoding: .utf8) else { return }
-        let dec = JSONDecoder()
+        let dec = TrainingJSON.decoder()
         for line in text.split(separator: "\n") {
             guard let l = try? dec.decode(TrainingLogLine.self, from: Data(line.utf8)) else { continue }
             if let p = l.progress { progress.append(p) }

@@ -82,6 +82,9 @@ public struct ActionSpaceConfig: Codable, Hashable, Sendable {
     public var slotCount: Int { keySlots + pointerSlots + 2 }
     public var keyClasses: Int { keys.count + 1 }
     public var pointerClasses: Int { pointerEvents.count + 1 }
+    /// Pixel2Play divides each head's cross-entropy by log(#classes). A head with a single class
+    /// (e.g. no mouse buttons selected) is always right and contributes 0 instead of 0 / log(1).
+    public static func lossScale(classes: Int) -> Double { classes > 1 ? 1 / Foundation.log(Double(classes)) : 0 }
     public var xClasses: Int { mouseMode == .relative ? mouseXEdges.count + 1 : absoluteColumns }
     public var yClasses: Int { mouseMode == .relative ? mouseYEdges.count + 1 : absoluteRows }
     public var zeroXClass: Int { mouseMode == .relative ? bucketize(0, mouseXEdges) : 0 }
