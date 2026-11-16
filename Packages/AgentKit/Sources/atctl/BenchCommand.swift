@@ -8,6 +8,7 @@ import MLX
 enum BenchCommand {
     static func run(_ args: [String]) throws {
         let o = Options(args)
+        if ProcessInfo.processInfo.environment["AT_LEGACY"] != nil { PolicyModel.useLegacyPaths(true) }
         var arch = PolicyArchitecture.p2p150M
         arch.layers = o.int("--layers", 10)
         arch.width = o.int("--width", 1024)

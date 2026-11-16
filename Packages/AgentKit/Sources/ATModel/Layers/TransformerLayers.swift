@@ -106,6 +106,25 @@ final class SelfAttention: Module {
     }
 }
 
+extension SelfAttention {
+    /// Attention computed per query block over only the key range that block may see. With a
+    /// mask that is causal at timestep granularity, every key outside the range is masked for
+    /// every query in the block, so the result equals full masked attention exactly while
+    /// skipping roughly half of the score matrix.
+    func attendChunked(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, mask: MLXArray, chunks: [(Range<Int>, Range<Int>)]) -> MLXArray {
+        precondition(sinks == 0, "chunked attention is for the backbone (no sinks)")
+        let B = q.dim(0), T = q.dim(2)
+        let parts = chunks.map { (qr, kr) -> MLXArray in
+            MLXFast.scaledDotProductAttention(
+                queries: q[0..., 0..., qr, 0...], keys: k[0..., 0..., kr, 0...], values: v[0..., 0..., kr, 0...], scale: scale,
+                mask: .array(mask[qr, kr]))
+        }
+        let out = concatenated(parts, axis: 2)
+        let y = out.transposed(0, 2, 1, 3).reshaped(B, T, heads * headDim)
+        return dropout(cProj(y))
+    }
+}
+
 /// SwiGLU feed-forward with a packed gate/up projection (`w13`), P2P `PackedSwiGLUFFN`.
 final class SwiGLU: Module, UnaryLayer {
     @ModuleInfo(key: "w13") var w13: Linear
@@ -138,10 +157,13 @@ final class TransformerLayer: Module {
         _ffnNorm.wrappedValue = RMSNormF32(dimensions: width)
     }
 
-    /// Full-sequence forward (training / reference).
-    func callAsFunction(_ x: MLXArray, mask: MLXArray?, ropeOffset: Int = 0) -> MLXArray {
+    /// Full-sequence forward (training / reference). `chunks` splits attention into query blocks
+    /// that each read only the keys they can see (exact for block-causal masks; see `attendChunked`).
+    func callAsFunction(_ x: MLXArray, mask: MLXArray?, ropeOffset: Int = 0, chunks: [(Range<Int>, Range<Int>)]? = nil) -> MLXArray {
         let (q, k, v) = attention.projectQKV(attentionNorm(x), ropeOffset: ropeOffset)
-        let h = x + attention.attend(q, k, v, mask: mask)
+        let a: MLXArray
+        if let chunks, let mask { a = attention.attendChunked(q, k, v, mask: mask, chunks: chunks) } else { a = attention.attend(q, k, v, mask: mask) }
+        let h = x + a
         return h + ffn(ffnNorm(h))
     }
 }

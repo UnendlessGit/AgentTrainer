@@ -135,7 +135,7 @@ struct ModelEditor: View {
 
             Section("Network") {
                 Stepper("Transformer layers: \(def.architecture.layers)", value: $def.architecture.layers, in: 2 ... 32)
-                Picker("Width", selection: $def.architecture.width) { ForEach([512, 768, 1024, 1536, 2048], id: \.self) { Text("\($0)").tag($0) } }
+                Picker("Width", selection: $def.architecture.width) { ForEach([128, 192, 256, 384, 512, 768, 1024, 1536, 2048], id: \.self) { Text("\($0)").tag($0) } }
                     .onChange(of: def.architecture.width) { _, w in def.architecture.heads = w / 64; def.architecture.kvHeads = w / 64; def.architecture.decoderHeads = max(1, w / 128) }
                 Stepper("Action decoder layers: \(def.architecture.decoderLayers)", value: $def.architecture.decoderLayers, in: 1 ... 6)
                 LabeledSlider(title: "Dropout", value: $def.architecture.dropout, range: 0 ... 0.3, step: 0.01)
@@ -337,6 +337,17 @@ struct TrainingSettingsSection: View {
             LabeledSlider(title: "Held-out recordings", value: $training.validationFraction, range: 0 ... 0.4, step: 0.05, format: { "\(Int($0 * 100))%" })
             Stepper("Validate every \(training.validateEverySteps) steps", value: $training.validateEverySteps, in: 50 ... 10000, step: 50)
             LabeledSlider(title: "Checkpoint every", value: $training.checkpointEveryMinutes, range: 2 ... 60, step: 1, format: { "\(Int($0)) min" })
+            Toggle("Keep the best model", isOn: $training.saveBest)
+                .help("Saves the model from the validation check with the lowest held-out loss as checkpoint “Best”. It is never pruned, and Run uses it unless you pick another checkpoint.")
+            Toggle("Early stopping", isOn: $training.earlyStopping)
+                .help("Stops training when the held-out loss hasn't improved for several validation checks in a row.")
+            if training.earlyStopping {
+                Stepper("Stop after \(training.earlyStoppingPatience) checks without improvement (\(training.earlyStoppingPatience * training.validateEverySteps) steps)",
+                        value: $training.earlyStoppingPatience, in: 1 ... 50)
+            }
+            if (training.saveBest || training.earlyStopping) && training.validationFraction == 0 {
+                Text("Both need held-out recordings: set “Held-out recordings” above 0%.").font(.caption).foregroundStyle(.orange)
+            }
             LabeledSlider(title: "Action-history dropout", value: $training.historyDropout, range: 0 ... 0.9, step: 0.05, format: { "\(Int($0 * 100))%" })
             Text("Hides past actions from the model during training so it learns to act on what it sees instead of copying itself. Raise it if the model keeps repeating actions in Run.")
                 .font(.caption).foregroundStyle(.secondary)

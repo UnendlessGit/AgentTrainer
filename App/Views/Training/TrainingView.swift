@@ -176,6 +176,15 @@ struct FolderChecklist: View {
 struct CheckpointsCard: View {
     let app: AppModel
     let entry: ModelEntry
+
+    static func label(_ name: String, url: URL) -> String {
+        if name == "best" {
+            guard let st = ModelPackage.checkpointState(url, name: name) else { return "Best" }
+            return st.validationLoss.map { String(format: "Best · step %d (held-out loss %.3f)", st.step, $0) } ?? "Best · step \(st.step)"
+        }
+        guard let n = Int(name.replacingOccurrences(of: "step-", with: "")) else { return name }
+        return "Step \(n)"
+    }
     var body: some View {
         Card(title: "Checkpoints", symbol: "externaldrive") {
             if entry.checkpoints.isEmpty {
@@ -186,7 +195,7 @@ struct CheckpointsCard: View {
                 let active = (entry.definition.activeCheckpoint ?? entry.checkpoints.last) == name
                 HStack {
                     Image(systemName: active ? "checkmark.circle.fill" : "circle").foregroundStyle(active ? .green : .secondary)
-                    Text(name.replacingOccurrences(of: "step-", with: "Step ").replacingOccurrences(of: "Step 0", with: "Step ")).monospacedDigit()
+                    Text(Self.label(name, url: entry.url)).monospacedDigit()
                     Spacer()
                     Button("Use for Run") {
                         var d = entry.definition; d.activeCheckpoint = name; app.models.save(d)

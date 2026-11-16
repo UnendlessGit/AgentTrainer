@@ -53,6 +53,17 @@ public struct PolicyArchitecture: Codable, Hashable, Sendable {
 
     public static var p2p150M: PolicyArchitecture { PolicyArchitecture() }
     public static var p2p300M: PolicyArchitecture { var a = PolicyArchitecture(); a.layers = 20; return a }
+    /// Smaller blank models: the same Pixel2Play architecture with 64-wide attention heads.
+    public static var medium22M: PolicyArchitecture { small(width: 384, layers: 6) }
+    public static var small10M: PolicyArchitecture { small(width: 256, layers: 4) }
+    public static var tiny5M: PolicyArchitecture { small(width: 128, layers: 8) }
+    static func small(width: Int, layers: Int) -> PolicyArchitecture {
+        var a = PolicyArchitecture()
+        a.width = width; a.layers = layers; a.heads = width / 64; a.kvHeads = width / 64
+        a.decoderLayers = 2; a.decoderHeads = max(1, width / 128)
+        return a
+    }
+
     public static var compact60M: PolicyArchitecture {
         var a = PolicyArchitecture(); a.width = 768; a.layers = 6; a.heads = 12; a.kvHeads = 12; a.decoderHeads = 6; a.decoderLayers = 2; return a
     }

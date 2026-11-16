@@ -113,6 +113,8 @@ public final class PolicyStepper {
         capacity = cap
         let a = model.architecture
         let dt = model.computeDType
+        // Live inference uses fixed weights: fold the stem's BatchNorms into its convs once.
+        if !model.training { model.vision.prepareInference(dtype: dt) }
         keys = (0 ..< a.layers).map { _ in MLXArray.zeros([1, a.resolvedKVHeads, cap, a.headDim], dtype: dt) }
         values = (0 ..< a.layers).map { _ in MLXArray.zeros([1, a.resolvedKVHeads, cap, a.headDim], dtype: dt) }
         slotPos = Array(repeating: 0, count: cap)

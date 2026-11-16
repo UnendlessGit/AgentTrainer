@@ -43,3 +43,10 @@ import Foundation
     #expect(back.loss.isNaN)
     #expect(back.headLosses[1] == .infinity)
 }
+
+@Test func oldModelFilesGetBestAndEarlyStoppingDefaults() throws {
+    let old = #"{"learningRate": 0.0002, "totalSteps": 1234}"#.data(using: .utf8)!
+    let h = try JSONDecoder().decode(TrainingHyperparameters.self, from: old)
+    #expect(h.learningRate == 0.0002 && h.totalSteps == 1234)
+    #expect(h.saveBest && !h.earlyStopping && h.earlyStoppingPatience == 5)
+}

@@ -149,6 +149,12 @@ enum EngineTrainSelfTest {
         def.training.totalSteps = 20
         def.training.validateEverySteps = 20
         def.architecture.memorySeconds = 4
+        // Optional: train a copy of an existing model's definition (speed comparisons).
+        if i + 3 < CommandLine.arguments.count, let d = try? ModelPackage.read(URL(fileURLWithPath: CommandLine.arguments[i + 3])) {
+            def = d; def.id = UUID(); def.name = "selftest"; def.architectureLocked = false; def.trainedSteps = 0; def.activeCheckpoint = nil
+            def.training.totalSteps = 25; def.training.validateEverySteps = 1000
+            report.append("using the definition of \(d.name)")
+        }
         let modelURL = out.appendingPathComponent("selftest.atmodel")
         try? FileManager.default.removeItem(at: modelURL)
         do { try ModelPackage.write(def, to: modelURL) } catch { report.append("FAIL: \(error)"); return }
@@ -177,7 +183,9 @@ enum EngineTrainSelfTest {
         }
         report.append("phase: \(app.training.phase?.rawValue ?? "none") · \(app.training.message)")
         if let e = app.training.errorMessage { report.append("error: \(e)") }
-        if let p = app.training.progress.last { report.append(String(format: "steps %d, loss %.3f, %.0f frames/s", p.step, p.loss, p.framesPerSecond)) }
+        if let p = app.training.progress.last { report.append(String(format: "steps %d, loss %.3f, %.0f frames/s, %.2f s/step", p.step, p.loss, p.framesPerSecond, p.secondsPerStep)) }
+        let late = app.training.progress.suffix(10)
+        if !late.isEmpty { report.append(String(format: "mean of last %d steps: %.2f s/step", late.count, late.map(\.secondsPerStep).reduce(0, +) / Double(late.count))) }
         if let v = app.training.validation.last { report.append(String(format: "validation key F1 %.2f", v.keyF1)) }
         report.append("checkpoints: \(ModelPackage.checkpointNames(modelURL))")
     }

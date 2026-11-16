@@ -57,19 +57,22 @@ final class Validator {
             let mask = MLXArray(clip.mask, [1, T])
             let (text, present) = embed(clip)
             let lang = language(clip)
-            let logits = model(frames: frames, actionsIn: acts, text: text, textPresent: present, language: lang)
+            // The vision stem runs once per clip; all passes below reuse its tokens (eval mode is
+            // deterministic, and rolling frames in time just rolls their tokens).
+            let img = model.clipImageTokens(frames)
+            let logits = model(frames: frames, actionsIn: acts, text: text, textPresent: present, language: lang, imageTokens: img)
             let parts = PolicyLoss.compute(logits, actions: acts, mask: mask, space: space, zWeight: 0)
             // Visual reliance: same clip with frames rolled half a clip in time.
-            let rolled = concatenated([frames[0..., (T / 2)..., 0...], frames[0..., 0 ..< (T / 2), 0...]], axis: 1)
-            let shuffled = PolicyLoss.compute(model(frames: rolled, actionsIn: acts, text: text, textPresent: present, language: lang), actions: acts, mask: mask, space: space, zWeight: 0)
-            let blind = PolicyLoss.compute(model(frames: frames, actionsIn: acts, text: text, textPresent: present, historyKeep: MLXArray.zeros([1, T], dtype: .bool), language: lang),
+            let rolled = concatenated([img[0..., (T / 2)..., 0..., 0...], img[0..., 0 ..< (T / 2), 0..., 0...]], axis: 1)
+            let shuffled = PolicyLoss.compute(model(frames: frames, actionsIn: acts, text: text, textPresent: present, language: lang, imageTokens: rolled), actions: acts, mask: mask, space: space, zWeight: 0)
+            let blind = PolicyLoss.compute(model(frames: frames, actionsIn: acts, text: text, textPresent: present, historyKeep: MLXArray.zeros([1, T], dtype: .bool), language: lang, imageTokens: img),
                                            actions: acts, mask: mask, space: space, zWeight: 0)
             var textParts: PolicyLoss.Parts?
             let hasText = clip.text.contains { $0 >= 0 }
             if hasText {
                 var noLang = lang
                 if let b = lang?.typingBytes { noLang?.typingBytes = MLXArray.full(b.shape, values: MLXArray(Int32(256))) }
-                textParts = PolicyLoss.compute(model(frames: frames, actionsIn: acts, text: text, textPresent: MLXArray.zeros([1, T], dtype: .bool), language: noLang),
+                textParts = PolicyLoss.compute(model(frames: frames, actionsIn: acts, text: text, textPresent: MLXArray.zeros([1, T], dtype: .bool), language: noLang, imageTokens: img),
                                                actions: acts, mask: mask, space: space, zWeight: 0)
             }
             let keyPred = argMax(logits.keys, axis: -1), ptrPred = argMax(logits.pointer, axis: -1)

@@ -39,10 +39,27 @@ Frames carry ScreenCaptureKit's display time; input events carry their CGEvent t
 ## Training
 
 - fp32 master weights + AdamW state, bf16 compute model (3× faster, half the memory of fp32).
-- **Stem gradient sampling**: all frames go through EfficientNet without gradients; a random subset (32/clip) is recomputed with gradients scaled N/K (unbiased). BatchNorm statistics are frozen (clips are single-recording, so batch statistics would be biased). 10 s clips at 30 Hz train at ~1.4 s/clip, ~11 GB peak.
+- **Stem gradient sampling**: a random subset of frames (32/clip) goes through EfficientNet with gradients scaled N/K (unbiased), the rest without gradients. BatchNorm statistics are frozen (clips are single-recording, so batch statistics would be biased). 10 s clips at 30 Hz train at ~1.4 s/clip, ~11 GB peak.
 - P2P loss (CE / log #classes per head + z-loss), warmup + cosine schedule, gradient clipping, P2P's clip-consistent augmentations.
 - **Anti-copycat action-history dropout** (beyond P2P): past-action tokens are hidden in random spans and replaced by a learned "unknown" token, forcing decisions from vision. In the Test Arena this raised vision-only agreement with the expert from 34% to 78%.
-- Validation on held-out *recordings*: per-head NLL/perplexity, relative cross-entropy vs. label frequency, key/click onset F1, mouse direction/correlation, visual reliance (frames shuffled in time), history reliance (past actions hidden), language reliance (instruction removed).
+- Validation on held-out *recordings*: per-head NLL/perplexity, relative cross-entropy vs. label frequency, key/click onset F1, mouse direction/correlation, visual reliance (frames shuffled in time), history reliance (past actions hidden), language reliance (instruction removed). The stem runs once per validation clip; the four passes reuse its tokens.
+- **Best model and early stopping** (both optional): every validation that lowers the held-out loss saves checkpoint `best` (never pruned; Run uses it unless another is pinned). Early stopping ends the run after N checks without improvement.
+
+### Training speed (same math, measured on the Compact 60M model, 10 s × 30 Hz clips, batch 3)
+
+| | step | frames/s |
+|---|---|---|
+| before | 2.15 s | 420 |
+| after | 1.30 s | 690 |
+
+What changed, each checked against the original path:
+- **Vision stem.** BatchNorm statistics are frozen, so each BatchNorm is folded into its conv weights and bias + SiLU run as one fused kernel; the squeeze-excite gates and the projection's BatchNorm are folded into per-sample 1×1 projection weights. Depthwise convolutions get a hand-written backward (MLX's grouped-conv gradients were 10–40× slower than the forward): strided input gradients via zero-insertion + a stride-1 correlation, weight gradients via a small Metal kernel. Stem forward+backward: 5× faster. Each frame now goes through the stem once (sampled frames with gradients, the rest without), instead of the sampled ones twice.
+- **Attention.** The mask is causal at timestep granularity, so attention is computed in query blocks that read only the keys they can see (exactly equal, ~40% fewer scores), with an additive mask (faster in MLX's fused kernels).
+- **Whole step compiled.** Forward + backward is one `compile`d graph (fused elementwise ops, no re-tracing); identical loss and gradients to the uncompiled step.
+- **Optimizer.** AdamW with MLX's exact update, each parameter's update + bf16 copy one fused kernel; same checkpoint format.
+- **Augmentation.** Warp, colour and blur are single Metal passes reading the uint8 frames (190 → 40 ms per step).
+- **Embedding gradients in fp32.** Found while checking the compiled step: in bf16, the action-embedding gradients (thousands of contributions scatter-added into a few rows) differed by up to 18% between identical runs. The compute copy now keeps these four tables in fp32 (agreement 4·10⁻⁸). This is a precision fix, not a speed change.
+- Verification: in fp32, new vs original gradients differ by 1.2·10⁻⁷ overall; in bf16 both paths are equally far from an fp32 reference (0.50% overall). P2P parity (8·10⁻⁵) and streaming parity are unchanged; unit tests cover each rewrite. Larger batches gave no extra throughput (the GPU is saturated), so automatic batch size is unchanged.
 
 ## Language
 

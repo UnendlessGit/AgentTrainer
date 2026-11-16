@@ -103,7 +103,10 @@ public final class Trainer: @unchecked Sendable {
         // Model: fp32 master weights for the optimizer, a compute copy (bf16) for forward/backward.
         emit(.phase(.preparing, "Loading weights"))
         let master = PolicyModel(architecture: a, actions: def.actions)
-        let opt = AdamW(learningRate: Float(hp.learningRate), betas: (Float(hp.beta1), Float(hp.beta2)), eps: 1e-8, weightDecay: Float(hp.weightDecay))
+        let computeType: DType = hp.bf16 ? .bfloat16 : .float32
+        let opt = FusedAdamW(learningRate: Float(hp.learningRate), betas: (Float(hp.beta1), Float(hp.beta2)), eps: 1e-8,
+                             weightDecay: Float(hp.weightDecay), computeType: computeType)
+        opt.keepsFP32 = PolicyModel.keepsFP32
         var startStep = 0
         var resumeFrom = resumeCheckpoint(def)
         while let ck = resumeFrom {
@@ -133,9 +136,8 @@ public final class Trainer: @unchecked Sendable {
             if def.initialization != .blank { throw TrainerError.missingPretrained(def.initialization.label) }
         }
         master.freezeBatchNormStatistics()
-        let computeType: DType = hp.bf16 ? .bfloat16 : .float32
         let compute = PolicyModel(architecture: a, actions: def.actions)
-        compute.update(parameters: ModuleParameters.unflattened(master.parameters().flattened().map { ($0.0, $0.1.asType(computeType)) }))
+        compute.update(parameters: ModuleParameters.unflattened(master.parameters().flattened().map { ($0.0, $0.1.asType(PolicyModel.keepsFP32($0.0) ? .float32 : computeType)) }))
         compute.setTraining()
         compute.freezeBatchNormStatistics()
         compute.visionGradientFrames = min(32, length)
@@ -185,7 +187,7 @@ public final class Trainer: @unchecked Sendable {
             return l
         }
 
-        let vg = valueAndGrad(model: compute) { (m: PolicyModel, b: [MLXArray]) -> [MLXArray] in
+        let vgPlain = valueAndGrad(model: compute) { (m: PolicyModel, b: [MLXArray]) -> [MLXArray] in
             var lang: LanguageInputs?
             if b.count > 6 {
                 lang = LanguageInputs(screenEmbeddings: b[6].size > 0 ? b[6] : nil, screenBoxes: b[7].size > 0 ? b[7] : nil,
@@ -195,6 +197,25 @@ public final class Trainer: @unchecked Sendable {
             let p = PolicyLoss.compute(logits, actions: b[1], mask: b[2], space: space, zWeight: Float(hp.zLossWeight))
             return [p.total] + p.perHead
         }
+        // The whole forward + backward compiled into one graph: MLX fuses the many small
+        // elementwise ops (residuals, dropout, casts, loss) and skips re-tracing every step.
+        // Shapes are fixed for the run; randomness flows through the global random state.
+        let useCompile = ProcessInfo.processInfo.environment["AT_NO_COMPILE"] == nil
+        compute.recordsDebug = !useCompile
+        compute.prepareMasks(steps: length)
+        var gradKeys: [String] = []
+        let compiledStep = compile(inputs: [compute, MLXRandom.globalState], outputs: [MLXRandom.globalState]) { (inputs: [MLXArray]) -> [MLXArray] in
+            let (values, grads) = vgPlain(compute, inputs)
+            let flat = grads.flattened()
+            gradKeys = flat.map(\.0)
+            return values + flat.map(\.1)
+        }
+        func vg(_ m: PolicyModel, _ inputs: [MLXArray]) -> ([MLXArray], ModuleParameters) {
+            guard useCompile else { return vgPlain(m, inputs) }
+            let out = compiledStep(inputs)
+            let nValues = out.count - gradKeys.count
+            return (Array(out[0 ..< nValues]), ModuleParameters.unflattened(Array(zip(gradKeys, out[nValues...]))))
+        }
 
         // MARK: Loop
         emit(.phase(.training, "Training"))
@@ -203,10 +224,26 @@ public final class Trainer: @unchecked Sendable {
         var lastEmit = Date.distantPast
         var smoothed: Double?
         var lastLoss = 0.0
+        // Best held-out loss so far. Resuming continues the comparison with the saved "best";
+        // a fresh run starts over (an old "best" from a previous run would not be comparable).
         var bestValidation = Double.infinity
+        let bestDir = request.modelURL.appendingPathComponent(ModelPackage.checkpoints).appendingPathComponent(Self.bestName)
+        if startStep > 0, let st = try? JSONDecoder().decode(CheckpointState.self, from: Data(contentsOf: bestDir.appendingPathComponent(ModelPackage.state))),
+           let v = st.validationLoss {
+            bestValidation = v; bestStep = st.step
+        } else if startStep == 0 {
+            try? FileManager.default.removeItem(at: bestDir)
+        }
+        var checksWithoutImprovement = 0
+        var stoppedEarly = false
         let logHandle = Self.openLog(request.modelURL)
         defer { try? logHandle?.close() }
         MLX.GPU.resetPeakMemory()
+        // AT_TRAIN_PROFILE=1: time each phase (adds sync points, so only for measuring).
+        let profile = ProcessInfo.processInfo.environment["AT_TRAIN_PROFILE"] != nil
+        var prof: [String: Double] = [:], profSteps = 0
+        var tp = Date()
+        func mark(_ k: String) { if profile { prof[k, default: 0] += Date().timeIntervalSince(tp); tp = Date() } }
 
         while step < hp.totalSteps {
             if try checkControl(master: master, opt: opt, def: &def, step: step, loss: lastLoss, epoch: loader.epochProgress) { break }
@@ -214,44 +251,145 @@ public final class Trainer: @unchecked Sendable {
             let lr = learningRate(step: step, hp: hp)
             var accumulated: ModuleParameters?
             var losses = [Double](repeating: 0, count: 5)
+            var pendingValues: [MLXArray] = []
+            tp = Date()
             for _ in 0 ..< accumulation {
                 var clips: [ClipData] = []
                 for _ in 0 ..< batch { clips.append(try loader.next()) }
+                mark("1 wait for data")
                 let S = a.frameSize, T = length
-                let frames = stacked(clips.map { augmenter(MLXArray($0.frames, [T, S, S, 3], dtype: .uint8).asType(.float32)) })
+                let frames = stacked(clips.map { augmenter(MLXArray($0.frames, [T, S, S, 3], dtype: .uint8), dtype: computeType) })
                 let acts = MLXArray(clips.flatMap(\.classes), [clips.count, T, space.slotCount])
                 let mask = MLXArray(clips.flatMap(\.mask), [clips.count, T])
                 let (text, present) = textArrays(clips, dropout: true)
                 let keep = MLXArray(clips.flatMap { _ in Self.historyKeepMask(length: T, dropout: hp.historyDropout) }, [clips.count, T])
-                var inputs = [frames.asType(computeType), acts, mask, text, present, keep]
+                var inputs = [frames, acts, mask, text, present, keep]
                 if let l = languageInputs(clips) {
                     let empty = MLXArray.zeros([0])
                     inputs += [l.screenEmbeddings ?? empty, l.screenBoxes ?? empty, l.screenMask ?? empty, l.typingBytes ?? empty]
                 }
+                if profile { eval(inputs); mark("2 upload + augment") }
+                if profile && profSteps == 3 {
+                    let f = inputs[0]
+                    tp = Date(); eval(compute.profileStem(f)); mark("x stem forward, all frames")
+                    tp = Date(); eval(compute(frames: f, actionsIn: inputs[1], text: inputs[3], textPresent: inputs[4], historyKeep: inputs[5]).keys); mark("x full forward only")
+                }
+                if ProcessInfo.processInfo.environment["AT_LEGACY_CHECK"] != nil, step == startStep {
+                    // New training path vs the original one on the same batch and random state.
+                    MLXRandom.seed(7); let (v1, g1) = vg(compute, inputs); eval(v1, g1)
+                    PolicyModel.useLegacyPaths(true)
+                    MLXRandom.seed(7); let (v2, g2) = vgPlain(compute, inputs); eval(v2, g2)
+                    PolicyModel.useLegacyPaths(false)
+                    let gNew = Dictionary(uniqueKeysWithValues: g1.flattened()), gOld = Dictionary(uniqueKeysWithValues: g2.flattened())
+                    var rels: [(Double, String)] = []
+                    var num = 0.0, den = 0.0
+                    for (k, x) in gNew {
+                        guard let y = gOld[k] else { continue }
+                        let x32 = x.asType(.float32), y32 = y.asType(.float32)
+                        let d2 = Double((x32 - y32).square().sum().item(Float.self)), n2 = Double(x32.square().sum().item(Float.self))
+                        num += d2; den += n2
+                        rels.append(((d2 / max(n2, 1e-30)).squareRoot(), k))
+                    }
+                    if computeType != .float32 {
+                        // fp32 reference with the same weights: how far is each bf16 path from it?
+                        let ref = PolicyModel(architecture: a, actions: def.actions)
+                        ref.update(parameters: ModuleParameters.unflattened(master.parameters().flattened()))
+                        ref.setTraining(); ref.freezeBatchNormStatistics(); ref.visionGradientFrames = compute.visionGradientFrames; ref.recordsDebug = false
+                        let vgRef = valueAndGrad(model: ref) { (m: PolicyModel, b: [MLXArray]) -> [MLXArray] in
+                            let logits = m(frames: b[0], actionsIn: b[1], text: b[3], textPresent: b[4], historyKeep: b[5])
+                            return [PolicyLoss.compute(logits, actions: b[1], mask: b[2], space: space, zWeight: Float(hp.zLossWeight)).total]
+                        }
+                        var refInputs = inputs; refInputs[0] = inputs[0].asType(.float32)
+                        MLXRandom.seed(7); let (_, gr) = vgRef(ref, refInputs); eval(gr)
+                        let r = Dictionary(uniqueKeysWithValues: gr.flattened())
+                        func err(_ g: [String: MLXArray], stemOnly: Bool) -> Double {
+                            var n = 0.0, d = 0.0
+                            for (k, x) in r where !stemOnly || k.hasPrefix("vision.stem") {
+                                guard let y = g[k] else { continue }
+                                n += Double((x - y.asType(.float32)).square().sum().item(Float.self)); d += Double(x.square().sum().item(Float.self))
+                            }
+                            return (n / max(d, 1e-30)).squareRoot()
+                        }
+                        log(String(format: "BF16 ERROR vs fp32 reference | all params: new %.2e old %.2e | vision stem: new %.2e old %.2e",
+                                   err(gNew, stemOnly: false), err(gOld, stemOnly: false), err(gNew, stemOnly: true), err(gOld, stemOnly: true)))
+                    }
+                    rels.sort { $0.0 > $1.0 }
+                    log(String(format: "LEGACY CHECK: loss new %.6f old %.6f | all-gradient rel diff %.2e | median %.2e | worst: %@",
+                               v1[0].item(Float.self), v2[0].item(Float.self), (num / den).squareRoot(), rels[rels.count / 2].0,
+                               rels.prefix(4).map { String(format: "%.1e %@", $0.0, $0.1) }.joined(separator: ", ")))
+                }
+                if ProcessInfo.processInfo.environment["AT_COMPILE_CHECK"] != nil, step == startStep, useCompile {
+                    // Same inputs and random state through the plain and the compiled step.
+                    MLXRandom.seed(42); let (v1, g1) = vgPlain(compute, inputs); eval(v1, g1)
+                    MLXRandom.seed(42); let (_, g0) = vgPlain(compute, inputs); eval(g0)
+                    for key in ["emb_key.weight", "emb_pointer.weight", "emb_x.weight"] {
+                        let x = Dictionary(uniqueKeysWithValues: g1.flattened())[key]!.asType(.float32), y = Dictionary(uniqueKeysWithValues: g0.flattened())[key]!.asType(.float32)
+                        log(String(format: "PLAIN vs PLAIN %@: rel diff %.2e", key, sqrt((x - y).square().sum()).item(Float.self) / sqrt(x.square().sum()).item(Float.self)))
+                    }
+                    MLXRandom.seed(42); let (v2, g2) = vg(compute, inputs); eval(v2, g2)
+                    let a = Dictionary(uniqueKeysWithValues: g1.flattened()), b = Dictionary(uniqueKeysWithValues: g2.flattened())
+                    var rels: [(Double, String)] = []
+                    for (k, x) in a {
+                        guard let y = b[k] else { log("COMPILE CHECK: missing grad \(k)"); continue }
+                        let x32 = x.asType(.float32), y32 = y.asType(.float32)
+                        let rel = Double(sqrt((x32 - y32).square().sum()).item(Float.self)) / max(Double(sqrt(x32.square().sum()).item(Float.self)), 1e-20)
+                        rels.append((rel, k + String(format: " |g| %.2e", sqrt(x32.square().sum()).item(Float.self))))
+                    }
+                    rels.sort { $0.0 > $1.0 }
+                    let worst = rels.first?.0 ?? 0, worstKey = rels.prefix(6).map { String(format: "%.1e %@", $0.0, $0.1) }.joined(separator: "; ")
+                    let median = rels.isEmpty ? 0 : rels[rels.count / 2].0
+                    log(String(format: "COMPILE CHECK: median rel grad-norm diff %.2e", median))
+                    log(String(format: "COMPILE CHECK: loss plain %.6f compiled %.6f | grads %d vs %d | worst rel grad diff %.2e (%@)",
+                               v1[0].item(Float.self), v2[0].item(Float.self), a.count, b.count, worst, worstKey))
+                }
                 let (values, grads) = vg(compute, inputs)
                 try mlxErrors.check()
-                let g32 = grads.mapValues { $0.asType(.float32) }
-                accumulated = accumulated.map { acc in
-                    ModuleParameters.unflattened(zip(acc.flattened(), g32.flattened()).map { ($0.0.0, $0.0.1 + $0.1.1) })
-                } ?? g32
-                eval(values, accumulated!)
-                try mlxErrors.check()
-                for (i, v) in values.enumerated() { losses[i] += Double(v.item(Float.self)) / Double(accumulation) }
+                mark("3 build graph (CPU)")
+                if accumulation == 1 {
+                    accumulated = grads // the fused optimizer casts to fp32 itself
+                } else {
+                    let g32 = grads.mapValues { $0.asType(.float32) }
+                    accumulated = accumulated.map { acc in
+                        ModuleParameters.unflattened(zip(acc.flattened(), g32.flattened()).map { ($0.0.0, $0.0.1 + $0.1.1) })
+                    } ?? g32
+                }
+                if accumulation > 1 || profile {
+                    eval(values, accumulated!)
+                    try mlxErrors.check()
+                    mark("4 forward + backward (GPU)")
+                    for (i, v) in values.enumerated() { losses[i] += Double(v.item(Float.self)) / Double(accumulation) }
+                } else {
+                    pendingValues = values // evaluated together with the optimizer update below
+                }
             }
-            guard losses.allSatisfy(\.isFinite) else { throw TrainerError.diverged(step: step + 1) }
+            if accumulation > 1 || profile {
+                guard losses.allSatisfy(\.isFinite) else { throw TrainerError.diverged(step: step + 1) }
+            }
             var grads = accumulated!
             if accumulation > 1 { grads = grads.mapValues { $0 / Float(accumulation) } }
-            var gradNorm = 0.0
-            if hp.gradientClip > 0 {
-                let (clipped, norm) = clipGradNorm(gradients: grads, maxNorm: Float(hp.gradientClip))
-                grads = clipped
-                gradNorm = Double(norm.item(Float.self))
-            }
             opt.learningRate = Float(lr)
-            opt.update(model: master, gradients: grads)
-            compute.update(parameters: ModuleParameters.unflattened(master.trainableParameters().flattened().map { ($0.0, $0.1.asType(computeType)) }))
-            eval(master, opt, compute)
+            let norm = opt.update(master: master, compute: compute, gradients: grads, clip: Float(max(0, hp.gradientClip)))
+            mark("5a optimizer graph (CPU)")
+            // One submission for forward, backward and update: no GPU idle gap between them.
+            eval([norm] + opt.arrays + pendingValues, master, compute)
+            if !pendingValues.isEmpty {
+                try mlxErrors.check()
+                for (i, v) in pendingValues.enumerated() { losses[i] = Double(v.item(Float.self)) }
+                pendingValues = []
+                // The update already ran, but nothing is saved after a non-finite step: training stops here.
+                guard losses.allSatisfy(\.isFinite) else { throw TrainerError.diverged(step: step + 1) }
+            }
+            let gradNorm = hp.gradientClip > 0 ? Double(norm.item(Float.self)) : 0
             try mlxErrors.check()
+            mark("5b optimizer (GPU)")
+            if profile {
+                profSteps += 1
+                if profSteps == 2 { prof = [:] } // drop warm-up
+                if profSteps > 2, (profSteps - 2) % 5 == 0 {
+                    let n = Double(profSteps - 2)
+                    log("PROFILE over \(Int(n)) steps (batch \(batch)×\(length)): " + prof.keys.sorted().map { k in String(format: "%@ %.0f ms", k, prof[k]! / (k.hasPrefix("x") ? 1 : n) * 1000) }.joined(separator: " | "))
+                }
+            }
             step += 1
             lastLoss = losses[0]
             smoothed = smoothed.map { $0 * 0.9 + losses[0] * 0.1 } ?? losses[0]
@@ -273,8 +411,25 @@ public final class Trainer: @unchecked Sendable {
                     emit(.validation(m))
                     Self.append(logHandle, TrainingLogLine(validation: m))
                     let total = m.nll.enumerated().map { $0.element * ActionSpaceConfig.lossScale(classes: [space.keyClasses, space.pointerClasses, space.xClasses, space.yClasses][$0.offset]) }.reduce(0, +)
-                    if total < bestValidation { bestValidation = total; markBest(step: step) }
+                    if total < bestValidation {
+                        bestValidation = total
+                        bestStep = step
+                        checksWithoutImprovement = 0
+                        if hp.saveBest {
+                            try saveBest(master: master, step: step, validationLoss: total, trainLoss: lastLoss, epoch: loader.epochProgress)
+                            log(String(format: "New best held-out loss %.4f at step %d (saved as \"best\")", total, step))
+                        }
+                    } else {
+                        checksWithoutImprovement += 1
+                        if hp.earlyStopping {
+                            log("Held-out loss hasn't improved for \(checksWithoutImprovement) of \(hp.earlyStoppingPatience) checks (best: step \(bestStep ?? 0))")
+                        }
+                        if hp.earlyStopping && checksWithoutImprovement >= max(1, hp.earlyStoppingPatience) {
+                            stoppedEarly = true
+                        }
+                    }
                 }
+                if stoppedEarly { break }
                 emit(.phase(.training, "Training"))
             }
             if Date().timeIntervalSince(lastCheckpoint) > hp.checkpointEveryMinutes * 60 {
@@ -284,11 +439,37 @@ public final class Trainer: @unchecked Sendable {
         }
         emit(.phase(.saving, "Saving"))
         try saveCheckpoint(master: master, opt: opt, def: &def, step: step, loss: lastLoss, epoch: loader.epochProgress)
-        emit(.phase(stopRequested ? .stopped : .finished, stopRequested ? "Stopped at step \(step)" : "Finished \(step) steps"))
+        // Run uses the best checkpoint unless the user pinned another one.
+        if hp.saveBest, FileManager.default.fileExists(atPath: bestDir.path), var latest = try? ModelPackage.read(request.modelURL), latest.activeCheckpoint == nil {
+            latest.activeCheckpoint = Self.bestName
+            try? ModelPackage.write(latest, to: request.modelURL)
+        }
+        if stoppedEarly {
+            emit(.phase(.finished, "Stopped early at step \(step): the held-out loss stopped improving (best at step \(bestStep ?? step))"))
+        } else {
+            emit(.phase(stopRequested ? .stopped : .finished, stopRequested ? "Stopped at step \(step)" : "Finished \(step) steps"))
+        }
+    }
+
+    static let bestName = "best"
+
+    /// Writes the current weights as checkpoint "best" (no optimizer state: it is a model to run,
+    /// and training can still resume from it).
+    private func saveBest(master: PolicyModel, step: Int, validationLoss: Double, trainLoss: Double, epoch: Double) throws {
+        let dir = request.modelURL.appendingPathComponent(ModelPackage.checkpoints).appendingPathComponent(Self.bestName)
+        let tmp = request.modelURL.appendingPathComponent(ModelPackage.checkpoints).appendingPathComponent(".best-writing")
+        try? FileManager.default.removeItem(at: tmp)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        try master.saveWeights(to: tmp.appendingPathComponent(ModelPackage.weights), metadata: ["step": "\(step)", "best": "1"])
+        let state = CheckpointState(step: step, epoch: epoch, trainLoss: trainLoss, validationLoss: validationLoss, rngSeed: 0, dataCursor: 0)
+        try JSONEncoder().encode(state).write(to: tmp.appendingPathComponent(ModelPackage.state))
+        try? FileManager.default.removeItem(at: dir)
+        try FileManager.default.moveItem(at: tmp, to: dir)
+        emit(.checkpoint(name: Self.bestName, step: step))
     }
 
     /// Handles pause / stop / manual checkpoint. Returns true to stop.
-    private func checkControl(master: PolicyModel, opt: AdamW, def: inout ModelDefinition, step: Int, loss: Double, epoch: Double) throws -> Bool {
+    private func checkControl(master: PolicyModel, opt: FusedAdamW, def: inout ModelDefinition, step: Int, loss: Double, epoch: Double) throws -> Bool {
         control.lock()
         let stop = stopRequested, pause = pauseRequested, ckpt = checkpointRequested
         checkpointRequested = false
@@ -355,7 +536,7 @@ public final class Trainer: @unchecked Sendable {
         return names.filter { $0.hasPrefix("step-") }.last.map { dir.appendingPathComponent($0) }
     }
 
-    private func saveCheckpoint(master: PolicyModel, opt: AdamW, def: inout ModelDefinition, step: Int, loss: Double, epoch: Double) throws {
+    private func saveCheckpoint(master: PolicyModel, opt: FusedAdamW, def: inout ModelDefinition, step: Int, loss: Double, epoch: Double) throws {
         let name = CheckpointState.name(step: step)
         let dir = request.modelURL.appendingPathComponent(ModelPackage.checkpoints).appendingPathComponent(name)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -375,7 +556,6 @@ public final class Trainer: @unchecked Sendable {
     }
 
     private var bestStep: Int?
-    private func markBest(step: Int) { bestStep = step }
 
     /// Keeps the three newest checkpoints, the best-validation one, and any the user pinned for Run.
     private func pruneCheckpoints() {

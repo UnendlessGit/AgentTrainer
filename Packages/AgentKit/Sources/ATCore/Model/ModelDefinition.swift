@@ -68,12 +68,19 @@ public struct TrainingHyperparameters: Codable, Hashable, Sendable {
     public var historyDropout = 0.5
     public var bf16 = true
     public var seed = 0
+    /// Keep a copy of the model from the validation check with the lowest held-out loss
+    /// (checkpoint "best"), whether or not early stopping is on.
+    public var saveBest = true
+    /// Stop when the held-out loss hasn't improved for `earlyStoppingPatience` validation checks.
+    public var earlyStopping = false
+    public var earlyStoppingPatience = 5
     public init() {}
 
     enum CodingKeys: String, CodingKey {
         case learningRate, weightDecay, beta1, beta2, warmupSteps, schedule, minLRFactor, gradientClip, zLossWeight, batchSize
         case gradientAccumulation, totalSteps, validationFraction, validateEverySteps, checkpointEveryMinutes, augmentations
         case augmentationStrength, instructionDropout, historyDropout, bf16, seed
+        case saveBest, earlyStopping, earlyStoppingPatience
     }
 
     public init(from d: Decoder) throws {
@@ -89,6 +96,8 @@ public struct TrainingHyperparameters: Codable, Hashable, Sendable {
         checkpointEveryMinutes = v(.checkpointEveryMinutes, def.checkpointEveryMinutes); augmentations = v(.augmentations, def.augmentations)
         augmentationStrength = v(.augmentationStrength, def.augmentationStrength); instructionDropout = v(.instructionDropout, def.instructionDropout)
         historyDropout = v(.historyDropout, def.historyDropout); bf16 = v(.bf16, def.bf16); seed = v(.seed, def.seed)
+        saveBest = v(.saveBest, def.saveBest); earlyStopping = v(.earlyStopping, def.earlyStopping)
+        earlyStoppingPatience = v(.earlyStoppingPatience, def.earlyStoppingPatience)
     }
 
     public static var fineTune: TrainingHyperparameters {
@@ -125,7 +134,7 @@ public struct ModelDefinition: Codable, Hashable, Sendable, Identifiable {
     public var isTrained: Bool { trainedSteps > 0 }
 
     public enum Preset: String, CaseIterable, Identifiable, Sendable {
-        case gameP2P150, gameP2P300, appControl, compact
+        case gameP2P150, gameP2P300, appControl, compact, medium, small, tiny
         public var id: String { rawValue }
         public var title: String {
             switch self {
@@ -133,6 +142,9 @@ public struct ModelDefinition: Codable, Hashable, Sendable, Identifiable {
             case .gameP2P300: "Game agent · P2P 300M"
             case .appControl: "App control"
             case .compact: "Compact (from scratch)"
+            case .medium: "Medium · 22M (from scratch)"
+            case .small: "Small · 10M (from scratch)"
+            case .tiny: "Tiny · 5M (from scratch)"
             }
         }
         public var subtitle: String {
@@ -141,6 +153,9 @@ public struct ModelDefinition: Codable, Hashable, Sendable, Identifiable {
             case .gameP2P300: "309M parameters, pretrained. More capacity, ~48 FPS, trains ~2× slower."
             case .appControl: "Full keyboard, absolute pointer, screen-text reading and typing. Starts from P2P 150M."
             case .compact: "60M parameters, blank. Fast to train; needs more recordings to play well."
+            case .medium: "Same architecture, 384 wide × 6 layers. Trains quickly; a good size for a few hours of recordings."
+            case .small: "Same architecture, 256 wide × 4 layers. Very fast to train and run; for simple games and small datasets."
+            case .tiny: "Same architecture, 128 wide × 8 layers. The fastest; for very simple tasks."
             }
         }
     }
@@ -158,6 +173,10 @@ public struct ModelDefinition: Codable, Hashable, Sendable, Identifiable {
         case .compact:
             var t = TrainingHyperparameters(); t.totalSteps = 8000
             return ModelDefinition(name: name, initialization: .blank, architecture: .compact60M, actions: .gameDefault, training: t)
+        case .medium, .small, .tiny:
+            var t = TrainingHyperparameters(); t.totalSteps = 8000
+            let a: PolicyArchitecture = preset == .medium ? .medium22M : preset == .small ? .small10M : .tiny5M
+            return ModelDefinition(name: name, initialization: .blank, architecture: a, actions: .gameDefault, training: t)
         }
     }
 }
@@ -183,8 +202,14 @@ public enum ModelPackage {
     public static func checkpointNames(_ url: URL) -> [String] {
         let dir = url.appendingPathComponent(checkpoints)
         return ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
-            .filter { FileManager.default.fileExists(atPath: dir.appendingPathComponent($0).appendingPathComponent(weights).path) }
+            .filter { !$0.hasPrefix(".") && FileManager.default.fileExists(atPath: dir.appendingPathComponent($0).appendingPathComponent(weights).path) }
             .sorted()
+    }
+
+    /// The saved state of a checkpoint (step, losses), if readable.
+    public static func checkpointState(_ url: URL, name: String) -> CheckpointState? {
+        let f = url.appendingPathComponent(checkpoints).appendingPathComponent(name).appendingPathComponent(state)
+        return (try? Data(contentsOf: f)).flatMap { try? JSONDecoder().decode(CheckpointState.self, from: $0) }
     }
 }
 

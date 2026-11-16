@@ -31,6 +31,17 @@ public struct PolicyLayout: Hashable, Sendable {
         return !kIsAOut
     }
 
+    /// Query blocks for chunked attention: each covers whole timesteps and lists the token range
+    /// of keys any of its queries may see (earlier steps within `history`, up to the block's end).
+    public func attentionChunks(steps: Int, history: Int, count: Int) -> [(Range<Int>, Range<Int>)] {
+        let n = max(1, min(count, steps))
+        return (0 ..< n).map { c in
+            let s0 = steps * c / n, s1 = steps * (c + 1) / n
+            let k0 = max(0, s0 - history)
+            return (s0 * tokensPerStep ..< s1 * tokensPerStep, k0 * tokensPerStep ..< s1 * tokensPerStep)
+        }
+    }
+
     /// Boolean `[N, N]` mask for a full sequence of `steps` timesteps (true = may attend).
     public func fullMask(steps: Int, history: Int) -> MLXArray {
         let n = steps * tokensPerStep

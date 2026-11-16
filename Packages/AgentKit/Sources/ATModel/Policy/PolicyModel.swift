@@ -130,6 +130,8 @@ public final class PolicyModel: Module {
     public internal(set) var lastAOutStates: MLXArray?
     /// Intermediate tensors from the last forward, for parity debugging.
     public var debugTrace: [String: MLXArray] = [:]
+    /// Keep `debugTrace` / `lastAOutStates` (off for compiled training, where they would be tracers).
+    public var recordsDebug = true
 
     public init(architecture a: PolicyArchitecture, actions: ActionSpaceConfig) {
         self.architecture = a
@@ -183,6 +185,10 @@ public final class PolicyModel: Module {
     public var width: Int { architecture.width }
     public var computeDType: DType { imgPos.dtype }
 
+    /// Parameters a low-precision compute copy keeps in fp32: embedding tables, whose gradient is a
+    /// scatter-add of thousands of contributions into a few rows (in bf16 that lost up to ~18%).
+    public static func keepsFP32(_ key: String) -> Bool { key.hasPrefix("emb_") || key.hasPrefix("byte_emb") }
+
     // MARK: Pieces shared by training and streaming
 
     /// uint8 `[N, H, W, 3]` RGB → `[N, D]` image tokens (P2P: `/255`, no mean/std).
@@ -192,12 +198,31 @@ public final class PolicyModel: Module {
         // Stem gradient sampling: every frame goes through the EfficientNet stem without gradients,
         // a random subset is recomputed with gradients (scaled by n/k so the estimate is unbiased).
         // BatchNorm statistics are frozen in training, so both passes give identical values.
+        if Self.legacyStemSampling {
+            let k = visionGradientFrames
+            let all = stopGradient(vision.stem(normalize(frames))).reshaped(n, -1)
+            let order = argSort(MLXRandom.uniform(0 ..< 1, [n]))[0 ..< k]
+            let sub = vision.stem(normalize(frames[order])).reshaped(k, -1)
+            let mixed = all.at[order].add((sub - stopGradient(sub)) * (Float(n) / Float(k)))
+            return vision.norm(vision.proj(mixed)) + imgPos
+        }
+        // Each frame goes through the stem once: the k sampled frames with gradients, the rest
+        // without. The sampled frames' gradient is scaled by n/k; `(sub − stopGradient(sub))` is
+        // exactly zero, so their values are untouched.
         let k = visionGradientFrames
-        let all = stopGradient(vision.stem(normalize(frames))).reshaped(n, -1)
-        let order = argSort(MLXRandom.uniform(0 ..< 1, [n]))[0 ..< k]
-        let sub = vision.stem(normalize(frames[order])).reshaped(k, -1)
-        let mixed = all.at[order].add((sub - stopGradient(sub)) * (Float(n) / Float(k)))
+        let perm = argSort(MLXRandom.uniform(0 ..< 1, [n]))
+        let gradIdx = perm[0 ..< k], restIdx = perm[k...]
+        let sub = vision.stem(normalize(frames[gradIdx])).reshaped(k, -1)
+        let rest = stopGradient(vision.stem(normalize(frames[restIdx]))).reshaped(n - k, -1)
+        let scaled = sub + (sub - stopGradient(sub)) * (Float(n) / Float(k) - 1)
+        let mixed = concatenated([scaled, rest], axis: 0)[argSort(perm)]
         return vision.norm(vision.proj(mixed)) + imgPos
+    }
+
+    /// Stem + projection for `[N, H, W, 3]` frames without gradients (profiling).
+    public func profileStem(_ frames: MLXArray) -> MLXArray {
+        let f = frames.reshaped(-1, frames.dim(-3), frames.dim(-2), frames.dim(-1))
+        return stopGradient(vision(normalize(f)))
     }
 
     func normalize(_ frames: MLXArray) -> MLXArray {
@@ -212,12 +237,13 @@ public final class PolicyModel: Module {
     /// Training mode with frozen BatchNorm statistics in the vision stem (affine parameters still learn).
     public func setTraining() {
         train(true)
-        for (_, m) in vision.namedModules() where m is BatchNorm { m.train(false) }
+        vision.clearInferenceCache()
+        for (_, m) in vision.namedModules() where m is FrozenBatchNorm { m.train(false) }
     }
 
     /// Excludes BatchNorm running statistics from the trainable parameters (no weight decay on them).
     public func freezeBatchNormStatistics() {
-        for (_, m) in vision.namedModules() where m is BatchNorm {
+        for (_, m) in vision.namedModules() where m is FrozenBatchNorm {
             m.freeze(recursive: false, keys: ["running_mean", "running_var"])
         }
     }
@@ -238,7 +264,7 @@ public final class PolicyModel: Module {
             embX(a[.ellipsis, (ks + ps) ..< (ks + ps + 1)]),
             embY(a[.ellipsis, (ks + ps + 1) ..< (ks + ps + 2)]),
         ]
-        return concatenated(parts, axis: -2)
+        return concatenated(parts, axis: -2).asType(computeDType)
     }
 
     /// Logits for decoder outputs `[..., S, D]`.
@@ -262,12 +288,14 @@ public final class PolicyModel: Module {
     }
 
     func embedSlot(_ s: Int, _ classes: MLXArray) -> MLXArray {
+        let e: MLXArray
         switch actions.kind(ofSlot: s) {
-        case .key: embKey(classes)
-        case .pointer: embPointer(classes)
-        case .x: embX(classes)
-        case .y: embY(classes)
+        case .key: e = embKey(classes)
+        case .pointer: e = embPointer(classes)
+        case .x: e = embX(classes)
+        case .y: e = embY(classes)
         }
+        return e.asType(computeDType)
     }
 
     func history(forLayer i: Int, steps: Int) -> Int {
@@ -281,6 +309,41 @@ public final class PolicyModel: Module {
         let m = layout.fullMask(steps: steps, history: history)
         maskCache[key] = m
         return m
+    }
+
+    /// The same mask as additive 0 / −∞ in `dtype` (the fused attention kernels are faster with it).
+    func additiveMask(steps: Int, history: Int, dtype: DType) -> MLXArray {
+        let key = "add/\(steps)/\(history)/\(dtype)"
+        if let m = maskCache[key] { return m }
+        let m = which(mask(steps: steps, history: history), MLXArray(Float(0)), MLXArray(-Float.infinity)).asType(dtype)
+        eval(m)
+        maskCache[key] = m
+        return m
+    }
+
+    /// Builds and caches every mask a `steps`-long forward uses (call before `compile`, so no
+    /// mask is created while tracing).
+    public func prepareMasks(steps: Int) {
+        for i in 0 ..< architecture.layers {
+            _ = additiveMask(steps: steps, history: history(forLayer: i, steps: steps), dtype: computeDType)
+        }
+    }
+
+    /// The original two-pass stem sampling (for equivalence checks).
+    nonisolated(unsafe) public static var legacyStemSampling = false
+    /// Switches every training-speed optimisation back to the original code path (equivalence checks).
+    public static func useLegacyPaths(_ on: Bool) {
+        legacyStemSampling = on
+        ConvBNAct.fused = !on
+        DepthwiseConv.customBackward = !on
+        attentionChunkCount = on ? 1 : 4
+    }
+
+    /// Query blocks for long sequences (see `SelfAttention.attendChunked`); nil when not worth it.
+    nonisolated(unsafe) public static var attentionChunkCount = 4
+    func chunks(steps: Int, history: Int) -> [(Range<Int>, Range<Int>)]? {
+        guard Self.attentionChunkCount > 1, steps * layout.tokensPerStep >= 768 else { return nil }
+        return layout.attentionChunks(steps: steps, history: history, count: Self.attentionChunkCount)
     }
 
     /// Screen-text item tokens, their summary (for the thinking token) and the decoder memory.
@@ -298,7 +361,7 @@ public final class PolicyModel: Module {
             parts.append(items); masks.append(m)
         }
         if let be = byteEmb, let pos = bytePos, let bytes = l.typingBytes {
-            parts.append(be(bytes) + pos[0 ..< bytes.dim(-1)].asType(computeDType))
+            parts.append(be(bytes).asType(computeDType) + pos[0 ..< bytes.dim(-1)].asType(computeDType))
             masks.append(bytes .!= Int32(256))
         }
         return (summary, concatenated(parts, axis: -2), concatenated(masks, axis: -1))
@@ -311,15 +374,23 @@ public final class PolicyModel: Module {
     /// - actionsIn: int32 `[B, T, S]` actions taken after each frame (fed back as history and as decoder inputs)
     /// - text: `[B, T, 768]` instruction embeddings, `textPresent`: bool `[B, T]`
     /// - thinkingExtra: optional `[B, T, D]` added to the first thinking token (screen-text summary)
+    /// Image tokens `[B, T, D]` for uint8 frames `[B, T, H, W, 3]`, to reuse across forwards over
+    /// the same frames (validation). Deterministic in eval mode.
+    public func clipImageTokens(_ frames: MLXArray) -> MLXArray {
+        let B = frames.dim(0), T = frames.dim(1)
+        return imageTokens(frames.reshaped(B * T, frames.dim(2), frames.dim(3), frames.dim(4))).reshaped(B, T, 1, width)
+    }
+
     public func callAsFunction(frames: MLXArray, actionsIn: MLXArray, text: MLXArray, textPresent: MLXArray,
-                               thinkingExtra: MLXArray? = nil, historyKeep: MLXArray? = nil, language: LanguageInputs? = nil) -> PolicyLogits {
+                               thinkingExtra: MLXArray? = nil, historyKeep: MLXArray? = nil, language: LanguageInputs? = nil,
+                               imageTokens precomputed: MLXArray? = nil) -> PolicyLogits {
         let B = frames.dim(0), T = frames.dim(1), D = width, S = actions.slotCount
         let lang = languageTokens(language, leading: [B, T])
         var extras = [MLXArray]()
         if let t = thinkingExtra { extras.append(t) }
         if let s = lang?.summary { extras.append(s) }
         let thinkingExtra: MLXArray? = extras.isEmpty ? nil : extras.dropFirst().reduce(extras[0], +)
-        let img = imageTokens(frames.reshaped(B * T, frames.dim(2), frames.dim(3), frames.dim(4))).reshaped(B, T, 1, D)
+        let img = precomputed ?? imageTokens(frames.reshaped(B * T, frames.dim(2), frames.dim(3), frames.dim(4))).reshaped(B, T, 1, D)
         let txt = textTokens(text.reshaped(B * T, -1), present: textPresent.reshaped(B * T)).reshaped(B, T, 1, D)
         var think = broadcast(thinking.expandedDimensions(axes: [0, 1]), to: [B, T, architecture.thinkingTokens, D])
         if let extra = thinkingExtra {
@@ -333,22 +404,23 @@ public final class PolicyModel: Module {
             act = which(keep.reshaped(B, T, 1, 1), act, broadcast(actionUnknown + actionPos, to: act.shape).asType(act.dtype))
         }
         var x = concatenated([txt, img, think, aOut, act], axis: 2).reshaped(B, T * layout.tokensPerStep, D)
-        debugTrace["seq_in"] = x
+        if recordsDebug { debugTrace["seq_in"] = x }
         if gradientCheckpointing && training && layerCheckpoints.count != backbone.count {
             layerCheckpoints = backbone.map { l in ModuleCheckpoint(l) { m, a in [m(a[0], mask: a[1])] } }
         }
         for (i, layer) in backbone.enumerated() {
-            let m = mask(steps: T, history: history(forLayer: i, steps: T))
+            let hist = history(forLayer: i, steps: T)
+            let m = additiveMask(steps: T, history: hist, dtype: x.dtype)
             if gradientCheckpointing && training {
                 x = layerCheckpoints[i]([x, m])[0]
             } else {
-                x = layer(x, mask: m)
+                x = layer(x, mask: m, chunks: chunks(steps: T, history: hist))
             }
-            if i == 0 { debugTrace["layer0"] = x }
+            if i == 0 && recordsDebug { debugTrace["layer0"] = x }
         }
-        debugTrace["seq_out"] = x
+        if recordsDebug { debugTrace["seq_out"] = x }
         let aOutStates = x.reshaped(B, T, layout.tokensPerStep, D)[0..., 0..., layout.aOutIndex, 0...]
-        lastAOutStates = aOutStates
+        if recordsDebug { lastAOutStates = aOutStates }
         let h = decoder.run(aOut: aOutStates.reshaped(B * T, D), inputs: actEmb.reshaped(B * T, S, D),
                             memory: lang?.memory.reshaped(B * T, -1, D), memoryMask: lang?.mask.reshaped(B * T, -1))
         let out = h[0..., 0 ..< S, 0...].reshaped(B, T, S, D)
