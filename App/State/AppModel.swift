@@ -7,9 +7,9 @@ enum AppTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .recordings: "Recordings"
+        case .recordings: "Record"
         case .library: "Library"
-        case .models: "AI Models"
+        case .models: "Models"
         case .training: "Training"
         case .run: "Run"
         case .arena: "Test Arena"
@@ -64,6 +64,8 @@ final class AppModel {
     }
 
     func registerHotkeys() {
+        // Snapshot and self-test copies of the app must never react to the user's shortcuts.
+        if CommandLine.arguments.contains(where: { $0 == "--ui-snapshot" || $0.hasPrefix("--selftest") }) { return }
         let st = settings.stored
         HotkeyCenter.shared.register(1, st.recordHotkey) { [weak self] in Task { await self?.recorder.toggle() } }
         HotkeyCenter.shared.register(5, st.cancelRecordingHotkey) { [weak self] in Task { await self?.recorder.cancel() } }

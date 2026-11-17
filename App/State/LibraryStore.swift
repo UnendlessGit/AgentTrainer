@@ -10,6 +10,8 @@ final class LibraryStore {
     var selectedFolder: URL { didSet { reloadRecordings() } }
     var includeSubfolders = true { didSet { reloadRecordings() } }
     private(set) var recordings: [LibraryRecording] = []
+    /// Every recording in the library (for the folder tree).
+    private(set) var all: [LibraryRecording] = []
     var lastError: String?
 
     init(root: URL) {
@@ -44,6 +46,7 @@ final class LibraryStore {
         if !FileManager.default.fileExists(atPath: selectedFolder.path) { selectedFolder = fs.root }
         normalizeSelection()
         reloadRecordings()
+        all = fs.recordings(in: fs.root, recursive: true)
     }
 
     private func reloadRecordings() { recordings = fs.recordings(in: selectedFolder, recursive: includeSubfolders && !isRootSelected) }

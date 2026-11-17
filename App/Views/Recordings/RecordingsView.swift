@@ -4,131 +4,270 @@ import SwiftUI
 
 struct RecordingsView: View {
     @Bindable var app: AppModel
-    private var rec: RecorderController { app.recorder }
 
     var body: some View {
         @Bindable var settings = app.settings
         @Bindable var rec = app.recorder
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                PageHeader(title: "Recordings", subtitle: "Record yourself playing or using an app. Screen, keys, mouse and scroll are captured on one clock.")
-                RecordControlCard(app: app)
-                if let e = rec.errorMessage { InlineError(message: e) }
-                Card(title: "What to record", symbol: "macwindow",
-                     trailing: AnyView(Button { Task { await rec.refreshTargets() } } label: {
-                         if rec.loadingTargets { ProgressView().controlSize(.small) } else { Label("Refresh", systemImage: "arrow.clockwise") }
-                     }.disabled(rec.isBusy))) {
-                    TargetGrid(targets: rec.targets, thumbnails: rec.thumbnails, selection: $rec.selectedTargetID)
-                        .disabled(rec.isBusy)
-                }
-                HStack(alignment: .top, spacing: 18) {
-                    Card(title: "Capture", symbol: "camera.viewfinder") {
-                        Picker("Resolution", selection: $settings.stored.captureMaxHeight) {
-                            Text("480p").tag(480); Text("720p").tag(720); Text("1080p").tag(1080); Text("1440p").tag(1440)
+        HStack(alignment: .top, spacing: 32) {
+            stage(rec).riseIn()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    targets(rec)
+                    Rows(title: "Capture") {
+                        Row(title: "Save to") {
+                            Picker("", selection: $rec.destination) {
+                                ForEach(app.library.flatFolders, id: \.url) { f in Text(String(repeating: "   ", count: f.depth) + f.name).tag(f.url) }
+                            }
+                            .labelsHidden().fixedSize()
                         }
-                        Picker("Frame rate", selection: $settings.stored.captureFPS) {
-                            Text("30 fps").tag(30); Text("60 fps").tag(60)
+                        Row(title: "Resolution") {
+                            Picker("", selection: $settings.stored.captureMaxHeight) {
+                                Text("480p").tag(480); Text("720p").tag(720); Text("1080p").tag(1080); Text("1440p").tag(1440)
+                            }
+                            .labelsHidden().fixedSize()
                         }
-                        .pickerStyle(.segmented)
-                        Toggle("Show the mouse pointer in the video", isOn: $settings.stored.showsCursor)
-                        LabeledSlider(title: "Video quality", value: $settings.stored.videoQuality, range: 0.1 ... 1, format: { "\(Int($0 * 100))%" })
-                        if let s = rec.plannedSettings {
-                            Text(verbatim: "\(s.width)×\(s.height) at \(s.fps) fps · training frames saved losslessly at 192×192")
-                                .font(.caption).foregroundStyle(.secondary)
+                        Row(title: "Frame rate") { Segmented(options: [(30, "30"), (60, "60 fps")], selection: $settings.stored.captureFPS, compact: true) }
+                        Row(title: "Task") {
+                            TextField("e.g. Drive to the gas station", text: $rec.task)
+                                .textFieldStyle(.plain).multilineTextAlignment(.trailing).font(Theme.font(14)).frame(maxWidth: 220)
+                        }
+                        Row(title: "Name") {
+                            TextField("Automatic", text: $rec.name)
+                                .textFieldStyle(.plain).multilineTextAlignment(.trailing).font(Theme.font(14)).frame(maxWidth: 220)
                         }
                     }
                     .disabled(rec.isBusy)
-                    Card(title: "Input", symbol: "keyboard") {
+                    Rows(title: "Input", footer: "Only events while the recorded window is in front are kept when that option is on.") {
                         Toggle("Keyboard", isOn: $settings.stored.input.keyboard)
                         Toggle("Mouse movement", isOn: $settings.stored.input.mouseMovement)
                         Toggle("Mouse buttons", isOn: $settings.stored.input.mouseButtons)
                         Toggle("Scrolling", isOn: $settings.stored.input.scroll)
-                        Toggle("Only while the recorded window is in front", isOn: $settings.stored.input.onlyWhenTargetFocused)
+                        Toggle("Only while the window is in front", isOn: $settings.stored.input.onlyWhenTargetFocused)
+                    }
+                    .toggleStyle(.oled)
+                    .disabled(rec.isBusy)
+                    Rows(title: "Video") {
+                        Toggle("Show the mouse pointer", isOn: $settings.stored.showsCursor).toggleStyle(.oled)
+                        LabeledSlider(title: "Quality", value: $settings.stored.videoQuality, range: 0.1 ... 1, format: { "\(Int($0 * 100))%" })
                     }
                     .disabled(rec.isBusy)
+                    HUDRows(title: "Recording HUD", options: $settings.stored.recordHUD, showsVision: false)
                 }
-                HStack(alignment: .top, spacing: 18) {
-                    Card(title: "Save to", symbol: "folder") {
-                        Picker("Library folder", selection: $rec.destination) {
-                            ForEach(app.library.flatFolders, id: \.url) { f in
-                                Text(String(repeating: "    ", count: f.depth) + f.name).tag(f.url)
-                            }
-                        }
-                        TextField("Name (optional)", text: $rec.name)
-                        TextField("What are you doing? e.g. “Collect wood and build a house”", text: $rec.task, axis: .vertical)
-                            .lineLimit(1 ... 3)
-                        Text("The task becomes the instruction for language-enabled models. You can add timed instructions in the Library later.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    .disabled(rec.isBusy)
-                    Card(title: "Recording HUD", symbol: "rectangle.inset.bottomright.filled") {
-                        HUDOptionsEditor(options: $settings.stored.recordHUD, showsVision: false)
-                    }
-                }
+                .padding(.bottom, 32)
             }
-            .padding(24)
+            .scrollIndicators(.never)
+            .frame(width: 380)
+            .riseIn(0.08)
         }
+        .padding([.horizontal, .top], 32)
         .task { if rec.targets.isEmpty { await rec.refreshTargets() } }
+        .task(id: rec.selectedTargetID) {
+            rec.preview = nil
+            await rec.runPreview { [weak rec] in rec?.phase == .idle }
+        }
         .onAppear { if !app.library.flatFolders.contains(where: { $0.url == rec.destination }) { rec.destination = app.library.fs.root } }
     }
-}
 
-struct RecordControlCard: View {
-    let app: AppModel
-    var body: some View {
-        let rec = app.recorder
-        Card(title: "Session", symbol: "record.circle") {
-            HStack(spacing: 18) {
-                Button { Task { await rec.toggle() } } label: {
-                    ZStack {
-                        Circle().fill(rec.phase == .recording ? Color.red : Color.red.opacity(0.85)).frame(width: 64, height: 64)
-                        if rec.phase == .recording {
-                            RoundedRectangle(cornerRadius: 5).fill(.white).frame(width: 22, height: 22)
-                        } else if case .countdown(let n) = rec.phase {
-                            Text("\(n)").font(.title.bold()).foregroundStyle(.white)
-                        } else if rec.phase == .saving {
-                            ProgressView().controlSize(.small).tint(.white)
-                        } else {
-                            Circle().fill(.white).frame(width: 24, height: 24)
-                        }
-                    }
+    // MARK: Stage: preview, record controls, live numbers
+
+    func stage(_ rec: RecorderController) -> some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title(rec)).displayStyle(48).contentTransition(.opacity)
+                Spacer()
+                if let s = rec.plannedSettings {
+                    Text(verbatim: "\(rec.selectedTarget?.name ?? "") · \(s.width) × \(s.height) · \(s.fps) fps").font(Theme.font(13)).foregroundStyle(Theme.muted).lineLimit(1)
                 }
-                .buttonStyle(.plain)
-                .disabled(rec.phase == .saving)
-                .help("Start or stop recording (\(app.settings.stored.recordHotkey.display))")
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title(rec)).font(.title2.weight(.semibold))
-                    Text(rec.selectedTarget.map { "Target: \($0.name)" } ?? "No target selected").foregroundStyle(.secondary)
-                    Text("Save: \(app.settings.stored.recordHotkey.display) · Discard: \(app.settings.stored.cancelRecordingHotkey.display)").font(.caption).foregroundStyle(.tertiary)
+            }
+            if let e = rec.errorMessage { InlineError(message: e) }
+            preview(rec)
+            HStack(alignment: .center, spacing: 28) {
+                recordButton(rec)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(rec.stats.elapsed.durationText).displayStyle(44).contentTransition(.numericText())
+                    Text("Save \(app.settings.stored.recordHotkey.display) · Discard \(app.settings.stored.cancelRecordingHotkey.display)")
+                        .font(Theme.font(12.5)).foregroundStyle(Theme.muted)
                 }
                 Spacer()
-                if let last = rec.lastSaved, rec.phase == .idle {
-                    Button { app.library.selectedFolder = last.deletingLastPathComponent(); app.tab = .library } label: {
-                        Label("Open last recording", systemImage: "film")
-                    }
+                HStack(spacing: 36) {
+                    stat("\(rec.stats.frames)", "frames")
+                    stat("\(rec.stats.droppedFrames)", "dropped", color: rec.stats.droppedFrames > 0 ? Theme.warning : Theme.text)
+                    stat("\(rec.stats.events)", "input events")
+                    stat(rec.stats.frames > 0 ? String(format: "%.0f", rec.stats.averageFPS) : "–", "fps")
                 }
             }
-            if rec.phase == .recording || rec.stats.frames > 0 {
-                HStack(spacing: 10) {
-                    StatTile(title: "Duration", value: rec.stats.elapsed.durationText, symbol: "clock")
-                    StatTile(title: "Frames", value: "\(rec.stats.frames)", symbol: "photo.stack")
-                    StatTile(title: "Average FPS", value: String(format: "%.1f", rec.stats.averageFPS), symbol: "speedometer")
-                    StatTile(title: "Input events", value: "\(rec.stats.events)", symbol: "keyboard")
-                    StatTile(title: "Encoder drops", value: "\(rec.stats.droppedFrames)", symbol: "exclamationmark.triangle",
-                             tint: rec.stats.droppedFrames > 0 ? .orange : .accentColor)
+            .padding(.bottom, 32)
+        }
+        .frame(maxWidth: .infinity)
+        .animation(Theme.spring, value: rec.phase)
+    }
+
+    func preview(_ rec: RecorderController) -> some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Theme.surface)
+            if let id = rec.selectedTargetID, let img = rec.preview ?? rec.thumbnails[id] {
+                Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .padding(18)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .id(id)
+                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "macwindow").font(.system(size: 34, weight: .light)).foregroundStyle(Theme.faint)
+                    Text(rec.targets.isEmpty ? "Open the game or app, then refresh the list" : "Choose what to record").font(Theme.font(13)).foregroundStyle(Theme.muted)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            if rec.phase == .recording {
+                HStack(spacing: 8) { LiveDot(color: Theme.danger); Text("REC").font(Theme.font(12, .bold)).tracking(0.8) }
+                    .foregroundStyle(Theme.dangerText)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Theme.danger.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .padding(18)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .topLeading)))
+            }
+            if case .countdown(let n) = rec.phase {
+                Text("\(n)").displayStyle(120).frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .contentTransition(.numericText(countsDown: true))
+                    .transition(.opacity)
+            }
+        }
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(rec.phase == .recording ? Theme.danger.opacity(0.5) : Theme.hairline, lineWidth: rec.phase == .recording ? 1.5 : 1))
+        .animation(Theme.spring, value: rec.selectedTargetID)
+    }
+
+    func recordButton(_ rec: RecorderController) -> some View {
+        RecordButton(phase: rec.phase) { Task { await rec.toggle() } }
+            .help("Start or stop and save (\(app.settings.stored.recordHotkey.display))")
+            .disabled(rec.phase == .saving || (rec.phase == .idle && rec.selectedTarget == nil))
+    }
+
+    func stat(_ v: String, _ caption: String, color: Color = Theme.text) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(v).font(Theme.font(22, .semibold)).monospacedDigit().foregroundStyle(color).contentTransition(.numericText())
+            Text(caption).font(Theme.font(12)).foregroundStyle(Theme.muted)
         }
     }
 
     func title(_ r: RecorderController) -> String {
         switch r.phase {
         case .idle: "Ready to record"
-        case .countdown(let n): "Starting in \(n)…"
+        case .countdown: "Get ready"
         case .recording: "Recording"
         case .saving: "Saving…"
         }
     }
+
+    // MARK: Targets
+
+    func targets(_ rec: RecorderController) -> some View {
+        @Bindable var rec = rec
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                SectionLabel("What to record")
+                Spacer()
+                Button { Task { await rec.refreshTargets() } } label: {
+                    Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold))
+                        .rotationEffect(.degrees(rec.loadingTargets ? 360 : 0))
+                        .animation(rec.loadingTargets ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default, value: rec.loadingTargets)
+                }
+                .buttonStyle(.atQuiet)
+                .help("Refresh the list")
+                .disabled(rec.isBusy)
+            }
+            VStack(spacing: 4) {
+                ForEach(rec.targets) { t in
+                    let on = rec.selectedTargetID == t.id
+                    Button { withAnimation(Theme.snappy) { rec.selectedTargetID = t.id } } label: {
+                        HStack(spacing: 12) {
+                            Group {
+                                if let img = rec.thumbnails[t.id] {
+                                    Image(nsImage: img).resizable().aspectRatio(contentMode: .fill).frame(width: 56, height: 34).clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                } else {
+                                    Placeholder(symbol: t.isDisplay ? "display" : "macwindow", radius: 6).frame(width: 56, height: 34)
+                                }
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(t.name).font(Theme.font(14, .semibold)).lineLimit(1)
+                                Text(t.isDisplay ? "Display" : "Window · \(t.info.appName ?? "")").font(Theme.font(12)).foregroundStyle(Theme.muted).lineLimit(1)
+                            }
+                            Spacer(minLength: 0)
+                            if on { Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).transition(.scale.combined(with: .opacity)) }
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 8)
+                    }
+                    .buttonStyle(RowButtonStyle(selected: on, radius: 12))
+                }
+                if rec.targets.isEmpty && !rec.loadingTargets {
+                    Text("No windows found. Open the game or app, then refresh.").font(Theme.font(13)).foregroundStyle(Theme.muted).padding(10)
+                }
+            }
+            .disabled(rec.isBusy)
+        }
+    }
+}
+
+/// The big record button: a red dot that morphs into a stop square.
+struct RecordButton: View {
+    let phase: RecorderController.Phase
+    let action: () -> Void
+    @State private var hover = false
+    @Environment(\.isEnabled) private var enabled
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(Theme.text).frame(width: 64, height: 64)
+                Circle().strokeBorder(Color.white.opacity(0.12), lineWidth: 6).frame(width: 78, height: 78)
+                if phase == .saving {
+                    ProgressView().controlSize(.small).tint(.black)
+                } else {
+                    RoundedRectangle(cornerRadius: phase == .recording ? 6 : 13, style: .continuous)
+                        .fill(Theme.danger)
+                        .frame(width: phase == .recording ? 22 : 26, height: phase == .recording ? 22 : 26)
+                }
+            }
+            .scaleEffect(hover && enabled ? 1.05 : 1)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .opacity(enabled ? 1 : 0.4)
+        .onHover { hover = $0 }
+        .animation(Theme.spring, value: phase)
+        .animation(Theme.snappy, value: hover)
+        .accessibilityLabel(phase == .recording ? "Stop and save" : "Start recording")
+    }
+}
+
+/// HUD options as rows inside a grouped panel.
+struct HUDRows: View {
+    let title: String
+    @Binding var options: HUDOptions
+    var showsVision: Bool
+    var body: some View {
+        Rows(title: title, footer: "The HUD is hidden from recordings and from the model's view.") {
+            Toggle("Show HUD", isOn: $options.enabled.animation(Theme.spring)).toggleStyle(.oled)
+            if options.enabled {
+                Toggle("Keyboard", isOn: $options.keyboard).toggleStyle(.oled)
+                Toggle("Mouse", isOn: $options.mouse).toggleStyle(.oled)
+                Toggle("Stats", isOn: $options.stats).toggleStyle(.oled)
+                if showsVision { Toggle("What the model sees", isOn: $options.vision).toggleStyle(.oled) }
+                Row(title: "Corner") {
+                    Picker("", selection: $options.corner) { ForEach(HUDCorner.allCases) { Text($0.label).tag($0) } }.labelsHidden().fixedSize()
+                }
+                LabeledSlider(title: "Size", value: $options.scale, range: 0.6 ... 1.8, format: { "\(Int($0 * 100))%" })
+                LabeledSlider(title: "Opacity", value: $options.opacity, range: 0.3 ... 1, format: { "\(Int($0 * 100))%" })
+            }
+        }
+    }
+}
+
+/// Kept for other screens: HUD options as plain controls.
+struct HUDOptionsEditor: View {
+    @Binding var options: HUDOptions
+    var showsVision: Bool
+    var body: some View { HUDRows(title: "HUD", options: $options, showsVision: showsVision) }
 }
 
 struct TargetGrid: View {
@@ -138,51 +277,37 @@ struct TargetGrid: View {
 
     var body: some View {
         if targets.isEmpty {
-            Text("No windows found yet. Open the game or app, then press Refresh.").foregroundStyle(.secondary)
+            Text("No windows found yet. Open the game or app, then press Refresh.").font(Theme.font(13)).foregroundStyle(Theme.muted)
         } else {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170, maximum: 230), spacing: 12)], spacing: 12) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 14)], spacing: 14) {
                 ForEach(targets) { t in
-                    Button { selection = t.id } label: {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 8).fill(.quaternary)
-                                if let img = thumbnails[t.id] {
-                                    Image(nsImage: img).resizable().aspectRatio(contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 6)).padding(4)
-                                } else {
-                                    Image(systemName: t.isDisplay ? "display" : "macwindow").font(.largeTitle).foregroundStyle(.secondary)
+                    let on = selection == t.id
+                    Button { withAnimation(Theme.snappy) { selection = t.id } } label: {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Color.clear
+                                .frame(height: 104).frame(maxWidth: .infinity)
+                                .overlay {
+                                    if let img = thumbnails[t.id] {
+                                        Image(nsImage: img).resizable().scaledToFill()
+                                    } else {
+                                        Placeholder(symbol: t.isDisplay ? "display" : "macwindow", radius: 9)
+                                    }
                                 }
+                                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(t.name).font(Theme.font(13, .semibold)).lineLimit(1)
+                                Text(t.isDisplay ? "Display" : "Window").font(Theme.font(12)).foregroundStyle(Theme.muted)
                             }
-                            .frame(height: 100)
-                            Label(t.name, systemImage: t.isDisplay ? "display" : "macwindow").font(.callout).lineLimit(1)
                         }
-                        .padding(8)
-                        .background(RoundedRectangle(cornerRadius: 10).fill(selection == t.id ? Color.accentColor.opacity(0.18) : .clear))
-                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(selection == t.id ? Color.accentColor : .clear, lineWidth: 2))
+                        .padding(10)
+                        .background(on ? Theme.raised : Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(on ? Theme.text : Theme.hairline, lineWidth: on ? 1.5 : 1))
+                        .scaleEffect(on ? 1 : 0.985)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
             }
         }
-    }
-}
-
-struct HUDOptionsEditor: View {
-    @Binding var options: HUDOptions
-    var showsVision: Bool
-    var body: some View {
-        Toggle("Show HUD", isOn: $options.enabled)
-        Group {
-            HStack {
-                Toggle("Keyboard", isOn: $options.keyboard)
-                Toggle("Mouse", isOn: $options.mouse)
-                Toggle("Stats", isOn: $options.stats)
-                if showsVision { Toggle("AI vision", isOn: $options.vision) }
-            }
-            Picker("Corner", selection: $options.corner) { ForEach(HUDCorner.allCases) { Text($0.label).tag($0) } }
-            LabeledSlider(title: "Size", value: $options.scale, range: 0.6 ... 1.8, format: { "\(Int($0 * 100))%" })
-            LabeledSlider(title: "Opacity", value: $options.opacity, range: 0.3 ... 1, format: { "\(Int($0 * 100))%" })
-        }
-        .disabled(!options.enabled)
-        Text("The HUD is hidden from recordings and from the model's view.").font(.caption).foregroundStyle(.secondary)
     }
 }

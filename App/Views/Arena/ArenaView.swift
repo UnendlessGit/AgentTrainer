@@ -22,21 +22,22 @@ struct ArenaView: View {
                 Card(title: "Game", symbol: "gamecontroller") {
                     Picker("Mode", selection: $mode) { ForEach(ArenaGame.Mode.allCases) { Text($0.title).tag($0) } }
                     Text(description(mode)).font(.callout).foregroundStyle(.secondary)
-                    Button("Open a playable window") { ArenaWindows.show(ArenaGameView(mode: mode), title: "AgentTrainer Test Arena — \(mode.title)") }
+                    Button("Open a playable window") { ArenaWindows.show(ArenaGameView(mode: mode), title: "AgentTrainer Test Arena — \(mode.title)") }.buttonStyle(.atPrimary)
                     Text("The window can be recorded in the Recordings tab and controlled from the Run tab, exactly like a real game.").font(.caption).foregroundStyle(.secondary)
                 }
                 HStack(alignment: .top, spacing: 18) {
                     Card(title: "Expert demonstrations", symbol: "person.fill.checkmark") {
                         LabeledSlider(title: "Length", value: $minutes, range: 2 ... 60, step: 1, format: { "\(Int($0)) min" })
-                        Button(generating ? "Generating…" : "Add to Library") { Task { await generate() } }.disabled(generating)
+                        Button(generating ? "Generating…" : "Add to Library") { Task { await generate() } }.buttonStyle(.atSecondary).disabled(generating)
                         Text("Writes real recordings (video, input timeline, training frames, instructions) into Library/Test Arena.").font(.caption).foregroundStyle(.secondary)
                     }
                     Card(title: "Evaluate a model", symbol: "flag.checkered") {
                         Picker("Model", selection: $selectedModel) {
                             ForEach(app.models.models.filter { !$0.checkpoints.isEmpty }) { Text($0.definition.name).tag(Optional($0.id)) }
                         }
-                        Button(evaluating ? "Playing…" : "Play 3 × 60 s") { Task { await evaluate() } }.disabled(evaluating || selectedModel == nil)
+                        Button(evaluating ? "Playing…" : "Play 3 × 60 s") { Task { await evaluate() } }.buttonStyle(.atPrimary).disabled(evaluating || selectedModel == nil)
                         Button(correcting ? "Recording corrections…" : "Record 5 min of corrections") { Task { await corrections() } }
+                            .buttonStyle(.atSecondary)
                             .disabled(correcting || evaluating || selectedModel == nil)
                             .help("The model plays; the expert takes over when it gets stuck, like you would in Run. Adds a correction recording to the Library for further training.")
                         if let result { Text(result).font(.callout.monospaced()).fixedSize(horizontal: false, vertical: true) }
@@ -45,14 +46,14 @@ struct ArenaView: View {
                 }
                 Card(title: "Sync check", symbol: "metronome") {
                     HStack {
-                        Button("Open Sync Check window") { ArenaWindows.show(SyncCheckView(), title: "AgentTrainer Sync Check") }
-                        Button("Analyze last recording") { analyzeSync() }.disabled(app.recorder.lastSaved == nil)
+                        Button("Open Sync Check window") { ArenaWindows.show(SyncCheckView(), title: "AgentTrainer Sync Check") }.buttonStyle(.atSecondary)
+                        Button("Analyze last recording") { analyzeSync() }.buttonStyle(.atSecondary).disabled(app.recorder.lastSaved == nil)
                     }
                     if let syncResult { Text(syncResult).font(.callout.monospaced()) }
                     Text("Record the Sync Check window, press keys about once a second, stop, then analyze. It reports how long after each key event the white flash shows up in a captured frame. A steady value (low jitter) means frames and input are on one clock.").font(.caption).foregroundStyle(.secondary)
                 }
             }
-            .padding(24)
+            .padding(32)
         }
         .onAppear { if selectedModel == nil { selectedModel = app.models.models.first(where: { !$0.checkpoints.isEmpty })?.id } }
     }

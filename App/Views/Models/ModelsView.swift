@@ -8,16 +8,50 @@ struct ModelsView: View {
     @State private var showingNew = false
 
     var body: some View {
-        HSplitView {
-            VStack(spacing: 0) {
-                List(selection: $app.selectedModelID) {
+        HStack(spacing: 0) {
+            modelList.frame(width: 300).riseIn()
+            Rectangle().fill(Theme.hairline).frame(width: 1)
+            ZStack {
+                if let e = app.models.entry(app.selectedModelID) {
+                    ModelEditor(app: app, entry: e).id(e.id).transition(.opacity)
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "brain").font(.system(size: 36, weight: .light)).foregroundStyle(Theme.faint)
+                        Text("No model selected").font(Theme.font(17, .semibold))
+                        Text("Create a model to train on your recordings.").font(Theme.font(13)).foregroundStyle(Theme.muted)
+                        Button("New Model…") { showingNew = true }.buttonStyle(.atPrimary).padding(.top, 6)
+                    }
+                    .transition(.opacity)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .animation(Theme.spring, value: app.selectedModelID)
+        }
+        .sheet(isPresented: $showingNew) { NewModelSheet(app: app) }
+        .onAppear { if app.selectedModelID == nil { app.selectedModelID = app.models.models.first?.id } }
+    }
+
+    private var modelList: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(spacing: 2) {
                     ForEach(app.models.models) { m in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(m.definition.name)
-                            Text(m.definition.isTrained ? "\(m.definition.trainedSteps) steps trained" : "Not trained yet")
-                                .font(.caption).foregroundStyle(.secondary)
+                        let on = app.selectedModelID == m.id
+                        Button { withAnimation(Theme.snappy) { app.selectedModelID = m.id } } label: {
+                            HStack(spacing: 10) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(m.definition.name).font(Theme.font(14, .semibold)).lineLimit(1)
+                                    HStack(spacing: 6) {
+                                        if app.training.isActive && app.training.jobModelID == m.id { LiveDot(size: 5) }
+                                        Text(subtitle(m)).font(Theme.font(12)).foregroundStyle(Theme.muted).lineLimit(1)
+                                    }
+                                }
+                                Spacer(minLength: 4)
+                                Text(String(format: "%.0fM", Double(m.definition.parameterCount) / 1e6)).font(Theme.font(12)).monospacedDigit().foregroundStyle(Theme.muted)
+                            }
+                            .padding(.horizontal, 14).padding(.vertical, 11)
                         }
-                        .tag(m.id)
+                        .buttonStyle(RowButtonStyle(selected: on, radius: 12))
                         .contextMenu {
                             Button("Duplicate") { app.selectedModelID = app.models.duplicate(m)?.id }
                             Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([m.url]) }
@@ -26,32 +60,24 @@ struct ModelsView: View {
                         }
                     }
                 }
-                Divider()
-                HStack {
-                    Button { showingNew = true } label: { Label("New Model", systemImage: "plus") }
-                    Spacer()
-                }
-                .buttonStyle(.borderless).padding(8)
+                .padding(10)
             }
-            .frame(minWidth: 200, idealWidth: 230, maxWidth: 300)
-            Group {
-                if let e = app.models.entry(app.selectedModelID) {
-                    ModelEditor(app: app, entry: e).id(e.id)
-                } else {
-                    ContentUnavailableView {
-                        Label("No model selected", systemImage: "brain")
-                    } description: {
-                        Text("Create a model to train on your recordings.")
-                    } actions: {
-                        Button("New Model…") { showingNew = true }.buttonStyle(.borderedProminent)
-                    }
-                }
-            }
-            .frame(minWidth: 520, maxWidth: .infinity)
+            .scrollIndicators(.never)
+            Rectangle().fill(Theme.hairline).frame(height: 1)
+            Button { showingNew = true } label: { Label("New Model", systemImage: "plus").frame(maxWidth: .infinity) }
+                .buttonStyle(.atPrimary)
+                .padding(14)
         }
-        .sheet(isPresented: $showingNew) { NewModelSheet(app: app) }
+    }
+
+    func subtitle(_ m: ModelEntry) -> String {
+        if m.checkpoints.contains("best"), let st = ModelPackage.checkpointState(m.url, name: "best") { return "\(m.definition.trainedSteps) steps · best \(st.step)" }
+        if m.definition.isTrained { return "\(m.definition.trainedSteps) steps trained" }
+        return m.definition.initialization == .blank ? "Not trained" : "Pretrained · not trained"
     }
 }
+
+// MARK: New model
 
 struct NewModelSheet: View {
     let app: AppModel
@@ -60,44 +86,60 @@ struct NewModelSheet: View {
     @State private var preset = ModelDefinition.Preset.gameP2P150
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("New AI Model").font(.title2.bold())
-            TextField("Name", text: $name)
-            ForEach(ModelDefinition.Preset.allCases) { p in
-                Button { preset = p } label: {
-                    HStack(alignment: .top, spacing: 12) {
-                        Image(systemName: preset == p ? "largecircle.fill.circle" : "circle").foregroundStyle(.tint)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(p.title).font(.headline)
-                            Text(p.subtitle).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 18) {
+            Text("New model").displayStyle(30)
+            TextField("Name", text: $name).textFieldStyle(DarkFieldStyle())
+            ScrollView {
+                VStack(spacing: 8) {
+                    ForEach(ModelDefinition.Preset.allCases) { p in
+                        let on = preset == p
+                        Button { withAnimation(Theme.snappy) { preset = p } } label: {
+                            HStack(alignment: .top, spacing: 12) {
+                                ZStack {
+                                    Circle().strokeBorder(on ? Theme.text : Theme.faint, lineWidth: on ? 5 : 1.5).frame(width: 18, height: 18)
+                                }
+                                .padding(.top, 2)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(p.title).font(Theme.font(14, .semibold))
+                                    Text(p.subtitle).font(Theme.font(12.5)).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true).multilineTextAlignment(.leading)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(14)
                         }
-                        Spacer()
+                        .buttonStyle(RowButtonStyle(selected: on, radius: 12))
                     }
-                    .padding(12)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(preset == p ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.06)))
                 }
-                .buttonStyle(.plain)
             }
+            .frame(maxHeight: 420)
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Cancel") { dismiss() }.buttonStyle(.atSecondary).keyboardShortcut(.cancelAction)
                 Button("Create") {
                     if let e = app.models.create(ModelDefinition.make(preset, name: name)) { app.selectedModelID = e.id }
                     dismiss()
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.atPrimary)
+                .keyboardShortcut(.defaultAction)
                 .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
-        .padding(24)
-        .frame(width: 520)
+        .padding(28)
+        .frame(width: 540)
+        .background(Theme.surface)
+        .preferredColorScheme(.dark)
     }
 }
+
+// MARK: Editor
+
+enum ModelSection: String, CaseIterable { case general = "General", network = "Network", visionLanguage = "Vision & language", actions = "Actions", training = "Training" }
 
 struct ModelEditor: View {
     let app: AppModel
     let entry: ModelEntry
     @State private var def: ModelDefinition
+    @State private var section = ModelSection.general
     @State private var bench: String?
     @State private var benchmarking = false
 
@@ -108,106 +150,244 @@ struct ModelEditor: View {
     }
 
     private var locked: Bool { def.architectureLocked }
+    private var shapeLocked: Bool { locked || def.initialization != .blank }
 
     var body: some View {
-        Form {
-            Section {
-                TextField("Name", text: $def.name)
-                TextField("Notes", text: $def.notes, axis: .vertical).lineLimit(1 ... 4)
-                LabeledContent("Parameters") { Text(String(format: "%.0fM", Double(def.parameterCount) / 1e6)).monospacedDigit() }
-                LabeledContent("Status") {
-                    Text(def.isTrained ? "\(def.trainedSteps) training steps · \(entry.checkpoints.count) checkpoints" : "Not trained yet")
+        VStack(alignment: .leading, spacing: 0) {
+            header.padding(.horizontal, 40).padding(.top, 28).riseIn()
+            Segmented(options: ModelSection.allCases.map { ($0, $0.rawValue) }, selection: $section)
+                .padding(.horizontal, 40).padding(.top, 22).padding(.bottom, 4)
+                .riseIn(0.05)
+            ScrollView {
+                Group {
+                    switch section {
+                    case .general: general
+                    case .network: network
+                    case .visionLanguage: visionLanguage
+                    case .actions: actionsSection
+                    case .training: TrainingPanels(training: $def.training)
+                    }
                 }
-                if locked {
-                    Label("The network shape is fixed because training has started. Duplicate the model to change it.", systemImage: "lock")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-            } header: { Text("Overview") }
-
-            Section("Starting point") {
-                Picker("Initialize from", selection: $def.initialization) {
-                    ForEach(ModelInitialization.allCases, id: \.self) { Text($0.label).tag($0) }
-                }
-                .disabled(locked)
-                .onChange(of: def.initialization) { _, i in applyInitialization(i) }
-                if def.initialization != .blank { PretrainedStatus(app: app, initialization: def.initialization) }
+                .id(section)
+                .transition(.opacity.combined(with: .offset(y: 8)))
+                .padding(.horizontal, 40).padding(.top, 18).padding(.bottom, 40)
             }
+            .scrollIndicators(.never)
+            .animation(Theme.spring, value: section)
+        }
+        .onChange(of: def) { _, d in app.models.save(d) }
+    }
 
-            Section("Network") {
-                Stepper("Transformer layers: \(def.architecture.layers)", value: $def.architecture.layers, in: 2 ... 32)
-                Picker("Width", selection: $def.architecture.width) { ForEach([128, 192, 256, 384, 512, 768, 1024, 1536, 2048], id: \.self) { Text("\($0)").tag($0) } }
-                    .onChange(of: def.architecture.width) { _, w in def.architecture.heads = w / 64; def.architecture.kvHeads = w / 64; def.architecture.decoderHeads = max(1, w / 128) }
-                Stepper("Action decoder layers: \(def.architecture.decoderLayers)", value: $def.architecture.decoderLayers, in: 1 ... 6)
-                LabeledSlider(title: "Dropout", value: $def.architecture.dropout, range: 0 ... 0.3, step: 0.01)
-                if def.initialization != .blank {
-                    Text("Pretrained models keep Pixel2Play's shape (\(def.initialization == .p2p300M ? 20 : 10) layers × 1024).").font(.caption).foregroundStyle(.secondary)
+    private var header: some View {
+        HStack(alignment: .bottom, spacing: 16) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(def.name.isEmpty ? "Untitled" : def.name).displayStyle(42).lineLimit(1)
+                HStack(spacing: 14) {
+                    Text(String(format: "%.0fM parameters", Double(def.parameterCount) / 1e6))
+                    Text(def.isTrained ? "\(def.trainedSteps) steps trained" : "Not trained yet")
+                    if let st = ModelPackage.checkpointState(entry.url, name: "best") { Pill(text: "Best · step \(st.step)") }
                 }
+                .font(Theme.font(13)).foregroundStyle(Theme.muted)
             }
-            .disabled(locked || def.initialization != .blank)
+            Spacer()
+            Button("Duplicate") { app.selectedModelID = app.models.duplicate(entry)?.id }.buttonStyle(.atSmall)
+            Button { app.selectedModelID = entry.id; app.tab = .training } label: { Label("Train", systemImage: "play.fill") }.buttonStyle(.atSmallPrimary)
+        }
+    }
 
-            Section("Vision") {
-                Picker("Input size", selection: $def.architecture.frameSize) { Text("192 × 192 (Pixel2Play)").tag(192); Text("256 × 256").tag(256) }
-                    .disabled(locked || def.initialization != .blank)
-                Toggle("Grayscale", isOn: $def.architecture.grayscale).disabled(locked)
-                Text("Frames are squashed to a square like Pixel2Play; the same GPU resize is used for training and running.").font(.caption).foregroundStyle(.secondary)
+    // MARK: General
+
+    private var general: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            if locked {
+                HStack(spacing: 10) {
+                    Image(systemName: "lock.fill")
+                    Text("Network, vision, memory and actions are fixed once training starts. Duplicate the model to change them.")
+                }
+                .font(Theme.font(13)).foregroundStyle(Theme.warning)
+                .padding(.horizontal, 16).padding(.vertical, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.warning.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
-
-            Section("Temporal memory") {
-                Picker("Decisions per second", selection: $def.architecture.stepRateHz) {
-                    ForEach([20, 30, 40, 60], id: \.self) { Text("\($0) Hz").tag($0) }
+            HStack(alignment: .top, spacing: 18) {
+                Panel {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Starting point").font(Theme.font(14, .semibold))
+                        ForEach(ModelInitialization.allCases, id: \.self) { i in
+                            let on = def.initialization == i
+                            Button {
+                                withAnimation(Theme.snappy) { def.initialization = i; applyInitialization(i) }
+                            } label: {
+                                HStack(alignment: .top, spacing: 12) {
+                                    Circle().strokeBorder(on ? Theme.text : Theme.faint, lineWidth: on ? 5 : 1.5).frame(width: 16, height: 16).padding(.top, 2)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(title(i)).font(Theme.font(14, .semibold))
+                                        Text(detail(i)).font(Theme.font(12)).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    Spacer(minLength: 0)
+                                }
+                                .padding(12)
+                            }
+                            .buttonStyle(RowButtonStyle(selected: on, radius: 12))
+                            .disabled(locked)
+                        }
+                        if def.initialization != .blank { PretrainedStatus(app: app, initialization: def.initialization).padding(.top, 4) }
+                    }
                 }
-                .pickerStyle(.segmented)
-                LabeledSlider(title: "Memory", value: $def.architecture.memorySeconds, range: 5 ... 30, step: 1, format: { "\(Int($0)) s" })
-                Text("\(def.architecture.contextSteps) timesteps · \(def.architecture.contextSteps * def.architecture.tokensPerStep(slots: def.actions.slotCount)) tokens kept in the KV cache; each step only processes the new frame.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            .disabled(locked)
-
-            Section("Language") {
-                Toggle("Follow instructions", isOn: $def.usesInstructions)
-                LabeledSlider(title: "Instruction dropout", value: $def.training.instructionDropout, range: 0 ... 0.6, step: 0.05)
-                Toggle("Read text on screen (OCR)", isOn: $def.architecture.screenText).disabled(locked)
-                if def.architecture.screenText {
-                    Stepper("Screen text items: \(def.architecture.screenTextItems)", value: $def.architecture.screenTextItems, in: 2 ... 16).disabled(locked)
+                Panel {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("About").font(Theme.font(14, .semibold))
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Name").font(Theme.font(12)).foregroundStyle(Theme.muted)
+                            TextField("Name", text: $def.name).textFieldStyle(DarkFieldStyle())
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Notes").font(Theme.font(12)).foregroundStyle(Theme.muted)
+                            TextField("What is this model for?", text: $def.notes, axis: .vertical).textFieldStyle(DarkFieldStyle()).lineLimit(3 ... 6)
+                        }
+                        HStack(spacing: 28) {
+                            BigStat(value: String(format: "%.0f", Double(def.parameterCount) / 1e6), unit: "M", caption: "parameters", size: 30)
+                            BigStat(value: "\(entry.checkpoints.count)", caption: "checkpoints", size: 30)
+                        }
+                        .padding(.top, 6)
+                    }
                 }
-                Toggle("Type text from instructions", isOn: $def.architecture.literalTyping).disabled(locked)
-                Text("Instructions and on-screen text are embedded with EmbeddingGemma (on device). Typing lets the model copy characters from an instruction like “type hello”.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section("Actions the model can use") {
-                KeyVocabularyPicker(keys: $def.actions.keys).disabled(locked)
-                Stepper("Simultaneous keys: \(def.actions.keySlots)", value: $def.actions.keySlots, in: 1 ... 8).disabled(locked || def.initialization != .blank)
-                PointerVocabularyPicker(events: $def.actions.pointerEvents).disabled(locked)
-                Picker("Mouse", selection: $def.actions.mouseMode) {
-                    Text("Relative movement (games)").tag(MouseMode.relative)
-                    Text("Pointer position (apps)").tag(MouseMode.absolute)
-                }
-                .disabled(locked)
-                if def.actions.mouseMode == .absolute {
-                    Stepper("Pointer grid: \(def.actions.absoluteColumns) × \(def.actions.absoluteRows)", value: $def.actions.absoluteColumns, in: 32 ... 256, step: 16)
-                        .onChange(of: def.actions.absoluteColumns) { _, c in def.actions.absoluteRows = c * 9 / 16 }
-                        .disabled(locked)
-                }
-                Picker("Mouse sampling", selection: $def.actions.mouseSampling) {
-                    Text("Smooth (truncated normal)").tag(MouseSampling.truncatedNormal)
-                    Text("Bin center").tag(MouseSampling.center)
-                }
-                Text("These define what the model can output. The Run tab can still block any of them without retraining.").font(.caption).foregroundStyle(.secondary)
-            }
-
-            TrainingSettingsSection(training: $def.training)
-
-            Section("Speed on this Mac") {
-                HStack {
-                    Button(benchmarking ? "Measuring…" : "Run benchmark") { Task { await benchmark() } }.disabled(benchmarking)
-                    if let bench { Text(bench).monospacedDigit() }
-                }
-                Text("Measures one real-time step with a full memory window, random weights, bf16.").font(.caption).foregroundStyle(.secondary)
             }
         }
-        .formStyle(.grouped)
-        .onChange(of: def) { _, d in app.models.save(d) }
+    }
+
+    func title(_ i: ModelInitialization) -> String {
+        switch i { case .blank: "Blank"; case .p2p150M: "Pixel2Play 150M"; case .p2p300M: "Pixel2Play 300M" }
+    }
+
+    func detail(_ i: ModelInitialization) -> String {
+        switch i {
+        case .blank: "Vision stem from Pixel2Play, the rest learned from your recordings."
+        case .p2p150M: "Pretrained on 8,300 h of gameplay. 183M parameters."
+        case .p2p300M: "Pretrained, twice as deep. 309M parameters, slower to train."
+        }
+    }
+
+    // MARK: Network
+
+    private var network: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionLabel("Size")
+                HStack(spacing: 10) {
+                    ForEach(Array(sizes.enumerated()), id: \.offset) { _, s in
+                        let on = def.architecture.width == s.arch.width && def.architecture.layers == s.arch.layers
+                        Button { withAnimation(Theme.snappy) { applySize(s.arch) } } label: {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(s.size).displayStyle(28)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(s.name).font(Theme.font(13, .semibold))
+                                    Text("\(s.arch.width) × \(s.arch.layers)").font(Theme.font(12)).foregroundStyle(Theme.muted)
+                                }
+                            }
+                            .padding(16)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(on ? Theme.raised : Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(on ? Theme.text : Theme.hairline, lineWidth: on ? 1.5 : 1))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(shapeLocked)
+                        .opacity(shapeLocked && !on ? 0.45 : 1)
+                    }
+                }
+                if def.initialization != .blank {
+                    Text("Pretrained models keep Pixel2Play's shape (\(def.initialization == .p2p300M ? 20 : 10) layers × 1024).").font(Theme.font(12)).foregroundStyle(Theme.muted)
+                }
+            }
+            Rows(title: "Shape") {
+                Row(title: "Transformer layers") { NumberStepper(value: $def.architecture.layers, range: 2 ... 32) }
+                Row(title: "Width") {
+                    Picker("", selection: $def.architecture.width) { ForEach([128, 192, 256, 384, 512, 768, 1024, 1536, 2048], id: \.self) { Text("\($0)").tag($0) } }
+                        .labelsHidden().fixedSize()
+                        .onChange(of: def.architecture.width) { _, w in def.architecture.heads = w / 64; def.architecture.kvHeads = w / 64; def.architecture.decoderHeads = max(1, w / 128) }
+                }
+                Row(title: "Action decoder layers") { NumberStepper(value: $def.architecture.decoderLayers, range: 1 ... 6) }
+                LabeledSlider(title: "Dropout", value: $def.architecture.dropout, range: 0 ... 0.3, step: 0.01)
+            }
+            .disabled(shapeLocked)
+            Rows(title: "Memory", footer: "\(def.architecture.contextSteps) timesteps · \(def.architecture.contextSteps * def.architecture.tokensPerStep(slots: def.actions.slotCount)) tokens in memory. Each decision only processes the new frame.") {
+                Row(title: "Decisions per second") { Segmented(options: [20, 30, 40, 60].map { ($0, "\($0)") }, selection: $def.architecture.stepRateHz, compact: true) }
+                LabeledSlider(title: "Memory", value: $def.architecture.memorySeconds, range: 5 ... 30, step: 1, format: { "\(Int($0)) s" })
+            }
+            .disabled(locked)
+            Rows(title: "Speed on this Mac", footer: "One real-time step with a full memory window, random weights, bf16.") {
+                Row(title: bench ?? "Not measured yet") {
+                    Button(benchmarking ? "Measuring…" : "Run benchmark") { Task { await benchmark() } }.buttonStyle(.atSmall).disabled(benchmarking)
+                }
+            }
+        }
+    }
+
+    private var sizes: [(size: String, name: String, arch: PolicyArchitecture)] {
+        [("5M", "Tiny", .tiny5M), ("10M", "Small", .small10M), ("22M", "Medium", .medium22M), ("60M", "Compact", .compact60M), ("183M", "P2P 150M", .p2p150M)]
+    }
+
+    func applySize(_ a: PolicyArchitecture) {
+        def.architecture.width = a.width; def.architecture.layers = a.layers; def.architecture.heads = a.heads; def.architecture.kvHeads = a.kvHeads
+        def.architecture.decoderLayers = a.decoderLayers; def.architecture.decoderHeads = a.decoderHeads
+    }
+
+    // MARK: Vision & language
+
+    private var visionLanguage: some View {
+        HStack(alignment: .top, spacing: 18) {
+            Rows(title: "Vision", footer: "Frames are squashed to a square like Pixel2Play; the same GPU resize is used for training and running.") {
+                Row(title: "Input size") {
+                    Picker("", selection: $def.architecture.frameSize) { Text("192 × 192").tag(192); Text("256 × 256").tag(256) }.labelsHidden().fixedSize()
+                        .disabled(shapeLocked)
+                }
+                Toggle("Grayscale", isOn: $def.architecture.grayscale).toggleStyle(.oled).disabled(locked)
+            }
+            Rows(title: "Language", footer: "Instructions and on-screen text are embedded on device with EmbeddingGemma. Typing lets the model copy characters from an instruction like “type hello”.") {
+                Toggle("Follow instructions", isOn: $def.usesInstructions.animation(Theme.spring)).toggleStyle(.oled)
+                if def.usesInstructions {
+                    LabeledSlider(title: "Instruction dropout", value: $def.training.instructionDropout, range: 0 ... 0.6, step: 0.05, format: { "\(Int($0 * 100))%" })
+                }
+                Toggle("Read on-screen text", isOn: $def.architecture.screenText.animation(Theme.spring)).toggleStyle(.oled).disabled(locked)
+                if def.architecture.screenText {
+                    Row(title: "Text items per frame") { NumberStepper(value: $def.architecture.screenTextItems, range: 2 ... 16) }.disabled(locked)
+                }
+                Toggle("Type text from instructions", isOn: $def.architecture.literalTyping).toggleStyle(.oled).disabled(locked)
+            }
+        }
+    }
+
+    // MARK: Actions
+
+    private var actionsSection: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Panel {
+                KeyVocabularyPicker(keys: $def.actions.keys).disabled(locked)
+            }
+            HStack(alignment: .top, spacing: 18) {
+                Panel {
+                    PointerVocabularyPicker(events: $def.actions.pointerEvents).disabled(locked)
+                }
+                Rows(title: "Mouse", footer: "The Run tab can still block any action without retraining.") {
+                    Row(title: "Movement") {
+                        Segmented(options: [(MouseMode.relative, "Relative"), (MouseMode.absolute, "Pointer")], selection: $def.actions.mouseMode, compact: true)
+                    }
+                    .disabled(locked)
+                    if def.actions.mouseMode == .absolute {
+                        Row(title: "Pointer grid", detail: "\(def.actions.absoluteColumns) × \(def.actions.absoluteRows)") {
+                            NumberStepper(value: $def.actions.absoluteColumns, range: 32 ... 256, step: 16)
+                                .onChange(of: def.actions.absoluteColumns) { _, c in def.actions.absoluteRows = c * 9 / 16 }
+                        }
+                        .disabled(locked)
+                    }
+                    Row(title: "Sampling") {
+                        Segmented(options: [(MouseSampling.truncatedNormal, "Smooth"), (MouseSampling.center, "Bin center")], selection: $def.actions.mouseSampling, compact: true)
+                    }
+                    Row(title: "Simultaneous keys") { NumberStepper(value: $def.actions.keySlots, range: 1 ... 8) }.disabled(shapeLocked)
+                }
+            }
+        }
     }
 
     func applyInitialization(_ i: ModelInitialization) {
@@ -238,7 +418,27 @@ struct ModelEditor: View {
             return r
         }.value
         let budget = 1000 / Double(arch.stepRateHz)
-        bench = String(format: "%.1f ms per step → %.0f FPS max · %@ for %d Hz", ms, 1000 / ms, ms < budget * 0.8 ? "✓ fast enough" : "⚠︎ too slow", arch.stepRateHz)
+        withAnimation(Theme.spring) {
+            bench = String(format: "%.1f ms per decision · up to %.0f per second %@", ms, 1000 / ms, ms < budget * 0.8 ? "✓" : "· too slow for \(arch.stepRateHz) Hz")
+        }
+    }
+}
+
+/// − value + stepper.
+struct NumberStepper: View {
+    @Binding var value: Int
+    let range: ClosedRange<Int>
+    var step = 1
+    @Environment(\.isEnabled) private var enabled
+    var body: some View {
+        HStack(spacing: 10) {
+            Button { withAnimation(Theme.snappy) { value = max(range.lowerBound, value - step) } } label: { Image(systemName: "minus").font(.system(size: 11, weight: .bold)).frame(width: 28, height: 28) }
+                .buttonStyle(ATButtonStyle(kind: .secondary, height: 28)).disabled(value <= range.lowerBound)
+            Text("\(value)").font(Theme.font(14, .semibold)).monospacedDigit().frame(minWidth: 30).contentTransition(.numericText())
+            Button { withAnimation(Theme.snappy) { value = min(range.upperBound, value + step) } } label: { Image(systemName: "plus").font(.system(size: 11, weight: .bold)).frame(width: 28, height: 28) }
+                .buttonStyle(ATButtonStyle(kind: .secondary, height: 28)).disabled(value >= range.upperBound)
+        }
+        .opacity(enabled ? 1 : 0.5)
     }
 }
 
@@ -247,17 +447,19 @@ struct PretrainedStatus: View {
     let initialization: ModelInitialization
     var body: some View {
         if let item = app.downloads.item(for: initialization) {
-            HStack {
+            HStack(spacing: 10) {
                 switch item.state {
-                case .done: Label("Weights downloaded", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                case .done:
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.live)
+                    Text("Weights downloaded").font(Theme.font(13)).foregroundStyle(Theme.live)
                 case .downloading:
-                    ProgressView(value: item.fraction).frame(width: 160)
-                    Text("\(item.received.bytesText) of \(item.expectedBytes.bytesText)").font(.caption).monospacedDigit()
-                    Button("Pause") { app.downloads.pause(item.id) }
+                    ProgressView(value: item.fraction).tint(Theme.text).frame(width: 140)
+                    Text("\(item.received.bytesText) of \(item.expectedBytes.bytesText)").font(Theme.font(12)).monospacedDigit().foregroundStyle(Theme.muted)
+                    Button("Pause") { app.downloads.pause(item.id) }.buttonStyle(.atSmall)
                 case .paused, .notStarted, .failed:
-                    if case .failed(let m) = item.state { Text(m).font(.caption).foregroundStyle(.orange) }
-                    Button("Download \(item.expectedBytes.bytesText)") { app.downloads.start(item.id) }
-                    Text("MIT license · elefantai/open-p2p").font(.caption).foregroundStyle(.secondary)
+                    if case .failed(let m) = item.state { Text(m).font(Theme.font(12)).foregroundStyle(Theme.warning) }
+                    Button("Download \(item.expectedBytes.bytesText)") { app.downloads.start(item.id) }.buttonStyle(.atSmallPrimary)
+                    Text("MIT · elefantai/open-p2p").font(Theme.font(12)).foregroundStyle(Theme.muted)
                 }
             }
         }
@@ -268,33 +470,37 @@ struct KeyVocabularyPicker: View {
     @Binding var keys: [String]
     @Environment(\.isEnabled) private var enabled
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Keys (\(keys.count)) — click to add or remove").font(.callout)
-            let unit: CGFloat = 26
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Keys the model can press").font(Theme.font(14, .semibold))
+                    Text("\(keys.count) selected · keys outside this set are never learned or pressed").font(Theme.font(12)).foregroundStyle(Theme.muted).contentTransition(.numericText())
+                }
+                Spacer()
+                Button("Pixel2Play set") { withAnimation(Theme.snappy) { keys = KeyCatalog.p2pKeys } }.buttonStyle(.atSmall)
+                Button("Game set") { withAnimation(Theme.snappy) { keys = KeyCatalog.p2pKeys + KeyCatalog.gameExtras } }.buttonStyle(.atSmall)
+                Button("Full keyboard") { withAnimation(Theme.snappy) { keys = KeyCatalog.p2pKeys + KeyCatalog.fullKeyboard.filter { !KeyCatalog.p2pKeys.contains($0) } } }.buttonStyle(.atSmall)
+            }
+            let unit: CGFloat = 40
             ZStack(alignment: .topLeading) {
                 ForEach(KeyCatalog.all) { k in
                     let on = keys.contains(k.id)
                     Button {
-                        if on { keys.removeAll { $0 == k.id } } else { keys.append(k.id) }
+                        withAnimation(Theme.snappy) { if on { keys.removeAll { $0 == k.id } } else { keys.append(k.id) } }
                     } label: {
-                        Text(k.label.count > 3 ? String(k.label.prefix(4)) : k.label.uppercased())
-                            .font(.system(size: 9, weight: .medium))
-                            .frame(width: k.width * unit - 3, height: unit - 3)
-                            .background(RoundedRectangle(cornerRadius: 4).fill(on ? Color.accentColor : Color.secondary.opacity(0.12)))
-                            .foregroundStyle(on ? .white : .primary)
+                        Text(k.label.count > 3 ? String(k.label.prefix(5)) : k.label.uppercased())
+                            .font(Theme.font(k.label.count > 3 ? 9.5 : 12, .semibold))
+                            .frame(width: k.width * unit - 5, height: unit - 5)
+                            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(on ? Theme.text : Theme.raised))
+                            .foregroundStyle(on ? Color.black : Theme.text2)
+                            .scaleEffect(on ? 1 : 0.96)
                     }
                     .buttonStyle(.plain)
                     .offset(x: k.x * unit, y: k.y * unit)
                 }
             }
             .frame(width: 16.5 * unit, height: 6.6 * unit, alignment: .topLeading)
-            .opacity(enabled ? 1 : 0.6)
-            HStack {
-                Button("Pixel2Play set") { keys = KeyCatalog.p2pKeys }
-                Button("Game set") { keys = KeyCatalog.p2pKeys + KeyCatalog.gameExtras }
-                Button("Full keyboard") { keys = KeyCatalog.p2pKeys + KeyCatalog.fullKeyboard.filter { !KeyCatalog.p2pKeys.contains($0) } }
-            }
-            .controlSize(.small)
+            .opacity(enabled ? 1 : 0.55)
         }
     }
 }
@@ -302,68 +508,104 @@ struct KeyVocabularyPicker: View {
 struct PointerVocabularyPicker: View {
     @Binding var events: [PointerEvent]
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Mouse buttons and scrolling").font(.callout)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), alignment: .leading)], alignment: .leading) {
-                ForEach(PointerEvent.allCases, id: \.self) { e in
-                    Toggle(e.label, isOn: Binding(get: { events.contains(e) }, set: { on in
-                        if on { events.append(e); events = PointerEvent.allCases.filter(events.contains) } else { events.removeAll { $0 == e } }
-                    }))
-                    .toggleStyle(.checkbox)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Buttons and scrolling").font(Theme.font(14, .semibold))
+            FlowChips(items: PointerEvent.allCases.map { ($0, $0.label) }, isOn: { events.contains($0) }) { e in
+                withAnimation(Theme.snappy) {
+                    if events.contains(e) { events.removeAll { $0 == e } } else { events.append(e); events = PointerEvent.allCases.filter(events.contains) }
                 }
             }
         }
     }
 }
 
-struct TrainingSettingsSection: View {
-    @Binding var training: TrainingHyperparameters
+/// Wrapping toggle chips.
+struct FlowChips<T: Hashable>: View {
+    let items: [(T, String)]
+    let isOn: (T) -> Bool
+    let toggle: (T) -> Void
     var body: some View {
-        Section("Training") {
-            LabeledContent("Learning rate") {
-                TextField("", value: $training.learningRate, format: .number.notation(.scientific)).frame(width: 90).multilineTextAlignment(.trailing)
-            }
-            Picker("Schedule", selection: $training.schedule) { Text("Cosine").tag(LRSchedule.cosine); Text("Constant (P2P)").tag(LRSchedule.constant) }
-            Stepper("Warmup: \(training.warmupSteps) steps", value: $training.warmupSteps, in: 0 ... 5000, step: 50)
-            Stepper("Total steps: \(training.totalSteps)", value: $training.totalSteps, in: 100 ... 500_000, step: 500)
-            Picker("Clips per step", selection: $training.batchSize) {
-                Text("Automatic").tag(0); ForEach([1, 2, 4, 8], id: \.self) { Text("\($0)").tag($0) }
-            }
-            Stepper("Gradient accumulation: \(training.gradientAccumulation)×", value: $training.gradientAccumulation, in: 1 ... 16)
-            LabeledContent("Weight decay") {
-                TextField("", value: $training.weightDecay, format: .number.notation(.scientific)).frame(width: 90).multilineTextAlignment(.trailing)
-            }
-            LabeledSlider(title: "Gradient clip", value: $training.gradientClip, range: 0 ... 5, step: 0.25)
-            LabeledSlider(title: "Held-out recordings", value: $training.validationFraction, range: 0 ... 0.4, step: 0.05, format: { "\(Int($0 * 100))%" })
-            Stepper("Validate every \(training.validateEverySteps) steps", value: $training.validateEverySteps, in: 50 ... 10000, step: 50)
-            LabeledSlider(title: "Checkpoint every", value: $training.checkpointEveryMinutes, range: 2 ... 60, step: 1, format: { "\(Int($0)) min" })
-            Toggle("Keep the best model", isOn: $training.saveBest)
-                .help("Saves the model from the validation check with the lowest held-out loss as checkpoint “Best”. It is never pruned, and Run uses it unless you pick another checkpoint.")
-            Toggle("Early stopping", isOn: $training.earlyStopping)
-                .help("Stops training when the held-out loss hasn't improved for several validation checks in a row.")
-            if training.earlyStopping {
-                Stepper("Stop after \(training.earlyStoppingPatience) checks without improvement (\(training.earlyStoppingPatience * training.validateEverySteps) steps)",
-                        value: $training.earlyStoppingPatience, in: 1 ... 50)
-            }
-            if (training.saveBest || training.earlyStopping) && training.validationFraction == 0 {
-                Text("Both need held-out recordings: set “Held-out recordings” above 0%.").font(.caption).foregroundStyle(.orange)
-            }
-            LabeledSlider(title: "Action-history dropout", value: $training.historyDropout, range: 0 ... 0.9, step: 0.05, format: { "\(Int($0 * 100))%" })
-            Text("Hides past actions from the model during training so it learns to act on what it sees instead of copying itself. Raise it if the model keeps repeating actions in Run.")
-                .font(.caption).foregroundStyle(.secondary)
-            Toggle("bf16 mixed precision", isOn: $training.bf16)
-            VStack(alignment: .leading) {
-                Text("Augmentations (same for every frame of a clip, as in Pixel2Play)").font(.callout)
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), alignment: .leading)], alignment: .leading) {
-                    ForEach(Augmentation.allCases) { a in
-                        Toggle(a.label, isOn: Binding(get: { training.augmentations.contains(a) }, set: { on in
-                            if on { training.augmentations.append(a) } else { training.augmentations.removeAll { $0 == a } }
-                        }))
-                        .toggleStyle(.checkbox)
-                    }
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 120), spacing: 6, alignment: .leading)], alignment: .leading, spacing: 6) {
+            ForEach(items, id: \.0) { item, label in
+                let on = isOn(item)
+                Button { toggle(item) } label: {
+                    Text(label).font(Theme.font(12.5, on ? .semibold : .regular)).lineLimit(1)
+                        .foregroundStyle(on ? Color.black : Theme.text2)
+                        .padding(.horizontal, 12).frame(height: 30)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(on ? Theme.text : Theme.raised, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
-                LabeledSlider(title: "Strength", value: $training.augmentationStrength, range: 0 ... 2, step: 0.1)
+                .buttonStyle(.plain)
             }
         }
     }
+}
+
+/// Training hyperparameters, grouped.
+struct TrainingPanels: View {
+    @Binding var training: TrainingHyperparameters
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 18) {
+                Rows(title: "Schedule") {
+                    Row(title: "Learning rate") {
+                        TextField("", value: $training.learningRate, format: .number.notation(.scientific)).textFieldStyle(.plain)
+                            .font(Theme.font(14)).multilineTextAlignment(.trailing).frame(width: 90)
+                    }
+                    Row(title: "Schedule") { Segmented(options: [(LRSchedule.cosine, "Cosine"), (LRSchedule.constant, "Constant")], selection: $training.schedule, compact: true) }
+                    Row(title: "Warmup steps") { NumberStepper(value: $training.warmupSteps, range: 0 ... 5000, step: 50) }
+                    Row(title: "Total steps") { NumberStepper(value: $training.totalSteps, range: 100 ... 500_000, step: 500) }
+                    Row(title: "Clips per step") {
+                        Picker("", selection: $training.batchSize) { Text("Automatic").tag(0); ForEach([1, 2, 4, 8], id: \.self) { Text("\($0)").tag($0) } }.labelsHidden().fixedSize()
+                    }
+                    Row(title: "Gradient accumulation") { NumberStepper(value: $training.gradientAccumulation, range: 1 ... 16) }
+                }
+                VStack(alignment: .leading, spacing: 18) {
+                    Rows(title: "Validation", footer: (training.saveBest || training.earlyStopping) && training.validationFraction == 0 ? "Both need held-out recordings above 0%." : "The best model is saved as “Best” and used by Run unless you pick another checkpoint.") {
+                        LabeledSlider(title: "Held-out recordings", value: $training.validationFraction, range: 0 ... 0.4, step: 0.05, format: { "\(Int($0 * 100))%" })
+                        Row(title: "Validate every") { NumberStepper(value: $training.validateEverySteps, range: 50 ... 10000, step: 50) }
+                        Toggle("Keep the best model", isOn: $training.saveBest).toggleStyle(.oled)
+                        Toggle("Early stopping", isOn: $training.earlyStopping.animation(Theme.spring)).toggleStyle(.oled)
+                        if training.earlyStopping {
+                            Row(title: "Stop after", detail: "\(training.earlyStoppingPatience * training.validateEverySteps) steps without improvement") {
+                                NumberStepper(value: $training.earlyStoppingPatience, range: 1 ... 50)
+                            }
+                        }
+                    }
+                    Rows(title: "Checkpoints") {
+                        LabeledSlider(title: "Save every", value: $training.checkpointEveryMinutes, range: 2 ... 60, step: 1, format: { "\(Int($0)) min" })
+                    }
+                }
+            }
+            HStack(alignment: .top, spacing: 18) {
+                Rows(title: "Regularisation", footer: "History dropout hides past actions so the model acts on what it sees instead of copying itself. Raise it if the model repeats actions in Run.") {
+                    LabeledSlider(title: "Action-history dropout", value: $training.historyDropout, range: 0 ... 0.9, step: 0.05, format: { "\(Int($0 * 100))%" })
+                    Row(title: "Weight decay") {
+                        TextField("", value: $training.weightDecay, format: .number.notation(.scientific)).textFieldStyle(.plain)
+                            .font(Theme.font(14)).multilineTextAlignment(.trailing).frame(width: 90)
+                    }
+                    LabeledSlider(title: "Gradient clip", value: $training.gradientClip, range: 0 ... 5, step: 0.25)
+                    Toggle("bf16 mixed precision", isOn: $training.bf16).toggleStyle(.oled)
+                }
+                Panel {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Augmentations").font(Theme.font(14, .semibold))
+                        Text("The same for every frame of a clip, as in Pixel2Play.").font(Theme.font(12)).foregroundStyle(Theme.muted)
+                        FlowChips(items: Augmentation.allCases.map { ($0, $0.label) }, isOn: { training.augmentations.contains($0) }) { a in
+                            withAnimation(Theme.snappy) {
+                                if training.augmentations.contains(a) { training.augmentations.removeAll { $0 == a } } else { training.augmentations.append(a) }
+                            }
+                        }
+                        LabeledSlider(title: "Strength", value: $training.augmentationStrength, range: 0 ... 2, step: 0.1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Kept for compatibility with older call sites.
+struct TrainingSettingsSection: View {
+    @Binding var training: TrainingHyperparameters
+    var body: some View { TrainingPanels(training: $training) }
 }

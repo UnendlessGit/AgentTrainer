@@ -9,58 +9,58 @@ struct RunView: View {
     var body: some View {
         @Bindable var run = app.runner
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                PageHeader(title: "Run", subtitle: "Let a trained model play or control an app in real time. Touch the keyboard or mouse to take over.")
-                controlCard
+            VStack(alignment: .leading, spacing: 24) {
+                controlPanel.riseIn()
                 if let e = run.errorMessage { InlineError(message: e) }
-                if run.isRunning { statsCard }
-                Card(title: "What to control", symbol: "macwindow",
-                     trailing: AnyView(Button { Task { await run.refreshTargets() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }.disabled(run.isRunning))) {
-                    TargetGrid(targets: run.targets, thumbnails: run.thumbnails, selection: $run.selectedTargetID).disabled(run.isRunning)
-                }
-                if run.selectedModel?.definition.usesInstructions == true {
-                    Card(title: "Instruction", symbol: "text.bubble") {
-                        HStack {
-                            TextField("e.g. “Walk to the door and open it”", text: $run.instruction)
-                                .onSubmit { run.applyInstruction() }
-                            Button(run.isRunning ? "Send" : "Set") { run.applyInstruction() }
+                HStack(alignment: .top, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 20) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack {
+                                SectionLabel("What to control")
+                                Spacer()
+                                Button { Task { await run.refreshTargets() } } label: { Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold)) }
+                                    .buttonStyle(.atQuiet).help("Refresh").disabled(run.isRunning)
+                            }
+                            TargetGrid(targets: run.targets, thumbnails: run.thumbnails, selection: $run.selectedTargetID).disabled(run.isRunning)
                         }
-                        if let a = run.appliedInstruction { Text("Following: “\(a)”").font(.caption).foregroundStyle(.secondary) }
-                        if !run.encoderStatus.isEmpty { Text(run.encoderStatus).font(.caption).foregroundStyle(.orange) }
-                        Text("You can change the instruction while the model runs; it takes effect on the next frame.").font(.caption).foregroundStyle(.secondary)
+                        if run.selectedModel?.definition.usesInstructions == true { instruction }
                     }
-                }
-                HStack(alignment: .top, spacing: 18) {
-                    Card(title: "Allowed actions", symbol: "hand.raised") {
-                        Toggle("Keyboard", isOn: $run.prefs.permissions.keyboard)
-                        Toggle("Typing (letters, numbers, symbols)", isOn: $run.prefs.permissions.typingKeys).disabled(!run.prefs.permissions.keyboard)
-                        Toggle("Mouse movement", isOn: $run.prefs.permissions.mouseMovement)
-                        Toggle("Mouse buttons", isOn: $run.prefs.permissions.mouseButtons)
-                        Toggle("Scrolling", isOn: $run.prefs.permissions.scroll)
-                        BlockedKeysEditor(blocked: $run.prefs.permissions.blockedKeys)
-                        Text("These only filter what is sent. The model and its training are not changed.").font(.caption).foregroundStyle(.secondary)
+                    .riseIn(0.05)
+                    VStack(alignment: .leading, spacing: 16) {
+                        Rows(title: "Allowed actions", footer: "These only filter what is sent. The model and its training are not changed.") {
+                            Toggle("Keyboard", isOn: $run.prefs.permissions.keyboard)
+                            Toggle("Typing keys", isOn: $run.prefs.permissions.typingKeys).disabled(!run.prefs.permissions.keyboard)
+                            Toggle("Mouse movement", isOn: $run.prefs.permissions.mouseMovement)
+                            Toggle("Mouse buttons", isOn: $run.prefs.permissions.mouseButtons)
+                            Toggle("Scrolling", isOn: $run.prefs.permissions.scroll)
+                            BlockedKeysEditor(blocked: $run.prefs.permissions.blockedKeys)
+                        }
+                        .toggleStyle(.oled)
+                        Rows(title: "Behaviour") {
+                            LabeledSlider(title: "Randomness", value: $run.prefs.temperature, range: 0 ... 1.5, step: 0.05, format: { $0 == 0 ? "off" : String(format: "%.2f", $0) })
+                            LabeledSlider(title: "Mouse sensitivity", value: $run.prefs.sensitivity, range: 0.25 ... 3, step: 0.05, format: { String(format: "%.2f×", $0) })
+                            Row(title: "Mouse output") {
+                                Picker("", selection: $run.prefs.mouseMode) { ForEach(MouseOutputMode.allCases, id: \.self) { Text($0.label).tag($0) } }.labelsHidden().fixedSize()
+                            }
+                            Toggle("Only act while the target is in front", isOn: $run.prefs.focusGuard).toggleStyle(.oled)
+                            Toggle("Feed the model its own past actions", isOn: $run.prefs.useActionHistory).toggleStyle(.oled)
+                                .help("Pixel2Play does this. With small datasets models often play better without it, because they stop copying their own previous actions.")
+                            Toggle("Dry run · show actions, send nothing", isOn: $run.prefs.dryRun).toggleStyle(.oled)
+                            Toggle("Record my corrections for training", isOn: $run.prefs.recordCorrections).toggleStyle(.oled)
+                            Row(title: "Mouse injection", detail: "Moves the mouse in a small square to check the game accepts it") {
+                                Button("Test") { Task { await run.mouseTest() } }.buttonStyle(.atSmall).disabled(run.isRunning || run.selectedTarget == nil)
+                            }
+                        }
+                        .disabled(run.isRunning)
+                        HUDRows(title: "Run HUD", options: $run.prefs.hud, showsVision: true)
                     }
-                    Card(title: "Behavior", symbol: "slider.horizontal.3") {
-                        LabeledSlider(title: "Randomness", value: $run.prefs.temperature, range: 0 ... 1.5, step: 0.05, format: { $0 == 0 ? "off" : String(format: "%.2f", $0) })
-                        LabeledSlider(title: "Mouse sensitivity", value: $run.prefs.sensitivity, range: 0.25 ... 3, step: 0.05, format: { String(format: "%.2f×", $0) })
-                        Picker("Mouse output", selection: $run.prefs.mouseMode) { ForEach(MouseOutputMode.allCases, id: \.self) { Text($0.label).tag($0) } }
-                        Toggle("Only act while the target is in front", isOn: $run.prefs.focusGuard)
-                        Toggle("Feed the model its own past actions", isOn: $run.prefs.useActionHistory)
-                            .help("Pixel2Play does this. With small datasets models often play better without it, because they stop copying their own previous actions.")
-                        Toggle("Dry run (show actions in the HUD, send nothing)", isOn: $run.prefs.dryRun)
-                        Toggle("Record my corrections for training", isOn: $run.prefs.recordCorrections)
-                        Button("Test mouse control on the target") { Task { await run.mouseTest() } }
-                            .disabled(run.isRunning || run.selectedTarget == nil)
-                            .help("Brings the target forward and moves the mouse in a small square. Use it to check that a game accepts synthetic input.")
-                    }
-                    .disabled(run.isRunning)
-                }
-                Card(title: "Run HUD", symbol: "rectangle.inset.bottomright.filled") {
-                    HUDOptionsEditor(options: $run.prefs.hud, showsVision: true)
+                    .frame(width: 400)
+                    .riseIn(0.1)
                 }
             }
-            .padding(24)
+            .padding(32)
         }
+        .scrollIndicators(.never)
         .task {
             app.runner.library = app.library
             if run.targets.isEmpty { await run.refreshTargets() }
@@ -68,34 +68,77 @@ struct RunView: View {
         }
     }
 
-    private var controlCard: some View {
+    // MARK: Control panel
+
+    private var controlPanel: some View {
         let run = app.runner
-        return Card(title: "Agent", symbol: "play.circle") {
-            HStack(spacing: 16) {
-                Button { Task { await run.toggle() } } label: {
-                    Image(systemName: run.isRunning ? "stop.fill" : "play.fill").font(.title).frame(width: 64, height: 64)
-                        .background(Circle().fill(run.isRunning ? Color.red : Color.green)).foregroundStyle(.white)
-                }
-                .buttonStyle(.plain)
+        let s = run.stats
+        let hz = run.selectedModel?.definition.architecture.stepRateHz ?? 30
+        return HStack(spacing: 26) {
+            GoButton(running: run.isRunning, starting: run.isStarting) { Task { await run.toggle() } }
                 .disabled(run.isStarting || run.selectedModel == nil)
-                VStack(alignment: .leading, spacing: 6) {
-                    Picker("Model", selection: Binding(get: { run.selectedModelID }, set: { run.selectedModelID = $0 })) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    Menu {
                         ForEach(app.models.models) { m in
-                            Text(m.checkpoints.isEmpty ? "\(m.definition.name) (not trained)" : m.definition.name).tag(Optional(m.id))
+                            Button(m.checkpoints.isEmpty ? "\(m.definition.name) (not trained)" : m.definition.name) { run.selectedModelID = m.id }
+                                .disabled(m.checkpoints.isEmpty)
+                        }
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(run.selectedModel?.definition.name ?? "Choose a model").displayStyle(34).lineLimit(1)
+                            Image(systemName: "chevron.down").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.muted)
                         }
                     }
-                    .frame(maxWidth: 360)
+                    .menuStyle(.button).buttonStyle(.plain).fixedSize()
                     .disabled(run.isRunning)
-                    Text(statusText).foregroundStyle(.secondary).font(.callout)
-                    Text("Start/stop \(app.settings.stored.runHotkey.display) · pause \(app.settings.stored.pauseHotkey.display) · emergency stop \(app.settings.stored.emergencyHotkey.display)")
-                        .font(.caption).foregroundStyle(.tertiary)
+                    if let m = run.selectedModel, let cp = m.definition.activeCheckpoint ?? m.checkpoints.last {
+                        Pill(text: CheckpointsCard.label(cp, url: m.url), color: cp == "best" ? Theme.live : Theme.text2)
+                    }
                 }
-                Spacer()
-                if run.isRunning {
-                    Button { run.togglePause() } label: { Label(run.isPaused ? "Resume" : "Pause", systemImage: run.isPaused ? "play" : "pause") }
-                        .controlSize(.large)
+                HStack(spacing: 8) {
+                    if run.isRunning { LiveDot(color: s.paused ? Theme.warning : Theme.live) }
+                    Text(statusText).font(Theme.font(13)).foregroundStyle(run.isRunning ? Theme.text2 : Theme.muted).lineLimit(1)
                 }
+                Text("Start/stop \(app.settings.stored.runHotkey.display) · Pause \(app.settings.stored.pauseHotkey.display) · Emergency \(app.settings.stored.emergencyHotkey.display)")
+                    .font(Theme.font(12)).foregroundStyle(Theme.faint)
             }
+            Spacer(minLength: 16)
+            HStack(spacing: 36) {
+                BigStat(value: run.isRunning ? String(format: "%.1f", s.fps) : "–", caption: "of \(hz) decisions / s", size: 34,
+                        color: run.isRunning && s.fps < Double(hz) * 0.95 ? Theme.warning : Theme.text)
+                BigStat(value: run.isRunning ? String(format: "%.1f", s.modelMs) : "–", unit: "ms", caption: "model step", size: 34)
+                BigStat(value: run.isRunning ? String(format: "%.0f", s.endToEndMs) : "–", unit: "ms", caption: "screen → action", size: 34)
+                BigStat(value: run.isRunning ? "\(s.takeovers)" : "–", caption: "takeovers", size: 34)
+            }
+            if run.isRunning {
+                Button { run.togglePause() } label: { Label(run.isPaused ? "Resume" : "Pause", systemImage: run.isPaused ? "play.fill" : "pause.fill") }
+                    .buttonStyle(.atSecondary)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            }
+        }
+        .padding(.horizontal, 26).padding(.vertical, 22)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(run.isRunning ? Theme.live.opacity(0.35) : Theme.hairline))
+        .animation(Theme.spring, value: run.isRunning)
+        .animation(Theme.spring, value: s.fps)
+    }
+
+    private var instruction: some View {
+        @Bindable var run = app.runner
+        return VStack(alignment: .leading, spacing: 10) {
+            SectionLabel("Instruction")
+            HStack(spacing: 10) {
+                Image(systemName: "text.bubble").font(.system(size: 14)).foregroundStyle(Theme.muted)
+                TextField("e.g. Walk to the door and open it", text: $run.instruction).textFieldStyle(.plain).font(Theme.font(15))
+                    .onSubmit { run.applyInstruction() }
+                Button(run.isRunning ? "Send" : "Set") { run.applyInstruction() }.buttonStyle(.atSmallPrimary)
+            }
+            .padding(.leading, 16).padding(.trailing, 8).frame(height: 52)
+            .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Theme.hairline))
+            if let a = run.appliedInstruction { Text("Following “\(a)”").font(Theme.font(12)).foregroundStyle(Theme.live) }
+            if !run.encoderStatus.isEmpty { Text(run.encoderStatus).font(Theme.font(12)).foregroundStyle(Theme.warning) }
         }
     }
 
@@ -103,27 +146,47 @@ struct RunView: View {
         let run = app.runner
         if run.isStarting { return "Loading model…" }
         guard run.isRunning else {
-            if let m = run.selectedModel { return m.checkpoints.isEmpty ? "This model hasn't been trained yet." : "Ready · \(m.definition.architecture.stepRateHz) decisions per second" }
+            if let m = run.selectedModel {
+                if m.checkpoints.isEmpty { return "This model hasn't been trained yet." }
+                return "Ready · \(run.selectedTarget?.name ?? "choose what to control")"
+            }
             return "Choose a model"
         }
         if run.stats.paused { return run.stats.pauseReason.isEmpty ? "Paused" : run.stats.pauseReason }
         if !run.stats.pauseReason.isEmpty { return run.stats.pauseReason }
-        return "Running \(run.loadedCheckpoint.replacingOccurrences(of: "step-", with: "step "))"
+        return "Running on \(run.selectedTarget?.name ?? "the target")"
     }
+}
 
-    private var statsCard: some View {
-        let s = app.runner.stats
-        let hz = app.runner.selectedModel?.definition.architecture.stepRateHz ?? 30
-        return LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
-            StatTile(title: "Decisions / s", value: String(format: "%.1f of %d", s.fps, hz), symbol: "speedometer", tint: s.fps >= Double(hz) * 0.95 ? .green : .orange)
-            StatTile(title: "Model step", value: String(format: "%.1f ms", s.modelMs), symbol: "cpu")
-            StatTile(title: "Preprocess", value: String(format: "%.1f ms", s.preprocessMs), symbol: "photo")
-            StatTile(title: "Frame age", value: String(format: "%.1f ms", s.frameAgeMs), symbol: "clock")
-            StatTile(title: "Screen → action", value: String(format: "%.1f ms", s.endToEndMs), symbol: "bolt")
-            StatTile(title: "Missed ticks", value: "\(s.droppedTicks)", symbol: "exclamationmark.triangle", tint: s.droppedTicks > 0 ? .orange : .accentColor)
-            StatTile(title: "Takeovers", value: "\(s.takeovers)", symbol: "hand.raised")
-            StatTile(title: "Active steps / s", value: String(format: "%.1f", s.actionsPerSecond), symbol: "keyboard")
+/// The large start/stop control.
+struct GoButton: View {
+    let running: Bool
+    let starting: Bool
+    let action: () -> Void
+    @State private var hover = false
+    @Environment(\.isEnabled) private var enabled
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(running ? Theme.danger : Theme.text).frame(width: 72, height: 72)
+                Circle().strokeBorder((running ? Theme.danger : Color.white).opacity(0.15), lineWidth: 6).frame(width: 86, height: 86)
+                if starting {
+                    ProgressView().controlSize(.small).tint(.black)
+                } else if running {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous).fill(.white).frame(width: 22, height: 22)
+                } else {
+                    Image(systemName: "play.fill").font(.system(size: 26)).foregroundStyle(.black).offset(x: 2)
+                }
+            }
+            .scaleEffect(hover && enabled ? 1.05 : 1)
+            .contentShape(Circle())
         }
+        .buttonStyle(.plain)
+        .opacity(enabled ? 1 : 0.4)
+        .onHover { hover = $0 }
+        .animation(Theme.spring, value: running)
+        .animation(Theme.snappy, value: hover)
+        .accessibilityLabel(running ? "Stop" : "Start")
     }
 }
 
@@ -131,14 +194,12 @@ struct BlockedKeysEditor: View {
     @Binding var blocked: Set<String>
     private let common = ["command", "rcommand", "escape", "tab", "return", "option", "control", "delete", "q"]
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Never press").font(.callout)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), alignment: .leading)], alignment: .leading) {
-                ForEach(common, id: \.self) { k in
-                    Toggle(KeyCatalog.info(k).map { $0.id.hasPrefix("r") && $0.id != "return" ? "R " + $0.label : $0.label } ?? k,
-                           isOn: Binding(get: { blocked.contains(k) }, set: { if $0 { blocked.insert(k) } else { blocked.remove(k) } }))
-                        .toggleStyle(.checkbox).font(.caption)
-                }
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Never press").font(Theme.font(14))
+            FlowChips(items: common.map { k in
+                (k, KeyCatalog.info(k).map { $0.id.hasPrefix("r") && $0.id != "return" ? "R " + $0.label : $0.label } ?? k)
+            }, isOn: { blocked.contains($0) }) { k in
+                withAnimation(Theme.snappy) { if blocked.contains(k) { blocked.remove(k) } else { blocked.insert(k) } }
             }
         }
     }

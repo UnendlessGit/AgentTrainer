@@ -13,8 +13,8 @@ struct AutoLabelButton: View {
         if labels.running {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
-                Text(labels.message).font(.caption).lineLimit(1).frame(maxWidth: 220)
-                Button("Stop") { labels.stop() }
+                Text(labels.message).font(Theme.font(11)).foregroundStyle(Theme.muted).lineLimit(1).frame(maxWidth: 120)
+                Button("Stop") { labels.stop() }.buttonStyle(.atSmall)
             }
         } else {
             Button {
@@ -24,6 +24,7 @@ struct AutoLabelButton: View {
                 }
                 labels.label([recording.url])
             } label: { Label("Auto-label", systemImage: "sparkles") }
+            .buttonStyle(.atSmall)
             .disabled(!labels.modelReady)
             .help(labels.modelReady ? "Write instructions with the local vision-language model (replaces earlier automatic ones; yours are kept)" : "Download the labelling model in Settings → Downloads first")
         }
@@ -35,20 +36,20 @@ struct LanguageDownloadsRows: View {
     var body: some View {
         ForEach([LanguageModels.embeddingGemma, LanguageModels.labeler], id: \.id) { m in
             let st = app.hub.state(m)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack {
-                    Text(m.title)
-                    Spacer()
-                    if st.done {
-                        Button("Delete", role: .destructive) { app.hub.delete(m) }
-                    } else if st.running {
-                        ProgressView(value: st.fraction).frame(width: 120)
-                        Button("Cancel") { app.hub.cancel(m) }
-                    } else {
-                        Button("Download (~\(m.approximateBytes.bytesText))") { app.hub.start(m) }
+            Row(title: m.title, detail: "\(m.repo) · \(m.license)\(st.error.map { " · \($0)" } ?? "")") {
+                if st.done {
+                    HStack(spacing: 10) {
+                        Text("Downloaded").font(Theme.font(13)).foregroundStyle(Theme.live)
+                        Button("Delete") { app.hub.delete(m) }.buttonStyle(.atSmallDestructive)
                     }
+                } else if st.running {
+                    HStack(spacing: 10) {
+                        ProgressView(value: st.fraction).tint(Theme.text).frame(width: 120)
+                        Button("Cancel") { app.hub.cancel(m) }.buttonStyle(.atSmall)
+                    }
+                } else {
+                    Button("Download ~\(m.approximateBytes.bytesText)") { app.hub.start(m) }.buttonStyle(.atSmallPrimary)
                 }
-                Text("\(m.repo) · \(m.license)\(st.error.map { " · \($0)" } ?? "")").font(.caption).foregroundStyle(st.error == nil ? Color.secondary : Color.orange)
             }
         }
     }

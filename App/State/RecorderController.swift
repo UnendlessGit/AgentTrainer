@@ -35,6 +35,18 @@ final class RecorderController {
     }
 
     var selectedTarget: CaptureTarget? { targets.first { $0.id == selectedTargetID } }
+    /// A large, regularly refreshed still of the selected target (the Record tab's preview).
+    var preview: NSImage?
+
+    /// Refreshes `preview` about once a second while `active` returns true.
+    func runPreview(active: @escaping () -> Bool) async {
+        while !Task.isCancelled && active() {
+            if let t = selectedTarget, let img = await CaptureTargets.thumbnail(t, own: ownApps, maxWidth: 1600) {
+                preview = NSImage(cgImage: img, size: NSSize(width: img.width, height: img.height))
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+    }
     var isBusy: Bool { phase != .idle }
 
     func refreshTargets() async {
