@@ -134,7 +134,7 @@ final class RunController {
                 self.hud.model.visionCaption = "\(a.frameSize)×\(a.frameSize) \(a.grayscale ? "gray" : "RGB")"
                 self.hud.model.paused = rt.isPaused
                 self.hud.model.instruction = self.appliedInstruction
-                self.hud.model.statusLine = String(format: "%.0f fps · %.0f ms", self.stats.fps, self.stats.endToEndMs)
+                self.hud.model.statusLine = String(format: "%.1f / %d decisions/s · %.0f ms", self.stats.fps, a.stepRateHz, self.stats.endToEndMs)
             }
             timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {

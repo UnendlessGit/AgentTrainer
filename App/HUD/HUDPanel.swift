@@ -13,6 +13,7 @@ final class HUDPanelController {
     func show(mode: HUDModel.Mode, options: HUDOptions, on targetFrame: CGRect?, feed: @escaping @MainActor () -> Void) {
         model.mode = mode
         model.options = options
+        model.reset()
         guard options.enabled else { hide(); return }
         if panel == nil {
             let p = NSPanel(contentRect: .zero, styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: false)
@@ -44,9 +45,10 @@ final class HUDPanelController {
     }
 
     private func layout() {
-        guard let p = panel, let v = p.contentView, let s = screenFrame else { return }
-        let size = v.fittingSize
-        let m: CGFloat = 16
+        guard let p = panel, let s = screenFrame else { return }
+        // Fixed size: the HUD grows inside the panel towards its corner, so the window itself never jumps.
+        let size = HUDView.panelSize(scale: model.options.scale)
+        let m: CGFloat = 2
         let o: CGPoint
         switch model.options.corner {
         case .bottomRight: o = CGPoint(x: s.maxX - size.width - m, y: s.minY + m)

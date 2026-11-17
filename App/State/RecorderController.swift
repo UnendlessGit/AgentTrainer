@@ -120,7 +120,7 @@ final class RecorderController {
                 guard let s else { return }
                 self?.hud.model.push(s.live.snapshot)
                 let st = s.stats
-                self?.hud.model.statusLine = String(format: "%@  %.0f fps", Duration.seconds(st.elapsed).formatted(.time(pattern: .minuteSecond)), st.averageFPS)
+                self?.hud.model.statusLine = String(format: "%@ · %.0f fps", Duration.seconds(st.elapsed).formatted(.time(pattern: .minuteSecond)), st.averageFPS)
             }
             statsTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { if let s = self?.session { self?.stats = s.stats } }

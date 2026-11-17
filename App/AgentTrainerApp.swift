@@ -24,9 +24,10 @@ struct AgentTrainerMain {
 /// Runs headless self-tests and debug modes as soon as the app has launched (independent of windows).
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        guard CommandLine.arguments.contains(where: { $0.hasPrefix("--selftest") || $0 == "--ui-snapshot" }) else { return }
+        guard CommandLine.arguments.contains(where: { $0.hasPrefix("--selftest") || $0 == "--ui-snapshot" || $0 == "--hud-snapshot" }) else { return }
         Task { @MainActor in
             let app = AppModel.shared
+            await HUDSnapshotter.runIfRequested()
             await UISnapshotter.runIfRequested(app: app)
             await CaptureSelfTest.runIfRequested()
             await RunSelfTest.runIfRequested()
@@ -176,6 +177,39 @@ enum UISnapshotter {
                 view.cacheDisplay(in: view.bounds, to: rep)
                 try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("\(tab.rawValue)-return.png"))
             }
+        }
+        NSApp.terminate(nil)
+    }
+}
+
+/// Debug aid: `--hud-snapshot <dir>` renders the Record and Run HUDs with sample input to PNGs, then quits.
+enum HUDSnapshotter {
+    @MainActor static func runIfRequested() async {
+        guard let i = CommandLine.arguments.firstIndex(of: "--hud-snapshot"), i + 1 < CommandLine.arguments.count else { return }
+        let dir = URL(fileURLWithPath: CommandLine.arguments[i + 1])
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        func render(_ name: String, _ setup: (HUDModel) -> Void) {
+            let m = HUDModel()
+            setup(m)
+            let r = ImageRenderer(content: HUDView(model: m).background(Color(white: 0.05)))
+            r.scale = 2
+            if let img = r.nsImage, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) {
+                try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent(name + ".png"))
+            }
+        }
+        render("record-empty") { m in m.mode = .record; m.statusLine = "0:00 · 60 fps" }
+        render("record") { m in
+            m.mode = .record
+            m.statusLine = "0:42 · 60 fps"
+            for k in ["w", "d", "space", "shift", "a", "e", "s"] { m.push(.init(keys: [k])) }
+            m.push(.init(keys: ["w", "d"], buttons: [0], velocity: CGVector(dx: 420, dy: -60)))
+        }
+        render("run") { m in
+            m.mode = .run
+            m.statusLine = "29.8 / 30 decisions/s · 41 ms"
+            m.instruction = "Drive to the gas station and park"
+            for k in ["w", "a", "d", "space", "f", "s", "q", "up", "left"] { m.push(.init(keys: [k])) }
+            m.push(.init(keys: ["w"], velocity: CGVector(dx: -300, dy: 0), scroll: CGVector(dx: 0, dy: 1)))
         }
         NSApp.terminate(nil)
     }
