@@ -44,6 +44,8 @@ final class AppModel {
     let labels: LabelController
     var tab: AppTab = .recordings
     var selectedModelID: UUID?
+    /// Library tab state kept here so it survives switching tabs.
+    var libraryUI = LibraryUIState()
 
     init() {
         let s = AppSettings()
@@ -81,4 +83,12 @@ final class AppModel {
         models.setRoot(p.modelsRoot)
         recorder.destination = p.libraryRoot
     }
+}
+
+/// What the Library tab is showing: kept on the app model so leaving the tab and coming back restores it.
+struct LibraryUIState {
+    var selection = Set<URL>()
+    var anchor: URL?
+    var expanded = Set<URL>()
+    var search = ""
 }

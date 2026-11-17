@@ -13,7 +13,7 @@ struct ModelsView: View {
             Rectangle().fill(Theme.hairline).frame(width: 1)
             ZStack {
                 if let e = app.models.entry(app.selectedModelID) {
-                    ModelEditor(app: app, entry: e).id(e.id)
+                    ModelEditor(app: app, entry: e).id(e.id).transition(.identity)
                 } else {
                     VStack(spacing: 12) {
                         Image(systemName: "brain").font(.system(size: 36, weight: .light)).foregroundStyle(Theme.faint)
@@ -24,6 +24,8 @@ struct ModelsView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Plays once when the tab opens; picking another model swaps the editor without a fade.
+            .riseIn(0.06)
         }
         .sheet(isPresented: $showingNew) { NewModelSheet(app: app) }
         .onAppear { if app.selectedModelID == nil { app.selectedModelID = app.models.models.first?.id } }

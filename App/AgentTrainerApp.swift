@@ -166,6 +166,17 @@ enum UISnapshotter {
             view.cacheDisplay(in: view.bounds, to: rep)
             try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("\(tab.rawValue).png"))
         }
+        if only == nil {
+            // Return to Library and Models: what was selected there should still be selected.
+            for tab in [AppTab.library, .models] {
+                app.tab = tab
+                try? await Task.sleep(for: .seconds(1.5))
+                guard let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }), let view = window.contentView?.superview ?? window.contentView,
+                      let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+                view.cacheDisplay(in: view.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("\(tab.rawValue)-return.png"))
+            }
+        }
         NSApp.terminate(nil)
     }
 }

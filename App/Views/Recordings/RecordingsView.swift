@@ -8,65 +8,58 @@ struct RecordingsView: View {
     var body: some View {
         @Bindable var settings = app.settings
         @Bindable var rec = app.recorder
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                header(rec).riseIn()
-                if let e = rec.errorMessage { InlineError(message: e) }
-                HStack(alignment: .top, spacing: 24) {
-                    stage(rec)
-                        .frame(minWidth: 380, maxWidth: 580)
-                        .riseIn(0.05)
-                    HStack(alignment: .top, spacing: 16) {
-                        VStack(spacing: 16) {
-                            Rows(title: "Capture") {
-                                Row(title: "Save to") {
-                                    Picker("", selection: $rec.destination) {
-                                        ForEach(app.library.flatFolders, id: \.url) { f in Text(String(repeating: "   ", count: f.depth) + f.name).tag(f.url) }
-                                    }
-                                    .labelsHidden().fixedSize()
-                                }
-                                Row(title: "Resolution") {
-                                    Picker("", selection: $settings.stored.captureMaxHeight) {
-                                        Text("480p").tag(480); Text("720p").tag(720); Text("1080p").tag(1080); Text("1440p").tag(1440)
-                                    }
-                                    .labelsHidden().fixedSize()
-                                }
-                                Row(title: "Frame rate") { Segmented(options: [(30, "30"), (60, "60 fps")], selection: $settings.stored.captureFPS, compact: true) }
-                                Row(title: "Task") {
-                                    TextField("What are you doing?", text: $rec.task)
-                                        .textFieldStyle(.plain).multilineTextAlignment(.trailing).font(Theme.font(14)).frame(maxWidth: 200)
-                                }
-                                Row(title: "Name") {
-                                    TextField("Automatic", text: $rec.name)
-                                        .textFieldStyle(.plain).multilineTextAlignment(.trailing).font(Theme.font(14)).frame(maxWidth: 200)
-                                }
+        HStack(alignment: .top, spacing: 32) {
+            stage(rec).riseIn()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    targets(rec)
+                    Rows(title: "Capture") {
+                        Row(title: "Save to") {
+                            Picker("", selection: $rec.destination) {
+                                ForEach(app.library.flatFolders, id: \.url) { f in Text(String(repeating: "   ", count: f.depth) + f.name).tag(f.url) }
                             }
-                            .disabled(rec.isBusy)
-                            HUDRows(title: "Recording HUD", options: $settings.stored.recordHUD, showsVision: false)
+                            .labelsHidden().fixedSize()
                         }
-                        VStack(spacing: 16) {
-                            Rows(title: "Input") {
-                                Toggle("Keyboard", isOn: $settings.stored.input.keyboard)
-                                Toggle("Mouse movement", isOn: $settings.stored.input.mouseMovement)
-                                Toggle("Mouse buttons", isOn: $settings.stored.input.mouseButtons)
-                                Toggle("Scrolling", isOn: $settings.stored.input.scroll)
-                                Toggle(isOn: $settings.stored.input.onlyWhenTargetFocused) { Row(title: "Only while in front", detail: "Ignore input while you use other apps") }
+                        Row(title: "Resolution") {
+                            Picker("", selection: $settings.stored.captureMaxHeight) {
+                                Text("480p").tag(480); Text("720p").tag(720); Text("1080p").tag(1080); Text("1440p").tag(1440)
                             }
-                            .toggleStyle(.oled)
-                            .disabled(rec.isBusy)
-                            Rows(title: "Video") {
-                                Toggle("Show the mouse pointer", isOn: $settings.stored.showsCursor).toggleStyle(.oled)
-                                LabeledSlider(title: "Quality", value: $settings.stored.videoQuality, range: 0.1 ... 1, format: { "\(Int($0 * 100))%" })
-                            }
-                            .disabled(rec.isBusy)
+                            .labelsHidden().fixedSize()
+                        }
+                        Row(title: "Frame rate") { Segmented(options: [(30, "30"), (60, "60 fps")], selection: $settings.stored.captureFPS, compact: true) }
+                        Row(title: "Task") {
+                            TextField("e.g. Drive to the gas station", text: $rec.task)
+                                .textFieldStyle(.plain).multilineTextAlignment(.trailing).font(Theme.font(14)).frame(maxWidth: 220)
+                        }
+                        Row(title: "Name") {
+                            TextField("Automatic", text: $rec.name)
+                                .textFieldStyle(.plain).multilineTextAlignment(.trailing).font(Theme.font(14)).frame(maxWidth: 220)
                         }
                     }
-                    .riseIn(0.1)
+                    .disabled(rec.isBusy)
+                    Rows(title: "Input", footer: "Only events while the recorded window is in front are kept when that option is on.") {
+                        Toggle("Keyboard", isOn: $settings.stored.input.keyboard)
+                        Toggle("Mouse movement", isOn: $settings.stored.input.mouseMovement)
+                        Toggle("Mouse buttons", isOn: $settings.stored.input.mouseButtons)
+                        Toggle("Scrolling", isOn: $settings.stored.input.scroll)
+                        Toggle("Only while the window is in front", isOn: $settings.stored.input.onlyWhenTargetFocused)
+                    }
+                    .toggleStyle(.oled)
+                    .disabled(rec.isBusy)
+                    Rows(title: "Video") {
+                        Toggle("Show the mouse pointer", isOn: $settings.stored.showsCursor).toggleStyle(.oled)
+                        LabeledSlider(title: "Quality", value: $settings.stored.videoQuality, range: 0.1 ... 1, format: { "\(Int($0 * 100))%" })
+                    }
+                    .disabled(rec.isBusy)
+                    HUDRows(title: "Recording HUD", options: $settings.stored.recordHUD, showsVision: false)
                 }
+                .padding(.bottom, 32)
             }
-            .padding(32)
+            .scrollIndicators(.never)
+            .frame(width: 380)
+            .riseIn(0.08)
         }
-        .scrollIndicators(.never)
+        .padding([.horizontal, .top], 32)
         .task { if rec.targets.isEmpty { await rec.refreshTargets() } }
         .task(id: rec.selectedTargetID) {
             rec.preview = nil
@@ -75,66 +68,49 @@ struct RecordingsView: View {
         .onAppear { if !app.library.flatFolders.contains(where: { $0.url == rec.destination }) { rec.destination = app.library.fs.root } }
     }
 
-    // MARK: Header
-
-    func header(_ rec: RecorderController) -> some View {
-        @Bindable var rec = rec
-        return HStack(alignment: .bottom, spacing: 20) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(title(rec)).displayStyle(44).contentTransition(.opacity).animation(Theme.spring, value: rec.phase)
-                if let s = rec.plannedSettings {
-                    Text(verbatim: "\(s.width) × \(s.height) · \(s.fps) fps · training frames saved losslessly at 192 × 192").font(Theme.font(13)).foregroundStyle(Theme.muted)
-                }
-            }
-            Spacer(minLength: 20)
-            TargetPicker(targets: rec.targets, thumbnails: rec.thumbnails, selection: $rec.selectedTargetID, loading: rec.loadingTargets) {
-                Task { await rec.refreshTargets() }
-            }
-            .frame(width: 380)
-            .disabled(rec.isBusy)
-        }
-    }
-
     // MARK: Stage: preview, record controls, live numbers
 
     func stage(_ rec: RecorderController) -> some View {
-        VStack(alignment: .leading, spacing: 20) {
-            preview(rec).aspectRatio(16 / 10, contentMode: .fit)
-            HStack(alignment: .center, spacing: 22) {
-                RecordButton(phase: rec.phase) { Task { await rec.toggle() } }
-                    .help("Start or stop and save (\(app.settings.stored.recordHotkey.display))")
-                    .disabled(rec.phase == .saving || (rec.phase == .idle && rec.selectedTarget == nil))
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(rec.stats.elapsed.durationText).displayStyle(40).contentTransition(.numericText())
-                    Text("Save \(app.settings.stored.recordHotkey.display) · Discard \(app.settings.stored.cancelRecordingHotkey.display)")
-                        .font(Theme.font(12.5)).foregroundStyle(Theme.muted)
+        VStack(alignment: .leading, spacing: 22) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title(rec)).displayStyle(48).contentTransition(.opacity)
+                Spacer()
+                if let s = rec.plannedSettings {
+                    Text(verbatim: "\(rec.selectedTarget?.name ?? "") · \(s.width) × \(s.height) · \(s.fps) fps").font(Theme.font(13)).foregroundStyle(Theme.muted).lineLimit(1)
                 }
-                Spacer(minLength: 0)
             }
-            HStack(spacing: 0) {
-                stat("\(rec.stats.frames)", "frames")
-                stat("\(rec.stats.droppedFrames)", "dropped", color: rec.stats.droppedFrames > 0 ? Theme.warning : Theme.text)
-                stat("\(rec.stats.events)", "input events")
-                stat(rec.stats.frames > 0 ? String(format: "%.0f", rec.stats.averageFPS) : "–", "fps")
+            if let e = rec.errorMessage { InlineError(message: e) }
+            preview(rec)
+            HStack(alignment: .center, spacing: 20) {
+                recordButton(rec)
+                Text("Save \(app.settings.stored.recordHotkey.display) · Discard \(app.settings.stored.cancelRecordingHotkey.display)")
+                    .font(Theme.font(12.5)).foregroundStyle(Theme.muted)
+                Spacer()
+                HStack(spacing: 36) {
+                    stat(rec.stats.elapsed.durationText, "time")
+                    stat("\(rec.stats.frames)", "frames")
+                    stat("\(rec.stats.droppedFrames)", "dropped", color: rec.stats.droppedFrames > 0 ? Theme.warning : Theme.text)
+                    stat("\(rec.stats.events)", "input events")
+                    stat(rec.stats.frames > 0 ? String(format: "%.0f", rec.stats.averageFPS) : "–", "fps")
+                }
             }
-            .padding(.vertical, 14)
-            .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Theme.hairline))
+            .padding(.bottom, 32)
         }
+        .frame(maxWidth: .infinity)
         .animation(Theme.spring, value: rec.phase)
     }
 
     func preview(_ rec: RecorderController) -> some View {
         ZStack(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Theme.surface)
+            RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Theme.surface)
             if let id = rec.selectedTargetID, let img = rec.preview ?? rec.thumbnails[id] {
                 Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .padding(14)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .padding(18)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 10) {
-                    Image(systemName: "macwindow").font(.system(size: 30, weight: .light)).foregroundStyle(Theme.faint)
+                    Image(systemName: "macwindow").font(.system(size: 34, weight: .light)).foregroundStyle(Theme.faint)
                     Text(rec.targets.isEmpty ? "Open the game or app, then refresh the list" : "Choose what to record").font(Theme.font(13)).foregroundStyle(Theme.muted)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -144,24 +120,38 @@ struct RecordingsView: View {
                     .foregroundStyle(Theme.dangerText)
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(Theme.danger.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .padding(16)
-                    .transition(.scale(scale: 0.8, anchor: .topLeading).combined(with: .opacity))
+                    .padding(18)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .topLeading)))
             }
             if case .countdown(let n) = rec.phase {
-                Text("\(n)").displayStyle(110).frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                Text("\(n)").displayStyle(120).frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
                     .contentTransition(.numericText(countsDown: true))
+                    .transition(.opacity)
             }
         }
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(rec.phase == .recording ? Theme.danger.opacity(0.55) : Theme.hairline, lineWidth: rec.phase == .recording ? 1.5 : 1))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(rec.phase == .recording ? Theme.danger.opacity(0.5) : Theme.hairline, lineWidth: rec.phase == .recording ? 1.5 : 1))
+    }
+
+    func recordButton(_ rec: RecorderController) -> some View {
+        Button { Task { await rec.toggle() } } label: {
+            switch rec.phase {
+            case .idle: Label("Record", systemImage: "record.circle")
+            case .countdown: Label("Cancel", systemImage: "xmark")
+            case .recording: Label("Stop and save", systemImage: "stop.fill")
+            case .saving: Label("Saving…", systemImage: "arrow.down.circle")
+            }
+        }
+        .buttonStyle(rec.phase == .recording ? ATButtonStyle.atDestructive : ATButtonStyle.atPrimary)
+        .help("Start or stop and save (\(app.settings.stored.recordHotkey.display))")
+        .disabled(rec.phase == .saving || (rec.phase == .idle && rec.selectedTarget == nil))
     }
 
     func stat(_ v: String, _ caption: String, color: Color = Theme.text) -> some View {
-        VStack(spacing: 4) {
-            Text(v).font(Theme.font(20, .semibold)).monospacedDigit().foregroundStyle(color).contentTransition(.numericText())
-            Text(caption).font(Theme.font(11.5)).foregroundStyle(Theme.muted)
+        VStack(alignment: .leading, spacing: 4) {
+            Text(v).font(Theme.font(22, .semibold)).monospacedDigit().foregroundStyle(color).contentTransition(.numericText())
+            Text(caption).font(Theme.font(12)).foregroundStyle(Theme.muted)
         }
-        .frame(maxWidth: .infinity)
     }
 
     func title(_ r: RecorderController) -> String {
@@ -172,104 +162,53 @@ struct RecordingsView: View {
         case .saving: "Saving…"
         }
     }
-}
 
-/// A dropdown of windows and displays, showing the chosen one with its thumbnail.
-struct TargetPicker: View {
-    let targets: [CaptureTarget]
-    let thumbnails: [String: NSImage]
-    @Binding var selection: String?
-    var loading = false
-    var refresh: () -> Void
-    @State private var hover = false
-    @Environment(\.isEnabled) private var enabled
+    // MARK: Targets
 
-    var body: some View {
-        let sel = targets.first { $0.id == selection }
-        HStack(spacing: 8) {
-            Menu {
-                let displays = targets.filter(\.isDisplay), windows = targets.filter { !$0.isDisplay }
-                if !displays.isEmpty {
-                    Section("Displays") { ForEach(displays) { item($0) } }
+    func targets(_ rec: RecorderController) -> some View {
+        @Bindable var rec = rec
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                SectionLabel("What to record")
+                Spacer()
+                Button { Task { await rec.refreshTargets() } } label: {
+                    Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold))
+                        .rotationEffect(.degrees(rec.loadingTargets ? 360 : 0))
+                        .animation(rec.loadingTargets ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default, value: rec.loadingTargets)
                 }
-                if !windows.isEmpty {
-                    Section("Windows") { ForEach(windows) { item($0) } }
-                }
-                if targets.isEmpty { Text("No windows found. Open the game or app, then refresh.") }
-            } label: {
-                HStack(spacing: 12) {
-                    Group {
-                        if let s = sel, let img = thumbnails[s.id] {
-                            Color.clear.overlay { Image(nsImage: img).resizable().scaledToFill() }
-                        } else {
-                            Placeholder(symbol: sel?.isDisplay == true ? "display" : "macwindow", radius: 6)
+                .buttonStyle(.atQuiet)
+                .help("Refresh the list")
+                .disabled(rec.isBusy)
+            }
+            VStack(spacing: 4) {
+                ForEach(rec.targets) { t in
+                    let on = rec.selectedTargetID == t.id
+                    Button { withAnimation(Theme.snappy) { rec.selectedTargetID = t.id } } label: {
+                        HStack(spacing: 12) {
+                            Group {
+                                if let img = rec.thumbnails[t.id] {
+                                    Image(nsImage: img).resizable().aspectRatio(contentMode: .fill).frame(width: 56, height: 34).clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                } else {
+                                    Placeholder(symbol: t.isDisplay ? "display" : "macwindow", radius: 6).frame(width: 56, height: 34)
+                                }
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(t.name).font(Theme.font(14, .semibold)).lineLimit(1)
+                                Text(t.isDisplay ? "Display" : "Window · \(t.info.appName ?? "")").font(Theme.font(12)).foregroundStyle(Theme.muted).lineLimit(1)
+                            }
+                            Spacer(minLength: 0)
+                            if on { Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).transition(.scale.combined(with: .opacity)) }
                         }
+                        .padding(.horizontal, 10).padding(.vertical, 8)
                     }
-                    .frame(width: 64, height: 40)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(sel?.name ?? "Choose a window").font(Theme.font(14, .semibold)).lineLimit(1)
-                        Text(sel.map { $0.isDisplay ? "Display" : "Window · \($0.info.appName ?? "")" } ?? "\(targets.count) available")
-                            .font(Theme.font(12)).foregroundStyle(Theme.muted).lineLimit(1)
-                    }
-                    Spacer(minLength: 0)
-                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.muted)
+                    .buttonStyle(RowButtonStyle(selected: on, radius: 12))
                 }
-                .padding(.leading, 8).padding(.trailing, 14).frame(height: 56)
-                .background(hover && enabled ? Theme.raised : Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Theme.hairline))
-                .contentShape(Rectangle())
-            }
-            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
-            .onHover { hover = $0 }
-            .animation(.easeOut(duration: 0.15), value: hover)
-            Button(action: refresh) {
-                Image(systemName: "arrow.clockwise").font(.system(size: 13, weight: .semibold))
-                    .rotationEffect(.degrees(loading ? 360 : 0))
-                    .animation(loading ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default, value: loading)
-                    .frame(width: 30)
-            }
-            .buttonStyle(ATButtonStyle(kind: .secondary, height: 56))
-            .help("Refresh the list")
-        }
-        .opacity(enabled ? 1 : 0.5)
-    }
-
-    func item(_ t: CaptureTarget) -> some View {
-        Button { selection = t.id } label: {
-            Label(t.name, systemImage: t.id == selection ? "checkmark" : (t.isDisplay ? "display" : "macwindow"))
-        }
-    }
-}
-
-/// The big record button: a red dot that morphs into a stop square.
-struct RecordButton: View {
-    let phase: RecorderController.Phase
-    let action: () -> Void
-    @State private var hover = false
-    @Environment(\.isEnabled) private var enabled
-    var body: some View {
-        Button(action: action) {
-            ZStack {
-                Circle().fill(Theme.text).frame(width: 60, height: 60)
-                Circle().strokeBorder(Color.white.opacity(0.12), lineWidth: 6).frame(width: 74, height: 74)
-                if phase == .saving {
-                    ProgressView().controlSize(.small).tint(.black)
-                } else {
-                    RoundedRectangle(cornerRadius: phase == .recording ? 6 : 13, style: .continuous)
-                        .fill(Theme.danger)
-                        .frame(width: phase == .recording ? 22 : 26, height: phase == .recording ? 22 : 26)
+                if rec.targets.isEmpty && !rec.loadingTargets {
+                    Text("No windows found. Open the game or app, then refresh.").font(Theme.font(13)).foregroundStyle(Theme.muted).padding(10)
                 }
             }
-            .scaleEffect(hover && enabled ? 1.05 : 1)
-            .contentShape(Circle())
+            .disabled(rec.isBusy)
         }
-        .buttonStyle(.plain)
-        .opacity(enabled ? 1 : 0.4)
-        .onHover { hover = $0 }
-        .animation(Theme.spring, value: phase)
-        .animation(Theme.snappy, value: hover)
-        .accessibilityLabel(phase == .recording ? "Stop and save" : "Start recording")
     }
 }
 
@@ -279,10 +218,13 @@ struct HUDRows: View {
     @Binding var options: HUDOptions
     var showsVision: Bool
     var body: some View {
-        Rows(title: title, footer: "Hidden from recordings and from the model's view.") {
+        Rows(title: title, footer: "The HUD is hidden from recordings and from the model's view.") {
             Toggle("Show HUD", isOn: $options.enabled.animation(Theme.spring)).toggleStyle(.oled)
             if options.enabled {
-                FlowChips(items: shows, isOn: { isOn($0) }) { k in withAnimation(Theme.snappy) { toggle(k) } }
+                Toggle("Keyboard", isOn: $options.keyboard).toggleStyle(.oled)
+                Toggle("Mouse", isOn: $options.mouse).toggleStyle(.oled)
+                Toggle("Stats", isOn: $options.stats).toggleStyle(.oled)
+                if showsVision { Toggle("What the model sees", isOn: $options.vision).toggleStyle(.oled) }
                 Row(title: "Corner") {
                     Picker("", selection: $options.corner) { ForEach(HUDCorner.allCases) { Text($0.label).tag($0) } }.labelsHidden().fixedSize()
                 }
@@ -291,21 +233,53 @@ struct HUDRows: View {
             }
         }
     }
+}
 
-    private var shows: [(String, String)] {
-        [("keyboard", "Keyboard"), ("mouse", "Mouse"), ("stats", "Stats")] + (showsVision ? [("vision", "What it sees")] : [])
-    }
+/// Kept for other screens: HUD options as plain controls.
+struct HUDOptionsEditor: View {
+    @Binding var options: HUDOptions
+    var showsVision: Bool
+    var body: some View { HUDRows(title: "HUD", options: $options, showsVision: showsVision) }
+}
 
-    private func isOn(_ k: String) -> Bool {
-        switch k { case "keyboard": options.keyboard; case "mouse": options.mouse; case "stats": options.stats; default: options.vision }
-    }
+struct TargetGrid: View {
+    let targets: [CaptureTarget]
+    let thumbnails: [String: NSImage]
+    @Binding var selection: String?
 
-    private func toggle(_ k: String) {
-        switch k {
-        case "keyboard": options.keyboard.toggle()
-        case "mouse": options.mouse.toggle()
-        case "stats": options.stats.toggle()
-        default: options.vision.toggle()
+    var body: some View {
+        if targets.isEmpty {
+            Text("No windows found yet. Open the game or app, then press Refresh.").font(Theme.font(13)).foregroundStyle(Theme.muted)
+        } else {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 14)], spacing: 14) {
+                ForEach(targets) { t in
+                    let on = selection == t.id
+                    Button { withAnimation(Theme.snappy) { selection = t.id } } label: {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Color.clear
+                                .frame(height: 104).frame(maxWidth: .infinity)
+                                .overlay {
+                                    if let img = thumbnails[t.id] {
+                                        Image(nsImage: img).resizable().scaledToFill()
+                                    } else {
+                                        Placeholder(symbol: t.isDisplay ? "display" : "macwindow", radius: 9)
+                                    }
+                                }
+                                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(t.name).font(Theme.font(13, .semibold)).lineLimit(1)
+                                Text(t.isDisplay ? "Display" : "Window").font(Theme.font(12)).foregroundStyle(Theme.muted)
+                            }
+                        }
+                        .padding(10)
+                        .background(on ? Theme.raised : Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(on ? Theme.text : Theme.hairline, lineWidth: on ? 1.5 : 1))
+                        .scaleEffect(on ? 1 : 0.985)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
     }
 }

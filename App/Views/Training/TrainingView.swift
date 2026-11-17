@@ -18,16 +18,21 @@ struct TrainingView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let entry = app.models.entry(app.selectedModelID) ?? app.models.models.first {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 24) {
-                        header(entry).riseIn()
-                        if let e = tc.errorMessage { InlineError(message: e) }
-                        stats(entry).riseIn(0.05)
-                        HStack(alignment: .top, spacing: 24) {
-                            VStack(spacing: 24) {
-                                chartPanel
-                                DatasetPicker(app: app, entry: entry)
-                            }
+                VStack(alignment: .leading, spacing: 24) {
+                    header(entry).riseIn()
+                    if let e = tc.errorMessage { InlineError(message: e) }
+                    // Fixed height, so the space below goes to the chart row and its scrolling side column.
+                    stats(entry).fixedSize(horizontal: false, vertical: true).riseIn(0.05)
+                    HStack(alignment: .top, spacing: 24) {
+                        // Chart and dataset stay put; the recordings list grows into the free height.
+                        VStack(spacing: 24) {
+                            chartPanel
+                            DatasetPicker(app: app, entry: entry, fillsHeight: true)
+                        }
+                        .padding(.bottom, 32)
+                        .frame(maxHeight: .infinity, alignment: .top)
+                        // Only the side column scrolls.
+                        ScrollView {
                             VStack(spacing: 16) {
                                 CheckpointsCard(app: app, entry: entry)
                                 earlyStopping(entry)
@@ -35,13 +40,16 @@ struct TrainingView: View {
                                 resources
                                 if !tc.logs.isEmpty { logPanel }
                             }
-                            .frame(width: 350)
+                            .padding(.bottom, 32)
                         }
-                        .riseIn(0.1)
+                        .scrollIndicators(.never)
+                        .scrollBounceBehavior(.basedOnSize)
+                        .frame(width: 350)
                     }
-                    .padding(32)
+                    .frame(maxHeight: .infinity, alignment: .top)
+                    .riseIn(0.1)
                 }
-                .scrollIndicators(.never)
+                .padding([.horizontal, .top], 32)
             }
         }
         .animation(Theme.spring, value: tc.phase)
@@ -475,6 +483,8 @@ struct CheckpointsCard: View {
 struct DatasetPicker: View {
     let app: AppModel
     let entry: ModelEntry
+    /// When true the list grows to fill the space it is given instead of a fixed height.
+    var fillsHeight = false
     var body: some View {
         let sel = app.training.selection[entry.id] ?? []
         let all = app.library.allRecordings()
@@ -493,7 +503,8 @@ struct DatasetPicker: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(height: 220)
+                .scrollBounceBehavior(.basedOnSize)
+                .frame(minHeight: fillsHeight ? 120 : 220, maxHeight: fillsHeight ? .infinity : 220)
                 .disabled(app.training.isActive)
             }
         }

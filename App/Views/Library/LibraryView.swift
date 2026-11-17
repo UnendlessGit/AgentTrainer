@@ -3,10 +3,11 @@ import SwiftUI
 
 struct LibraryView: View {
     @Bindable var app: AppModel
-    @State private var selection = Set<URL>()
-    @State private var anchor: URL?
-    @State private var expanded = Set<URL>()
-    @State private var search = ""
+    // Selection, open folders and search live on the app model, so they survive switching tabs.
+    private var selection: Set<URL> { get { app.libraryUI.selection } nonmutating set { app.libraryUI.selection = newValue } }
+    private var anchor: URL? { get { app.libraryUI.anchor } nonmutating set { app.libraryUI.anchor = newValue } }
+    private var expanded: Set<URL> { get { app.libraryUI.expanded } nonmutating set { app.libraryUI.expanded = newValue } }
+    private var search: String { get { app.libraryUI.search } nonmutating set { app.libraryUI.search = newValue } }
     @State private var newFolderParent: URL?
     @State private var renaming: URL?
     @State private var renamingMany: [URL] = []
@@ -20,12 +21,13 @@ struct LibraryView: View {
         HStack(spacing: 0) {
             sidebar.frame(width: 360).riseIn()
             Rectangle().fill(Theme.hairline).frame(width: 1)
-            detail.frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Plays once when the tab opens; picking another recording swaps the content without a fade.
+            detail.frame(maxWidth: .infinity, maxHeight: .infinity).riseIn(0.06)
         }
         .onAppear {
             lib.refresh()
             if expanded.isEmpty, let first = lib.tree.children.first { expanded.insert(first.url) }
-            if CommandLine.arguments.contains("--open-first-recording"), let r = visibleOrder.first { selection = [r] }
+            if CommandLine.arguments.contains("--open-first-recording"), selection.isEmpty, let r = visibleOrder.first { selection = [r] }
         }
         .onChange(of: lib.all) { _, recs in
             let present = Set(recs.map(\.url))
@@ -122,7 +124,7 @@ struct LibraryView: View {
             HStack(spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass").font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.muted)
-                    TextField("Search", text: $search.animation(Theme.spring)).textFieldStyle(.plain).font(Theme.font(13.5))
+                    TextField("Search", text: $app.libraryUI.search.animation(Theme.spring)).textFieldStyle(.plain).font(Theme.font(13.5))
                     if searching {
                         Button { withAnimation(Theme.spring) { search = "" } } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.muted) }.buttonStyle(.plain)
                     }
@@ -134,6 +136,7 @@ struct LibraryView: View {
             }
             .padding(.horizontal, 16).padding(.top, 18).padding(.bottom, 10)
 
+            ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     if !recordings(in: lib.fs.root).isEmpty || lib.tree.recordingCount > 0 {
@@ -152,6 +155,9 @@ struct LibraryView: View {
                 .padding(.horizontal, 10).padding(.bottom, 12)
             }
             .scrollIndicators(.never)
+            // Coming back to the tab: bring the selected recording into view.
+            .onAppear { if let u = anchor.flatMap({ selection.contains($0) ? $0 : nil }) ?? visibleOrder.first(where: selection.contains) { proxy.scrollTo(u, anchor: .center) } }
+            }
             .focusable()
             .focusEffectDisabled()
             .onDeleteCommand { if !selection.isEmpty { confirmTrash = selected.map(\.url) } }
@@ -242,6 +248,7 @@ struct LibraryView: View {
             .padding(.leading, 34 + CGFloat(depth) * 16).padding(.trailing, 10).padding(.vertical, 6)
         }
         .buttonStyle(RowButtonStyle(selected: on))
+        .id(r.url)
         .draggable(r.url)
         .contextMenu {
             let targets = on ? selected.map(\.url) : [r.url]
@@ -277,6 +284,7 @@ struct LibraryView: View {
                                     onRename: { nameField = r.meta.name; renaming = r.url },
                                     onTrash: { confirmTrash = [r.url] })
                     .id(r.url)
+                    .transition(.identity)
             } else if sel.count > 1 {
                 VStack(spacing: 18) {
                     ZStack {
@@ -299,12 +307,14 @@ struct LibraryView: View {
                     Text("⌘-click or ⇧-click to change the selection.").font(Theme.font(12)).foregroundStyle(Theme.faint)
                 }
                 .padding(32)
+                .transition(.identity)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "film").font(.system(size: 36, weight: .light)).foregroundStyle(Theme.faint)
                     Text("No recording selected").font(Theme.font(17, .semibold))
                     Text("Open a folder and pick a recording to play it and edit its instructions.").font(Theme.font(13)).foregroundStyle(Theme.muted)
                 }
+                .transition(.identity)
             }
         }
     }
