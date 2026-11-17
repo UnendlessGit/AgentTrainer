@@ -49,7 +49,6 @@ struct RecordingDetailView: View {
                         Button("Move to Trash", action: onTrash).buttonStyle(.atSmallDestructive)
                     }
                 }
-                .riseIn()
 
                 HStack(alignment: .top, spacing: 22) {
                     VStack(alignment: .leading, spacing: 14) {
@@ -73,13 +72,11 @@ struct RecordingDetailView: View {
                         }
                         replayInspector
                     }
-                    .riseIn(0.06)
                     VStack(alignment: .leading, spacing: 14) {
                         infoRows
                         AnnotationEditor(annotations: $annotations, currentTime: currentTime, duration: recording.meta.duration, app: app, recording: recording)
                     }
                     .frame(width: 340)
-                    .riseIn(0.12)
                 }
             }
             .padding(.horizontal, 36).padding(.vertical, 28)

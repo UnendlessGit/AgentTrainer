@@ -12,50 +12,49 @@ struct RunView: View {
             VStack(alignment: .leading, spacing: 24) {
                 controlPanel.riseIn()
                 if let e = run.errorMessage { InlineError(message: e) }
-                HStack(alignment: .top, spacing: 24) {
-                    VStack(alignment: .leading, spacing: 20) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack {
-                                SectionLabel("What to control")
-                                Spacer()
-                                Button { Task { await run.refreshTargets() } } label: { Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold)) }
-                                    .buttonStyle(.atQuiet).help("Refresh").disabled(run.isRunning)
+                HStack(alignment: .top, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            SectionLabel("What to control")
+                            TargetPicker(targets: run.targets, thumbnails: run.thumbnails, selection: $run.selectedTargetID) {
+                                Task { await run.refreshTargets() }
                             }
-                            TargetGrid(targets: run.targets, thumbnails: run.thumbnails, selection: $run.selectedTargetID).disabled(run.isRunning)
+                            .disabled(run.isRunning)
                         }
                         if run.selectedModel?.definition.usesInstructions == true { instruction }
-                    }
-                    .riseIn(0.05)
-                    VStack(alignment: .leading, spacing: 16) {
                         Rows(title: "Allowed actions", footer: "These only filter what is sent. The model and its training are not changed.") {
                             Toggle("Keyboard", isOn: $run.prefs.permissions.keyboard)
                             Toggle("Typing keys", isOn: $run.prefs.permissions.typingKeys).disabled(!run.prefs.permissions.keyboard)
                             Toggle("Mouse movement", isOn: $run.prefs.permissions.mouseMovement)
                             Toggle("Mouse buttons", isOn: $run.prefs.permissions.mouseButtons)
                             Toggle("Scrolling", isOn: $run.prefs.permissions.scroll)
-                            BlockedKeysEditor(blocked: $run.prefs.permissions.blockedKeys)
                         }
                         .toggleStyle(.oled)
+                    }
+                    .riseIn(0.05)
+                    VStack(alignment: .leading, spacing: 16) {
                         Rows(title: "Behaviour") {
                             LabeledSlider(title: "Randomness", value: $run.prefs.temperature, range: 0 ... 1.5, step: 0.05, format: { $0 == 0 ? "off" : String(format: "%.2f", $0) })
-                            LabeledSlider(title: "Mouse sensitivity", value: $run.prefs.sensitivity, range: 0.25 ... 3, step: 0.05, format: { String(format: "%.2f×", $0) })
+                            LabeledSlider(title: "Mouse speed", value: $run.prefs.sensitivity, range: 0.25 ... 3, step: 0.05, format: { String(format: "%.2f×", $0) })
                             Row(title: "Mouse output") {
                                 Picker("", selection: $run.prefs.mouseMode) { ForEach(MouseOutputMode.allCases, id: \.self) { Text($0.label).tag($0) } }.labelsHidden().fixedSize()
                             }
                             Toggle("Only act while the target is in front", isOn: $run.prefs.focusGuard).toggleStyle(.oled)
-                            Toggle("Feed the model its own past actions", isOn: $run.prefs.useActionHistory).toggleStyle(.oled)
-                                .help("Pixel2Play does this. With small datasets models often play better without it, because they stop copying their own previous actions.")
-                            Toggle("Dry run · show actions, send nothing", isOn: $run.prefs.dryRun).toggleStyle(.oled)
-                            Toggle("Record my corrections for training", isOn: $run.prefs.recordCorrections).toggleStyle(.oled)
-                            Row(title: "Mouse injection", detail: "Moves the mouse in a small square to check the game accepts it") {
+                            Toggle(isOn: $run.prefs.useActionHistory) { Row(title: "Feed it its own past actions", detail: "Pixel2Play does. Small datasets often play better without.") }.toggleStyle(.oled)
+                            Toggle(isOn: $run.prefs.dryRun) { Row(title: "Dry run", detail: "Show actions in the HUD, send nothing") }.toggleStyle(.oled)
+                            Toggle("Record my corrections", isOn: $run.prefs.recordCorrections).toggleStyle(.oled)
+                            Row(title: "Mouse injection", detail: "Check the game accepts synthetic mouse input") {
                                 Button("Test") { Task { await run.mouseTest() } }.buttonStyle(.atSmall).disabled(run.isRunning || run.selectedTarget == nil)
                             }
                         }
                         .disabled(run.isRunning)
+                    }
+                    .riseIn(0.08)
+                    VStack(alignment: .leading, spacing: 16) {
+                        Panel { BlockedKeysEditor(blocked: $run.prefs.permissions.blockedKeys) }
                         HUDRows(title: "Run HUD", options: $run.prefs.hud, showsVision: true)
                     }
-                    .frame(width: 400)
-                    .riseIn(0.1)
+                    .riseIn(0.11)
                 }
             }
             .padding(32)

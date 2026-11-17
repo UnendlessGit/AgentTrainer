@@ -18,11 +18,9 @@ struct RootView: View {
                 }
             }
             .id(app.tab)
-            .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: 10)), removal: .opacity))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             Rectangle().fill(Theme.hairline).frame(height: 1)
         }
-        .animation(Theme.spring, value: app.tab)
         .foregroundStyle(Theme.text)
         .tint(Theme.text)
         .preferredColorScheme(.dark)
@@ -36,8 +34,10 @@ struct RootView: View {
             ToolbarItem(placement: .primaryAction) { StatusCluster(app: app) }
                 .sharedBackgroundVisibility(.hidden)
         }
-        .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
-        .toolbarBackground(Theme.ground, for: .windowToolbar)
+        // The bar stays see-through over the app's own black (in full screen the toolbar moves
+        // into a separate overlay that would otherwise draw the system grey).
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        .background(WindowStyler())
     }
 }
 
@@ -120,5 +120,58 @@ struct StatusCluster: View {
             Text(text).font(Theme.font(12.5)).foregroundStyle(Theme.text2).lineLimit(1)
         }
         .transition(.opacity.combined(with: .scale(scale: 0.9)))
+    }
+}
+
+/// Paints the window itself black, so nothing grey shows behind the title bar. In full screen
+/// AppKit moves the toolbar into its own window with a frosted backing; that backing is removed
+/// so the bar stays true black.
+struct WindowStyler: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { Probe() }
+    func updateNSView(_ v: NSView, context: Context) {}
+
+    final class Probe: NSView {
+        private var observers: [NSObjectProtocol] = []
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let w = window else { return }
+            w.backgroundColor = .black
+            w.titlebarAppearsTransparent = true
+            w.titlebarSeparatorStyle = .none
+            w.appearance = NSAppearance(named: .darkAqua)
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = [NSWindow.willEnterFullScreenNotification, NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification].map { name in
+                NotificationCenter.default.addObserver(forName: name, object: w, queue: .main) { _ in
+                    MainActor.assumeIsolated {
+                        Self.blackenToolbars()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { Self.blackenToolbars() }
+                    }
+                }
+            }
+        }
+
+        deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+
+        @MainActor static func blackenToolbars() {
+            for w in NSApp.windows {
+                let name = String(describing: type(of: w))
+                guard name.contains("FullScreen") || name.contains("Toolbar") || w.styleMask.contains(.fullScreen) else { continue }
+                w.backgroundColor = .black
+                w.appearance = NSAppearance(named: .darkAqua)
+                if let root = w.contentView?.superview ?? w.contentView { hideBackdrops(in: root) }
+            }
+        }
+
+        @MainActor static func hideBackdrops(in view: NSView) {
+            for v in view.subviews {
+                let name = String(describing: type(of: v))
+                if v is NSVisualEffectView || name.contains("TitlebarBackground") || name.contains("BackdropView") {
+                    v.isHidden = true
+                } else {
+                    hideBackdrops(in: v)
+                }
+            }
+        }
     }
 }

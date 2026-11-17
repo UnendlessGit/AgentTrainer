@@ -277,7 +277,6 @@ struct LibraryView: View {
                                     onRename: { nameField = r.meta.name; renaming = r.url },
                                     onTrash: { confirmTrash = [r.url] })
                     .id(r.url)
-                    .transition(.opacity)
             } else if sel.count > 1 {
                 VStack(spacing: 18) {
                     ZStack {
@@ -300,17 +299,14 @@ struct LibraryView: View {
                     Text("⌘-click or ⇧-click to change the selection.").font(Theme.font(12)).foregroundStyle(Theme.faint)
                 }
                 .padding(32)
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "film").font(.system(size: 36, weight: .light)).foregroundStyle(Theme.faint)
                     Text("No recording selected").font(Theme.font(17, .semibold))
                     Text("Open a folder and pick a recording to play it and edit its instructions.").font(Theme.font(13)).foregroundStyle(Theme.muted)
                 }
-                .transition(.opacity)
             }
         }
-        .animation(Theme.spring, value: sel.map(\.url))
     }
 }
 

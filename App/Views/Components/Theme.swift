@@ -83,7 +83,7 @@ struct Rows<Content: View>: View {
             Group(subviews: content) { subviews in
                 ForEach(Array(subviews.enumerated()), id: \.offset) { i, sub in
                     if i > 0 { Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1).padding(.leading, 18) }
-                    sub.padding(.horizontal, 18).padding(.vertical, 12).frame(minHeight: 48)
+                    sub.padding(.horizontal, 18).padding(.vertical, 10).frame(minHeight: 44)
                 }
             }
             if let footer {

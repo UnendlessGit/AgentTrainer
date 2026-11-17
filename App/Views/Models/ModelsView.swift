@@ -13,7 +13,7 @@ struct ModelsView: View {
             Rectangle().fill(Theme.hairline).frame(width: 1)
             ZStack {
                 if let e = app.models.entry(app.selectedModelID) {
-                    ModelEditor(app: app, entry: e).id(e.id).transition(.opacity)
+                    ModelEditor(app: app, entry: e).id(e.id)
                 } else {
                     VStack(spacing: 12) {
                         Image(systemName: "brain").font(.system(size: 36, weight: .light)).foregroundStyle(Theme.faint)
@@ -21,11 +21,9 @@ struct ModelsView: View {
                         Text("Create a model to train on your recordings.").font(Theme.font(13)).foregroundStyle(Theme.muted)
                         Button("New Model…") { showingNew = true }.buttonStyle(.atPrimary).padding(.top, 6)
                     }
-                    .transition(.opacity)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .animation(Theme.spring, value: app.selectedModelID)
         }
         .sheet(isPresented: $showingNew) { NewModelSheet(app: app) }
         .onAppear { if app.selectedModelID == nil { app.selectedModelID = app.models.models.first?.id } }
@@ -154,10 +152,9 @@ struct ModelEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header.padding(.horizontal, 40).padding(.top, 28).riseIn()
+            header.padding(.horizontal, 40).padding(.top, 28)
             Segmented(options: ModelSection.allCases.map { ($0, $0.rawValue) }, selection: $section)
                 .padding(.horizontal, 40).padding(.top, 22).padding(.bottom, 4)
-                .riseIn(0.05)
             ScrollView {
                 Group {
                     switch section {

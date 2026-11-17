@@ -143,6 +143,21 @@ enum UISnapshotter {
             NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
         }
         let only = CommandLine.arguments.firstIndex(of: "--tab").map { CommandLine.arguments[$0 + 1] }
+        if CommandLine.arguments.contains("--fullscreen"), let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }) {
+            // Full-screen check: the title bar lives in a separate window there, so capture the display.
+            if let t = only.flatMap(AppTab.init(rawValue:)) { app.tab = t }
+            window.toggleFullScreen(nil)
+            try? await Task.sleep(for: .seconds(3))
+            if let targets = try? await CaptureTargets.load().targets, let display = targets.first(where: \.isDisplay),
+               let img = await CaptureTargets.thumbnail(display, own: [], maxWidth: 1728) {
+                let rep = NSBitmapImageRep(cgImage: img)
+                try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("fullscreen.png"))
+            }
+            window.toggleFullScreen(nil)
+            try? await Task.sleep(for: .seconds(1.5))
+            NSApp.terminate(nil)
+            return
+        }
         for tab in AppTab.allCases where only == nil || only == tab.rawValue {
             app.tab = tab
             try? await Task.sleep(for: .seconds(tab == .recordings ? 4 : 1.5))
