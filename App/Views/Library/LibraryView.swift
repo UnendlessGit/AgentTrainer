@@ -66,6 +66,7 @@ struct LibraryView: View {
         } message: {
             Text("Applies to the whole of each recording and replaces any earlier whole-recording instruction. Leave empty to remove it. Timed instructions are kept.")
         }
+        .sheet(item: $app.autoLabelTarget) { t in AutoLabelSheet(app: app, target: t) }
         .confirmationDialog(confirmTrash.count == 1 ? "Move to Trash?" : "Move \(confirmTrash.count) items to Trash?",
                             isPresented: Binding(get: { !confirmTrash.isEmpty }, set: { if !$0 { confirmTrash = [] } })) {
             Button("Move to Trash", role: .destructive) { withAnimation(Theme.spring) { lib.trash(confirmTrash); selection.subtract(confirmTrash) }; confirmTrash = [] }
@@ -268,6 +269,7 @@ struct LibraryView: View {
             } else {
                 Button("Rename \(targets.count) Recordings…") { nameField = ""; renamingMany = targets }
             }
+            Button(targets.count == 1 ? "Auto Label…" : "Auto Label \(targets.count)…") { app.autoLabelTarget = AutoLabelTarget(recordings: targets) }
             Button(targets.count == 1 ? "Set Instruction…" : "Set Instruction for \(targets.count)…") { nameField = ""; instructionFor = targets }
             if targets.count == 1 {
                 Button("Arm for Replay (\(app.settings.stored.replayHotkey.display))") { withAnimation(Theme.spring) { app.replay.arm(r) } }
@@ -316,7 +318,8 @@ struct LibraryView: View {
                     HStack(spacing: 8) {
                         Menu { moveTargets(for: sel.map(\.url)) } label: { Text("Move to…") }.menuStyle(.button).buttonStyle(.atSecondary).fixedSize()
                         Button("Rename…") { nameField = ""; renamingMany = sel.map(\.url) }.buttonStyle(.atSecondary)
-                        Button("Set Instruction…") { nameField = ""; instructionFor = sel.map(\.url) }.buttonStyle(.atSecondary)
+                        Button { app.autoLabelTarget = AutoLabelTarget(recordings: sel.map(\.url)) } label: { Label("Auto Label…", systemImage: "sparkles") }
+                            .buttonStyle(.atSecondary)
                         Button("Move to Trash…") { confirmTrash = sel.map(\.url) }.buttonStyle(.atDestructive)
                     }
                     Text("⌘-click or ⇧-click to change the selection.").font(Theme.font(12)).foregroundStyle(Theme.faint)

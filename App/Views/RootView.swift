@@ -95,7 +95,17 @@ struct StatusCluster: View {
             if app.runner.isRunning {
                 Button { app.tab = .run } label: { status(color: Theme.live, app.runner.footerLine) }.buttonStyle(.plain)
             }
-            if app.recorder.phase != .recording, app.training.footerLine == nil, !app.runner.isRunning {
+            if app.labels.running {
+                Button {
+                    app.tab = .library
+                    app.autoLabelTarget = AutoLabelTarget(recordings: app.labels.recordings)
+                } label: {
+                    status(color: Theme.ai, "Labelling \(Int(app.labels.progress.fraction * 100))%" + (app.labels.progress.secondsLeft.map { " · \(LabelProgressLine.left($0)) left" } ?? ""))
+                }
+                .buttonStyle(.plain)
+                .help(app.labels.progress.status)
+            }
+            if app.recorder.phase != .recording, app.training.footerLine == nil, !app.runner.isRunning, !app.labels.running {
                 Text(verbatim: "\(SystemInfo.chipName) · \(ProcessInfo.processInfo.physicalMemory / 1_073_741_824) GB").font(Theme.font(12.5)).foregroundStyle(Theme.muted)
             }
             Rectangle().fill(Theme.hairlineStrong).frame(width: 1, height: 16)
@@ -112,6 +122,7 @@ struct StatusCluster: View {
         .padding(.trailing, 4)
         .animation(Theme.spring, value: app.recorder.phase == .recording)
         .animation(Theme.spring, value: app.runner.isRunning)
+        .animation(Theme.spring, value: app.labels.running)
     }
 
     func status(color: Color, _ text: String) -> some View {

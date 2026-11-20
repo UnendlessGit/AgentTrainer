@@ -29,42 +29,29 @@ final class EngineService: NSObject, EngineServiceProtocol {
         switch job {
         case .train(let req): startTraining(req, reply: reply)
         case .autoLabel(let req): startLabelling(req, reply: reply)
+        case .labelChat(let req): startChat(req, reply: reply)
         }
     }
 
-    private var labelling = false
-    private var cancelLabelling = false
-
     private func startLabelling(_ req: AutoLabelRequest, reply: @escaping (Data?, String?) -> Void) {
-        lock.lock()
-        if labelling { lock.unlock(); reply(nil, "Already labelling."); return }
-        labelling = true; cancelLabelling = false
-        lock.unlock()
+        if LabellerHost.shared.busy { reply(nil, LabelError.busy.localizedDescription); return }
+        if TrainingGate.isTraining { reply(nil, LabelError.training.localizedDescription); return }
         let client = self.client
-        func emit(_ e: TrainingEvent) { client?.receive(e.encoded()) }
-        let thread = Thread { [weak self] in
-            defer { self?.lock.lock(); self?.labelling = false; self?.lock.unlock() }
-            do {
-                emit(.phase(.preparing, "Loading the labelling model"))
-                let labeler = try AutoLabeler(directory: req.modelDirectory)
-                for (i, url) in req.recordings.enumerated() {
-                    if self?.cancelLabelling == true { emit(.phase(.stopped, "Stopped")); return }
-                    let segs = try labeler.label(recording: url, request: req) { f, m in
-                        emit(.phase(.training, "\(i + 1)/\(req.recordings.count) · \(m) (\(Int(f * 100))%)"))
-                    }
-                    var ann = RecordingIO.readAnnotations(url)
-                    if req.replaceAutomatic { ann.segments.removeAll { $0.source == .auto } }
-                    ann.segments += segs
-                    ann.segments.sort { $0.start < $1.start }
-                    try RecordingIO.writeAnnotations(ann, to: url)
-                    emit(.log("\(url.deletingPathExtension().lastPathComponent): \(segs.count) instructions"))
-                }
-                emit(.phase(.finished, "Labelled \(req.recordings.count) recording\(req.recordings.count == 1 ? "" : "s")"))
-            } catch {
-                emit(.failed(error.localizedDescription))
-            }
-        }
+        let thread = Thread { LabelJob.run(req) { client?.receive($0.encoded()) } }
         thread.stackSize = 16 << 20
+        thread.qualityOfService = .userInitiated
+        thread.name = "agenttrainer.labelling"
+        thread.start()
+        reply(req.jobID.uuidString.data(using: .utf8), nil)
+    }
+
+    private func startChat(_ req: LabelChatRequest, reply: @escaping (Data?, String?) -> Void) {
+        if LabellerHost.shared.busy { reply(nil, LabelError.busy.localizedDescription); return }
+        let client = self.client
+        let thread = Thread { LabelChatJob.run(req) { client?.receive($0.encoded()) } }
+        thread.stackSize = 16 << 20
+        thread.qualityOfService = .userInitiated
+        thread.name = "agenttrainer.label-chat"
         thread.start()
         reply(req.jobID.uuidString.data(using: .utf8), nil)
     }
@@ -72,6 +59,7 @@ final class EngineService: NSObject, EngineServiceProtocol {
     private func startTraining(_ req: TrainingRequest, reply: @escaping (Data?, String?) -> Void) {
         lock.lock()
         if trainer != nil { lock.unlock(); reply(nil, "A training job is already running."); return }
+        if LabellerHost.shared.busy { lock.unlock(); reply(nil, "Auto Label is running. Training needs the same GPU memory, so wait for it to finish or stop it."); return }
         let client = self.client
         let t = Trainer(request: req, encoderFactory: { LanguageModels.instructionEncoder(pretrainedRoot: req.pretrainedRoot) }) { event in
             client?.receive(event.encoded())
@@ -79,7 +67,11 @@ final class EngineService: NSObject, EngineServiceProtocol {
         trainer = t
         jobID = req.jobID.uuidString
         lock.unlock()
+        // Training needs the GPU memory the labelling model would hold.
+        LabellerHost.shared.release()
+        TrainingGate.begin()
         let thread = Thread { [weak self] in
+            defer { TrainingGate.end() }
             t.run()
             self?.lock.lock()
             self?.trainer = nil
@@ -96,7 +88,8 @@ final class EngineService: NSObject, EngineServiceProtocol {
     func control(_ jobID: String, command: String, reply: @escaping (Bool) -> Void) {
         lock.lock()
         let t = trainer
-        if command == "stop-labelling" { cancelLabelling = true; lock.unlock(); reply(true); return }
+        if command == "stop-labelling" { lock.unlock(); LabellerHost.shared.stop(); reply(true); return }
+        if command == "release-labeller" { lock.unlock(); LabellerHost.shared.release(); reply(true); return }
         lock.unlock()
         guard let t else { reply(false); return }
         switch command {

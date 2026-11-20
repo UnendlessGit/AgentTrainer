@@ -35,6 +35,9 @@ final class TrainingDataset {
     let slots: Int
     let absoluteCursor: Bool
     var screenItems = 0
+    /// Instruction wordings to pick from per clip (main id → every wording's id); empty for validation,
+    /// which always uses the main wording so its numbers stay comparable.
+    var wordings: [Int32: [Int32]] = [:]
 
     init(recordings: [PreparedRecording], length: Int, frameSize: Int, slots: Int, absoluteCursor: Bool) {
         self.recordings = recordings; self.length = length; self.frameSize = frameSize; self.slots = slots; self.absoluteCursor = absoluteCursor
@@ -85,6 +88,8 @@ enum DatasetBuilder {
             guard let meta = try? RecordingIO.readMeta(url) else { log("Skipped \(url.lastPathComponent): unreadable"); continue }
             let frames = try RecordingIO.readFrames(url), events = try RecordingIO.readEvents(url)
             var ann = RecordingIO.readAnnotations(url)
+            // Instructions with variations: the main wording stands in for all of them in `text`.
+            if model.usesInstructions { for seg in ann.segments { texts.register(seg) } }
             if model.architecture.literalTyping {
                 // Typing bursts become `type "…"` instructions (appended last so they take precedence).
                 ann.segments += TypingDetector.segments(events: events)
@@ -269,6 +274,17 @@ final class ClipLoader: @unchecked Sendable {
                         if k < items.count { sIds.append(items[k].0); sBoxes += items[k].1 } else { sIds.append(-1); sBoxes += [0, 0, 0, 0, 0] }
                     }
                 }
+            }
+        }
+        if !dataset.wordings.isEmpty {
+            // One wording per instruction for the whole clip, so it reads like a real instruction.
+            var picked: [Int32: Int32] = [:]
+            text = text.map { id in
+                guard id >= 0, let options = dataset.wordings[id] else { return id }
+                if let p = picked[id] { return p }
+                let p = options.randomElement() ?? id
+                picked[id] = p
+                return p
             }
         }
         return ClipData(frames: frames, classes: classes, mask: mask, text: text, screenIds: sIds, screenBoxes: sBoxes)

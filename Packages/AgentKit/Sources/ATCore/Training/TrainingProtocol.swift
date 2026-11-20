@@ -98,6 +98,13 @@ public enum TrainingEvent: Codable, Sendable {
     case checkpoint(name: String, step: Int)
     case log(String)
     case failed(String)
+    /// Auto-labelling: one new instruction for a recording (written to it already).
+    case labelled(recording: URL, segment: TextSegment)
+    /// Auto-labelling progress: recording i of n, fraction of it done, seconds left (estimate).
+    case labelProgress(recording: Int, of: Int, fraction: Double, secondsLeft: Double?, status: String)
+    /// Chat with the labelling model: more of its reply, or the end of it.
+    case chatDelta(String)
+    case chatDone(String?)
 
     public func encoded() -> Data { (try? TrainingJSON.encoder().encode(self)) ?? Data() }
     public static func decode(_ d: Data) -> TrainingEvent? { try? TrainingJSON.decoder().decode(TrainingEvent.self, from: d) }

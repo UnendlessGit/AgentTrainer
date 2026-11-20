@@ -47,6 +47,8 @@ final class AppModel {
     var selectedModelID: UUID?
     /// Opens the model editor on this section next time it appears (e.g. Training → Choose folders).
     var pendingModelSection: ModelSection?
+    /// Recordings the Auto Label sheet is open for (nil = closed).
+    var autoLabelTarget: AutoLabelTarget?
     /// Library tab state kept here so it survives switching tabs.
     var libraryUI = LibraryUIState()
 
@@ -90,6 +92,12 @@ final class AppModel {
         models.setRoot(p.modelsRoot)
         recorder.destination = p.libraryRoot
     }
+}
+
+/// The recordings the Auto Label sheet works on.
+struct AutoLabelTarget: Identifiable, Equatable {
+    let id = UUID()
+    var recordings: [URL]
 }
 
 /// What the Library tab is showing: kept on the app model so leaving the tab and coming back restores it.

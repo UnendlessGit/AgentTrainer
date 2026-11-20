@@ -164,6 +164,7 @@ final class TrainingController {
         case .checkpoint: models.refresh()
         case .log(let s): logs.append(s)
         case .failed(let m): phase = .failed; errorMessage = m; jobID = nil; models.refresh()
+        case .labelled, .labelProgress, .chatDelta, .chatDone: break
         }
     }
 

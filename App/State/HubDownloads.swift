@@ -21,7 +21,7 @@ final class HubDownloads {
 
     init(pretrainedRoot: URL) {
         self.pretrainedRoot = pretrainedRoot
-        for m in [LanguageModels.embeddingGemma, LanguageModels.labeler] {
+        for m in [LanguageModels.embeddingGemma] + LanguageModels.labelers {
             states[m.id] = State(done: LanguageModels.isDownloaded(m, pretrainedRoot: pretrainedRoot))
         }
     }
@@ -69,6 +69,40 @@ final class HubDownloads {
     }
 
     func cancel(_ m: LanguageModels.HubModel) { tasks[m.id]?.cancel() }
+
+    // MARK: LM Studio
+
+    /// LM Studio's copy of the same model files, if it has one.
+    func lmStudioCopy(_ m: LanguageModels.HubModel) -> URL? {
+        let d = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".lmstudio/models").appendingPathComponent(m.repo)
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: d.appendingPathComponent("config.json").path),
+              let files = try? fm.contentsOfDirectory(atPath: d.path), files.contains(where: { $0.hasSuffix(".safetensors") }) else { return nil }
+        return d
+    }
+
+    /// Uses LM Studio's copy: on this disk it's a clone, so it's instant and takes no extra space.
+    func importFromLMStudio(_ m: LanguageModels.HubModel) {
+        guard let src = lmStudioCopy(m), tasks[m.id] == nil else { return }
+        states[m.id] = State(running: true)
+        let dest = LanguageModels.directory(m, pretrainedRoot: pretrainedRoot)
+        tasks[m.id] = Task { [weak self] in
+            let result: String? = await Task.detached(priority: .userInitiated) {
+                do {
+                    let fm = FileManager.default
+                    try? fm.removeItem(at: dest)
+                    try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try fm.copyItem(at: src, to: dest)
+                    fm.createFile(atPath: dest.appendingPathComponent(".complete").path, contents: nil)
+                    return nil
+                } catch { return error.localizedDescription }
+            }.value
+            await MainActor.run {
+                self?.tasks[m.id] = nil
+                self?.states[m.id] = result == nil ? State(done: true) : State(error: result)
+            }
+        }
+    }
 
     func delete(_ m: LanguageModels.HubModel) {
         cancel(m)

@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await CaptureSelfTest.runIfRequested()
             await RunSelfTest.runIfRequested()
             await EngineTrainSelfTest.runIfRequested(app: app)
+            await LabelSelfTest.runIfRequested(app: app)
         }
     }
 
@@ -161,6 +162,24 @@ enum UISnapshotter {
             try? await Task.sleep(for: .seconds(1.5))
             NSApp.terminate(nil)
             return
+        }
+        if let k = CommandLine.arguments.firstIndex(of: "--auto-label-sheet"), k + 1 < CommandLine.arguments.count {
+            // The Auto Label sheet for the first recordings in the library, in one of its states.
+            let state = CommandLine.arguments[k + 1]
+            app.tab = .library
+            try? await Task.sleep(for: .seconds(1.5))
+            let urls = Array(app.library.all.prefix(state == "many" ? 3 : 1).map(\.url))
+            guard !urls.isEmpty else { NSApp.terminate(nil); return }
+            if state == "chat" || state == "live" { app.labels.previewForSnapshot(recordings: urls, live: state == "live") }
+            app.autoLabelTarget = AutoLabelTarget(recordings: urls)
+            try? await Task.sleep(for: .seconds(2))
+            if let sheet = NSApp.windows.compactMap(\.attachedSheet).first, let view = sheet.contentView,
+               let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                view.cacheDisplay(in: view.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("auto-label-\(state).png"))
+            }
+            // An open sheet holds up a normal quit.
+            exit(0)
         }
         for tab in AppTab.allCases where only == nil || only == tab.rawValue {
             app.tab = tab

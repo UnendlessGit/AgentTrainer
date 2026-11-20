@@ -84,6 +84,8 @@ public final class Trainer: @unchecked Sendable {
                                        absoluteCursor: def.actions.mouseMode == .absolute)
         var valSet = TrainingDataset(recordings: valRecs, length: length, frameSize: a.frameSize, slots: def.actions.slotCount,
                                      absoluteCursor: def.actions.mouseMode == .absolute)
+        trainSet.wordings = texts.wordings
+        if !texts.wordings.isEmpty { log("\(texts.wordings.count) instructions have variations; each clip uses one at random") }
         if a.screenText {
             trainSet.screenItems = a.screenTextItems
             valSet.screenItems = a.screenTextItems

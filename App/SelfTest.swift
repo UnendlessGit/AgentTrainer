@@ -189,3 +189,70 @@ enum EngineTrainSelfTest {
         report.append("checkpoints: \(ModelPackage.checkpointNames(modelURL))")
     }
 }
+
+/// `--selftest-label <recording.atrec> <dir>`: Auto Label end to end through the engine on a copy of
+/// a recording (the original is never touched): one chat message about the footage, then labelling of
+/// its first 25 seconds with 3 variations. Writes report.txt and the labelled copy into <dir>.
+@MainActor
+enum LabelSelfTest {
+    static func runIfRequested(app: AppModel) async {
+        guard let i = CommandLine.arguments.firstIndex(of: "--selftest-label"), i + 2 < CommandLine.arguments.count else { return }
+        let source = URL(fileURLWithPath: CommandLine.arguments[i + 1])
+        let out = URL(fileURLWithPath: CommandLine.arguments[i + 2])
+        var report: [String] = []
+        defer {
+            try? report.joined(separator: "\n").write(to: out.appendingPathComponent("report.txt"), atomically: true, encoding: .utf8)
+            NSApp.terminate(nil)
+        }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: out, withIntermediateDirectories: true)
+        let copy = out.appendingPathComponent("labelled.atrec")
+        try? fm.removeItem(at: copy)
+        do { try fm.copyItem(at: source, to: copy) } catch { report.append("FAIL: copy: \(error)"); return }
+        var ann = RecordingIO.readAnnotations(copy)
+        let duration = (try? RecordingIO.readMeta(copy).duration) ?? 0
+        ann.segments.removeAll { $0.source == .auto }
+        if duration > 25 { ann.excluded.append(TimeRange(start: 25, end: duration + 1)) }
+        try? RecordingIO.writeAnnotations(ann, to: copy)
+
+        let labels = app.labels
+        guard labels.modelReady else { report.append("FAIL: labelling model \(labels.model.title) not downloaded"); return }
+        report.append("model: \(labels.model.title)")
+
+        // Chat
+        let t0 = Date()
+        labels.send("What do you see in this footage? Answer in two sentences.", about: [copy])
+        while labels.chatBusy, Date().timeIntervalSince(t0) < 300 { try? await Task.sleep(for: .milliseconds(200)) }
+        if let e = labels.chatError { report.append("FAIL: chat: \(e)"); return }
+        guard let reply = labels.chat.last, reply.role == .assistant, !reply.text.isEmpty else { report.append("FAIL: no chat reply"); return }
+        report.append(String(format: "chat reply in %.1f s: %@", Date().timeIntervalSince(t0), reply.text))
+        // A follow-up in the same conversation (the model should still have the overview).
+        let t1 = Date()
+        labels.send("Write instructions about where the car is heading.", about: [copy])
+        while labels.chatBusy, Date().timeIntervalSince(t1) < 300 { try? await Task.sleep(for: .milliseconds(200)) }
+        report.append(String(format: "follow-up reply in %.1f s: %@", Date().timeIntervalSince(t1), labels.chat.last?.text ?? "none"))
+
+        // Labelling
+        var o = LabelOptions()
+        o.variations = 3
+        let t2 = Date()
+        labels.label([copy], options: o)
+        var revisions = 0, sawProgress = false
+        while labels.running, Date().timeIntervalSince(t2) < 900 {
+            try? await Task.sleep(for: .milliseconds(250))
+            revisions = labels.revision(copy)
+            if labels.progress.fraction > 0 { sawProgress = true }
+        }
+        if labels.running { report.append("FAIL: labelling still running after 15 min"); labels.stop(); return }
+        if let e = labels.lastError { report.append("FAIL: labelling: \(e)"); return }
+        let result = RecordingIO.readAnnotations(copy).segments.filter { $0.source == .auto }
+        report.append(String(format: "labelled in %.1f s: %d instructions, %d live updates, progress seen: %@", Date().timeIntervalSince(t2), result.count, revisions, sawProgress ? "yes" : "no"))
+        for s in result {
+            report.append(String(format: "  %5.1f–%5.1f  %@  (%d variations)", s.start, s.end, s.text, s.variants?.count ?? 0))
+            if let ob = s.observation { report.append("      seen: \(ob)") }
+            for v in s.variants ?? [] { report.append("      · \(v)") }
+        }
+        let ok = !result.isEmpty && result.allSatisfy { $0.end <= 25.01 } && result.contains { ($0.variants?.count ?? 0) > 0 } && revisions >= result.count
+        report.append(ok ? "PASS" : "FAIL: expected instructions with variations inside the first 25 s, each reported live")
+    }
+}

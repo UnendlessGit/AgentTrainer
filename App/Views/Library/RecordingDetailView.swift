@@ -96,6 +96,10 @@ struct RecordingDetailView: View {
         }
         .scrollIndicators(.never)
         .onChange(of: annotations) { _, new in try? RecordingIO.writeAnnotations(new, to: recording.url) }
+        // Auto Label writes instructions into the recording as it goes; show them as they arrive.
+        .onChange(of: app.labels.revision(recording.url)) { _, _ in
+            withAnimation(Theme.spring) { annotations = RecordingIO.readAnnotations(recording.url) }
+        }
         .task {
             let url = recording.url, meta = recording.meta
             let rows = await Task.detached { ActivityRow.load(url: url, meta: meta) }.value
@@ -301,26 +305,19 @@ struct AnnotationEditor: View {
                 HStack {
                     Text("Instructions").font(Theme.font(14, .semibold))
                     Spacer()
-                    AutoLabelButton(app: app, recording: recording, annotations: $annotations)
+                    if annotations.segments.contains(where: { $0.source == .auto }) && !app.labels.isLabelling(recording.url) {
+                        Button("Clear automatic") { withAnimation(Theme.spring) { annotations.segments.removeAll { $0.source == .auto } } }
+                            .buttonStyle(.atQuiet).help("Remove the instructions Auto Label wrote. Yours stay.")
+                    }
+                    AutoLabelButton(app: app, recording: recording)
                 }
                 if annotations.segments.isEmpty {
                     Text("No instructions yet. Add what you were doing at each point, or let the local AI write them.")
                         .font(Theme.font(12.5)).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
                 }
                 ForEach($annotations.segments) { $seg in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 6) {
-                            Image(systemName: icon(seg.source)).font(.system(size: 11)).foregroundStyle(Theme.muted).help(seg.source.rawValue)
-                            TimeField(value: $seg.start).frame(width: 52)
-                            Text("–").foregroundStyle(Theme.muted)
-                            TimeField(value: $seg.end).frame(width: 52)
-                            Spacer()
-                            Button { withAnimation(Theme.spring) { annotations.segments.removeAll { $0.id == seg.id } } } label: { Image(systemName: "xmark").font(.system(size: 10, weight: .bold)) }
-                                .buttonStyle(.atQuiet).help("Remove")
-                        }
-                        TextField("What were you doing?", text: $seg.text, axis: .vertical).textFieldStyle(DarkFieldStyle()).lineLimit(1 ... 3)
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    SegmentEditor(segment: $seg) { withAnimation(Theme.spring) { annotations.segments.removeAll { $0.id == seg.id } } }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                 }
                 Button { withAnimation(Theme.spring) { add() } } label: { Label("Add at \(currentTime.durationText)", systemImage: "plus") }.buttonStyle(.atSmall)
             }
@@ -361,13 +358,94 @@ struct AnnotationEditor: View {
         annotations.segments.append(TextSegment(start: currentTime, end: end, text: "", source: .user))
         annotations.segments.sort { $0.start < $1.start }
     }
+}
 
-    func icon(_ s: TextSegment.Source) -> String {
+/// One instruction: its time range, text, what the labeller saw, and its variations.
+struct SegmentEditor: View {
+    @Binding var segment: TextSegment
+    let onRemove: () -> Void
+    @State private var showVariations = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: Self.icon(segment.source)).font(.system(size: 11))
+                    .foregroundStyle(segment.source == .auto ? Theme.ai : Theme.muted).help(Self.sourceName(segment.source))
+                TimeField(value: $segment.start).frame(width: 52)
+                Text("–").foregroundStyle(Theme.muted)
+                TimeField(value: $segment.end).frame(width: 52)
+                Spacer()
+                Button { withAnimation(Theme.snappy) { showVariations.toggle() } } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).rotationEffect(.degrees(showVariations ? 90 : 0))
+                        Text(variationsLabel)
+                    }
+                    .font(Theme.font(11.5, .medium)).foregroundStyle((segment.variants ?? []).isEmpty ? Theme.faint : Theme.ai)
+                }
+                .buttonStyle(.plain)
+                .help("Other wordings of this instruction. Training picks one at random for each clip.")
+                Button(action: onRemove) { Image(systemName: "xmark").font(.system(size: 10, weight: .bold)) }
+                    .buttonStyle(.atQuiet).help("Remove")
+            }
+            TextField("What were you doing?", text: $segment.text, axis: .vertical).textFieldStyle(DarkFieldStyle()).lineLimit(1 ... 3)
+            if let o = segment.observation, !o.isEmpty {
+                Label { Text(o) } icon: { Image(systemName: "eye") }
+                    .font(Theme.font(11.5)).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
+                    .help("What the labelling model saw in this part")
+            }
+            if showVariations {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(Array((segment.variants ?? []).enumerated()), id: \.offset) { i, _ in
+                        HStack(spacing: 6) {
+                            TextField("Another way to say it", text: variantBinding(i)).textFieldStyle(DarkFieldStyle()).font(Theme.font(12.5))
+                            Button { removeVariant(i) } label: { Image(systemName: "minus").font(.system(size: 10, weight: .bold)) }
+                                .buttonStyle(.atQuiet).help("Remove this variation")
+                        }
+                    }
+                    Button { withAnimation(Theme.snappy) { segment.variants = (segment.variants ?? []) + [""] } } label: {
+                        Label("Add variation", systemImage: "plus").font(Theme.font(12))
+                    }
+                    .buttonStyle(.atQuiet)
+                }
+                .padding(.leading, 14)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+
+    var variationsLabel: String {
+        let n = (segment.variants ?? []).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
+        return n == 0 ? "Variations" : "\(n) variation\(n == 1 ? "" : "s")"
+    }
+
+    func variantBinding(_ i: Int) -> Binding<String> {
+        Binding(get: { (segment.variants ?? []).indices.contains(i) ? segment.variants![i] : "" },
+                set: { v in if var list = segment.variants, list.indices.contains(i) { list[i] = v; segment.variants = list } })
+    }
+
+    func removeVariant(_ i: Int) {
+        withAnimation(Theme.snappy) {
+            guard var list = segment.variants, list.indices.contains(i) else { return }
+            list.remove(at: i)
+            segment.variants = list.isEmpty ? nil : list
+        }
+    }
+
+    static func icon(_ s: TextSegment.Source) -> String {
         switch s {
         case .user: "person"
         case .auto: "sparkles"
         case .typing: "keyboard"
         case .task: "flag"
+        }
+    }
+
+    static func sourceName(_ s: TextSegment.Source) -> String {
+        switch s {
+        case .user: "Written by you"
+        case .auto: "Written by Auto Label"
+        case .typing: "Typed text"
+        case .task: "Whole-recording instruction"
         }
     }
 }

@@ -2,31 +2,27 @@ import ATCore
 import ATLanguage
 import SwiftUI
 
-/// "Auto-label" in the recording inspector: the local VLM writes instructions for the clip.
+/// "Auto Label" in a recording's instructions: opens the Auto Label sheet, or shows the progress
+/// while this recording is being labelled.
 struct AutoLabelButton: View {
     let app: AppModel
     let recording: LibraryRecording
-    @Binding var annotations: RecordingAnnotations
 
     var body: some View {
         let labels = app.labels
-        if labels.running {
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text(labels.message).font(Theme.font(11)).foregroundStyle(Theme.muted).lineLimit(1).frame(maxWidth: 120)
-                Button("Stop") { labels.stop() }.buttonStyle(.atSmall)
-            }
-        } else {
-            Button {
-                labels.onFinished = { [weak lib = app.library] in
-                    lib?.refresh()
-                    annotations = RecordingIO.readAnnotations(recording.url)
+        if labels.isLabelling(recording.url) {
+            Button { app.autoLabelTarget = AutoLabelTarget(recordings: labels.recordings) } label: {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Labelling \(Int(labels.progress.fraction * 100))%").font(Theme.font(12, .medium)).monospacedDigit()
                 }
-                labels.label([recording.url])
-            } label: { Label("Auto-label", systemImage: "sparkles") }
+            }
             .buttonStyle(.atSmall)
-            .disabled(!labels.modelReady)
-            .help(labels.modelReady ? "Write instructions with the local vision-language model (replaces earlier automatic ones; yours are kept)" : "Download the labelling model in Settings → Downloads first")
+            .help(labels.progress.status)
+        } else {
+            Button { app.autoLabelTarget = AutoLabelTarget(recordings: [recording.url]) } label: { Label("Auto Label", systemImage: "sparkles") }
+                .buttonStyle(.atSmall)
+                .help("Let the local vision-language model watch this recording and write its instructions")
         }
     }
 }
@@ -34,19 +30,25 @@ struct AutoLabelButton: View {
 struct LanguageDownloadsRows: View {
     let app: AppModel
     var body: some View {
-        ForEach([LanguageModels.embeddingGemma, LanguageModels.labeler], id: \.id) { m in
+        ForEach([LanguageModels.embeddingGemma] + LanguageModels.labelers, id: \.id) { m in
             let st = app.hub.state(m)
-            Row(title: m.title, detail: "\(m.repo) · \(m.license)\(st.error.map { " · \($0)" } ?? "")") {
+            let isLabeler = m.id != LanguageModels.embeddingGemma.id
+            Row(title: isLabeler ? "Labelling model (\(m.title))" : m.title,
+                detail: "\(isLabeler ? m.summary + " " : "")\(m.repo) · \(m.license)\(st.error.map { " · \($0)" } ?? "")") {
                 if st.done {
                     HStack(spacing: 10) {
-                        Text("Downloaded").font(Theme.font(13)).foregroundStyle(Theme.live)
+                        Text("Ready").font(Theme.font(13)).foregroundStyle(Theme.live)
                         Button("Delete") { app.hub.delete(m) }.buttonStyle(.atSmallDestructive)
+                            .disabled(isLabeler && app.labels.running)
                     }
                 } else if st.running {
                     HStack(spacing: 10) {
                         ProgressView(value: st.fraction).tint(Theme.text).frame(width: 120)
                         Button("Cancel") { app.hub.cancel(m) }.buttonStyle(.atSmall)
                     }
+                } else if app.hub.lmStudioCopy(m) != nil {
+                    Button("Use LM Studio's copy") { app.hub.importFromLMStudio(m) }.buttonStyle(.atSmallPrimary)
+                        .help("LM Studio already has this model. Using its files is instant and takes no extra space.")
                 } else {
                     Button("Download ~\(m.approximateBytes.bytesText)") { app.hub.start(m) }.buttonStyle(.atSmallPrimary)
                 }

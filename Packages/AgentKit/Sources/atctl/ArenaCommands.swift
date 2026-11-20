@@ -67,6 +67,7 @@ enum ArenaCommands {
             case .checkpoint(let n, _): print("checkpoint \(n)")
             case .log(let s): print("· \(s)")
             case .failed(let m): print("FAILED: \(m)")
+            case .labelled, .labelProgress, .chatDelta, .chatDone: break
             }
         }
         trainer.run()

@@ -105,7 +105,24 @@ public struct TextSegment: Codable, Hashable, Sendable, Identifiable {
     public var end: Double
     public var text: String
     public var source: Source
-    public init(start: Double, end: Double, text: String, source: Source) { self.start = start; self.end = end; self.text = text; self.source = source }
+    /// Other wordings of the same instruction. Training picks one of `text` and these at random
+    /// for each clip, so the model learns the meaning instead of one exact sentence.
+    public var variants: [String]?
+    /// What the labelling model saw in this part (auto labels), so you can check its reading.
+    public var observation: String?
+    public init(start: Double, end: Double, text: String, source: Source, variants: [String]? = nil, observation: String? = nil) {
+        self.start = start; self.end = end; self.text = text; self.source = source; self.variants = variants; self.observation = observation
+    }
+
+    /// The instruction and its variations, without blanks or repeats.
+    public var wordings: [String] {
+        var seen = Set<String>(), out: [String] = []
+        for w in [text] + (variants ?? []) {
+            let t = w.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty, seen.insert(t.lowercased()).inserted { out.append(t) }
+        }
+        return out
+    }
 }
 
 public struct TimeRange: Codable, Hashable, Sendable, Identifiable {
@@ -126,7 +143,12 @@ public struct RecordingAnnotations: Codable, Hashable, Sendable {
 
     /// Instruction active at time `t` (latest segment containing it).
     public func instruction(at t: Double) -> String? {
-        segments.last(where: { t >= $0.start && t < $0.end })?.text
+        segment(at: t)?.text
+    }
+
+    /// The instruction segment in effect at `t` (the last one listed wins where they overlap).
+    public func segment(at t: Double) -> TextSegment? {
+        segments.last(where: { t >= $0.start && t < $0.end })
     }
 }
 

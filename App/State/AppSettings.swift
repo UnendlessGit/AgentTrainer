@@ -55,6 +55,15 @@ struct HUDOptions: Codable, Hashable {
     var corner = HUDCorner.bottomRight
 }
 
+/// How Auto Label works, remembered between runs.
+struct LabelOptions: Codable, Hashable {
+    var detail = LabelDetail.normal
+    var variations = 5
+    var doubleCheck = false
+    var video = LabelVideoDetail.standard
+    var replaceAutomatic = true
+}
+
 struct StoredSettings: Codable {
     var libraryRoot: String?
     var modelsRoot: String?
@@ -84,6 +93,9 @@ struct StoredSettings: Codable {
     /// Injected mouse units per Roblox mouse pixel, measured by Elkborn's CALIBRATE MOUSE (1 = not calibrated).
     var elkbornUnitsPerPixel = 1.0
     var elkbornCalibrated = false
+    /// The labelling model Auto Label uses (`LanguageModels.labelers` id); nil = the best downloaded one.
+    var labelerModelID: String?
+    var labelOptions = LabelOptions()
 
     /// Every AgentTrainer shortcut: never recorded as input, never replayed, never a takeover.
     var appHotkeys: [Hotkey] { [recordHotkey, cancelRecordingHotkey, runHotkey, pauseHotkey, emergencyHotkey, replayHotkey, correctionHotkey] }
