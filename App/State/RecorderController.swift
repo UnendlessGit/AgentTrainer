@@ -47,7 +47,7 @@ final class RecorderController {
             try? await Task.sleep(for: .seconds(1))
         }
     }
-    var isBusy: Bool { phase != .idle }
+    var isBusy: Bool { phase != .idle || elkbornMode != .off }
 
     func refreshTargets() async {
         loadingTargets = true
@@ -83,7 +83,7 @@ final class RecorderController {
     }
 
     func start() async {
-        guard phase == .idle else { return }
+        guard phase == .idle, elkbornMode == .off else { return }
         if targets.isEmpty { await refreshTargets() }
         guard let target = selectedTarget, let capture = plannedSettings else {
             errorMessage = "Choose a window or display to record."
@@ -108,7 +108,7 @@ final class RecorderController {
                                   appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")
         cfg.videoQuality = settings.stored.videoQuality
         let st = settings.stored
-        cfg.ignoredHotkeys = [st.recordHotkey, st.cancelRecordingHotkey, st.runHotkey, st.pauseHotkey, st.emergencyHotkey].map { ($0.keyCode, $0.cgFlags) }
+        cfg.ignoredHotkeys = st.appHotkeys.map { ($0.keyCode, $0.cgFlags) }
         do {
             let s = try RecordingSession(config: cfg)
             s.onError = { [weak self] e in Task { @MainActor in self?.errorMessage = e.localizedDescription; await self?.stop() } }
@@ -146,6 +146,72 @@ final class RecorderController {
             library.refresh()
         case .idle, .saving: break
         }
+    }
+
+    // MARK: Elkborn replays
+
+    enum ElkbornMode: Equatable { case off, listening, calibrating }
+    var elkbornMode = ElkbornMode.off
+    var elkbornPhase = ElkbornReplayRecorder.Phase.idle
+    var elkbornStatus = ""
+    var elkbornSaved = 0
+    private var elkborn: ElkbornReplayRecorder?
+
+    /// Captures the selected Roblox window and turns every Elkborn Training Data replay shown in it
+    /// into a recording in the "Save to" folder (or, with `calibrate`, measures the mouse once).
+    func startElkborn(calibrate: Bool) async {
+        guard phase == .idle, elkbornMode == .off else { return }
+        if targets.isEmpty { await refreshTargets() }
+        guard let target = selectedTarget, let capture = plannedSettings else {
+            errorMessage = "Choose the Roblox window first."
+            return
+        }
+        // the folder chosen under "Save to", like ordinary recordings
+        let folder = destination
+        var cfg = ElkbornReplayRecorder.Config(target: target, settings: CaptureSettings(width: capture.width, height: capture.height, fps: capture.fps, showsCursor: false),
+                                               destination: folder, appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")
+        cfg.videoQuality = settings.stored.videoQuality
+        cfg.unitsPerPixel = settings.stored.elkbornUnitsPerPixel
+        do {
+            let r = try ElkbornReplayRecorder(config: cfg)
+            r.onPhase = { [weak self] phase, text in
+                Task { @MainActor in
+                    self?.elkbornPhase = phase
+                    if !text.isEmpty { self?.elkbornStatus = text }
+                }
+            }
+            r.onSaved = { [weak self] _ in
+                Task { @MainActor in
+                    self?.elkbornSaved += 1
+                    self?.library.refresh()
+                }
+            }
+            r.onError = { [weak self] text in Task { @MainActor in self?.errorMessage = text } }
+            r.onCalibrated = { [weak self] unitsPerPixel, _ in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.settings.stored.elkbornUnitsPerPixel = unitsPerPixel
+                    self.settings.stored.elkbornCalibrated = true
+                    await self.stopElkborn()
+                    self.elkbornStatus = String(format: "Calibrated: %.3f mouse units per Roblox pixel.", unitsPerPixel)
+                }
+            }
+            try await r.start(excluding: ownApps, calibrate: calibrate)
+            elkborn = r
+            elkbornMode = calibrate ? .calibrating : .listening
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func stopElkborn() async {
+        guard let r = elkborn else { return }
+        elkborn = nil
+        await r.stop()
+        elkbornMode = .off
+        elkbornPhase = .idle
+        library.refresh()
     }
 
     func stop() async {

@@ -39,11 +39,14 @@ final class AppModel {
     let recorder: RecorderController
     let training: TrainingController
     let runner: RunController
+    let replay: ReplayController
     let downloads: DownloadCenter
     let hub: HubDownloads
     let labels: LabelController
     var tab: AppTab = .recordings
     var selectedModelID: UUID?
+    /// Opens the model editor on this section next time it appears (e.g. Training → Choose folders).
+    var pendingModelSection: ModelSection?
     /// Library tab state kept here so it survives switching tabs.
     var libraryUI = LibraryUIState()
 
@@ -59,8 +62,10 @@ final class AppModel {
         recorder = RecorderController(settings: s, library: library)
         training = TrainingController(settings: s, models: models, library: library)
         runner = RunController(settings: s, models: models)
+        replay = ReplayController(settings: s, runner: runner)
         selectedModelID = models.models.first?.id
         runner.library = library
+        runner.correctionDestination = { [weak recorder, weak library] in recorder?.destination ?? library?.fs.root ?? s.paths.libraryRoot }
         labels.onFinished = { [weak library] in library?.refresh() }
         registerHotkeys()
     }
@@ -73,7 +78,9 @@ final class AppModel {
         HotkeyCenter.shared.register(5, st.cancelRecordingHotkey) { [weak self] in Task { await self?.recorder.cancel() } }
         HotkeyCenter.shared.register(2, st.runHotkey) { [weak self] in Task { await self?.runner.toggle() } }
         HotkeyCenter.shared.register(3, st.pauseHotkey) { [weak self] in self?.runner.togglePause() }
-        HotkeyCenter.shared.register(4, st.emergencyHotkey) { [weak self] in self?.runner.emergencyStop() }
+        HotkeyCenter.shared.register(4, st.emergencyHotkey) { [weak self] in self?.runner.emergencyStop(); self?.replay.stop() }
+        HotkeyCenter.shared.register(6, st.replayHotkey) { [weak self] in self?.replay.toggle() }
+        HotkeyCenter.shared.register(7, st.correctionHotkey) { [weak self] in self?.runner.toggleCorrection() }
     }
 
     func applyStorageRoots() {

@@ -18,6 +18,8 @@ do {
     switch command {
     case "smoke":
         print(MLXSmokeTest.run())
+    case "elkborn-decode":
+        try ElkbornCommand.run(rest)
     case "parity":
         guard rest.count >= 2 else { fail("usage: atctl parity <checkpoint.ckpt> <reference.safetensors>") }
         try ParityCommand.run(checkpoint: URL(fileURLWithPath: rest[0]), reference: URL(fileURLWithPath: rest[1]))

@@ -61,6 +61,28 @@ final class ModelStore {
         return create(d)
     }
 
+    /// Forgets everything the model learned: its checkpoints, training log and metrics go to the
+    /// Trash, and every setting that training froze can be changed again. Returns the new definition.
+    func resetBrain(_ e: ModelEntry) -> ModelDefinition? {
+        let fm = FileManager.default
+        do {
+            for name in [ModelPackage.checkpoints, ModelPackage.log, ModelPackage.metrics] {
+                let u = e.url.appendingPathComponent(name)
+                if fm.fileExists(atPath: u.path) { try fm.trashItem(at: u, resultingItemURL: nil) }
+            }
+            var d = e.definition
+            d.architectureLocked = false; d.trainedSteps = 0; d.activeCheckpoint = nil; d.lastTrainedAt = nil
+            try ModelPackage.write(d, to: e.url)
+            refresh()
+            lastError = nil
+            return d
+        } catch {
+            lastError = "Couldn't reset \(e.definition.name): \(error.localizedDescription)"
+            refresh()
+            return nil
+        }
+    }
+
     func trash(_ e: ModelEntry) {
         do { try FileManager.default.trashItem(at: e.url, resultingItemURL: nil); refresh() } catch { lastError = error.localizedDescription }
     }

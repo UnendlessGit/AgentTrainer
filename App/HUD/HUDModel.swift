@@ -4,10 +4,11 @@ import CoreGraphics
 import Foundation
 import Observation
 
-/// What the HUD shows. Fed ~30×/s from recording input (human) or model output (Run).
+/// What the HUD shows. Fed ~30×/s from recording input (human), model output (Run) or a replay.
 @MainActor @Observable
 final class HUDModel {
-    enum Mode { case record, run }
+    /// record: your input · run: the model's output · replay: a recording played back into a window.
+    enum Mode { case record, run, replay }
     var mode = Mode.record
     var options = HUDOptions()
     var snapshot = LiveInputState.Snapshot()
@@ -18,6 +19,10 @@ final class HUDModel {
     var statusLine = ""
     var instruction: String?
     var paused = false
+    /// Run mode: you took over with the correction shortcut.
+    var correcting = false
+    /// A short message (e.g. "Correction saved") shown under the status for a few seconds.
+    var notice: String?
     /// Every key used since the HUD was shown, in the order first pressed. Keys stay once used.
     private(set) var seen: [String] = []
 

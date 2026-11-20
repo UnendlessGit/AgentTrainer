@@ -44,6 +44,8 @@ let package = Package(
         .target(name: "ATRuntime", dependencies: ["ATCore", "ATModel", "ATCapture", "ATLanguage"]),
         .executableTarget(name: "atctl", dependencies: ["ATCore", "ATModel", "ATTraining", "ATLanguage", "ATCapture", "ATRuntime"]),
         .testTarget(name: "ATCoreTests", dependencies: ["ATCore"]),
+        .testTarget(name: "ATCaptureTests", dependencies: ["ATCapture", "ATCore"]),
+        .testTarget(name: "ATRuntimeTests", dependencies: ["ATRuntime", "ATCapture", "ATCore"]),
         .testTarget(name: "ATModelTests", dependencies: ["ATModel", "ATCore"], resources: [.copy("Fixtures")]),
         .testTarget(name: "ATTrainingTests", dependencies: ["ATTraining", "ATModel", "ATCore", .product(name: "MLXOptimizers", package: "mlx-swift")]),
     ],

@@ -51,6 +51,7 @@ struct RecordingsView: View {
                         LabeledSlider(title: "Quality", value: $settings.stored.videoQuality, range: 0.1 ... 1, format: { "\(Int($0 * 100))%" })
                     }
                     .disabled(rec.isBusy)
+                    elkborn(rec)
                     HUDRows(title: "Recording HUD", options: $settings.stored.recordHUD, showsVision: false)
                 }
                 .padding(.bottom, 32)
@@ -144,7 +145,37 @@ struct RecordingsView: View {
         }
         .buttonStyle(rec.phase == .recording ? ATButtonStyle.atDestructive : ATButtonStyle.atPrimary)
         .help("Start or stop and save (\(app.settings.stored.recordHotkey.display))")
-        .disabled(rec.phase == .saving || (rec.phase == .idle && rec.selectedTarget == nil))
+        .disabled(rec.phase == .saving || (rec.phase == .idle && rec.selectedTarget == nil) || rec.elkbornMode != .off)
+    }
+
+    // MARK: Elkborn replays
+
+    /// Training data from Elkborn: stored time trial runs replayed in the game and recorded here.
+    func elkborn(_ rec: RecorderController) -> some View {
+        let s = app.settings.stored
+        return Rows(title: "Elkborn replays", footer: "Record stored Elkborn time trial runs as training data. Select the Roblox window, press Listen, then RECORD or PLAYLIST in Elkborn's Extras › Training Data. Each replay is saved to the folder chosen under Save to, with the run's own inputs, on your keybinds, and the timecode corner blacked out.") {
+            Row(title: rec.elkbornMode == .listening ? "Listening" : "Listen for replays", detail: rec.elkbornMode == .listening ? "\(rec.elkbornSaved) saved this session" : nil) {
+                Button(rec.elkbornMode == .listening ? "Stop" : "Listen") {
+                    Task { if rec.elkbornMode == .listening { await rec.stopElkborn() } else { await rec.startElkborn(calibrate: false) } }
+                }
+                .buttonStyle(rec.elkbornMode == .listening ? ATButtonStyle.atSmall : ATButtonStyle.atSmallPrimary)
+                .disabled(rec.phase != .idle || rec.elkbornMode == .calibrating || rec.selectedTarget == nil)
+            }
+            Row(title: "Mouse calibration", detail: s.elkbornCalibrated ? String(format: "%.3f units per Roblox pixel", s.elkbornUnitsPerPixel) : "Not calibrated yet") {
+                Button(rec.elkbornMode == .calibrating ? "Cancel" : "Calibrate") {
+                    Task { if rec.elkbornMode == .calibrating { await rec.stopElkborn() } else { await rec.startElkborn(calibrate: true) } }
+                }
+                .buttonStyle(.atSmall)
+                .disabled(rec.phase != .idle || rec.elkbornMode == .listening || rec.selectedTarget == nil)
+                .help("Press Calibrate here, then CALIBRATE MOUSE in Elkborn's Training Data. AgentTrainer moves the mouse and measures how far the camera turns.")
+            }
+            if rec.elkbornMode != .off || !rec.elkbornStatus.isEmpty {
+                HStack(spacing: 8) {
+                    if rec.elkbornMode != .off { LiveDot(color: rec.elkbornPhase == .waiting ? Theme.muted : Theme.live) }
+                    Text(rec.elkbornStatus).font(Theme.font(12.5)).foregroundStyle(Theme.text2).lineLimit(2)
+                }
+            }
+        }
     }
 
     func stat(_ v: String, _ caption: String, color: Color = Theme.text) -> some View {
@@ -155,7 +186,16 @@ struct RecordingsView: View {
     }
 
     func title(_ r: RecorderController) -> String {
-        switch r.phase {
+        if r.elkbornMode == .calibrating { return "Calibrating" }
+        if r.elkbornMode == .listening {
+            switch r.elkbornPhase {
+            case .recording: return "Recording replay"
+            case .receiving: return "Reading replay"
+            case .saving: return "Saving replay"
+            default: return "Waiting for replays"
+            }
+        }
+        return switch r.phase {
         case .idle: "Ready to record"
         case .countdown: "Get ready"
         case .recording: "Recording"

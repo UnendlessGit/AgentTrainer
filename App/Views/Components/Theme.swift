@@ -21,6 +21,10 @@ enum Theme {
     static let danger = Color(hex: 0xFF453A)
     static let dangerText = Color(hex: 0xFF6961)
     static let warning = Color(hex: 0xFFB340)
+    /// You correcting the AI (the correction shortcut, correction recordings).
+    static let correction = Color(hex: 0x64D2FF)
+    /// What the AI did, where it sits next to your input (a correction's history).
+    static let ai = Color(hex: 0xBF5AF2)
 
     static let spring = Animation.spring(response: 0.42, dampingFraction: 0.86)
     static let snappy = Animation.spring(response: 0.28, dampingFraction: 0.9)

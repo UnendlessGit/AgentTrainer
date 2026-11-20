@@ -15,10 +15,17 @@ struct RunPreferences: Codable {
     var mouseMode = MouseOutputMode.pointer
     var dryRun = false
     var focusGuard = true
-    var recordCorrections = false
+    /// The correction shortcut saves what you did (plus the 10 s before it) as a recording.
+    var saveCorrections = true
+    /// Your input during a run (correcting or not) goes into the AI's action history as if it had
+    /// done it, limited to what the AI may press. Only matters with `useActionHistory`.
+    var correctionsAsHistory = true
     /// Off by default: with little training data, models fed their own past actions tend to repeat
     /// themselves (copycat). Pixel2Play feeds history; turn it on for large datasets.
     var useActionHistory = false
+    /// Black out the bottom-left corner where Elkborn's replays draw their timecode strip, for
+    /// models trained on Elkborn replays (those recordings have that corner blacked out).
+    var maskElkbornCorner = false
     var hud = HUDOptions()
 
     init() {}
@@ -31,8 +38,10 @@ struct RunPreferences: Codable {
         mouseMode = (try? c.decode(MouseOutputMode.self, forKey: .mouseMode)) ?? x.mouseMode
         dryRun = (try? c.decode(Bool.self, forKey: .dryRun)) ?? x.dryRun
         focusGuard = (try? c.decode(Bool.self, forKey: .focusGuard)) ?? x.focusGuard
-        recordCorrections = (try? c.decode(Bool.self, forKey: .recordCorrections)) ?? x.recordCorrections
+        saveCorrections = (try? c.decode(Bool.self, forKey: .saveCorrections)) ?? x.saveCorrections
+        correctionsAsHistory = (try? c.decode(Bool.self, forKey: .correctionsAsHistory)) ?? x.correctionsAsHistory
         useActionHistory = (try? c.decode(Bool.self, forKey: .useActionHistory)) ?? x.useActionHistory
+        maskElkbornCorner = (try? c.decode(Bool.self, forKey: .maskElkbornCorner)) ?? x.maskElkbornCorner
         hud = (try? c.decode(HUDOptions.self, forKey: .hud)) ?? x.hud
     }
 }
@@ -59,7 +68,12 @@ final class RunController {
     private var runtime: AgentRuntime?
     private var ownApps: [SCRunningApplication] = []
     private var timer: Timer?
-    private var correction: RecordingSession?
+    private var corrections: CorrectionRecorder?
+    /// The Record tab's "Save to" folder: where corrections are saved.
+    var correctionDestination: (() -> URL)?
+    /// Corrections saved during this run.
+    var savedCorrections = 0
+    var isCorrecting: Bool { stats.correcting }
     private var encoder: InstructionEncoder?
     private var visionImage: CGImage?
     weak var library: LibraryStore?
@@ -107,11 +121,13 @@ final class RunController {
             o.dryRun = prefs.dryRun
             o.focusGuard = prefs.focusGuard
             o.useActionHistory = prefs.useActionHistory
+            o.humanInputAsHistory = prefs.correctionsAsHistory
             o.pauseOnHumanInput = settings.stored.pauseOnHumanInput
             o.captureMaxHeight = settings.stored.captureMaxHeight
             o.keepGPUWarm = settings.stored.keepGPUWarm
+            if prefs.maskElkbornCorner { o.masks = [ElkbornCorner.mask(window: target.frame)] }
             let st = settings.stored
-            o.hotkeys = [st.recordHotkey, st.runHotkey, st.pauseHotkey, st.emergencyHotkey].map { ($0.keyCode, $0.cgFlags) }
+            o.hotkeys = st.appHotkeys.map { ($0.keyCode, $0.cgFlags) }
             let rt = try AgentRuntime(model: model, definition: def, target: target, options: o)
             rt.onVision = { [weak self] img in DispatchQueue.main.async { MainActor.assumeIsolated { self?.visionImage = img } } }
             rt.onStop = { [weak self] reason in MainActor.assumeIsolated { if let reason { self?.errorMessage = reason }; self?.stop() } }
@@ -125,7 +141,8 @@ final class RunController {
             runtime = rt
             loadedCheckpoint = ckpt
             isRunning = true
-            if prefs.recordCorrections { await startCorrectionRecording(target: target, model: def) }
+            savedCorrections = 0
+            if prefs.saveCorrections { await startCorrections(target: target, model: def) }
             hud.show(mode: .run, options: prefs.hud, on: target.frame) { [weak self] in
                 guard let self, let rt = self.runtime else { return }
                 self.hud.model.push(rt.output.snapshot)
@@ -133,14 +150,19 @@ final class RunController {
                 let a = def.architecture
                 self.hud.model.visionCaption = "\(a.frameSize)×\(a.frameSize) \(a.grayscale ? "gray" : "RGB")"
                 self.hud.model.paused = rt.isPaused
+                self.hud.model.correcting = rt.isCorrecting
                 self.hud.model.instruction = self.appliedInstruction
-                self.hud.model.statusLine = String(format: "%.1f / %d decisions/s · %.0f ms", self.stats.fps, a.stepRateHz, self.stats.endToEndMs)
+                if rt.isCorrecting {
+                    self.hud.model.statusLine = "You're in control · \(self.settings.stored.correctionHotkey.display) hands back"
+                } else {
+                    self.hud.model.statusLine = String(format: "%.1f / %d decisions/s · %.0f ms", self.stats.fps, a.stepRateHz, self.stats.endToEndMs)
+                }
             }
             timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self, let rt = self.runtime else { return }
                     self.stats = rt.currentStats
-                    self.footerLine = rt.isPaused ? "AI paused" : String(format: "AI running · %.0f fps", self.stats.fps)
+                    self.footerLine = rt.isCorrecting ? "You're correcting the AI" : rt.isPaused ? "AI paused" : String(format: "AI running · %.0f fps", self.stats.fps)
                 }
             }
         } catch {
@@ -155,17 +177,34 @@ final class RunController {
         timer?.invalidate()
         hud.hide()
         isRunning = false
-        let ranges = runtime?.controlRanges ?? []
         runtime = nil
-        if let c = correction {
-            correction = nil
-            Task { await finishCorrectionRecording(c, ranges: ranges) }
+        stats = RuntimeStats()
+        if let c = corrections {
+            corrections = nil
+            c.end()   // a correction still going when the AI stops is kept
+            Task.detached { await c.stop() }
         }
     }
 
     func togglePause() {
         guard let rt = runtime else { return }
+        if rt.isCorrecting { toggleCorrection(); return }
         rt.setPaused(!rt.isPaused, reason: rt.isPaused ? "" : "Paused")
+        stats = rt.currentStats
+    }
+
+    /// First press: the AI freezes and lets go of every key, and only you play. Second press: the AI
+    /// carries on from where you left it, and what you did (with the 10 s before it) is saved.
+    func toggleCorrection() {
+        guard let rt = runtime else { return }
+        if rt.isCorrecting {
+            rt.setCorrecting(false)
+            corrections?.end()
+        } else {
+            rt.setCorrecting(true)
+            ActionExecutor().releaseAll()
+            corrections?.begin()
+        }
         stats = rt.currentStats
     }
 
@@ -197,28 +236,39 @@ final class RunController {
 
     // MARK: Corrections (DAgger-style)
 
-    private func startCorrectionRecording(target: CaptureTarget, model: ModelDefinition) async {
-        guard let lib = library else { return }
-        let folder = lib.fs.root.appendingPathComponent("Corrections", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        var cfg = RecordingConfig(target: target, settings: CaptureSettings.fitting(target, maxHeight: settings.stored.captureMaxHeight, fps: settings.stored.captureFPS, showsCursor: settings.stored.showsCursor),
-                                  input: settings.stored.input, name: "\(model.name) corrections \(Date().formatted(.dateTime.month().day().hour().minute()))",
-                                  task: appliedInstruction ?? "", destination: folder, appVersion: "run")
+    /// Keeps the last seconds of the run on disk so each correction can be saved with the moments
+    /// that led to it: those are kept as context for training (the AI's part), and your part is what it learns.
+    private func startCorrections(target: CaptureTarget, model: ModelDefinition) async {
+        let st = settings.stored
+        let folder = correctionDestination?() ?? library?.fs.root ?? settings.paths.libraryRoot
+        let scratch = settings.paths.cacheRoot.appendingPathComponent("correction-buffer", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        var cfg = CorrectionRecorder.Config(target: target,
+                                            settings: CaptureSettings.fitting(target, maxHeight: st.captureMaxHeight, fps: st.captureFPS, showsCursor: st.showsCursor),
+                                            destination: folder, scratch: scratch,
+                                            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev",
+                                            modelName: model.name)
+        cfg.input = st.input
         cfg.input.onlyWhenTargetFocused = false
+        cfg.videoQuality = st.videoQuality
+        cfg.task = appliedInstruction ?? ""
+        cfg.ignoredHotkeys = st.appHotkeys.map { (code: $0.keyCode, modifiers: $0.cgFlags) }
         do {
-            let s = try RecordingSession(config: cfg)
-            try await s.start(excluding: ownApps)
-            correction = s
-        } catch { errorMessage = "Couldn't record corrections: \(error.localizedDescription)" }
-    }
-
-    private func finishCorrectionRecording(_ s: RecordingSession, ranges: [(UInt64, UInt64)]) async {
-        guard let url = try? await s.stop(), let t0 = s.firstFrameHostNs else { return }
-        var ann = RecordingIO.readAnnotations(url)
-        ann.modelControlled = ranges.map { TimeRange(start: Double(Int64($0.0) - Int64(t0)) / 1e9, end: Double(Int64($0.1) - Int64(t0)) / 1e9) }
-        try? RecordingIO.writeAnnotations(ann, to: url)
-        if var m = try? RecordingIO.readMeta(url) { m.isCorrectionRun = true; m.modelName = selectedModel?.definition.name; try? RecordingIO.writeMeta(m, to: url) }
-        library?.refresh()
+            let c = try CorrectionRecorder(config: cfg)
+            c.onSaved = { [weak self] url in
+                DispatchQueue.main.async { MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.savedCorrections += 1
+                    self.library?.refresh()
+                    self.hud.flash("Correction saved · \(url.deletingPathExtension().lastPathComponent)")
+                } }
+            }
+            c.onError = { [weak self] msg in
+                DispatchQueue.main.async { MainActor.assumeIsolated { self?.hud.flash(msg) } }
+            }
+            try await c.start(excluding: ownApps)
+            corrections = c
+        } catch { errorMessage = "Couldn't keep corrections: \(error.localizedDescription)" }
     }
 
     // MARK: Mouse injection test

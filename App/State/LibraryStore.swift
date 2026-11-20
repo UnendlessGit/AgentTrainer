@@ -22,6 +22,7 @@ final class LibraryStore {
         selectedFolder = f.root
         normalizeSelection()
         reloadRecordings()
+        all = f.recordings(in: f.root, recursive: true)
     }
 
     /// The library root itself isn't shown; its loose recordings appear as "Unsorted". Start on the
@@ -65,6 +66,15 @@ final class LibraryStore {
     }
 
     func allRecordings() -> [LibraryRecording] { fs.recordings(in: fs.root, recursive: true) }
+
+    /// A folder as stored in a model's training data: its path inside the library ("" is the root).
+    func folderKey(_ url: URL) -> String? {
+        let r = fs.root.standardizedFileURL.path, p = url.standardizedFileURL.path
+        if p == r { return "" }
+        return p.hasPrefix(r + "/") ? String(p.dropFirst(r.count + 1)) : nil
+    }
+
+    func folderURL(_ key: String) -> URL { key.isEmpty ? fs.root : fs.root.appendingPathComponent(key, isDirectory: true) }
 
     func relativeName(_ folder: URL) -> String {
         let r = fs.root.standardizedFileURL.path, p = folder.standardizedFileURL.path

@@ -27,6 +27,14 @@ public struct RuntimeOptions: Sendable {
     public var captureMaxHeight = 720
     public var captureFPS = 60
     public var hotkeys: [(code: UInt16, modifiers: CGEventFlags)] = []
+    /// Regions blacked out in every frame before the model sees it (normalised, top-left origin),
+    /// matching recordings that were masked the same way (e.g. Elkborn replays' timecode corner).
+    public var masks: [CGRect] = []
+    /// While the person is in control (paused or correcting), feed their input to the model as its
+    /// own past actions, so it carries on from what they did. Also while the model is in control:
+    /// anything the person presses that the model could press counts as the model's. Off: the model's history keeps its
+    /// own predictions (which are not sent).
+    public var humanInputAsHistory = true
     public init() {}
 }
 
@@ -41,6 +49,8 @@ public struct RuntimeStats: Sendable, Equatable {
     public var takeovers = 0
     public var paused = false
     public var pauseReason = ""
+    /// The person is correcting the model (the correction shortcut), as opposed to a plain pause.
+    public var correcting = false
     public var actionsPerSecond = 0.0
     /// Mean model-step time over steps 50-150 and over the last 100 steps (diagnostics).
     public var earlyStepMs = 0.0
@@ -132,8 +142,9 @@ public final class AgentRuntime: @unchecked Sendable {
         try await capturer.start(target, settings: settings, excluding: own)
         tap.ignoredHotkeys = options.hotkeys
         tap.onEvent = { [weak self] e in self?.human(e) }
-        // Takeover detection needs the tap (and Input Monitoring); without it the model still runs.
-        if options.pauseOnHumanInput { try? tap.start() }
+        // The tap feeds takeover detection and the person's input as history while they're in
+        // control (needs Input Monitoring); without it the model still runs.
+        try? tap.start()
         running = true
         workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil) { [weak self] n in
             guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
@@ -186,8 +197,18 @@ public final class AgentRuntime: @unchecked Sendable {
         DispatchQueue.main.async { self.onStop?(reason) }
     }
 
+    /// Hands control to the person (`true`) or back to the model, for a correction. Like a pause,
+    /// but shown and recorded as a correction.
+    public func setCorrecting(_ on: Bool) {
+        lock.lock(); stats.correcting = on; lock.unlock()
+        setPaused(on, reason: on ? "Correcting: you are in control" : "")
+    }
+
+    public var isCorrecting: Bool { lock.lock(); defer { lock.unlock() }; return stats.correcting }
+
     public func setPaused(_ p: Bool, reason: String = "") {
         lock.lock()
+        if !p { stats.correcting = false }
         paused = p
         pauseReason = reason
         stats.paused = p
@@ -236,7 +257,50 @@ public final class AgentRuntime: @unchecked Sendable {
         return a
     }
 
+    /// A person's input as the AI would have made it: only keys, buttons and mouse movement the
+    /// model has and is allowed to use; movement in the model's units (before Run sensitivity).
+    static func asModelAction(_ h: TimestepAction, space: ActionSpaceConfig, permissions: ActionPermissions, sensitivity: Double) -> TimestepAction {
+        var a = h
+        let known = Set(space.keys)
+        a.keys = h.keys.filter { known.contains($0) && permissions.allows(key: $0) }
+        let pointers = Set(space.pointerEvents)
+        a.pointer = h.pointer.filter { pointers.contains($0) && ($0.isScroll ? permissions.scroll : permissions.mouseButtons) }
+        if !space.movesMouse || !permissions.mouseMovement {
+            a.dx = 0; a.dy = 0
+        } else {
+            let k = sensitivity > 0 ? 1 / sensitivity : 1
+            a.dx = h.dx * k; a.dy = h.dy * k
+        }
+        return a
+    }
+
+    /// The AI's action with the person's input on top (both pressing at once counts as pressed).
+    static func merge(_ ai: TimestepAction, _ person: TimestepAction, absolute: Bool) -> TimestepAction {
+        var m = ai
+        m.keys.formUnion(person.keys)
+        m.pointer.formUnion(person.pointer)
+        if absolute {
+            if person.dx != 0 || person.dy != 0 { m.absX = person.absX; m.absY = person.absY }
+        } else {
+            m.dx += person.dx; m.dy += person.dy
+        }
+        return m
+    }
+
     // MARK: Loop
+
+    /// Blacks out normalised regions of a size x size RGB8 image.
+    static func blackOut(_ rgb: inout Data, size: Int, _ masks: [CGRect]) {
+        rgb.withUnsafeMutableBytes { raw in
+            let p = raw.bindMemory(to: UInt8.self)
+            for m in masks {
+                let x0 = max(0, Int((m.minX * Double(size)).rounded(.down))), x1 = min(size, Int((m.maxX * Double(size)).rounded(.up)))
+                let y0 = max(0, Int((m.minY * Double(size)).rounded(.down))), y1 = min(size, Int((m.maxY * Double(size)).rounded(.up)))
+                guard x1 > x0, y1 > y0 else { continue }
+                for y in y0 ..< y1 { for i in (y * size + x0) * 3 ..< (y * size + x1) * 3 { p[i] = 0 } }
+            }
+        }
+    }
 
     private func loop() {
         stepper = PolicyStepper(model: model)
@@ -246,8 +310,12 @@ public final class AgentRuntime: @unchecked Sendable {
         let period = UInt64(1_000_000_000 / rate)
         let size = definition.architecture.frameSize
         let space = definition.actions
-        let absolute = space.mouseMode == .absolute
+        let absolute = space.mouseMode == .absolute && space.movesMouse
+        // a model that doesn't move the mouse never does, whatever the Run tab allows
+        var permissions = options.permissions
+        if !space.movesMouse { permissions.mouseMovement = false }
         let area = target.frame
+        let masks = options.masks
         var next = HostClock.now()
         var tickTimes: [UInt64] = []
         var actionCount = 0
@@ -273,6 +341,7 @@ public final class AgentRuntime: @unchecked Sendable {
             var rgb = Data()
             let input: MLXArray? = resizer.resize(frame.pixelBuffer, size: size, cursor: cursor) { buf in
                 rgb = Data(buf)
+                if !masks.isEmpty { Self.blackOut(&rgb, size: size, masks) }
                 return MLXArray(rgb, [size, size, 3], dtype: .uint8)
             }
             guard let input else { continue }
@@ -291,19 +360,29 @@ public final class AgentRuntime: @unchecked Sendable {
             let t2 = HostClock.now()
             var action = space.decode(result.classes)
 
+            // Your own input this step, reduced to what the AI itself could have done. With
+            // "count my input as the AI's" on it goes into the AI's history whether or not it is in
+            // control, so it carries on from your moves. Input to another app never counts.
+            let human = drainHuman(area: area)
+            let mine = options.humanInputAsHistory && focusOK
+                ? Self.asModelAction(human, space: space, permissions: permissions, sensitivity: options.mouseSensitivity) : nil
             var executed = TimestepAction()
-            if isPaused || !focusOK || options.dryRun {
-                if isPaused || !focusOK { executor.releaseAll() }
-                executed = isPaused || !focusOK ? drainHuman(area: area) : action
+            if isPaused || !focusOK {
+                executor.releaseAll()
+                executed = mine ?? (isPaused && !options.humanInputAsHistory ? action : TimestepAction())
                 if !focusOK && !isPaused { lock.lock(); stats.pauseReason = "Waiting for \(target.info.appName ?? "the target") to be in front"; lock.unlock() }
             } else {
                 if !absolute { action.absX = Double(cursor?.x ?? 0.5); action.absY = Double(cursor?.y ?? 0.5) }
-                executor.apply(action, absolute: absolute, area: area, permissions: options.permissions)
-                executed = action
-                executed.keys = executor.heldKeys
-                executed.pointer = action.pointer.filter { $0.isScroll ? options.permissions.scroll : options.permissions.mouseButtons }
-                if !options.permissions.mouseMovement { executed.dx = 0; executed.dy = 0 }
-                _ = drainHuman(area: area)
+                if options.dryRun {
+                    executed = action
+                } else {
+                    executor.apply(action, absolute: absolute, area: area, permissions: permissions)
+                    executed = action
+                    executed.keys = executor.heldKeys
+                    executed.pointer = action.pointer.filter { $0.isScroll ? permissions.scroll : permissions.mouseButtons }
+                    if !permissions.mouseMovement { executed.dx = 0; executed.dy = 0 }
+                }
+                if let mine { executed = Self.merge(executed, mine, absolute: absolute) }
                 lock.lock(); stats.pauseReason = ""; lock.unlock()
             }
             let enc = space.encode(executed)

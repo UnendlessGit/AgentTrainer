@@ -24,10 +24,10 @@ struct TrainingView: View {
                     // Fixed height, so the space below goes to the chart row and its scrolling side column.
                     stats(entry).fixedSize(horizontal: false, vertical: true).riseIn(0.05)
                     HStack(alignment: .top, spacing: 24) {
-                        // Chart and dataset stay put; the recordings list grows into the free height.
+                        // The chart and the training-data summary; only the side column scrolls.
                         VStack(spacing: 24) {
                             chartPanel
-                            DatasetPicker(app: app, entry: entry, fillsHeight: true)
+                            TrainingDataSummary(app: app, entry: entry)
                         }
                         .padding(.bottom, 32)
                         .frame(maxHeight: .infinity, alignment: .top)
@@ -123,8 +123,7 @@ struct TrainingView: View {
         if let d = tc.dataset, tc.jobModelID == entry.id {
             return "\(d.trainRecordings) recordings · \(d.trainSeconds.durationText) of gameplay · \(d.validationRecordings) held out · \(d.batchSize) clip\(d.batchSize == 1 ? "" : "s") per step"
         }
-        let sel = app.training.selection[entry.id] ?? []
-        return "\(sel.count) recording\(sel.count == 1 ? "" : "s") selected"
+        return TrainingDataTotals(folders: entry.definition.dataFolders, library: app.library).line
     }
 
     // MARK: Stats strip
@@ -478,91 +477,3 @@ struct CheckpointsCard: View {
     }
 }
 
-// MARK: Dataset
-
-struct DatasetPicker: View {
-    let app: AppModel
-    let entry: ModelEntry
-    /// When true the list grows to fill the space it is given instead of a fixed height.
-    var fillsHeight = false
-    var body: some View {
-        let sel = app.training.selection[entry.id] ?? []
-        let all = app.library.allRecordings()
-        let chosen = all.filter { sel.contains($0.url) }
-        Panel(padding: 20) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Recordings to learn from").font(Theme.font(14, .semibold))
-                    Spacer()
-                    Text("\(chosen.count) selected · \(chosen.reduce(0) { $0 + $1.meta.duration }.durationText) · \(Int(entry.definition.training.validationFraction * 100))% held out")
-                        .font(Theme.font(12)).foregroundStyle(Theme.muted).contentTransition(.numericText())
-                }
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        FolderChecklist(app: app, entry: entry, folder: app.library.tree, depth: 0, all: all)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .scrollBounceBehavior(.basedOnSize)
-                .frame(minHeight: fillsHeight ? 120 : 220, maxHeight: fillsHeight ? .infinity : 220)
-                .disabled(app.training.isActive)
-            }
-        }
-    }
-}
-
-struct FolderChecklist: View {
-    let app: AppModel
-    let entry: ModelEntry
-    let folder: LibraryFolder
-    let depth: Int
-    let all: [LibraryRecording]
-
-    var body: some View {
-        let inFolder = all.filter { $0.folder.standardizedFileURL.path.hasPrefix(folder.url.standardizedFileURL.path) }
-        let direct = all.filter { $0.folder.standardizedFileURL == folder.url.standardizedFileURL }
-        let sel = app.training.selection[entry.id] ?? []
-        let count = inFolder.filter { sel.contains($0.url) }.count
-        check(state: inFolder.isEmpty ? 0 : count == inFolder.count ? 2 : count > 0 ? 1 : 0,
-              title: depth == 0 ? "Whole library" : folder.name, icon: depth == 0 ? "books.vertical" : "folder", bold: true,
-              trailing: "\(count)/\(inFolder.count)") {
-            var s = app.training.selection[entry.id] ?? []
-            let on = count != inFolder.count
-            for r in inFolder { if on { s.insert(r.url) } else { s.remove(r.url) } }
-            app.training.selection[entry.id] = s
-            app.training.saveSelection()
-        }
-        .padding(.leading, CGFloat(depth) * 18)
-        .disabled(inFolder.isEmpty)
-        ForEach(direct) { r in
-            check(state: sel.contains(r.url) ? 2 : 0, title: r.meta.name, icon: nil, bold: false, trailing: r.meta.duration.durationText) {
-                var s = app.training.selection[entry.id] ?? []
-                if s.contains(r.url) { s.remove(r.url) } else { s.insert(r.url) }
-                app.training.selection[entry.id] = s
-                app.training.saveSelection()
-            }
-            .padding(.leading, CGFloat(depth + 1) * 18)
-        }
-        ForEach(folder.children) { FolderChecklist(app: app, entry: entry, folder: $0, depth: depth + 1, all: all) }
-    }
-
-    func check(state: Int, title: String, icon: String?, bold: Bool, trailing: String, action: @escaping () -> Void) -> some View {
-        Button { withAnimation(Theme.snappy) { action() } } label: {
-            HStack(spacing: 10) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 5, style: .continuous).fill(state > 0 ? Theme.text : Color.clear)
-                    RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(state > 0 ? Theme.text : Theme.faint, lineWidth: 1.5)
-                    if state == 2 { Image(systemName: "checkmark").font(.system(size: 9, weight: .heavy)).foregroundStyle(.black) }
-                    if state == 1 { Capsule().fill(.black).frame(width: 8, height: 2) }
-                }
-                .frame(width: 16, height: 16)
-                if let icon { Image(systemName: icon).font(.system(size: 12)).foregroundStyle(Theme.text2) }
-                Text(title).font(Theme.font(13, bold ? .semibold : .regular)).lineLimit(1)
-                Spacer()
-                Text(trailing).font(Theme.font(11.5)).monospacedDigit().foregroundStyle(Theme.muted)
-            }
-            .padding(.horizontal, 8).frame(height: 30)
-        }
-        .buttonStyle(RowButtonStyle(radius: 8))
-    }
-}

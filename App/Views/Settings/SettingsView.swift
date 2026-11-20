@@ -76,6 +76,8 @@ struct SettingsView: View {
                 HotkeyRow(title: "Discard recording", hotkey: $settings.stored.cancelRecordingHotkey) { app.registerHotkeys() }
                 HotkeyRow(title: "Start / stop the AI", hotkey: $settings.stored.runHotkey) { app.registerHotkeys() }
                 HotkeyRow(title: "Pause / resume the AI", hotkey: $settings.stored.pauseHotkey) { app.registerHotkeys() }
+                HotkeyRow(title: "Correct the AI (take over / hand back)", hotkey: $settings.stored.correctionHotkey) { app.registerHotkeys() }
+                HotkeyRow(title: "Replay the armed recording (Library)", hotkey: $settings.stored.replayHotkey) { app.registerHotkeys() }
                 HotkeyRow(title: "Emergency stop", hotkey: $settings.stored.emergencyHotkey) { app.registerHotkeys() }
             }
         case .recording:

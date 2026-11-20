@@ -144,6 +144,9 @@ enum UISnapshotter {
             NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
         }
         let only = CommandLine.arguments.firstIndex(of: "--tab").map { CommandLine.arguments[$0 + 1] }
+        if let j = CommandLine.arguments.firstIndex(of: "--model-section"), j + 1 < CommandLine.arguments.count {
+            app.pendingModelSection = ModelSection.allCases.first { $0.rawValue.lowercased() == CommandLine.arguments[j + 1].lowercased() }
+        }
         if CommandLine.arguments.contains("--fullscreen"), let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }) {
             // Full-screen check: the title bar lives in a separate window there, so capture the display.
             if let t = only.flatMap(AppTab.init(rawValue:)) { app.tab = t }
@@ -210,6 +213,26 @@ enum HUDSnapshotter {
             m.instruction = "Drive to the gas station and park"
             for k in ["w", "a", "d", "space", "f", "s", "q", "up", "left"] { m.push(.init(keys: [k])) }
             m.push(.init(keys: ["w"], velocity: CGVector(dx: -300, dy: 0), scroll: CGVector(dx: 0, dy: 1)))
+        }
+        render("run-correcting") { m in
+            m.mode = .run
+            m.paused = true
+            m.correcting = true
+            m.statusLine = "You're in control · ⌘7 hands back"
+            m.notice = "Correction saved · My Agent correction Nov 20 at 14:02"
+            for k in ["w", "a", "d", "space"] { m.push(.init(keys: [k])) }
+            m.push(.init())
+        }
+        render("replay") { m in
+            m.mode = .replay
+            m.statusLine = "12.4 / 38.2 s"
+            for k in ["w", "space", "shift", "e", "d"] { m.push(.init(keys: [k])) }
+            m.push(.init(keys: ["w", "space"], velocity: CGVector(dx: 260, dy: -20)))
+        }
+        render("replay-paused") { m in
+            m.mode = .replay
+            m.paused = true
+            m.statusLine = "waiting for Roblox"
         }
         NSApp.terminate(nil)
     }

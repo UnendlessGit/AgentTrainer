@@ -31,11 +31,15 @@ struct RecordingDetailView: View {
             VStack(alignment: .leading, spacing: 22) {
                 HStack(alignment: .bottom, spacing: 16) {
                     VStack(alignment: .leading, spacing: 8) {
-                        SectionLabel(app.library.relativeName(recording.folder))
+                        HStack(spacing: 8) {
+                            SectionLabel(app.library.relativeName(recording.folder))
+                            if recording.meta.isCorrectionRun { CorrectionTag(model: recording.meta.modelName) }
+                        }
                         Text(recording.meta.name).displayStyle(38).lineLimit(1).truncationMode(.middle)
                     }
                     Spacer(minLength: 12)
                     HStack(spacing: 8) {
+                        replayButton
                         Button("Rename", action: onRename).buttonStyle(.atSmall)
                         Menu {
                             ForEach(app.library.flatFolders, id: \.url) { f in
@@ -61,6 +65,14 @@ struct RecordingDetailView: View {
                             VStack(alignment: .leading, spacing: 10) {
                                 HStack {
                                     Text("Input activity").font(Theme.font(13, .semibold))
+                                    if !annotations.modelControlled.isEmpty {
+                                        HStack(spacing: 12) {
+                                            LegendDot(color: Theme.ai, text: "AI")
+                                            LegendDot(color: Theme.accent, text: "You")
+                                        }
+                                        .padding(.leading, 10)
+                                        .help("The AI's part is kept as context when training; the model learns from your part.")
+                                    }
                                     Spacer()
                                     Text("\(currentTime.durationText) / \(recording.meta.duration.durationText)").font(Theme.font(12)).monospacedDigit().foregroundStyle(Theme.muted)
                                 }
@@ -73,6 +85,7 @@ struct RecordingDetailView: View {
                         replayInspector
                     }
                     VStack(alignment: .leading, spacing: 14) {
+                        ReplayPanel(app: app, recording: recording)
                         infoRows
                         AnnotationEditor(annotations: $annotations, currentTime: currentTime, duration: recording.meta.duration, app: app, recording: recording)
                     }
@@ -96,6 +109,22 @@ struct RecordingDetailView: View {
         .onDisappear {
             player.pause()
             if let o = timeObserver { player.removeTimeObserver(o) }
+        }
+    }
+
+    /// Arms this recording for replay (the shortcut then plays it into the Run tab's window).
+    @ViewBuilder private var replayButton: some View {
+        let r = app.replay
+        if r.isArmed(recording.url) {
+            if r.isActive {
+                Button("Stop Replay") { r.stop() }.buttonStyle(.atSmallDestructive)
+            } else {
+                Pill(text: "Armed · \(app.settings.stored.replayHotkey.display)").help("Press \(app.settings.stored.replayHotkey.display) in the game to replay it")
+            }
+        } else {
+            Button { withAnimation(Theme.spring) { r.arm(recording) } } label: { Label("Replay", systemImage: "play.fill") }
+                .buttonStyle(.atSmallPrimary).disabled(r.isActive)
+                .help("Arm this recording, then press \(app.settings.stored.replayHotkey.display) in the game to play its keys and mouse back")
         }
     }
 
@@ -173,6 +202,33 @@ struct ActivityRow: Identifiable, Sendable {
     }
 }
 
+/// "Correction" label for recordings made with the correction shortcut.
+struct CorrectionTag: View {
+    var model: String?
+    var compact = false
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "arrow.uturn.backward.circle.fill").font(.system(size: compact ? 9.5 : 11, weight: .semibold))
+            Text("Correction").font(Theme.font(compact ? 10.5 : 11.5, .semibold))
+        }
+        .foregroundStyle(Theme.correction)
+        .padding(.horizontal, compact ? 6 : 8).padding(.vertical, compact ? 1.5 : 3)
+        .background(Theme.correction.opacity(0.14), in: Capsule())
+        .help(model.map { "You corrected \($0). The part before is the AI's, kept as context." } ?? "You corrected the AI. The part before is the AI's, kept as context.")
+    }
+}
+
+private struct LegendDot: View {
+    let color: Color
+    let text: String
+    var body: some View {
+        HStack(spacing: 5) {
+            RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 10, height: 6)
+            Text(text).font(Theme.font(11.5, .medium)).foregroundStyle(Theme.muted)
+        }
+    }
+}
+
 struct ActivityTimeline: View {
     let rows: [ActivityRow]
     let duration: Double
@@ -194,19 +250,29 @@ struct ActivityTimeline: View {
                         let x0 = labelW + w * r.start / max(duration, 0.01), x1 = labelW + w * r.end / max(duration, 0.01)
                         ctx.fill(Path(CGRect(x: x0, y: 0, width: max(2, x1 - x0), height: size.height)), with: .color(Color.white.opacity(0.08)))
                     }
+                    // The AI's part (a correction's history, or the AI playing in a correction run).
+                    for r in annotations.modelControlled {
+                        let x0 = labelW + w * min(1, r.start / max(duration, 0.01)), x1 = labelW + w * min(1, r.end / max(duration, 0.01))
+                        ctx.fill(Path(CGRect(x: x0, y: 10, width: max(2, x1 - x0), height: size.height - 10)), with: .color(Theme.ai.opacity(0.07)))
+                    }
+                    let ai = annotations.modelControlled
                     for (i, row) in rows.enumerated() {
                         let y = 14 + CGFloat(i) * 14
                         ctx.draw(Text(row.label).font(Theme.font(10, .medium)).foregroundStyle(Theme.muted), at: CGPoint(x: 2, y: y + 5), anchor: .leading)
                         let n = max(row.active.count, 1)
-                        var run: Int?
+                        // whether step j is the AI's: runs are split where that changes
+                        let isAI = { (j: Int) in !ai.isEmpty && ai.contains { r in let t = duration * (Double(j) + 0.5) / Double(n); return t >= r.start && t < r.end } }
+                        var run: Int?, runAI = false
                         for j in 0 ... row.active.count {
                             let on = j < row.active.count && row.active[j]
-                            if on, run == nil { run = j }
-                            if !on, let st = run {
+                            let jAI = on && isAI(j)
+                            if let st = run, !on || jAI != runAI {
+                                let base = runAI ? Theme.ai : row.id == "mouse" ? Theme.accentLine : Theme.accent
                                 ctx.fill(Path(roundedRect: CGRect(x: labelW + w * CGFloat(st) / CGFloat(n), y: y, width: max(1.5, w * CGFloat(j - st) / CGFloat(n)), height: 10), cornerRadius: 2),
-                                         with: .color(row.id == "mouse" ? Theme.accentLine.opacity(0.55) : Theme.accent))
+                                         with: .color(row.id == "mouse" ? base.opacity(0.55) : base))
                                 run = nil
                             }
+                            if on, run == nil { run = j; runAI = jAI }
                         }
                     }
                     let x = labelW + w * min(1, current / max(duration, 0.01))

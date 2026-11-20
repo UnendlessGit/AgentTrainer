@@ -78,6 +78,9 @@ public struct RecordingMeta: Codable, Hashable, Sendable, Identifiable {
     public var eventClock: String = "uptime-ns"
     public var isCorrectionRun = false
     public var modelName: String? = nil
+    /// Regions blacked out in every frame (normalised, top-left origin), e.g. the timecode corner
+    /// of an Elkborn replay. Runs of models trained on these recordings black out the same regions.
+    public var masks: [CodableRect]? = nil
 
     public init(id: UUID = UUID(), name: String, createdAt: Date = Date(), appVersion: String, target: CaptureTargetInfo,
                 captureWidth: Int, captureHeight: Int, sourceRect: CodableRect, captureFPS: Int, showsCursor: Bool,

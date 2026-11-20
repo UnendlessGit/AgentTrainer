@@ -52,12 +52,29 @@ struct RunView: View {
                             Toggle("Only act while the target is in front", isOn: $run.prefs.focusGuard).toggleStyle(.oled)
                             Toggle("Feed the model its own past actions", isOn: $run.prefs.useActionHistory).toggleStyle(.oled)
                                 .help("Pixel2Play does this. With small datasets models often play better without it, because they stop copying their own previous actions.")
+                            Toggle(isOn: $run.prefs.correctionsAsHistory) {
+                                Row(title: "Count my input as the AI's own actions",
+                                    detail: run.prefs.useActionHistory
+                                        ? "Anything you press while the AI runs (correcting or not) goes into its history as if it did it, but only keys and buttons the AI is allowed to use."
+                                        : "Needs “Feed the model its own past actions”: without history the AI doesn't see what was pressed.")
+                            }
+                            .toggleStyle(.oled)
+                            .disabled(!run.prefs.useActionHistory)
+                            .padding(.leading, 14)
+                            Toggle("Black out Elkborn's replay corner", isOn: $run.prefs.maskElkbornCorner).toggleStyle(.oled)
+                                .help("For models trained on Elkborn replays: those recordings have the timecode corner (bottom left) blacked out, so the model should see it blacked out when it plays too.")
                             Toggle("Dry run · show actions, send nothing", isOn: $run.prefs.dryRun).toggleStyle(.oled)
-                            Toggle("Record my corrections for training", isOn: $run.prefs.recordCorrections).toggleStyle(.oled)
                             Row(title: "Mouse injection", detail: "Moves the mouse in a small square to check the game accepts it") {
                                 Button("Test") { Task { await run.mouseTest() } }.buttonStyle(.atSmall).disabled(run.isRunning || run.selectedTarget == nil)
                             }
                         }
+                        .disabled(run.isRunning)
+                        Rows(title: "Corrections", footer: "Press \(app.settings.stored.correctionHotkey.display) while the AI plays to take over: it freezes and lets go of every key. Press it again to hand back. Each correction is saved with the 10 seconds before it as context, so the model learns what to do in that moment instead of what it did.") {
+                            Toggle(isOn: $run.prefs.saveCorrections) {
+                                Row(title: "Save corrections for training", detail: "Into the Record tab's folder: \(app.recorder.destination.standardizedFileURL == app.library.fs.root.standardizedFileURL ? "Library" : app.recorder.destination.lastPathComponent)")
+                            }
+                        }
+                        .toggleStyle(.oled)
                         .disabled(run.isRunning)
                         HUDRows(title: "Run HUD", options: $run.prefs.hud, showsVision: true)
                     }
@@ -109,7 +126,7 @@ struct RunView: View {
                     if run.isRunning { LiveDot(color: s.paused ? Theme.warning : Theme.live) }
                     Text(statusText).font(Theme.font(13)).foregroundStyle(run.isRunning ? Theme.text2 : Theme.muted).lineLimit(1)
                 }
-                Text("Start/stop \(app.settings.stored.runHotkey.display) · Pause \(app.settings.stored.pauseHotkey.display) · Emergency \(app.settings.stored.emergencyHotkey.display)")
+                Text("Start/stop \(app.settings.stored.runHotkey.display) · Pause \(app.settings.stored.pauseHotkey.display) · Correct \(app.settings.stored.correctionHotkey.display) · Emergency \(app.settings.stored.emergencyHotkey.display)")
                     .font(Theme.font(12)).foregroundStyle(Theme.faint)
             }
             Spacer(minLength: 16)

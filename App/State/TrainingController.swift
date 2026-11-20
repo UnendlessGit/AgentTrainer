@@ -27,16 +27,12 @@ final class TrainingController {
     var errorMessage: String?
     var gpuUtilization: Double?
     var thermal = ProcessInfo.processInfo.thermalState
-    /// Recordings chosen for training, per model.
-    var selection: [UUID: Set<URL>] = [:]
     private var monitor: Timer?
     private var startedAt: Date?
 
     init(settings: AppSettings, models: ModelStore, library: LibraryStore) {
         self.settings = settings; self.models = models; self.library = library
-        if let d = UserDefaults.standard.data(forKey: "trainingSelection"), let s = try? JSONDecoder().decode([UUID: [String]].self, from: d) {
-            selection = s.mapValues { Set($0.map { URL(fileURLWithPath: $0) }) }
-        }
+        migrateRecordingSelection()
         monitor = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.gpuUtilization = GPUMonitor.utilization()
@@ -57,8 +53,29 @@ final class TrainingController {
         return Double(p.totalSteps - p.step) * recent.reduce(0, +) / Double(recent.count)
     }
 
-    func saveSelection() {
-        if let d = try? JSONEncoder().encode(selection.mapValues { $0.map(\.path) }) { UserDefaults.standard.set(d, forKey: "trainingSelection") }
+    /// The recordings a model trains on: every recording directly inside its chosen library folders.
+    func recordings(for def: ModelDefinition) -> [LibraryRecording] {
+        let fm = FileManager.default
+        return Set(def.dataFolders ?? []).sorted().flatMap { key -> [LibraryRecording] in
+            let url = library.folderURL(key)
+            return fm.fileExists(atPath: url.path) ? library.fs.recordings(in: url, recursive: false) : []
+        }
+    }
+
+    /// Training data used to be picked per recording in the Training tab; models now keep whole
+    /// folders. Each model that had recordings picked gets the folders those recordings are in.
+    private func migrateRecordingSelection() {
+        let key = "trainingSelection"
+        guard let d = UserDefaults.standard.data(forKey: key), let old = try? JSONDecoder().decode([UUID: [String]].self, from: d) else { return }
+        for (id, paths) in old where !paths.isEmpty {
+            guard let e = models.entry(id), e.definition.dataFolders == nil else { continue }
+            let folders = Set(paths.compactMap { library.folderKey(URL(fileURLWithPath: $0).deletingLastPathComponent()) })
+            guard !folders.isEmpty else { continue }
+            var def = e.definition
+            def.dataFolders = folders.sorted()
+            models.save(def)
+        }
+        UserDefaults.standard.removeObject(forKey: key)
     }
 
     /// Loads past progress for a model from its training log.
@@ -100,9 +117,15 @@ final class TrainingController {
         }
     }
 
-    func start(model: ModelEntry, resumeFrom: String? = nil) {
-        let recs = Array(selection[model.id] ?? []).filter { FileManager.default.fileExists(atPath: $0.path) }
-        guard !recs.isEmpty else { errorMessage = "Choose at least one recording to train on."; return }
+    /// `recordings` overrides the model's folders (self-test).
+    func start(model: ModelEntry, resumeFrom: String? = nil, recordings: [URL]? = nil) {
+        let recs = recordings ?? self.recordings(for: model.definition).map(\.url)
+        guard !recs.isEmpty else {
+            errorMessage = (model.definition.dataFolders ?? []).isEmpty
+                ? "Choose the folders to train on in Models → \(model.definition.name) → Data."
+                : "The folders chosen for this model have no recordings yet."
+            return
+        }
         let split = Self.split(recs, fraction: model.definition.training.validationFraction, seed: model.definition.training.seed)
         let p = settings.paths
         let req = TrainingRequest(modelURL: model.url, trainRecordings: split.train, validationRecordings: split.validation,

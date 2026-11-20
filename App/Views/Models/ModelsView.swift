@@ -133,7 +133,7 @@ struct NewModelSheet: View {
 
 // MARK: Editor
 
-enum ModelSection: String, CaseIterable { case general = "General", network = "Network", visionLanguage = "Vision & language", actions = "Actions", training = "Training" }
+enum ModelSection: String, CaseIterable { case general = "General", data = "Data", network = "Network", visionLanguage = "Vision & language", actions = "Actions", training = "Training" }
 
 struct ModelEditor: View {
     let app: AppModel
@@ -142,6 +142,7 @@ struct ModelEditor: View {
     @State private var section = ModelSection.general
     @State private var bench: String?
     @State private var benchmarking = false
+    @State private var confirmReset = false
 
     init(app: AppModel, entry: ModelEntry) {
         self.app = app
@@ -161,6 +162,7 @@ struct ModelEditor: View {
                 Group {
                     switch section {
                     case .general: general
+                    case .data: TrainingDataSection(app: app, folders: $def.dataFolders, validationFraction: def.training.validationFraction)
                     case .network: network
                     case .visionLanguage: visionLanguage
                     case .actions: actionsSection
@@ -175,6 +177,15 @@ struct ModelEditor: View {
             .animation(Theme.spring, value: section)
         }
         .onChange(of: def) { _, d in app.models.save(d) }
+        .confirmationDialog("Reset \(def.name)'s brain?", isPresented: $confirmReset) {
+            Button("Reset Brain", role: .destructive) { resetBrain() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Everything it learned (\(def.trainedSteps) steps, \(entry.checkpoints.count) checkpoint\(entry.checkpoints.count == 1 ? "" : "s")) goes to the Trash, and every setting becomes editable again. Its settings and training folders stay.")
+        }
+        .onAppear {
+            if let s = app.pendingModelSection { section = s; app.pendingModelSection = nil }
+        }
     }
 
     private var header: some View {
@@ -189,9 +200,30 @@ struct ModelEditor: View {
                 .font(Theme.font(13)).foregroundStyle(Theme.muted)
             }
             Spacer()
+            Button { confirmReset = true } label: { Label("Reset Brain", systemImage: "arrow.counterclockwise") }
+                .buttonStyle(.atSmall)
+                .disabled(!canReset)
+                .help(resetHelp)
             Button("Duplicate") { app.selectedModelID = app.models.duplicate(entry)?.id }.buttonStyle(.atSmall)
             Button { app.selectedModelID = entry.id; app.tab = .training } label: { Label("Train", systemImage: "play.fill") }.buttonStyle(.atSmallPrimary)
         }
+    }
+
+    // MARK: Reset Brain
+
+    private var busy: Bool {
+        (app.training.isActive && app.training.jobModelID == entry.id) || (app.runner.isRunning && app.runner.selectedModelID == entry.id)
+    }
+    private var canReset: Bool { !busy && (def.architectureLocked || def.isTrained || !entry.checkpoints.isEmpty) }
+    private var resetHelp: String {
+        if busy { return "Stop training or running this model first." }
+        return canReset ? "Forget what the model learned so every setting can be changed again." : "Nothing learned yet."
+    }
+
+    private func resetBrain() {
+        guard !busy, let d = app.models.resetBrain(entry) else { return }
+        withAnimation(Theme.spring) { def = d }
+        if let e = app.models.entry(entry.id) { app.training.loadHistory(for: e) }
     }
 
     // MARK: General
@@ -201,7 +233,7 @@ struct ModelEditor: View {
             if locked {
                 HStack(spacing: 10) {
                     Image(systemName: "lock.fill")
-                    Text("Network, vision, memory and actions are fixed once training starts. Duplicate the model to change them.")
+                    Text("Network, vision, memory and actions are fixed once training starts. Reset Brain (or duplicate the model) to change them.")
                 }
                 .font(Theme.font(13)).foregroundStyle(Theme.warning)
                 .padding(.horizontal, 16).padding(.vertical, 12)
@@ -368,20 +400,30 @@ struct ModelEditor: View {
                 Panel {
                     PointerVocabularyPicker(events: $def.actions.pointerEvents).disabled(locked)
                 }
-                Rows(title: "Mouse", footer: "The Run tab can still block any action without retraining.") {
-                    Row(title: "Movement") {
-                        Segmented(options: [(MouseMode.relative, "Relative"), (MouseMode.absolute, "Pointer")], selection: $def.actions.mouseMode, compact: true)
+                Rows(title: "Mouse", footer: def.actions.movesMouse
+                     ? "The Run tab can still block any action without retraining."
+                     : "The model never moves the mouse: it learns no mouse movement from your recordings and sends none when it runs. Buttons and scrolling are separate.") {
+                    Toggle(isOn: $def.actions.movesMouse) {
+                        Row(title: "Move the mouse", detail: "Off for games played with the keyboard only.")
                     }
-                    .disabled(locked)
-                    if def.actions.mouseMode == .absolute {
+                    .toggleStyle(.oled)
+                    if def.actions.movesMouse {
+                        Row(title: "Movement") {
+                            Segmented(options: [(MouseMode.relative, "Relative"), (MouseMode.absolute, "Pointer")], selection: $def.actions.mouseMode, compact: true)
+                        }
+                        .disabled(locked)
+                    }
+                    if def.actions.movesMouse && def.actions.mouseMode == .absolute {
                         Row(title: "Pointer grid", detail: "\(def.actions.absoluteColumns) × \(def.actions.absoluteRows)") {
                             NumberStepper(value: $def.actions.absoluteColumns, range: 32 ... 256, step: 16)
                                 .onChange(of: def.actions.absoluteColumns) { _, c in def.actions.absoluteRows = c * 9 / 16 }
                         }
                         .disabled(locked)
                     }
-                    Row(title: "Sampling") {
-                        Segmented(options: [(MouseSampling.truncatedNormal, "Smooth"), (MouseSampling.center, "Bin center")], selection: $def.actions.mouseSampling, compact: true)
+                    if def.actions.movesMouse {
+                        Row(title: "Sampling") {
+                            Segmented(options: [(MouseSampling.truncatedNormal, "Smooth"), (MouseSampling.center, "Bin center")], selection: $def.actions.mouseSampling, compact: true)
+                        }
                     }
                     Row(title: "Simultaneous keys") { NumberStepper(value: $def.actions.keySlots, range: 1 ... 8) }.disabled(shapeLocked)
                 }

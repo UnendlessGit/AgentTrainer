@@ -160,8 +160,7 @@ enum EngineTrainSelfTest {
         do { try ModelPackage.write(def, to: modelURL) } catch { report.append("FAIL: \(error)"); return }
         let recs = LibraryFileSystem(root: data).recordings(in: data, recursive: true).map(\.url)
         let entry = ModelEntry(url: modelURL, definition: def, checkpoints: [])
-        app.training.selection[def.id] = Set(recs.prefix(3))
-        app.training.start(model: entry)
+        app.training.start(model: entry, recordings: Array(recs.prefix(3)))
         let t0 = Date()
         var pausedOnce = false
         while Date().timeIntervalSince(t0) < 600 {

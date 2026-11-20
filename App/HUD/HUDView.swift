@@ -8,8 +8,10 @@ struct HUDView: View {
     @Bindable var model: HUDModel
     private var s: CGFloat { model.options.scale }
     private var isRun: Bool { model.mode == .run }
-    private var fill: Color { isRun ? Theme.accent : Theme.text }
-    private var ink: Color { isRun ? .white : .black }
+    /// Run and replay both send input; they share the accent look.
+    private var sends: Bool { model.mode != .record }
+    private var fill: Color { sends ? Theme.accent : Theme.text }
+    private var ink: Color { sends ? .white : .black }
     private var right: Bool { model.options.corner == .bottomRight || model.options.corner == .topRight }
 
     /// Fixed panel size: the HUD grows inside it towards its corner, so the window never jumps.
@@ -19,6 +21,11 @@ struct HUDView: View {
         let size = Self.panelSize(scale: s)
         VStack(alignment: right ? .trailing : .leading, spacing: 10 * s) {
             if model.options.stats { status }
+            if let n = model.notice {
+                Label(n, systemImage: "checkmark.circle.fill").font(Theme.font(12 * s, .medium))
+                    .foregroundStyle(Theme.text2).lineLimit(1)
+                    .transition(.opacity.combined(with: .move(edge: right ? .trailing : .leading)))
+            }
             if isRun, let i = model.instruction, !i.isEmpty {
                 Text("“\(i)”").font(Theme.font(12 * s)).foregroundStyle(Theme.text2)
                     .lineLimit(1).truncationMode(.tail)
@@ -30,7 +37,7 @@ struct HUDView: View {
                 if model.options.keyboard {
                     KeyboardHUD(seen: model.seen, pressed: model.snapshot.keys, unit: 22 * s, fill: fill, ink: ink,
                                 anchor: right ? .bottomTrailing : .bottomLeading,
-                                emptyText: isRun ? "Keys appear as the model uses them" : "Keys appear as they’re pressed")
+                                emptyText: model.mode == .run ? "Keys appear as the model uses them" : model.mode == .replay ? "Keys appear as the replay presses them" : "Keys appear as they’re pressed")
                 }
                 if model.options.mouse {
                     MouseHUD(velocity: model.snapshot.velocity, buttons: model.snapshot.buttons, scroll: model.snapshot.scroll, fill: fill, scale: s)
@@ -43,6 +50,8 @@ struct HUDView: View {
         .fixedSize()
         // New keys widen the layout; the panel follows smoothly.
         .animation(.spring(response: 0.45, dampingFraction: 0.86), value: model.seen)
+        .animation(Theme.snappy, value: model.notice)
+        .animation(Theme.snappy, value: model.correcting)
         .foregroundStyle(Theme.text)
         .opacity(model.options.opacity)
         .padding(14 * s)
@@ -60,12 +69,18 @@ struct HUDView: View {
     }
 
     private var status: some View {
-        let color = isRun ? (model.paused ? Theme.warning : Theme.live) : Theme.danger
-        let label = isRun ? (model.paused ? "AI PAUSED" : "AI") : "REC"
+        let correcting = isRun && model.correcting
+        let color = correcting ? Theme.correction : sends ? (model.paused ? Theme.warning : Theme.live) : Theme.danger
+        let label = switch model.mode {
+        case .record: "REC"
+        case .run: correcting ? "CORRECTING" : model.paused ? "AI PAUSED" : "AI"
+        case .replay: model.paused ? "REPLAY PAUSED" : "REPLAY"
+        }
         return HStack(spacing: 8 * s) {
             LiveDot(color: color, size: 7 * s)
             Text(label).font(Theme.font(12 * s, .bold)).tracking(0.8)
-                .foregroundStyle(isRun ? color : Theme.dangerText)
+                .foregroundStyle(sends ? color : Theme.dangerText)
+                .contentTransition(.opacity)
             if !model.statusLine.isEmpty {
                 Text(model.statusLine).font(.system(size: 12 * s, design: .monospaced)).monospacedDigit()
                     .foregroundStyle(Theme.text2).lineLimit(1)

@@ -9,6 +9,7 @@ final class HUDPanelController {
     private var panel: NSPanel?
     private var timer: Timer?
     private var screenFrame: CGRect?
+    private var noticeTask: Task<Void, Never>?
 
     func show(mode: HUDModel.Mode, options: HUDOptions, on targetFrame: CGRect?, feed: @escaping @MainActor () -> Void) {
         model.mode = mode
@@ -39,8 +40,20 @@ final class HUDPanelController {
         layout()
     }
 
+    /// Shows a short message on the HUD for a few seconds.
+    func flash(_ text: String, seconds: Double = 3.5) {
+        model.notice = text
+        noticeTask?.cancel()
+        noticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            self?.model.notice = nil
+        }
+    }
+
     func hide() {
         timer?.invalidate(); timer = nil
+        noticeTask?.cancel(); model.notice = nil; model.correcting = false
         panel?.orderOut(nil)
     }
 

@@ -123,6 +123,10 @@ public struct ModelDefinition: Codable, Hashable, Sendable, Identifiable {
     public var lastTrainedAt: Date?
     /// Checkpoint used by Run (nil = latest).
     public var activeCheckpoint: String?
+    /// Library folders to train on, relative to the library root ("" = recordings directly in it).
+    /// Each folder means the recordings directly inside it, so new recordings there are included
+    /// automatically. nil for models saved before folders were chosen per model.
+    public var dataFolders: [String]?
 
     public init(name: String, initialization: ModelInitialization, architecture: PolicyArchitecture,
                 actions: ActionSpaceConfig, training: TrainingHyperparameters) {

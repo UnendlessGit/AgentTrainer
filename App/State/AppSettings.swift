@@ -64,6 +64,10 @@ struct StoredSettings: Codable {
     var runHotkey = Hotkey(keyCode: 0x31, command: true, shift: true, option: true) // ⌥⇧⌘Space
     var pauseHotkey = Hotkey(keyCode: 0x23, command: true, shift: true, option: true) // ⌥⇧⌘P
     var emergencyHotkey = Hotkey(keyCode: 0x35, command: true, shift: true) // ⇧⌘Esc
+    /// Starts / stops replaying the recording armed in the Library.
+    var replayHotkey = Hotkey(keyCode: 0x16, command: true) // ⌘6
+    /// While the AI runs: take over (the AI freezes) / hand back (the AI carries on).
+    var correctionHotkey = Hotkey(keyCode: 0x1A, command: true) // ⌘7
     var recordHUD = HUDOptions()
     var runHUD = HUDOptions()
     var captureFPS = 60
@@ -77,6 +81,12 @@ struct StoredSettings: Codable {
     var pauseOnHumanInput = true
     var keepGPUWarm = true
     var reduceRecordingWhileTraining = true
+    /// Injected mouse units per Roblox mouse pixel, measured by Elkborn's CALIBRATE MOUSE (1 = not calibrated).
+    var elkbornUnitsPerPixel = 1.0
+    var elkbornCalibrated = false
+
+    /// Every AgentTrainer shortcut: never recorded as input, never replayed, never a takeover.
+    var appHotkeys: [Hotkey] { [recordHotkey, cancelRecordingHotkey, runHotkey, pauseHotkey, emergencyHotkey, replayHotkey, correctionHotkey] }
 
     /// Decodes saved settings on top of the defaults, so settings added in later versions (and any
     /// that fail to decode) fall back to their defaults instead of resetting everything.

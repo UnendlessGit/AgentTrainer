@@ -36,6 +36,14 @@ public struct ActionSpaceConfig: Codable, Hashable, Sendable {
     public var mouseXStd: Double
     public var mouseYStd: Double
     public var mouseSampling: MouseSampling
+    /// Stored as an optional so models saved before this setting existed still load (nil = on).
+    public var mouseMovement: Bool?
+    /// Whether the model moves the mouse. Off: it learns "no movement" and never moves it, while
+    /// its keys and buttons work as usual (the mouse heads stay, so weights keep their shape).
+    public var movesMouse: Bool {
+        get { mouseMovement != false }
+        set { mouseMovement = newValue }
+    }
 
     public static let p2pXEdges: [Double] = [-500.1, -144.1, -76.1, -46.1, -29.1, -18.1, -11.1, -6.1, -3.1, -1.1, -0.1, 0,
                                              1, 3, 6, 11, 18, 29, 46, 76, 144, 500]
@@ -119,6 +127,11 @@ public struct ActionSpaceConfig: Codable, Hashable, Sendable {
         let pIdx = pointerIndex
         let ptr = step.pointer.compactMap { pIdx[$0] }.sorted()
         for s in 0 ..< pointerSlots { out.append(s < ptr.count ? Int32(ptr[s]) : 0) }
+        if !movesMouse {
+            out.append(Int32(zeroXClass))
+            out.append(Int32(zeroYClass))
+            return out
+        }
         switch mouseMode {
         case .relative:
             out.append(Int32(bucketize(step.dx * mouseUnitScale, mouseXEdges)))
@@ -141,6 +154,7 @@ public struct ActionSpaceConfig: Codable, Hashable, Sendable {
             a.pointer.insert(pointerEvents[Int(classes[s]) - 1])
         }
         let cx = Int(classes[keySlots + pointerSlots]), cy = Int(classes[keySlots + pointerSlots + 1])
+        if !movesMouse { return a }
         switch mouseMode {
         case .relative:
             a.dx = binValue(cx, edges: mouseXEdges, std: mouseXStd, sample: sampleMouse) / mouseUnitScale

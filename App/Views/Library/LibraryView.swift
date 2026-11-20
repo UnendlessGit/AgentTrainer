@@ -27,11 +27,13 @@ struct LibraryView: View {
         .onAppear {
             lib.refresh()
             if expanded.isEmpty, let first = lib.tree.children.first { expanded.insert(first.url) }
-            if CommandLine.arguments.contains("--open-first-recording"), selection.isEmpty, let r = visibleOrder.first { selection = [r] }
+            if CommandLine.arguments.contains("--open-first-recording"), selection.isEmpty, let r = visibleOrder.first ?? lib.all.first?.url { selection = [r] }
+            if CommandLine.arguments.contains("--arm-first-recording"), let r = lib.all.first(where: { selection.contains($0.url) }) { app.replay.arm(r) }
         }
         .onChange(of: lib.all) { _, recs in
             let present = Set(recs.map(\.url))
             selection = selection.filter(present.contains)
+            app.replay.relocate(in: recs)
         }
         .alert("New folder", isPresented: Binding(get: { newFolderParent != nil }, set: { if !$0 { newFolderParent = nil } })) {
             TextField("Name", text: $nameField)
@@ -241,9 +243,18 @@ struct LibraryView: View {
                 AsyncThumb(url: r.thumbnail).frame(width: 48, height: 28)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(r.meta.name).font(Theme.font(13, .medium)).lineLimit(1).truncationMode(.middle)
-                    Text("\(r.meta.duration.durationText)\(r.meta.isCorrectionRun ? " · correction run" : "")").font(Theme.font(11.5)).foregroundStyle(Theme.muted)
+                    HStack(spacing: 6) {
+                        Text(r.meta.duration.durationText).font(Theme.font(11.5)).foregroundStyle(Theme.muted)
+                        if r.meta.isCorrectionRun { CorrectionTag(model: r.meta.modelName, compact: true) }
+                    }
                 }
                 Spacer(minLength: 0)
+                if app.replay.isArmed(r.url) {
+                    Image(systemName: app.replay.isActive ? "dot.radiowaves.left.and.right" : "play.circle.fill")
+                        .font(.system(size: 13)).foregroundStyle(Theme.live)
+                        .help("Armed for replay · \(app.settings.stored.replayHotkey.display)")
+                        .transition(.opacity.combined(with: .scale(scale: 0.6)))
+                }
             }
             .padding(.leading, 34 + CGFloat(depth) * 16).padding(.trailing, 10).padding(.vertical, 6)
         }
@@ -258,6 +269,10 @@ struct LibraryView: View {
                 Button("Rename \(targets.count) Recordings…") { nameField = ""; renamingMany = targets }
             }
             Button(targets.count == 1 ? "Set Instruction…" : "Set Instruction for \(targets.count)…") { nameField = ""; instructionFor = targets }
+            if targets.count == 1 {
+                Button("Arm for Replay (\(app.settings.stored.replayHotkey.display))") { withAnimation(Theme.spring) { app.replay.arm(r) } }
+                    .disabled(app.replay.isActive || app.replay.isArmed(r.url))
+            }
             Menu(targets.count == 1 ? "Move To" : "Move \(targets.count) To") { moveTargets(for: targets) }
             Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting(targets) }
             Divider()
